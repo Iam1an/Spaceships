@@ -40,7 +40,7 @@ function isAccentMesh(o) {
   return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b < 0.35;
 }
 
-export function createShip({ tint, hullColor, accentColor, modelUrl = 'public/spaceship.glb' } = {}) {
+export function createShip({ tint, hullColor, accentColor, modelUrl = 'public/spaceship.glb', doubleSided = false } = {}) {
   const ship = new THREE.Group();
   ship.name = 'Ship';
 
@@ -51,6 +51,7 @@ export function createShip({ tint, hullColor, accentColor, modelUrl = 'public/sp
     model.traverse((o) => {
       if (o.isMesh && o.material) {
         o.material = o.material.clone();
+        if (doubleSided) o.material.side = THREE.DoubleSide;
         if (!o.material.color) return;
         // hullColor/accentColor take precedence; fall back to legacy tint.
         if (hullColor !== undefined || accentColor !== undefined) {

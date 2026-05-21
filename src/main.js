@@ -22,15 +22,15 @@ export async function startGame(opts = {}) {
   if (started) return;
   started = true;
 
-  // Preload the ship GLB before spawning any ships so the local player
-  // and remote players all use the loaded model instead of the primitive
-  // fallback. Also preload the admin variant; failure is silent so a
-  // missing GLB just falls back to the regular model.
+  // Preload the regular ship GLB before spawning any ships (same as before).
+  try { await loadShipModel(); } catch (e) { console.warn('[ship] GLB load failed, using primitives', e); }
+
+  // Kick off the admin model load in the background — NOT awaited here so
+  // the game message handler (which receives friends' color updates) gets
+  // registered without delay. The admin model will be ready long before the
+  // first remote-state messages arrive.
   const ADMIN_MODEL_URL = 'public/spaceshipADMIN.glb';
-  await Promise.allSettled([
-    loadShipModel(),
-    loadShipModel(ADMIN_MODEL_URL),
-  ]);
+  loadShipModel(ADMIN_MODEL_URL).catch(() => {});
 
   const scene = new THREE.Scene();
   const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -141,6 +141,7 @@ export async function startGame(opts = {}) {
     hullColor: savedHull,
     accentColor: savedAccent,
     modelUrl: isLocalAdmin ? ADMIN_MODEL_URL : 'public/spaceship.glb',
+    doubleSided: isLocalAdmin,
   });
   ship.scale.setScalar(SHIP_SCALE);
   // Apply server-provided spawn (team-specific) or fall back to mothership A.
@@ -363,8 +364,8 @@ export async function startGame(opts = {}) {
     const isRemoteAdmin = remoteName === 'Admin';
     const remoteModelUrl = isRemoteAdmin ? ADMIN_MODEL_URL : 'public/spaceship.glb';
     const remoteShip = colors
-      ? createShip({ hullColor: colors.hullColor, accentColor: colors.accentColor, modelUrl: remoteModelUrl })
-      : createShip({ tint: PALETTE[id % PALETTE.length], modelUrl: remoteModelUrl });
+      ? createShip({ hullColor: colors.hullColor, accentColor: colors.accentColor, modelUrl: remoteModelUrl, doubleSided: isRemoteAdmin })
+      : createShip({ tint: PALETTE[id % PALETTE.length], modelUrl: remoteModelUrl, doubleSided: isRemoteAdmin });
     remoteShip.scale.setScalar(SHIP_SCALE);
 
     // Constant-size dot above the ship. Red for enemies, green for allies.
@@ -901,10 +902,10 @@ export async function startGame(opts = {}) {
     new THREE.Vector3(-2.2, -0.05, -1.8),
     new THREE.Vector3( 2.2, -0.05, -1.8),
   ];
-  // Admin model has jets closer together; offset X inward to match.
+  // Admin model has jets closer together and further back.
   const ADMIN_TRAIL_OFFSETS = [
-    new THREE.Vector3(-1.4, -0.05, -1.8),
-    new THREE.Vector3( 1.4, -0.05, -1.8),
+    new THREE.Vector3(-0.9, -0.05, -2.4),
+    new THREE.Vector3( 0.9, -0.05, -2.4),
   ];
   const localTrailOffsets = isLocalAdmin ? ADMIN_TRAIL_OFFSETS : TRAIL_OFFSETS;
   // Enemy/remote-ship trails. Default on; users on low-end devices can
