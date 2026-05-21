@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { createSkybox } from './skybox.js';
-import { createShip, loadShipModel, applyColorsToShip } from './ship.js';
+import { createShip, loadShipModel, applyColorsToShip, isModelCached } from './ship.js';
 import { createAsteroidField, createAsteroidFieldFromData } from './asteroids.js';
 import { createBullets, BULLET_SPEED } from './bullets.js';
 import { createBeams } from './beams.js';
@@ -27,10 +27,11 @@ export async function startGame(opts = {}) {
 
   // Kick off the admin model load in the background — NOT awaited here so
   // the game message handler (which receives friends' color updates) gets
-  // registered without delay. The admin model will be ready long before the
-  // first remote-state messages arrive.
+  // registered without delay. We save the promise so getOrCreateRemote can
+  // swap the model in-place if it finishes after a remote admin ship was
+  // already created with the regular-model fallback.
   const ADMIN_MODEL_URL = 'public/spaceshipADMIN.glb';
-  loadShipModel(ADMIN_MODEL_URL).catch(() => {});
+  const adminModelReady = loadShipModel(ADMIN_MODEL_URL).catch(() => null);
 
   const scene = new THREE.Scene();
   const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -412,6 +413,32 @@ export async function startGame(opts = {}) {
       team: scores.get(id)?.team ?? null,
     };
     remotePlayers.set(id, r);
+
+    // If this is an admin player but the admin model wasn't cached yet,
+    // swap the ship's 3D model in-place once the download finishes.
+    if (isRemoteAdmin && !isModelCached(ADMIN_MODEL_URL)) {
+      adminModelReady.then((adminScene) => {
+        const rec = remotePlayers.get(id);
+        if (!rec || !adminScene) return;
+        // Remove non-marker children (the old placeholder model).
+        rec.ship.children.slice().forEach((c) => {
+          if (c !== rec.marker) rec.ship.remove(c);
+        });
+        const newModel = adminScene.clone(true);
+        newModel.rotation.y = -Math.PI / 2;
+        newModel.traverse((o) => {
+          if (o.isMesh && o.material) {
+            o.material = o.material.clone();
+            o.material.side = THREE.DoubleSide;
+          }
+        });
+        rec.ship.add(newModel);
+        rec.trailOffsets = ADMIN_TRAIL_OFFSETS;
+        const col = remoteColors.get(id);
+        if (col) applyColorsToShip(rec.ship, col.hullColor, col.accentColor);
+      });
+    }
+
     return r;
   }
 

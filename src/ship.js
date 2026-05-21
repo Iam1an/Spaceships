@@ -21,6 +21,10 @@ export function loadShipModel(url = 'public/spaceship.glb') {
   return promise;
 }
 
+export function isModelCached(url) {
+  return modelCache.has(url);
+}
+
 export function applyColorsToShip(ship, hullColor, accentColor) {
   ship.traverse((o) => {
     if (!o.isMesh || !o.material?.color) return;
