@@ -144,6 +144,24 @@ export async function startGame(opts = {}) {
     modelUrl: isLocalAdmin ? ADMIN_MODEL_URL : 'public/spaceship.glb',
     doubleSided: isLocalAdmin,
   });
+  // If we're admin but the model wasn't cached yet (still downloading),
+  // swap the geometry in-place once it finishes — same pattern as remotes.
+  if (isLocalAdmin && !isModelCached(ADMIN_MODEL_URL)) {
+    adminModelReady.then((adminScene) => {
+      if (!adminScene) return;
+      ship.children.slice().forEach((c) => ship.remove(c));
+      const newModel = adminScene.clone(true);
+      newModel.rotation.y = -Math.PI / 2;
+      newModel.traverse((o) => {
+        if (o.isMesh && o.material) {
+          o.material = o.material.clone();
+          o.material.side = THREE.DoubleSide;
+        }
+      });
+      ship.add(newModel);
+      applyColorsToShip(ship, savedHull, savedAccent);
+    });
+  }
   ship.scale.setScalar(SHIP_SCALE);
   // Apply server-provided spawn (team-specific) or fall back to mothership A.
   if (opts.spawn) {
