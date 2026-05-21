@@ -354,6 +354,7 @@ function enterGame() {
     mode: roomMode,
     bots: lastBots,
     hardMode: hardMode(),
+    pilotName: pilotName(),
   });
 }
 

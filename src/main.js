@@ -24,8 +24,13 @@ export async function startGame(opts = {}) {
 
   // Preload the ship GLB before spawning any ships so the local player
   // and remote players all use the loaded model instead of the primitive
-  // fallback.
-  try { await loadShipModel(); } catch (e) { console.warn('[ship] GLB load failed, using primitives', e); }
+  // fallback. Also preload the admin variant; failure is silent so a
+  // missing GLB just falls back to the regular model.
+  const ADMIN_MODEL_URL = 'public/spaceshipADMIN.glb';
+  await Promise.allSettled([
+    loadShipModel(),
+    loadShipModel(ADMIN_MODEL_URL),
+  ]);
 
   const scene = new THREE.Scene();
   const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -130,7 +135,13 @@ export async function startGame(opts = {}) {
   const SHIP_SCALE = 1.5;
   const savedHull   = parseInt(getSavedShipColor().replace('#', ''), 16);
   const savedAccent = parseInt(getSavedAccentColor().replace('#', ''), 16);
-  const ship = createShip({ hullColor: savedHull, accentColor: savedAccent });
+  const localPlayerName = (opts.pilotName || '').trim();
+  const isLocalAdmin = localPlayerName === 'Admin';
+  const ship = createShip({
+    hullColor: savedHull,
+    accentColor: savedAccent,
+    modelUrl: isLocalAdmin ? ADMIN_MODEL_URL : 'public/spaceship.glb',
+  });
   ship.scale.setScalar(SHIP_SCALE);
   // Apply server-provided spawn (team-specific) or fall back to mothership A.
   if (opts.spawn) {
@@ -348,9 +359,12 @@ export async function startGame(opts = {}) {
     let r = remotePlayers.get(id);
     if (r) return r;
     const colors = remoteColors.get(id);
+    const remoteName = (scores.get(id)?.name || '').trim();
+    const isRemoteAdmin = remoteName === 'Admin';
+    const remoteModelUrl = isRemoteAdmin ? ADMIN_MODEL_URL : 'public/spaceship.glb';
     const remoteShip = colors
-      ? createShip({ hullColor: colors.hullColor, accentColor: colors.accentColor })
-      : createShip({ tint: PALETTE[id % PALETTE.length] });
+      ? createShip({ hullColor: colors.hullColor, accentColor: colors.accentColor, modelUrl: remoteModelUrl })
+      : createShip({ tint: PALETTE[id % PALETTE.length], modelUrl: remoteModelUrl });
     remoteShip.scale.setScalar(SHIP_SCALE);
 
     // Constant-size dot above the ship. Red for enemies, green for allies.
@@ -380,6 +394,7 @@ export async function startGame(opts = {}) {
     r = {
       id,
       ship: remoteShip,
+      trailOffsets: isRemoteAdmin ? ADMIN_TRAIL_OFFSETS : TRAIL_OFFSETS,
       targetPos: new THREE.Vector3(),
       targetQuat: new THREE.Quaternion(),
       hasTarget: false,
@@ -886,6 +901,12 @@ export async function startGame(opts = {}) {
     new THREE.Vector3(-2.2, -0.05, -1.8),
     new THREE.Vector3( 2.2, -0.05, -1.8),
   ];
+  // Admin model has jets closer together; offset X inward to match.
+  const ADMIN_TRAIL_OFFSETS = [
+    new THREE.Vector3(-1.4, -0.05, -1.8),
+    new THREE.Vector3( 1.4, -0.05, -1.8),
+  ];
+  const localTrailOffsets = isLocalAdmin ? ADMIN_TRAIL_OFFSETS : TRAIL_OFFSETS;
   // Enemy/remote-ship trails. Default on; users on low-end devices can
   // turn this off in the settings panel. Captured at startGame time —
   // mid-match changes apply on next game.
@@ -1227,7 +1248,7 @@ export async function startGame(opts = {}) {
       const interval = 1 / cfg.rate;
       while (trailTimer >= interval) {
         trailTimer -= interval;
-        for (const off of TRAIL_OFFSETS) {
+        for (const off of localTrailOffsets) {
           const p = off.clone().applyQuaternion(ship.quaternion).add(ship.position);
           p.x += (Math.random() - 0.5) * cfg.jitter;
           p.y += (Math.random() - 0.5) * cfg.jitter;
@@ -1269,7 +1290,7 @@ export async function startGame(opts = {}) {
         const interval = 1 / cfg.rate;
         while (r.trailTimer >= interval) {
           r.trailTimer -= interval;
-          for (const off of TRAIL_OFFSETS) {
+          for (const off of (r.trailOffsets || TRAIL_OFFSETS)) {
             const p = off.clone().applyQuaternion(r.ship.quaternion).add(r.ship.position);
             p.x += (Math.random() - 0.5) * cfg.jitter;
             p.y += (Math.random() - 0.5) * cfg.jitter;

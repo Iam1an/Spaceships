@@ -1,23 +1,24 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-// Loaded once, then cloned for every player/remote ship. Cloning the
-// cached scene + per-mesh materials keeps tint changes and emissive
+// Loaded once per URL, then cloned for every player/remote ship. Cloning
+// the cached scene + per-mesh materials keeps tint changes and emissive
 // hit-flashes from bleeding across ships.
-let cachedModel = null;
-let loadPromise = null;
+const modelCache = new Map();   // url → THREE.Group
+const loadPromises = new Map(); // url → Promise<THREE.Group>
 
 export function loadShipModel(url = 'public/spaceship.glb') {
-  if (cachedModel) return Promise.resolve(cachedModel);
-  if (loadPromise) return loadPromise;
+  if (modelCache.has(url)) return Promise.resolve(modelCache.get(url));
+  if (loadPromises.has(url)) return loadPromises.get(url);
   const loader = new GLTFLoader();
-  loadPromise = new Promise((resolve, reject) => {
+  const promise = new Promise((resolve, reject) => {
     loader.load(url, (gltf) => {
-      cachedModel = gltf.scene;
-      resolve(cachedModel);
+      modelCache.set(url, gltf.scene);
+      resolve(gltf.scene);
     }, undefined, reject);
   });
-  return loadPromise;
+  loadPromises.set(url, promise);
+  return promise;
 }
 
 export function applyColorsToShip(ship, hullColor, accentColor) {
@@ -39,10 +40,11 @@ function isAccentMesh(o) {
   return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b < 0.35;
 }
 
-export function createShip({ tint, hullColor, accentColor } = {}) {
+export function createShip({ tint, hullColor, accentColor, modelUrl = 'public/spaceship.glb' } = {}) {
   const ship = new THREE.Group();
   ship.name = 'Ship';
 
+  const cachedModel = modelCache.get(modelUrl) ?? modelCache.get('public/spaceship.glb');
   if (cachedModel) {
     const model = cachedModel.clone(true);
     model.rotation.y = -Math.PI / 2;
