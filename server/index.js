@@ -664,6 +664,18 @@ function handleConnection(ws) {
       return;
     }
 
+    if (msg.type === 'ship-model') {
+      const room = ws.room;
+      if (!room) return;
+      const modelUrl = typeof msg.modelUrl === 'string' ? msg.modelUrl : null;
+      if (!modelUrl) return;
+      const out = JSON.stringify({ type: 'ship-model', id: ws.id, modelUrl });
+      for (const c of room.sockets) {
+        if (c !== ws && c.open) c.send(out);
+      }
+      return;
+    }
+
     if (msg.type === 'fire') {
       const room = ws.room;
       if (!room || !room.started) return;

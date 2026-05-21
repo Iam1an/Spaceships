@@ -265,6 +265,7 @@ export async function startGame(opts = {}) {
   const mpBotIds = isMp5v5 ? new Set(opts.bots.map((b) => b.id)) : new Set();
   const remotePlayers = new Map();
   const remoteColors = new Map(); // id -> { hullColor, accentColor } as hex integers
+  const remoteModels = new Map(); // id -> modelUrl (set by 'ship-model' broadcast)
   const PALETTE = [0xff5577, 0x55ff88, 0xffcc55, 0xaa66ff, 0x55ddff, 0xff99cc, 0xff8833, 0x99ff55];
 
   // Marker diamond textures: red for enemies, green for teammates. Shared
@@ -380,7 +381,7 @@ export async function startGame(opts = {}) {
     if (r) return r;
     const colors = remoteColors.get(id);
     const remoteName = (scores.get(id)?.name || '').trim();
-    const isRemoteAdmin = remoteName === 'Admin';
+    const isRemoteAdmin = remoteModels.get(id) === ADMIN_MODEL_URL || remoteName === 'Admin';
     const remoteModelUrl = isRemoteAdmin ? ADMIN_MODEL_URL : 'public/spaceship.glb';
     const remoteShip = colors
       ? createShip({ hullColor: colors.hullColor, accentColor: colors.accentColor, modelUrl: remoteModelUrl, doubleSided: isRemoteAdmin })
@@ -526,6 +527,9 @@ export async function startGame(opts = {}) {
       hullColor:   parseInt(getSavedShipColor().replace('#', ''), 16),
       accentColor: parseInt(getSavedAccentColor().replace('#', ''), 16),
     }));
+    if (isLocalAdmin) {
+      ws.send(JSON.stringify({ type: 'ship-model', modelUrl: ADMIN_MODEL_URL }));
+    }
   }
 
   if (ws) {
@@ -590,6 +594,34 @@ export async function startGame(opts = {}) {
         remoteColors.set(msg.id, { hullColor: hull, accentColor: accent });
         const r = remotePlayers.get(msg.id);
         if (r) applyColorsToShip(r.ship, hull, accent);
+        return;
+      }
+      if (msg.type === 'ship-model' && msg.id !== myId) {
+        remoteModels.set(msg.id, msg.modelUrl);
+        const isAdminModel = msg.modelUrl === ADMIN_MODEL_URL;
+        const r = remotePlayers.get(msg.id);
+        if (r && isAdminModel) {
+          // Ship already exists with wrong model — swap to admin model now.
+          adminModelReady.then((adminScene) => {
+            const rec = remotePlayers.get(msg.id);
+            if (!rec || !adminScene) return;
+            rec.ship.children.slice().forEach((c) => {
+              if (c !== rec.marker) rec.ship.remove(c);
+            });
+            const newModel = adminScene.clone(true);
+            newModel.rotation.y = -Math.PI / 2;
+            newModel.traverse((o) => {
+              if (o.isMesh && o.material) {
+                o.material = o.material.clone();
+                o.material.side = THREE.DoubleSide;
+              }
+            });
+            rec.ship.add(newModel);
+            rec.trailOffsets = ADMIN_TRAIL_OFFSETS;
+            const col = remoteColors.get(msg.id);
+            if (col) applyColorsToShip(rec.ship, col.hullColor, col.accentColor);
+          });
+        }
         return;
       }
       if (msg.type === 'state' && msg.id !== myId) {
