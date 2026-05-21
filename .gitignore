@@ -1,0 +1,27 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Build / logs
+dist/
+build/
+*.log
+
+# Env / secrets (none today, but be safe)
+.env
+.env.local
+.claude/settings.local.json
+
+# SQLite database (runtime data, not source)
+pilots.db
+pilots.db-shm
+pilots.db-wal

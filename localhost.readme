@@ -1,0 +1,69 @@
+Spaceships — running locally
+============================
+
+Prerequisites
+-------------
+- Node.js 18+ (check with `node --version`). The server uses ES modules and
+  `node --watch`, both available since Node 18.
+- npm comes bundled with Node.
+
+First-time setup
+----------------
+From the project root (the folder that has package.json):
+
+    npm install
+
+This downloads Express and the websocket dependency into node_modules/.
+You only need to run this once, or again if dependencies change.
+
+Run the server
+--------------
+    npm start
+
+You should see:
+
+    Spaceships server listening on port 4000
+    Local:  http://localhost:4000
+    LAN:    http://<your-ip>:4000
+
+Open http://localhost:4000 in a browser. The lobby loads and you can play.
+
+For development with auto-reload on server file changes:
+
+    npm run dev
+
+(restarts the server when files under server/ change; the browser still
+needs a manual refresh)
+
+Play with friends on your LAN
+-----------------------------
+Find your machine's local IP:
+
+    macOS:    ipconfig getifaddr en0
+    Linux:    hostname -I
+    Windows:  ipconfig    (look for IPv4 Address)
+
+Share that IP with someone on the same Wi-Fi:
+
+    http://192.168.x.x:4000
+
+Both browsers connect to the same server, then one player creates a room
+and the other joins with the 4-letter room code.
+
+Different port
+--------------
+The server reads PORT from the environment:
+
+    PORT=3000 npm start
+
+Useful if 4000 is busy.
+
+Troubleshooting
+---------------
+- "address already in use" — something else is on port 4000. Pick a different
+  port with `PORT=3001 npm start`, or find and kill the offender:
+      lsof -ti:4000 | xargs kill
+- Page loads but lobby shows "Open via http://localhost:4000" — you opened
+  index.html directly via file://. Always go through the server URL.
+- WebSocket fails on the LAN — check firewall settings. macOS may prompt to
+  allow Node to accept incoming connections the first time.
