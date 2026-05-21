@@ -23,6 +23,19 @@ export class ThirdPersonCamera {
     this._upDesired = new THREE.Vector3(0, 1, 0);
   }
 
+  snap() {
+    const back = new THREE.Vector3(0, 0, -1).applyQuaternion(this.target.quaternion);
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(this.target.quaternion);
+    this._desired.copy(this.target.position)
+      .addScaledVector(back, this.distance)
+      .addScaledVector(up, this.heightOffset);
+    this.camera.position.copy(this._desired);
+    this._upDesired.copy(up);
+    this.camera.up.copy(up);
+    this.yaw = 0;
+    this.pitch = 0.2;
+  }
+
   update(dt, input) {
     const { dx, dy } = input.consumeMouseDelta();
 

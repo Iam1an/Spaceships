@@ -163,6 +163,7 @@ export async function startGame(opts = {}) {
   scene.add(trails.group);
 
   const tpCam = new ThirdPersonCamera(camera, ship);
+  tpCam.snap();
   const input = new Input(renderer.domElement);
   // Control scheme (set in the lobby): 'mouse_keys' (default), 'keyboard'
   // (arrow steering, no mouse), or 'mobile' (touch joystick + on-screen
@@ -445,6 +446,7 @@ export async function startGame(opts = {}) {
     targetThrottle = 0;
     throttle = 0;
     ship.visible = true;
+    tpCam.snap();
   }
 
   function removeRemote(id) {
@@ -1394,11 +1396,10 @@ export async function startGame(opts = {}) {
 
     let bestAlignment = Infinity;
     let anyVisible = false;
-    // Bullets travel BULLET_SPEED · LIFE u (520 · 2 = 1040u); beam reaches
-    // BEAM_RANGE (1000u). Lead markers are visible across that whole range.
-    // Matches ASSIST_RANGE so the on-screen target box / lead marker
-    // disappear at the same distance the autoaim disengages.
-    const TARGETING_MAX_DIST = ASSIST_RANGE;
+    // Show target box whenever the diamond marker is visible so there is no
+    // confusing gap where you see the blip but not the stats. Aim-assist
+    // still only engages within ASSIST_RANGE (1000u).
+    const TARGETING_MAX_DIST = MARKER_VISIBLE_DIST;
     for (const r of remotePlayers.values()) {
       if (!r.alive || !r.hasTarget) {
         r.box.style.display = 'none';
@@ -1495,7 +1496,7 @@ export async function startGame(opts = {}) {
       r.box.style.left = sx + 'px';
       r.box.style.top = sy + 'px';
       const targetName = scores.get(r.id)?.name || `P${r.id}`;
-      r.label.textContent = `${targetName}  ${dist.toFixed(0)}u  HP ${r.hp}`;
+      r.label.textContent = `${targetName}  HP ${r.hp}`;
 
       // Lead marker stays on the enemy ship itself — no motion prediction.
       // sx/sy were already projected just above for the target box.
