@@ -313,7 +313,9 @@ function showHud() {
   // Drop the in-lobby flag so the settings panel's "Back to Menu" button
   // becomes visible (it's hidden while the lobby is on screen).
   document.body.classList.remove('in-lobby');
-  document.getElementById('hud').style.display = '';
+  if (localStorage.getItem('spaceships:showStats') !== '0') {
+    document.getElementById('hud-stats').style.display = '';
+  }
   document.getElementById('reticle').style.display = '';
   document.getElementById('healthbar').style.display = '';
   document.getElementById('chargebar').style.display = '';
@@ -799,4 +801,65 @@ requireAuth().then(() => {
     nameInput.style.opacity = '0.55';
     nameInput.title = 'Your callsign is your account username and cannot be changed here';
   }
+});
+
+// ── Controls popup ────────────────────────────────────────────────────────────
+
+const CONTROL_GUIDES = {
+  mouse_keys: [
+    ['Mouse / Arrows', 'Steer'],
+    ['LMB / F', 'Fire'],
+    ['Scroll / W / S', 'Throttle'],
+    ['Shift', 'Boost'],
+    ['Space', 'Drift / Charge'],
+    ['A / D', 'Roll'],
+    ['RMB', 'Free-look'],
+    ['P', 'Toggle gun'],
+    ['C', 'Aim assist'],
+    ['O', 'Grab mouse'],
+    ['L', 'Fullscreen'],
+  ],
+  keyboard: [
+    ['Arrows', 'Steer'],
+    ['F', 'Fire'],
+    ['W / S', 'Throttle'],
+    ['Shift', 'Boost'],
+    ['Space', 'Drift / Charge'],
+    ['A / D', 'Roll'],
+    ['P', 'Toggle gun'],
+    ['C', 'Aim assist'],
+    ['L', 'Fullscreen'],
+  ],
+  mobile: [
+    ['Left thumb', 'Steer'],
+    ['Right buttons', 'Fire / Boost / Drift'],
+    ['⟲ ⟳', 'Roll'],
+    ['Slider', 'Throttle'],
+  ],
+};
+
+const btnControlsPopup = document.getElementById('btnControlsPopup');
+const controlsPopup = document.getElementById('controls-popup');
+
+btnControlsPopup.addEventListener('click', () => {
+  const isHidden = controlsPopup.classList.toggle('hidden');
+  btnControlsPopup.textContent = isHidden ? 'CONTROLS ▾' : 'CONTROLS ▴';
+  if (!isHidden) {
+    const scheme = localStorage.getItem(SAVED_SCHEME_KEY) || 'mouse_keys';
+    const entries = CONTROL_GUIDES[scheme] || CONTROL_GUIDES.mouse_keys;
+    controlsPopup.innerHTML = entries
+      .map(([key, desc]) => `<div class="ctrl-row"><span class="ctrl-key">${key}</span><span class="ctrl-desc">${desc}</span></div>`)
+      .join('');
+  }
+});
+
+// ── Stats toggle ──────────────────────────────────────────────────────────────
+
+const showStatsInput = document.getElementById('showStatsInput');
+showStatsInput.checked = localStorage.getItem('spaceships:showStats') !== '0';
+showStatsInput.addEventListener('change', () => {
+  const show = showStatsInput.checked;
+  localStorage.setItem('spaceships:showStats', show ? '1' : '0');
+  const hudStats = document.getElementById('hud-stats');
+  if (hudStats) hudStats.style.display = show ? '' : 'none';
 });
