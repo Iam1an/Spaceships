@@ -941,7 +941,7 @@ export async function startGame(opts = {}) {
   let targetThrottle = 0;
   let throttle = 0;
 
-  const hud = document.getElementById('hud');
+  const hud = document.getElementById('hud-stats');
   const hpFill = document.getElementById('healthbar-fill');
   const hpText = document.getElementById('healthbar-text');
   const deathBanner = document.getElementById('deathbanner');
@@ -1541,16 +1541,7 @@ export async function startGame(opts = {}) {
       const x = ship.position.x.toFixed(0);
       const y = ship.position.y.toFixed(0);
       const z = ship.position.z.toFixed(0);
-      let controls;
-      if (controlScheme === 'keyboard') {
-        controls = `Arrows: steer  |  F: fire  |  P: toggle gun  |  C: aim assist  |  W/S: throttle  |  Space: drift/charge  |  Shift: boost  |  A/D: roll  |  L: fullscreen`;
-      } else if (controlScheme === 'mobile') {
-        controls = `Left thumb: steer  |  FIRE / BOOST / DRIFT  |  ⟲ ⟳: roll  |  slider: throttle`;
-      } else {
-        controls = `Mouse/Arrows: steer  |  LMB/F: fire  |  P: toggle gun  |  C: aim assist  |  Scroll/W/S: throttle  |  Space: drift/charge  |  Shift: boost  |  A/D: roll  |  RMB: free-look  |  O: grab mouse  |  L: fullscreen`;
-      }
       hud.textContent =
-        `${controls}\n` +
         `${status}   Speed: ${shipVelocity.length().toFixed(1)} u/s   X:${x} Y:${y} Z:${z}   Asteroids: ${asteroids.list.length}   Players: ${remotePlayers.size + 1}`;
     }
 
