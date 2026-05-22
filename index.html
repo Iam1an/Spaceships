@@ -21,12 +21,20 @@
     body { touch-action: none; overscroll-behavior: none; }
 
     /* ── In-game HUD ─────────────────────────────────────────────────── */
-    #hud {
+    #hud-stats {
       position: fixed; top: 10px; left: 10px;
       color: #9cf; font-size: 14px;
       text-shadow: 0 0 6px #000;
       pointer-events: none; white-space: pre-line;
     }
+    #btnControlsPopup { display: block; width: 100%; margin-top: 8px; padding: 6px 10px; font-family: inherit; font-size: 12px; letter-spacing: 1px; color: #9cf; background: rgba(74,163,255,0.07); border: 1.5px solid #44607f; border-radius: 7px; cursor: pointer; text-align: left; transition: color 0.12s, border-color 0.12s; }
+    #btnControlsPopup:hover { color: #ffe07a; border-color: #ffd97a; }
+    #controls-popup { background: rgba(0,8,20,0.6); border-radius: 8px; padding: 6px 8px; margin-top: 6px; }
+    #controls-popup.hidden { display: none; }
+    .ctrl-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; border-bottom: 1px solid rgba(176,224,255,0.08); font-size: 11px; }
+    .ctrl-row:last-child { border-bottom: none; }
+    .ctrl-key { color: #ffe07a; flex-shrink: 0; }
+    .ctrl-desc { color: #b0c8e0; text-align: right; }
     #reticle {
       position: fixed; top: 50%; left: 50%;
       width: 14px; height: 14px; margin: -7px 0 0 -7px;
@@ -450,7 +458,14 @@
         <button type="button" data-scheme="mobile">Mobile</button>
       </div>
     </div>
+    <button type="button" id="btnControlsPopup">CONTROLS ▾</button>
+    <div id="controls-popup" class="hidden"></div>
     <div class="hint">Keyboard / Mobile force stronger aim assist.</div>
+    <label style="margin-top:10px;">
+      <input type="checkbox" id="showStatsInput" checked />
+      <span>Show Stats</span>
+    </label>
+    <div class="hint">Speed, position and player count HUD.</div>
     <label style="margin-top:10px;">
       <input type="checkbox" id="hardModeInput" />
       <span>Secret Hard Mode</span>
