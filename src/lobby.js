@@ -32,8 +32,6 @@ let isHost = false;
 let mySpawn = null;
 let myAsteroids = null;
 let lastPlayers = [];
-let roomMode = 'normal';   // 'normal' | '5v5' — set by 'room' broadcast
-let lastBots = null;        // bot list sent with 5v5 'start'
 
 const nameInput = document.getElementById('nameInput');
 const SAVED_NAME_KEY = 'spaceships:pilotName';
@@ -249,11 +247,10 @@ function renderRoomList(rooms) {
     for (const room of rooms) {
       const entry = document.createElement('div');
       entry.className = 'room-entry';
-      const modeLabel = room.mode === '5v5' ? '5v5 Skirmish' : 'Normal';
       entry.innerHTML = `
         <div class="room-entry-info">
           <div class="room-entry-code">${room.code}</div>
-          <div class="room-entry-meta">${room.hostName} · ${room.playerCount} player${room.playerCount !== 1 ? 's' : ''} · ${modeLabel}</div>
+          <div class="room-entry-meta">${room.hostName} · ${room.playerCount} player${room.playerCount !== 1 ? 's' : ''}</div>
         </div>
         <button class="btn-join-room" data-code="${room.code}">Join</button>
       `;
@@ -281,7 +278,6 @@ function handle(msg) {
     case 'room':
       myId = msg.you;
       isHost = !!msg.host;
-      roomMode = msg.mode || 'normal';
       roomCodeEl.textContent = msg.code;
       document.getElementById('roomPrivacyBadge').textContent = msg.private ? 'PRIVATE' : 'OPEN';
       startBtn.classList.toggle('hidden', !isHost);
@@ -301,7 +297,6 @@ function handle(msg) {
     case 'start':
       mySpawn = msg.spawns?.[myId] || null;
       myAsteroids = msg.asteroids || null;
-      lastBots = Array.isArray(msg.bots) ? msg.bots : null;
       enterGame();
       break;
     case 'rooms-list':
@@ -351,8 +346,6 @@ function enterGame() {
     asteroids: myAsteroids, players: lastPlayers,
     noMouse: noMouse(),
     controlScheme: controlScheme(),
-    mode: roomMode,
-    bots: lastBots,
     hardMode: hardMode(),
     pilotName: pilotName(),
   });
@@ -398,12 +391,6 @@ document.getElementById('btnPlay').addEventListener('click', async () => {
   send({ type: 'create', private: isPrivateRoom() });
 });
 
-document.getElementById('btnCreate5v5').addEventListener('click', async () => {
-  setError('Connecting…');
-  try { await connect(); } catch (e) { setError(e.message); return; }
-  send({ type: 'name', name: pilotName() });
-  send({ type: 'create', mode: '5v5', private: isPrivateRoom() });
-});
 
 document.getElementById('btnSingle').addEventListener('click', () => {
   setError('');

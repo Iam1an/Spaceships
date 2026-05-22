@@ -345,8 +345,6 @@ export function createBotAI(record, deps) {
     const start = botPos.clone().addScaledVector(tmpFwd, 2.5);
     // Visual via shared bullet pool (renders + dies on asteroid contact).
     if (bullets) bullets.fire(start, tmpFwd, faction);
-    // Multiplayer hook: lets the host broadcast bot-fire so non-host
-    // clients render the same bullet visual.
     if (onFire) onFire(start, tmpFwd);
     // Authoritative tracking: each bot owns its in-flight bullets and runs
     // its own collision against opponents/asteroids. bullets.js only

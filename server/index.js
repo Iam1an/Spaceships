@@ -345,20 +345,6 @@ function spawnForTeam(team) {
   };
 }
 
-// Bots spawn with much wider jitter than humans so a full squad doesn't
-// clump on top of itself at the mothership. Humans still spawn tightly at the hangar.
-function spawnForBot(team) {
-  const t = TEAM_SPAWNS[team];
-  return {
-    pos: [
-      (Math.random() - 0.5) * 80,
-      (Math.random() - 0.5) * 30,
-      t.z + (Math.random() - 0.5) * 80,
-    ],
-    quat: t.quat,
-  };
-}
-
 // --- Asteroid field generation (server-authoritative) -----------------
 // We generate the layout once per game so all clients agree on positions,
 // sizes, and HP. HP is mutated on the server when bullets report hits.
@@ -507,7 +493,6 @@ function handleConnection(ws) {
           const humanCount = [...room.players.values()].filter(p => !p.isBot).length;
           list.push({
             code,
-            mode: room.mode,
             playerCount: humanCount,
             hostName: room.players.get(room.hostId)?.name || 'Unknown',
           });
@@ -520,12 +505,10 @@ function handleConnection(ws) {
     if (msg.type === 'create') {
       if (ws.room) leaveRoom(ws);
       const code = genCode();
-      const mode = msg.mode === '5v5' ? '5v5' : 'normal';
       const isPrivate = !!msg.private;
       const room = {
         code,
         hostId: ws.id,
-        mode,
         isPrivate,
         sockets: new Set([ws]),
         players: new Map([[ws.id, { name: ws.name, hp: SHIP_MAX_HP, alive: true, kills: 0, deaths: 0 }]]),
@@ -533,7 +516,7 @@ function handleConnection(ws) {
       };
       rooms.set(code, room);
       ws.room = room;
-      ws.send(JSON.stringify({ type: 'room', code, host: true, you: ws.id, mode, private: isPrivate }));
+      ws.send(JSON.stringify({ type: 'room', code, host: true, you: ws.id, private: isPrivate }));
       broadcastRoom(room);
       return;
     }
@@ -553,7 +536,7 @@ function handleConnection(ws) {
       room.sockets.add(ws);
       room.players.set(ws.id, { name: ws.name, hp: SHIP_MAX_HP, alive: true, kills: 0, deaths: 0 });
       ws.room = room;
-      ws.send(JSON.stringify({ type: 'room', code: room.code, host: false, you: ws.id, mode: room.mode || 'normal', private: room.isPrivate }));
+      ws.send(JSON.stringify({ type: 'room', code: room.code, host: false, you: ws.id, private: room.isPrivate }));
       broadcastRoom(room);
       return;
     }
@@ -562,69 +545,23 @@ function handleConnection(ws) {
       const room = ws.room;
       if (!room || room.hostId !== ws.id) return;
 
-      // 5v5 mode requires exactly 2 humans (one per team), then pads with
-      // 4 bot players per team. Bots live in room.players just like
-      // humans — HP, kills, friendly-fire all go through the same code.
-      if (room.mode === '5v5') {
-        const humans = [...room.players.keys()];
-        if (humans.length < 2) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Need 2 players for 5v5' }));
-          return;
-        }
-        // Assign humans to opposing teams: first joiner (host) = 0, other = 1.
-        const teamAssignments = new Map();
-        teamAssignments.set(humans[0], 0);
-        teamAssignments.set(humans[1], 1);
-        for (const [id, p] of room.players) {
-          p.team = teamAssignments.get(id) ?? 0;
-        }
-        // Bot players. IDs in a high range so they never collide with ws.ids.
-        // Names are team-stable (Red=team 0, Blue=team 1) so both clients
-        // read the same identity regardless of their own team.
-        room.botIds = [];
-        let nextBotId = 100000;
-        for (let i = 0; i < 4; i++) {
-          const id = nextBotId++;
-          room.players.set(id, {
-            name: `Red Bot ${i + 1}`, isBot: true, team: 0,
-            hp: SHIP_MAX_HP, alive: true, kills: 0, deaths: 0,
-          });
-          room.botIds.push(id);
-        }
-        for (let i = 0; i < 4; i++) {
-          const id = nextBotId++;
-          room.players.set(id, {
-            name: `Blue Bot ${i + 1}`, isBot: true, team: 1,
-            hp: SHIP_MAX_HP, alive: true, kills: 0, deaths: 0,
-          });
-          room.botIds.push(id);
-        }
-      }
-
       room.started = true;
       const spawns = {};
-      const bots = [];
-      // Track arrival order so non-5v5 rooms still get alternating
-      // teams (id % 2 could put both players on the same side and
-      // friendly-fire would block all damage).
       let humanIdx = 0;
       for (const [id, p] of room.players) {
         p.hp = SHIP_MAX_HP;
         p.alive = true;
         if (p.team === undefined) {
-          p.team = p.isBot ? 0 : (humanIdx++ % 2);
-        } else if (!p.isBot) {
+          p.team = humanIdx++ % 2;
+        } else {
           humanIdx++;
         }
         p.kills = 0;
         p.deaths = 0;
         p.invulnUntil = Date.now() + 2000;
-        const sp = { team: p.team, ...(p.isBot ? spawnForBot(p.team) : spawnForTeam(p.team)) };
-        spawns[id] = sp;
-        if (p.isBot) bots.push({ id, name: p.name, team: p.team, spawn: sp });
+        spawns[id] = { team: p.team, ...spawnForTeam(p.team) };
       }
       room.asteroids = generateAsteroidField(60, 400);
-      // 5v5 match: 2-minute timer, team with most kills wins.
       room.matchOver = false;
       room.teamKills = [0, 0];
       room.matchEnd = Date.now() + MATCH_DURATION_MS;
@@ -634,7 +571,7 @@ function handleConnection(ws) {
         const remaining = Math.max(0, (room.matchEnd - Date.now()) / 1000);
         broadcast(room, { type: 'match-state', timer: remaining, teamKills: room.teamKills });
       }, 1000);
-      broadcast(room, { type: 'start', spawns, asteroids: room.asteroids, bots });
+      broadcast(room, { type: 'start', spawns, asteroids: room.asteroids });
       broadcastRoom(room);
       return;
     }
@@ -708,7 +645,7 @@ function handleConnection(ws) {
           stillIn.hp = SHIP_MAX_HP;
           stillIn.alive = true;
           stillIn.invulnUntil = Date.now() + 2000;
-          const sp = stillIn.isBot ? spawnForBot(stillIn.team ?? 0) : spawnForTeam(stillIn.team ?? 0);
+          const sp = spawnForTeam(stillIn.team ?? 0);
           broadcast(room, { type: 'respawn', id: sid, pos: sp.pos, quat: sp.quat });
         }, RESPAWN_DELAY_MS);
       }
@@ -746,7 +683,7 @@ function handleConnection(ws) {
           stillIn.hp = SHIP_MAX_HP;
           stillIn.alive = true;
           stillIn.invulnUntil = Date.now() + 2000;
-          const sp = stillIn.isBot ? spawnForBot(stillIn.team ?? 0) : spawnForTeam(stillIn.team ?? 0);
+          const sp = spawnForTeam(stillIn.team ?? 0);
           broadcast(room, { type: 'respawn', id: targetId, pos: sp.pos, quat: sp.quat });
         }, RESPAWN_DELAY_MS);
       }
@@ -774,66 +711,6 @@ function handleConnection(ws) {
       return;
     }
 
-    // ---- 5v5 bot relays. Host owns bot AI; we just gate by host id and
-    // forward to other clients (or apply damage in the bot-hit case). ----
-    if (msg.type === 'bot-state') {
-      const room = ws.room;
-      if (!room || !room.started || room.hostId !== ws.id) return;
-      // Batch payload: [{id, pos, quat, boost, alive}, ...]
-      const out = JSON.stringify({ type: 'bot-state', bots: msg.bots });
-      for (const c of room.sockets) {
-        if (c !== ws && c.open) c.send(out);
-      }
-      return;
-    }
-
-    if (msg.type === 'bot-fire') {
-      const room = ws.room;
-      if (!room || !room.started || room.hostId !== ws.id) return;
-      const out = JSON.stringify({
-        type: 'bot-fire', botId: msg.botId, kind: msg.kind, shots: msg.shots,
-      });
-      for (const c of room.sockets) {
-        if (c !== ws && c.open) c.send(out);
-      }
-      return;
-    }
-
-    if (msg.type === 'bot-hit') {
-      const room = ws.room;
-      if (!room || !room.started || room.hostId !== ws.id) return;
-      const shooter = room.players.get(msg.botId);
-      const target = room.players.get(msg.targetId);
-      if (!shooter || !shooter.isBot) return;
-      if (!target || !target.alive) return;
-      if (msg.botId === msg.targetId) return;
-      if (shooter.team !== undefined && shooter.team === target.team) return;
-      if (target.invulnUntil && Date.now() < target.invulnUntil) return;
-      const dmg = msg.kind === 'beam' ? 10 : 10;
-      target.hp = Math.max(0, target.hp - dmg);
-      broadcast(room, { type: 'hp', id: msg.targetId, hp: target.hp });
-      if (target.hp === 0) {
-        target.alive = false;
-        target.deaths = (target.deaths || 0) + 1;
-        shooter.kills = (shooter.kills || 0) + 1;
-        if (room.teamKills && shooter.team !== undefined) {
-          room.teamKills[shooter.team] = (room.teamKills[shooter.team] || 0) + 1;
-        }
-        broadcast(room, { type: 'death', id: msg.targetId, killerId: msg.botId });
-        broadcastRoom(room);
-        const targetId = msg.targetId;
-        setTimeout(() => {
-          const stillIn = room.players.get(targetId);
-          if (!stillIn || !room.started) return;
-          stillIn.hp = SHIP_MAX_HP;
-          stillIn.alive = true;
-          stillIn.invulnUntil = Date.now() + 2000;
-          const sp = stillIn.isBot ? spawnForBot(stillIn.team ?? 0) : spawnForTeam(stillIn.team ?? 0);
-          broadcast(room, { type: 'respawn', id: targetId, pos: sp.pos, quat: sp.quat });
-        }, RESPAWN_DELAY_MS);
-      }
-      return;
-    }
   });
 
   ws.on('close', () => {

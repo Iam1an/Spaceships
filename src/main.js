@@ -258,11 +258,6 @@ export async function startGame(opts = {}) {
   const ws = opts.ws;
   const myId = opts.you;
   const isSolo = !!opts.solo;
-  // 5v5 multiplayer: host runs 8 bots locally and broadcasts their state.
-  // Non-host receives state and renders without running AI.
-  const isMp5v5 = !isSolo && opts.mode === '5v5' && Array.isArray(opts.bots);
-  const isMpHost = isMp5v5 && !!opts.host;
-  const mpBotIds = isMp5v5 ? new Set(opts.bots.map((b) => b.id)) : new Set();
   const remotePlayers = new Map();
   const remoteColors = new Map(); // id -> { hullColor, accentColor } as hex integers
   const remoteModels = new Map(); // id -> modelUrl (set by 'ship-model' broadcast)
@@ -482,13 +477,6 @@ export async function startGame(opts = {}) {
     r.ship.position.copy(r.targetPos);
     r.ship.quaternion.copy(r.targetQuat);
     r.ship.visible = true;
-    // MP 5v5 host: re-arm the bot's AI so it picks new targets / state.
-    // mpBots is forward-referenced; it's only populated on the host,
-    // and this function is called after setup so the lookup is safe.
-    if (isMpHost) {
-      const mb = mpBots.find((b) => b.id === id);
-      if (mb?.ai?.notifyRespawn) mb.ai.notifyRespawn();
-    }
   }
 
   function killSelf() {
@@ -536,58 +524,6 @@ export async function startGame(opts = {}) {
     ws.addEventListener('message', (e) => {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
-      if (msg.type === 'bot-state' && Array.isArray(msg.bots)) {
-        // Non-host: drive each bot remote from the host's authoritative
-        // transform stream. Host ignores (its bots are simulated locally).
-        if (isMpHost) return;
-        const now = performance.now() / 1000;
-        for (const b of msg.bots) {
-          const r = getOrCreateRemote(b.id);
-          if (b.alive === false) continue;
-          const newPos = new THREE.Vector3().fromArray(b.pos);
-          if (r.lastStateTime > 0) {
-            const dtState = now - r.lastStateTime;
-            if (dtState > 0.005 && dtState < 0.5) {
-              const measured = newPos.clone().sub(r.lastStatePos).divideScalar(dtState);
-              if (r.velSeeded) r.vel.lerp(measured, 0.45);
-              else { r.vel.copy(measured); r.velSeeded = true; }
-            }
-          }
-          r.lastStateTime = now;
-          r.lastStatePos.copy(newPos);
-          r.targetPos.copy(newPos);
-          r.targetQuat.fromArray(b.quat);
-          if (!r.hasTarget) {
-            r.ship.position.copy(r.targetPos);
-            r.ship.quaternion.copy(r.targetQuat);
-            r.hasTarget = true;
-          }
-        }
-        return;
-      }
-      if (msg.type === 'bot-fire') {
-        if (isMpHost) return; // host already rendered its own bot's bullet
-        const shooterTeam = scores.get(msg.botId)?.team ?? null;
-        const faction = (shooterTeam !== null && shooterTeam === myTeam) ? 'ally' : 'enemy';
-        if (msg.kind === 'beam') {
-          for (const shot of msg.shots) {
-            const origin = new THREE.Vector3().fromArray(shot.pos);
-            const end = new THREE.Vector3().fromArray(shot.end);
-            beams.fire(origin, end, faction);
-          }
-        } else {
-          for (const shot of msg.shots) {
-            const origin = new THREE.Vector3().fromArray(shot.pos);
-            const dir = new THREE.Vector3().fromArray(shot.dir);
-            bullets.fire(origin, dir, faction);
-          }
-        }
-        if (msg.shots.length > 0) {
-          const o = msg.shots[0].pos;
-          audio.play('shoot', distanceVol(new THREE.Vector3(o[0], o[1], o[2])));
-        }
-        return;
-      }
       if (msg.type === 'colors' && msg.id !== myId) {
         const hull   = typeof msg.hullColor   === 'number' ? msg.hullColor   : parseInt(String(msg.hullColor).replace('#', ''), 16);
         const accent = typeof msg.accentColor === 'number' ? msg.accentColor : parseInt(String(msg.accentColor).replace('#', ''), 16);
@@ -1429,11 +1365,8 @@ export async function startGame(opts = {}) {
     // Smooth remote players toward their last reported pose.
     const remoteLerp = 1 - Math.pow(0.001, dt * 8);
     for (const r of remotePlayers.values()) {
-      // Skip the lerp when WE are the source of the bot's pose — solo
-      // bots and the MP host's own bots write ship.position directly each
-      // frame. MP non-host bots, on the other hand, are driven by the
-      // host's bot-state stream and DO need this lerp to actually move.
-      if (r.isBot && (isSolo || isMpHost)) continue;
+      // Solo bots write ship.position directly each frame; lerp is for remote players only.
+      if (r.isBot && isSolo) continue;
       r.ship.position.lerp(r.targetPos, remoteLerp);
       r.ship.quaternion.slerp(r.targetQuat, remoteLerp);
     }
@@ -1460,15 +1393,6 @@ export async function startGame(opts = {}) {
       }
     }
 
-    // MP 5v5 host: tick local bot AIs. Respawns are server-driven, so we
-    // don't run respawn timers here — the bot becomes alive again via
-    // the 'respawn' broadcast which calls reviveRemote.
-    if (isMpHost && !matchOver) {
-      for (const b of mpBots) {
-        if (b.record.alive) b.ai.update(dt);
-      }
-    }
-    tickMpBotState(dt);
 
     if (tutorial) tutorial.update(dt);
 
@@ -1529,13 +1453,8 @@ export async function startGame(opts = {}) {
       // appears at closer range. Doesn't care about team — friendlies and
       // enemies both blip, you just read their color.
       if (r.marker) r.marker.visible = dist <= MARKER_VISIBLE_DIST;
-      // Targeting computer ignores teammates. In 5v5, also treat
-      // players whose team hasn't synced yet (null) as non-targets so
-      // they don't flash as enemies on game start.
-      const teamKnown = r.team !== null && r.team !== undefined;
-      const isTeammate = teamKnown && r.team === myTeam;
-      const unknownIn5v5 = isMp5v5 && !teamKnown;
-      if (isTeammate || unknownIn5v5) {
+      const isTeammate = r.team !== null && r.team !== undefined && r.team === myTeam;
+      if (isTeammate) {
         r.box.style.display = 'none';
         r.lead.style.display = 'none';
         continue;
@@ -1983,9 +1902,6 @@ export async function startGame(opts = {}) {
   // excluded — it's a guided lesson, not a match.
   const matchActive = SOLO_MODE === 'train' || !isSolo;
 
-  // Helper: build the entity adapter the bot AI consumes. In MP mode the
-  // bot's hits go through the server (bot-hit message) so HP stays
-  // server-authoritative; in solo they apply locally via applyHitToBot.
   function makeBotEntity(r) {
     return {
       id: r.id,
@@ -1994,19 +1910,10 @@ export async function startGame(opts = {}) {
       get velocity() { return r.vel; },
       get alive() { return r.alive; },
       takeHit(dmg, killerId, killerTeam) {
-        if (isMp5v5 && ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: 'bot-hit', botId: killerId, targetId: r.id, kind: 'bullet',
-          }));
-        } else {
-          applyHitToBot(r.id, dmg, killerId, killerTeam);
-        }
+        applyHitToBot(r.id, dmg, killerId, killerTeam);
       },
     };
   }
-  // Adapter for the local human player when a bot bullet hits us. Solo
-  // applies damage locally; MP reports it to the server (the server then
-  // broadcasts the 'hp' update back).
   const playerEntity = {
     id: opts.you,
     team: myTeam,
@@ -2014,13 +1921,7 @@ export async function startGame(opts = {}) {
     get velocity() { return shipVelocity; },
     get alive() { return myAlive; },
     takeHit(dmg, killerId, killerTeam) {
-      if (isMp5v5 && ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'bot-hit', botId: killerId, targetId: opts.you, kind: 'bullet',
-        }));
-      } else {
-        applyPlayerDamageLocal(dmg, killerId, killerTeam);
-      }
+      applyPlayerDamageLocal(dmg, killerId, killerTeam);
     },
   };
 
@@ -2073,120 +1974,6 @@ export async function startGame(opts = {}) {
     }
   }
   if (isSolo) spawnSoloEntities();
-
-  // ---- 5v5 multiplayer bot setup --------------------------------------
-  // Both clients render bots as remote players. The host additionally
-  // attaches AI to each one and is the source-of-truth for transforms
-  // and projectile collisions, which it broadcasts via bot-state /
-  // bot-fire / bot-hit.
-  const mpBots = []; // host-only: AI-driven bots we tick locally
-  function spawnMpBotEntities() {
-    if (!isMp5v5) return;
-    for (const b of opts.bots) {
-      const r = getOrCreateRemote(b.id);
-      r.isBot = true;
-      r.team = b.team;
-      r.alive = true;
-      r.hasTarget = true;
-      r.hp = SHIP_MAX_HP;
-      if (b.spawn?.pos) {
-        r.ship.position.fromArray(b.spawn.pos);
-        r.targetPos.fromArray(b.spawn.pos);
-      }
-      if (b.spawn?.quat) {
-        r.ship.quaternion.fromArray(b.spawn.quat);
-        r.targetQuat.fromArray(b.spawn.quat);
-      }
-      refreshMarker(r);
-      if (!scores.has(b.id)) {
-        scores.set(b.id, { name: b.name, team: b.team, kills: 0, deaths: 0 });
-      }
-      if (isMpHost) {
-        const entity = makeBotEntity(r);
-        const ai = createBotAI(r, {
-          team: b.team,
-          faction: b.team === myTeam ? 'ally' : 'enemy',
-          beams,
-          bullets,
-          asteroids,
-          solveIntercept,
-          raySphereDist,
-          audio,
-          distanceVol,
-          hardMode: !!opts.hardMode,
-          getOpponents: () => {
-            const out = [];
-            if (myAlive && myTeam !== b.team) out.push(playerEntity);
-            for (const [oid, other] of remotePlayers) {
-              if (oid === b.id || !other.alive) continue;
-              const oTeam = other.team;
-              if (oTeam === null || oTeam === undefined) continue;
-              if (oTeam === b.team) continue;
-              if (other.isBot) {
-                out.push(makeBotEntity(other));
-              } else {
-                // Non-host human player: hit reports go through bot-hit
-                // so the server can apply damage authoritatively.
-                out.push({
-                  id: other.id,
-                  get team() { return other.team; },
-                  get position() { return other.ship.position; },
-                  get velocity() { return other.vel; },
-                  get alive() { return other.alive; },
-                  takeHit(dmg, killerId) {
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                      ws.send(JSON.stringify({
-                        type: 'bot-hit', botId: killerId, targetId: other.id, kind: 'bullet',
-                      }));
-                    }
-                  },
-                });
-              }
-            }
-            return out;
-          },
-          onFire: (start, dir) => {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({
-              type: 'bot-fire',
-              botId: b.id,
-              kind: 'bullet',
-              shots: [{
-                pos: [start.x, start.y, start.z],
-                dir: [dir.x, dir.y, dir.z],
-              }],
-            }));
-          },
-        });
-        mpBots.push({ id: b.id, team: b.team, record: r, ai });
-      }
-    }
-    renderScoreboard();
-  }
-  spawnMpBotEntities();
-
-  // Host broadcasts each bot's authoritative transform at 20Hz.
-  const MP_BOT_STATE_HZ = 20;
-  let mpBotStateAccum = 0;
-  function tickMpBotState(dt) {
-    if (!isMpHost || mpBots.length === 0) return;
-    mpBotStateAccum += dt;
-    const interval = 1 / MP_BOT_STATE_HZ;
-    if (mpBotStateAccum < interval) return;
-    mpBotStateAccum = 0;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const list = [];
-    for (const b of mpBots) {
-      const r = b.record;
-      list.push({
-        id: b.id,
-        pos: [r.ship.position.x, r.ship.position.y, r.ship.position.z],
-        quat: [r.ship.quaternion.x, r.ship.quaternion.y, r.ship.quaternion.z, r.ship.quaternion.w],
-        alive: !!r.alive,
-      });
-    }
-    ws.send(JSON.stringify({ type: 'bot-state', bots: list }));
-  }
 
   // ---- Tutorial mode ---------------------------------------------------
   // Step machine that gates progression on real input/state changes, with
