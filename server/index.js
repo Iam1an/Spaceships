@@ -346,8 +346,7 @@ function spawnForTeam(team) {
 }
 
 // Bots spawn with much wider jitter than humans so a full squad doesn't
-// clump on top of itself at the mothership — matches the solo skirmish
-// spread (±40 / ±15 / ±40). Humans still spawn tightly at the hangar.
+// clump on top of itself at the mothership. Humans still spawn tightly at the hangar.
 function spawnForBot(team) {
   const t = TEAM_SPAWNS[team];
   return {

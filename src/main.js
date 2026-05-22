@@ -1439,7 +1439,7 @@ export async function startGame(opts = {}) {
     }
 
     // Solo: tick all bots' AI, run respawn timers for bots + player, and
-    // count down the match timer if a skirmish is active.
+    // count down the match timer.
     if (isSolo) {
       for (const b of bots) {
         if (b.record.alive) {
@@ -1968,24 +1968,20 @@ export async function startGame(opts = {}) {
   }
 
   // --- Solo mode wiring -------------------------------------------------
-  // 'train' = 1v1 vs one bot, no timer.
-  // 'skirmish' = 5v5: four ally bots (team 0) + five enemy bots (team 1),
-  // 2-minute timer, team with most kills wins.
+  // 'train' = 1v1 vs one bot, shorter timer so practice sessions wrap naturally.
   // Bots reuse the remote-player render pipeline; damage and respawns are
   // applied locally. Each bot is fed an `entity` for the player and other
   // bots so its targeting can pick the closest opponent.
   const SOLO_MODE = isSolo ? (opts.mode || 'train') : null;
   const myTeam = isSolo ? 0 : (opts.spawn?.team ?? 0);
-  // Train (1v1) gets a shorter timer so practice sessions wrap naturally;
-  // skirmish + MP stay on the standard 5-minute match.
   const MATCH_DURATION = SOLO_MODE === 'train' ? 180 : 300;
   const teamKills = [0, 0];
   let matchTimer = MATCH_DURATION;
   let matchOver = false;
-  // Skirmish, train, and any networked match show the team HUD + win
-  // banner. Solo ticks the timer locally; MP receives match-state from
-  // the server. Tutorial is excluded — it's a guided lesson, not a match.
-  const matchActive = SOLO_MODE === 'skirmish' || SOLO_MODE === 'train' || !isSolo;
+  // Train and any networked match show the team HUD + win banner. Solo ticks
+  // the timer locally; MP receives match-state from the server. Tutorial is
+  // excluded — it's a guided lesson, not a match.
+  const matchActive = SOLO_MODE === 'train' || !isSolo;
 
   // Helper: build the entity adapter the bot AI consumes. In MP mode the
   // bot's hits go through the server (bot-hit message) so HP stays
@@ -2074,18 +2070,6 @@ export async function startGame(opts = {}) {
       const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
       const pos = ship.position.clone().addScaledVector(fwd, 250);
       spawnBot(1, 1, pos, 'Bot');
-    } else if (SOLO_MODE === 'skirmish') {
-      const FRIENDLY_ANCHOR = new THREE.Vector3(0, 0, -540);
-      const ENEMY_ANCHOR = new THREE.Vector3(0, 0, 540);
-      const jitter = (range) => (Math.random() - 0.5) * range;
-      for (let i = 0; i < 4; i++) {
-        const pos = FRIENDLY_ANCHOR.clone().add(new THREE.Vector3(jitter(80), jitter(30), jitter(80)));
-        spawnBot(1 + i, 0, pos, `Ally ${i + 1}`);
-      }
-      for (let i = 0; i < 5; i++) {
-        const pos = ENEMY_ANCHOR.clone().add(new THREE.Vector3(jitter(80), jitter(30), jitter(80)));
-        spawnBot(5 + i, 1, pos, `Enemy ${i + 1}`);
-      }
     }
   }
   if (isSolo) spawnSoloEntities();
@@ -2413,18 +2397,9 @@ export async function startGame(opts = {}) {
   function reviveBotLocal(id) {
     const r = remotePlayers.get(id);
     if (!r) return;
-    // Pick a respawn anchor based on the bot's team in skirmish, or near
-    // the player in train.
-    let anchor;
-    if (SOLO_MODE === 'skirmish') {
-      anchor = r.team === 0
-        ? new THREE.Vector3(0, 0, -540)
-        : new THREE.Vector3(0, 0, 540);
-    } else {
-      anchor = ship.position.clone().add(new THREE.Vector3(
-        (Math.random() * 2 - 1), 0, (Math.random() * 2 - 1),
-      ).normalize().multiplyScalar(280));
-    }
+    const anchor = ship.position.clone().add(new THREE.Vector3(
+      (Math.random() * 2 - 1), 0, (Math.random() * 2 - 1),
+    ).normalize().multiplyScalar(280));
     r.ship.position.copy(anchor).add(new THREE.Vector3(
       (Math.random() - 0.5) * 60,
       (Math.random() - 0.5) * 20,
