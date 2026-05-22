@@ -141,8 +141,10 @@ export async function startGame(opts = {}) {
   const SHIP_SCALE = 1.5;
   const savedHull   = parseInt(getSavedShipColor().replace('#', ''), 16);
   const savedAccent = parseInt(getSavedAccentColor().replace('#', ''), 16);
+  // Names that get the admin ship model. Add more here as needed.
+  const ADMIN_SHIP_NAMES = new Set(['Admin', 'ariairspeed']);
   const localPlayerName = (opts.pilotName || '').trim();
-  const isLocalAdmin = localPlayerName === 'Admin';
+  const isLocalAdmin = ADMIN_SHIP_NAMES.has(localPlayerName);
   const ship = createShip({
     hullColor: savedHull,
     accentColor: savedAccent,
@@ -526,7 +528,7 @@ export async function startGame(opts = {}) {
     if (r) return r;
     const colors = remoteColors.get(id);
     const remoteName = (scores.get(id)?.name || '').trim();
-    const isRemoteAdmin = remoteModels.get(id) === ADMIN_MODEL_URL || remoteName === 'Admin';
+    const isRemoteAdmin = remoteModels.get(id) === ADMIN_MODEL_URL || ADMIN_SHIP_NAMES.has(remoteName);
     const remoteModelUrl = isRemoteAdmin ? ADMIN_MODEL_URL : 'public/spaceship.glb';
     const remoteShip = colors
       ? createShip({ hullColor: colors.hullColor, accentColor: colors.accentColor, modelUrl: remoteModelUrl, doubleSided: isRemoteAdmin })
