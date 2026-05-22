@@ -166,6 +166,19 @@
     #trials-best { font-size: 12px; color: #66ff88; letter-spacing: 1px; min-height: 14px; }
     #trials-last { font-size: 12px; color: #ffcc66; letter-spacing: 1px; min-height: 14px; }
 
+    #trials-countdown {
+      position: fixed; inset: 0;
+      display: none; align-items: center; justify-content: center;
+      pointer-events: none; z-index: 5;
+    }
+    #trials-countdown-num {
+      font-size: clamp(80px,20vw,160px);
+      font-family: 'Orbitron', sans-serif;
+      color: #ff5566;
+      text-shadow: 0 0 30px currentColor, 4px 4px 0 #000;
+      letter-spacing: 4px;
+    }
+
     #scoreboard {
       position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
       background: rgba(8,14,28,0.92); border: 3px solid #b0e0ff; border-radius: 16px;
@@ -708,6 +721,9 @@
     <div id="team0score">0</div>
     <div id="matchtimer">5:00</div>
     <div id="team1score">0</div>
+  </div>
+  <div id="trials-countdown">
+    <div id="trials-countdown-num">3</div>
   </div>
   <div id="trials-hud">
     <div id="trials-lap">LAP 1</div>
