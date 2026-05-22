@@ -787,5 +787,12 @@ requireAuth().then(() => {
     nameInput.readOnly = true;
     nameInput.style.opacity = '0.55';
     nameInput.title = 'Guests cannot change their callsign — log in to choose a name';
+  } else if (getToken()) {
+    // Logged-in players always use their account username.
+    const accountName = localStorage.getItem(SAVED_NAME_KEY) || 'Pilot';
+    nameInput.value = accountName;
+    nameInput.readOnly = true;
+    nameInput.style.opacity = '0.55';
+    nameInput.title = 'Your callsign is your account username and cannot be changed here';
   }
 });
