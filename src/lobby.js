@@ -651,6 +651,10 @@ applyColor();
 colorPreviewEl.style.borderColor = hslToHex(accentH, accentS, accentL);
 
 document.getElementById('btnCustomize').addEventListener('click', () => {
+  if (custPanel.classList.contains('open')) {
+    closeCustomization();
+    return;
+  }
   lobbyEl.classList.add('slide-left');
   custPanel.classList.add('open');
   if (!custScene) {
