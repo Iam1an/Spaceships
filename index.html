@@ -168,6 +168,16 @@
       cursor: pointer; user-select: none; z-index: 11;
     }
     #settingsBtn:hover { color: #ffe07a; border-color: #ffd97a; }
+    #btnCustomize {
+      position: fixed; top: 16px; right: calc(max(16px, env(safe-area-inset-right, 16px)) + 48px);
+      width: 40px; height: 40px; font-size: 22px; line-height: 38px;
+      background: rgba(8,14,28,0.78); color: #b0c8e0;
+      border: 2px solid #44607f; border-radius: 50%;
+      cursor: pointer; user-select: none; z-index: 11;
+      display: none;
+    }
+    #btnCustomize:hover { color: #ffe07a; border-color: #ffd97a; }
+    body.in-lobby #btnCustomize { display: block; }
     #settingsPanel {
       position: fixed; top: 66px; right: max(16px, env(safe-area-inset-right, 16px));
       width: min(280px, calc(100vw - 32px));
@@ -418,6 +428,7 @@
 </head>
 <body>
   <!-- Settings gear + panel (lobby-only, hidden once HUD shows). -->
+  <button id="btnCustomize" title="Customize Ship">🎨</button>
   <button id="settingsBtn" title="Settings">⚙</button>
   <div id="settingsPanel" class="hidden">
     <h3>SETTINGS</h3>
@@ -519,15 +530,8 @@
     <div id="lobby-main" class="screen">
       <div class="prompt">Pilot Name</div>
       <input id="nameInput" maxlength="16" placeholder="Pilot" autocomplete="off" />
-      <div class="scheme-picker-label">CONTROLS</div>
-      <div class="scheme-picker" id="schemePickerMain" data-scheme-picker>
-        <button type="button" data-scheme="mouse_keys">Mouse + Keys</button>
-        <button type="button" data-scheme="keyboard">Keyboard</button>
-        <button type="button" data-scheme="mobile">Mobile</button>
-      </div>
       <button class="big" id="btnMulti">Multiplayer</button>
       <button class="big" id="btnSingle">Single Player</button>
-      <button class="link" id="btnCustomize">✦ Customize Ship</button>
     </div>
 
     <div id="lobby-multi" class="screen hidden">
