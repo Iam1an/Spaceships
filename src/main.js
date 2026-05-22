@@ -275,6 +275,7 @@ export async function startGame(opts = {}) {
     : 'spaceships:trial1Best';
   const CP_TRIGGER_DIST = 55;
   const cpMeshes = [];
+  const tracerDots = [];
   let trialsNextCp = 0;
   let trialsTimer = 0;
   let trialsRunning = false;
@@ -307,6 +308,17 @@ export async function startGame(opts = {}) {
       mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), pathDir);
       scene.add(mesh);
       cpMeshes.push(mesh);
+    }
+
+    // Tracer dots: small glowing spheres that flow from the ship toward the
+    // next checkpoint so the player always knows where to go.
+    const dotGeo = new THREE.SphereGeometry(2.5, 5, 5);
+    for (let i = 0; i < 10; i++) {
+      const dotMat = new THREE.MeshBasicMaterial({ color: 0x66ffcc, transparent: true, opacity: 0.7 });
+      const dot = new THREE.Mesh(dotGeo, dotMat);
+      dot.visible = false;
+      scene.add(dot);
+      tracerDots.push(dot);
     }
 
     trialsCountdown = 3.0;
@@ -1590,6 +1602,23 @@ export async function startGame(opts = {}) {
           trialsTimer += dt;
           updateTrialsHud();
         }
+
+        // Animate tracer dots flowing from ship toward the next checkpoint.
+        if (tracerDots.length > 0) {
+          if (myAlive) {
+            const target = TRIAL_CPS[trialsNextCp];
+            const n = tracerDots.length;
+            const anim = (performance.now() * 0.0008) % 1;
+            for (let i = 0; i < n; i++) {
+              const t = ((i / n + anim) % 1) * 0.88 + 0.06;
+              tracerDots[i].position.lerpVectors(ship.position, target, t);
+              tracerDots[i].material.opacity = 0.12 + (1 - t) * 0.72;
+              tracerDots[i].visible = true;
+            }
+          } else {
+            for (const d of tracerDots) d.visible = false;
+          }
+        }
       }
     }
 
@@ -2409,6 +2438,7 @@ export async function startGame(opts = {}) {
           cpMeshes[i].material.color.setHex(i === 0 ? 0x66ffcc : 0x224466);
           cpMeshes[i].material.opacity = i === 0 ? 0.85 : 0.35;
         }
+        for (const d of tracerDots) d.visible = false;
         updateTrialsHud();
       } else {
         pos = [
