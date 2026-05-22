@@ -166,6 +166,16 @@
     #trials-best { font-size: 12px; color: #66ff88; letter-spacing: 1px; min-height: 14px; }
     #trials-last { font-size: 12px; color: #ffcc66; letter-spacing: 1px; min-height: 14px; }
 
+    .trial-btn.locked {
+      opacity: 0.38;
+      background: linear-gradient(180deg,#445566 0%,#223344 100%);
+      border-color: #556677;
+      box-shadow: none;
+      cursor: not-allowed;
+      color: #8899aa;
+    }
+    .trial-btn.locked:hover { transform: none; }
+
     #trials-countdown {
       position: fixed; inset: 0;
       display: none; align-items: center; justify-content: center;
@@ -618,7 +628,10 @@
 
     <div id="lobby-trials" class="screen hidden">
       <div class="prompt">Time Trials</div>
-      <button class="big" id="btnTrial1">Trial 1</button>
+      <button class="big trial-btn" id="btnTrial1">Trial 1</button>
+      <button class="big trial-btn" id="btnTrial2">Trial 2</button>
+      <button class="big trial-btn" id="btnTrial3">Trial 3</button>
+      <button class="big trial-btn" id="btnTrial4">Trial 4</button>
       <button class="link" id="btnBackTrials">← Back</button>
     </div>
 

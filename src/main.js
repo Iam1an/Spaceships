@@ -111,7 +111,8 @@ export async function startGame(opts = {}) {
     { pos: mothershipA.position, halfSize: MOTHERSHIP_HALF },
     { pos: mothershipB.position, halfSize: MOTHERSHIP_HALF },
   ];
-  if (opts.mode === 'trials') {
+  const isTrialsMode = !!(opts.solo && opts.mode && opts.mode.startsWith('trials'));
+  if (isTrialsMode) {
     mothershipA.visible = false;
     mothershipB.visible = false;
   }
@@ -171,8 +172,8 @@ export async function startGame(opts = {}) {
   if (opts.spawn) {
     ship.position.fromArray(opts.spawn.pos);
     ship.quaternion.fromArray(opts.spawn.quat);
-  } else if (opts.mode === 'trials') {
-    ship.position.set(0, 0, -420);
+  } else if (isTrialsMode) {
+    ship.position.set(0, 20, -510);
   } else {
     ship.position.set(0, 0, -540);
   }
@@ -180,18 +181,19 @@ export async function startGame(opts = {}) {
 
   // Prefer the server-authoritative field if it was sent in the start
   // message; fall back to local random generation for offline runs.
+  const _trialRockCount = opts.mode === 'trials4' ? 210
+    : opts.mode === 'trials3' ? 180
+    : opts.mode === 'trials2' ? 150
+    : isTrialsMode ? 120 : 60;
   const asteroids = opts.asteroids
     ? createAsteroidFieldFromData(opts.asteroids)
-    : (opts.mode === 'trials'
-      ? createAsteroidField({ count: 90, radius: 400, avoid: [...motherships, moonAvoid] })
-      : createAsteroidField({ count: 60, radius: 400, avoid: [...motherships, moonAvoid] }));
+    : createAsteroidField({ count: _trialRockCount, radius: 400, avoid: [...motherships, moonAvoid] });
   scene.add(asteroids.group);
 
-  // ── Time Trials: Trial 1 ────────────────────────────────────────────────
-  // Eight checkpoints in an oval circuit around the moon. Each is a torus
-  // ring oriented perpendicular to the path direction. The timer begins on
-  // the first crossing of CP0 (start/finish) and each completed circuit
-  // records a lap time.
+  // ── Time Trials checkpoint data ─────────────────────────────────────────
+  // Each trial has its own set of checkpoint positions. Rings are torus
+  // meshes oriented perpendicular to the path. Timer begins on the first
+  // crossing of CP0 (start/finish); each full circuit records a lap time.
   const TRIAL1_CPS = [
     new THREE.Vector3(   0,  20, -380),  // CP0  start / finish
     new THREE.Vector3( 180,  60, -260),  // CP1  climb right
@@ -206,6 +208,71 @@ export async function startGame(opts = {}) {
     new THREE.Vector3(-100,  30, -360),  // CP10 approach left
     new THREE.Vector3( 100, -40, -350),  // CP11 final approach
   ];
+  // Trial 2 — 14 CPs, tighter turns, closes in on the moon
+  const TRIAL2_CPS = [
+    new THREE.Vector3(   0,  20, -360),  // CP0  start
+    new THREE.Vector3( 160,  80, -220),  // CP1
+    new THREE.Vector3( 290, -40,  -80),  // CP2  tighter east entry
+    new THREE.Vector3( 310, -80,  100),  // CP3
+    new THREE.Vector3( 190, 100,  270),  // CP4
+    new THREE.Vector3(  40, -90,  330),  // CP5  low back
+    new THREE.Vector3(-120,  70,  310),  // CP6
+    new THREE.Vector3(-270, -60,  190),  // CP7
+    new THREE.Vector3(-300,  90,   20),  // CP8  close west pass
+    new THREE.Vector3(-270,-100, -170),  // CP9
+    new THREE.Vector3(-120,  60, -310),  // CP10
+    new THREE.Vector3(  20, -80, -310),  // CP11
+    new THREE.Vector3( 140,  90, -240),  // CP12
+    new THREE.Vector3( 260, -60, -120),  // CP13 final
+  ];
+  // Trial 3 — 16 CPs, extreme height variation, very tight
+  const TRIAL3_CPS = [
+    new THREE.Vector3(   0, -30, -370),  // CP0  start
+    new THREE.Vector3( 150, 100, -240),  // CP1  climb
+    new THREE.Vector3( 300, -80,  -60),  // CP2  dive
+    new THREE.Vector3( 350, 100,  120),  // CP3  climb
+    new THREE.Vector3( 220,-110,  280),  // CP4  deep dive
+    new THREE.Vector3(  60, 100,  350),  // CP5  high climb
+    new THREE.Vector3( -80,-110,  300),  // CP6  deep dive
+    new THREE.Vector3(-240, 100,  160),  // CP7  climb
+    new THREE.Vector3(-330, -90,    0),  // CP8  close left of moon
+    new THREE.Vector3(-260, 110, -180),  // CP9  climb
+    new THREE.Vector3(-120,-100, -290),  // CP10 dive
+    new THREE.Vector3(  20, 110, -350),  // CP11 climb
+    new THREE.Vector3( 170,-100, -250),  // CP12 dive
+    new THREE.Vector3( 310, 100,  -70),  // CP13 climb
+    new THREE.Vector3( 220,-110,  120),  // CP14 dive
+    new THREE.Vector3(  80,  80, -200),  // CP15 final approach
+  ];
+  // Trial 4 — 18 CPs, closest moon passes, maximum difficulty
+  const TRIAL4_CPS = [
+    new THREE.Vector3(   0,  50, -370),  // CP0  start
+    new THREE.Vector3( 180,-100, -210),  // CP1
+    new THREE.Vector3( 340, 110,  -40),  // CP2
+    new THREE.Vector3( 210,-110,  240),  // CP3
+    new THREE.Vector3(  40, 110,  340),  // CP4
+    new THREE.Vector3(-180,-110,  210),  // CP5
+    new THREE.Vector3(-160,  80,    0),  // CP6  close left of moon
+    new THREE.Vector3(-200,-100, -210),  // CP7
+    new THREE.Vector3(   0, 110, -180),  // CP8  above front of moon
+    new THREE.Vector3( 200,-100,  -40),  // CP9
+    new THREE.Vector3( 300, 100,  180),  // CP10
+    new THREE.Vector3(  80,-110,  320),  // CP11
+    new THREE.Vector3(-200, 100,  180),  // CP12
+    new THREE.Vector3(-320,-100,  -40),  // CP13
+    new THREE.Vector3(-200, 100, -220),  // CP14
+    new THREE.Vector3(   0,-110, -340),  // CP15 south close
+    new THREE.Vector3( 200, 100, -220),  // CP16
+    new THREE.Vector3( 100, -80, -330),  // CP17 final
+  ];
+  const TRIAL_CPS = opts.mode === 'trials4' ? TRIAL4_CPS
+    : opts.mode === 'trials3' ? TRIAL3_CPS
+    : opts.mode === 'trials2' ? TRIAL2_CPS
+    : TRIAL1_CPS;
+  const TRIAL_BEST_KEY = opts.mode === 'trials4' ? 'spaceships:trial4Best'
+    : opts.mode === 'trials3' ? 'spaceships:trial3Best'
+    : opts.mode === 'trials2' ? 'spaceships:trial2Best'
+    : 'spaceships:trial1Best';
   const CP_TRIGGER_DIST = 55;
   const cpMeshes = [];
   let trialsNextCp = 0;
@@ -218,12 +285,14 @@ export async function startGame(opts = {}) {
   let trialsCountdown = 0;
   let trialsCountdownActive = false;
 
-  if (opts.mode === 'trials') {
-    const savedBest = parseFloat(localStorage.getItem('spaceships:trial1Best'));
+  if (isTrialsMode) {
+    const savedBest = parseFloat(localStorage.getItem(TRIAL_BEST_KEY));
     if (!isNaN(savedBest)) trialsBestLap = savedBest;
 
+    cpCooldown = 1.5; // prevent CP0 triggering the instant the countdown ends
+
     const cpGeo = new THREE.TorusGeometry(48, 3.5, 8, 36);
-    for (let i = 0; i < TRIAL1_CPS.length; i++) {
+    for (let i = 0; i < TRIAL_CPS.length; i++) {
       const isNext = i === 0;
       const mat = new THREE.MeshBasicMaterial({
         color: isNext ? 0x66ffcc : 0x224466,
@@ -232,9 +301,9 @@ export async function startGame(opts = {}) {
         side: THREE.DoubleSide,
       });
       const mesh = new THREE.Mesh(cpGeo, mat);
-      mesh.position.copy(TRIAL1_CPS[i]);
-      const nextIdx = (i + 1) % TRIAL1_CPS.length;
-      const pathDir = TRIAL1_CPS[nextIdx].clone().sub(TRIAL1_CPS[i]).normalize();
+      mesh.position.copy(TRIAL_CPS[i]);
+      const nextIdx = (i + 1) % TRIAL_CPS.length;
+      const pathDir = TRIAL_CPS[nextIdx].clone().sub(TRIAL_CPS[i]).normalize();
       mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), pathDir);
       scene.add(mesh);
       cpMeshes.push(mesh);
@@ -1024,7 +1093,7 @@ export async function startGame(opts = {}) {
 
   function update(dt) {
     // Trials 3-2-1-GO countdown: freeze the ship, update the overlay, then release.
-    if (SOLO_MODE === 'trials' && trialsCountdownActive) {
+    if (isTrialsMode && trialsCountdownActive) {
       trialsCountdown -= dt;
       const cdWrap = document.getElementById('trials-countdown');
       const cdNum  = document.getElementById('trials-countdown-num');
@@ -1484,16 +1553,16 @@ export async function startGame(opts = {}) {
         if (matchTimer <= 0) endMatch();
       }
 
-      if (SOLO_MODE === 'trials' && cpMeshes.length > 0) {
+      if (isTrialsMode && cpMeshes.length > 0) {
         if (cpCooldown > 0) {
           cpCooldown -= dt;
-        } else if (myAlive && ship.position.distanceTo(TRIAL1_CPS[trialsNextCp]) < CP_TRIGGER_DIST) {
+        } else if (myAlive && ship.position.distanceTo(TRIAL_CPS[trialsNextCp]) < CP_TRIGGER_DIST) {
           cpMeshes[trialsNextCp].material.color.setHex(0x44aa66);
           cpMeshes[trialsNextCp].material.opacity = 0.15;
           boostMeter = Math.min(MAX_BOOST, boostMeter + 3.5);
           boostIdle = 0;
           const wasAtStart = trialsNextCp === 0;
-          trialsNextCp = (trialsNextCp + 1) % TRIAL1_CPS.length;
+          trialsNextCp = (trialsNextCp + 1) % TRIAL_CPS.length;
           cpCooldown = 1.5;
 
           if (wasAtStart) {
@@ -1505,7 +1574,7 @@ export async function startGame(opts = {}) {
               trialsLastLap = trialsTimer;
               if (trialsBestLap === null || trialsTimer < trialsBestLap) {
                 trialsBestLap = trialsTimer;
-                localStorage.setItem('spaceships:trial1Best', trialsBestLap.toFixed(3));
+                localStorage.setItem(TRIAL_BEST_KEY, trialsBestLap.toFixed(3));
               }
               trialsTimer = 0;
               trialsLap++;
@@ -2329,8 +2398,8 @@ export async function startGame(opts = {}) {
     myInvulnTimer = SPAWN_INVULN_DURATION;
     let pos, quat;
     if (isSolo) {
-      if (SOLO_MODE === 'trials') {
-        pos = [0, 20, -420];
+      if (isTrialsMode) {
+        pos = [0, 20, -510];
         quat = [0, 0, 0, 1];
         trialsRunning = false;
         trialsTimer = 0;
@@ -2396,11 +2465,11 @@ export async function startGame(opts = {}) {
     if (!trialsTimerEl) return;
     trialsTimerEl.textContent = trialsRunning ? fmtLapTime(trialsTimer) : '0:00.000';
     if (trialsLapEl) trialsLapEl.textContent = `LAP ${trialsLap || 1}`;
-    if (trialsCpEl) trialsCpEl.textContent = `CHECKPOINT ${trialsNextCp + 1} / ${TRIAL1_CPS.length}`;
+    if (trialsCpEl) trialsCpEl.textContent = `CHECKPOINT ${trialsNextCp + 1} / ${TRIAL_CPS.length}`;
     if (trialsBestEl) trialsBestEl.textContent = trialsBestLap !== null ? `Best: ${fmtLapTime(trialsBestLap)}` : '';
     if (trialsLastEl) trialsLastEl.textContent = trialsLastLap !== null ? `Last: ${fmtLapTime(trialsLastLap)}` : '';
   }
-  if (SOLO_MODE === 'trials' && trialsHudEl) {
+  if (isTrialsMode && trialsHudEl) {
     trialsHudEl.style.display = 'flex';
     updateTrialsHud();
   }

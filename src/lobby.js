@@ -430,6 +430,7 @@ document.getElementById('btnTutorialMouse').addEventListener('click', () => {
 
 document.getElementById('btnTrials').addEventListener('click', () => {
   setError('');
+  refreshTrialButtons();
   showScreen('trials');
 });
 
@@ -438,8 +439,38 @@ document.getElementById('btnBackTrials').addEventListener('click', () => {
   showScreen('single');
 });
 
+function refreshTrialButtons() {
+  const defs = [
+    { id: 'btnTrial2', label: 'Trial 2', mode: 'trials2', reqKey: 'spaceships:trial1Best' },
+    { id: 'btnTrial3', label: 'Trial 3', mode: 'trials3', reqKey: 'spaceships:trial2Best' },
+    { id: 'btnTrial4', label: 'Trial 4', mode: 'trials4', reqKey: 'spaceships:trial3Best' },
+  ];
+  for (const def of defs) {
+    const el = document.getElementById(def.id);
+    if (!el) continue;
+    const unlocked = localStorage.getItem(def.reqKey) !== null;
+    el.classList.toggle('locked', !unlocked);
+    el.textContent = unlocked ? def.label : `[LOCKED]  ${def.label}`;
+  }
+}
+
 document.getElementById('btnTrial1').addEventListener('click', () => {
   enterSoloGame('trials');
+});
+
+document.getElementById('btnTrial2').addEventListener('click', () => {
+  if (document.getElementById('btnTrial2').classList.contains('locked')) return;
+  enterSoloGame('trials2');
+});
+
+document.getElementById('btnTrial3').addEventListener('click', () => {
+  if (document.getElementById('btnTrial3').classList.contains('locked')) return;
+  enterSoloGame('trials3');
+});
+
+document.getElementById('btnTrial4').addEventListener('click', () => {
+  if (document.getElementById('btnTrial4').classList.contains('locked')) return;
+  enterSoloGame('trials4');
 });
 
 document.getElementById('btnFind').addEventListener('click', async () => {
