@@ -111,6 +111,10 @@ export async function startGame(opts = {}) {
     { pos: mothershipA.position, halfSize: MOTHERSHIP_HALF },
     { pos: mothershipB.position, halfSize: MOTHERSHIP_HALF },
   ];
+  if (opts.mode === 'trials') {
+    mothershipA.visible = false;
+    mothershipB.visible = false;
+  }
 
   // Indestructible obstacle at the origin: blocks line of sight between
   // the two motherships and acts as a sphere for ship collision, bullets,
@@ -167,6 +171,8 @@ export async function startGame(opts = {}) {
   if (opts.spawn) {
     ship.position.fromArray(opts.spawn.pos);
     ship.quaternion.fromArray(opts.spawn.quat);
+  } else if (opts.mode === 'trials') {
+    ship.position.set(0, 0, -420);
   } else {
     ship.position.set(0, 0, -540);
   }
@@ -176,8 +182,58 @@ export async function startGame(opts = {}) {
   // message; fall back to local random generation for offline runs.
   const asteroids = opts.asteroids
     ? createAsteroidFieldFromData(opts.asteroids)
-    : createAsteroidField({ count: 60, radius: 400, avoid: [...motherships, moonAvoid] });
+    : (opts.mode === 'trials'
+      ? createAsteroidField({ count: 18, radius: 340, avoid: [...motherships, moonAvoid] })
+      : createAsteroidField({ count: 60, radius: 400, avoid: [...motherships, moonAvoid] }));
   scene.add(asteroids.group);
+
+  // ── Time Trials: Trial 1 ────────────────────────────────────────────────
+  // Eight checkpoints in an oval circuit around the moon. Each is a torus
+  // ring oriented perpendicular to the path direction. The timer begins on
+  // the first crossing of CP0 (start/finish) and each completed circuit
+  // records a lap time.
+  const TRIAL1_CPS = [
+    new THREE.Vector3(   0,   0, -380),  // CP0 start / finish
+    new THREE.Vector3( 220,  30, -220),  // CP1
+    new THREE.Vector3( 350,   0,    0),  // CP2 right sweep
+    new THREE.Vector3( 220, -30,  220),  // CP3
+    new THREE.Vector3(   0,   0,  380),  // CP4 back straight
+    new THREE.Vector3(-220,  30,  220),  // CP5
+    new THREE.Vector3(-350,   0,    0),  // CP6 left sweep
+    new THREE.Vector3(-220, -30, -220),  // CP7
+  ];
+  const CP_TRIGGER_DIST = 55;
+  const cpMeshes = [];
+  let trialsNextCp = 0;
+  let trialsTimer = 0;
+  let trialsRunning = false;
+  let trialsBestLap = null;
+  let trialsLastLap = null;
+  let trialsLap = 0;
+  let cpCooldown = 0;
+
+  if (opts.mode === 'trials') {
+    const savedBest = parseFloat(localStorage.getItem('spaceships:trial1Best'));
+    if (!isNaN(savedBest)) trialsBestLap = savedBest;
+
+    const cpGeo = new THREE.TorusGeometry(48, 3.5, 8, 36);
+    for (let i = 0; i < TRIAL1_CPS.length; i++) {
+      const isNext = i === 0;
+      const mat = new THREE.MeshBasicMaterial({
+        color: isNext ? 0x66ffcc : 0x224466,
+        transparent: true,
+        opacity: isNext ? 0.85 : 0.35,
+        side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(cpGeo, mat);
+      mesh.position.copy(TRIAL1_CPS[i]);
+      const nextIdx = (i + 1) % TRIAL1_CPS.length;
+      const pathDir = TRIAL1_CPS[nextIdx].clone().sub(TRIAL1_CPS[i]).normalize();
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), pathDir);
+      scene.add(mesh);
+      cpMeshes.push(mesh);
+    }
+  }
 
   // Bullet hit-sphere is generous in both modes — mouse 6.0 (slight
   // forgiveness, lead correction still has to be roughly right), keys /
@@ -1391,6 +1447,43 @@ export async function startGame(opts = {}) {
         renderMatchHud();
         if (matchTimer <= 0) endMatch();
       }
+
+      if (SOLO_MODE === 'trials' && cpMeshes.length > 0) {
+        if (cpCooldown > 0) {
+          cpCooldown -= dt;
+        } else if (myAlive && ship.position.distanceTo(TRIAL1_CPS[trialsNextCp]) < CP_TRIGGER_DIST) {
+          cpMeshes[trialsNextCp].material.color.setHex(0x44aa66);
+          cpMeshes[trialsNextCp].material.opacity = 0.15;
+          const wasAtStart = trialsNextCp === 0;
+          trialsNextCp = (trialsNextCp + 1) % TRIAL1_CPS.length;
+          cpCooldown = 1.5;
+
+          if (wasAtStart) {
+            if (!trialsRunning) {
+              trialsRunning = true;
+              trialsTimer = 0;
+              trialsLap = 1;
+            } else {
+              trialsLastLap = trialsTimer;
+              if (trialsBestLap === null || trialsTimer < trialsBestLap) {
+                trialsBestLap = trialsTimer;
+                localStorage.setItem('spaceships:trial1Best', trialsBestLap.toFixed(3));
+              }
+              trialsTimer = 0;
+              trialsLap++;
+            }
+          }
+
+          cpMeshes[trialsNextCp].material.color.setHex(0x66ffcc);
+          cpMeshes[trialsNextCp].material.opacity = 0.9;
+          updateTrialsHud();
+        }
+
+        if (trialsRunning && myAlive) {
+          trialsTimer += dt;
+          updateTrialsHud();
+        }
+      }
     }
 
 
@@ -2198,14 +2291,26 @@ export async function startGame(opts = {}) {
     myInvulnTimer = SPAWN_INVULN_DURATION;
     let pos, quat;
     if (isSolo) {
-      // Spawn at the friendly anchor with a bit of jitter so we don't
-      // stack on top of teammates.
-      pos = [
-        (Math.random() - 0.5) * 60,
-        (Math.random() - 0.5) * 20,
-        -540 + (Math.random() - 0.5) * 60,
-      ];
-      quat = [0, 0, 0, 1];
+      if (SOLO_MODE === 'trials') {
+        pos = [0, 20, -420];
+        quat = [0, 0, 0, 1];
+        trialsRunning = false;
+        trialsTimer = 0;
+        trialsNextCp = 0;
+        cpCooldown = 2.0;
+        for (let i = 0; i < cpMeshes.length; i++) {
+          cpMeshes[i].material.color.setHex(i === 0 ? 0x66ffcc : 0x224466);
+          cpMeshes[i].material.opacity = i === 0 ? 0.85 : 0.35;
+        }
+        updateTrialsHud();
+      } else {
+        pos = [
+          (Math.random() - 0.5) * 60,
+          (Math.random() - 0.5) * 20,
+          -540 + (Math.random() - 0.5) * 60,
+        ];
+        quat = [0, 0, 0, 1];
+      }
     } else {
       pos = opts.spawn?.pos ?? [0, 0, 0];
       quat = opts.spawn?.quat ?? [0, 0, 0, 1];
@@ -2234,6 +2339,32 @@ export async function startGame(opts = {}) {
   if (matchActive && matchHudEl) {
     matchHudEl.style.display = 'flex';
     renderMatchHud();
+  }
+
+  // --- Trials HUD ----------------------------------------------------------
+  const trialsHudEl    = document.getElementById('trials-hud');
+  const trialsTimerEl  = document.getElementById('trials-timer');
+  const trialsCpEl     = document.getElementById('trials-checkpoint');
+  const trialsBestEl   = document.getElementById('trials-best');
+  const trialsLastEl   = document.getElementById('trials-last');
+  const trialsLapEl    = document.getElementById('trials-lap');
+  function fmtLapTime(t) {
+    const total = Math.max(0, t);
+    const m = Math.floor(total / 60);
+    const s = (total % 60).toFixed(3).padStart(6, '0');
+    return `${m}:${s}`;
+  }
+  function updateTrialsHud() {
+    if (!trialsTimerEl) return;
+    trialsTimerEl.textContent = trialsRunning ? fmtLapTime(trialsTimer) : '0:00.000';
+    if (trialsLapEl) trialsLapEl.textContent = `LAP ${trialsLap || 1}`;
+    if (trialsCpEl) trialsCpEl.textContent = `CHECKPOINT ${trialsNextCp + 1} / ${TRIAL1_CPS.length}`;
+    if (trialsBestEl) trialsBestEl.textContent = trialsBestLap !== null ? `Best: ${fmtLapTime(trialsBestLap)}` : '';
+    if (trialsLastEl) trialsLastEl.textContent = trialsLastLap !== null ? `Last: ${fmtLapTime(trialsLastLap)}` : '';
+  }
+  if (SOLO_MODE === 'trials' && trialsHudEl) {
+    trialsHudEl.style.display = 'flex';
+    updateTrialsHud();
   }
 
   function endMatch() {

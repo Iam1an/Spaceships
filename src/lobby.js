@@ -17,6 +17,7 @@ const screens = {
   room: document.getElementById('lobby-room'),
   single: document.getElementById('lobby-single'),
   tutorial: document.getElementById('lobby-tutorial'),
+  trials: document.getElementById('lobby-trials'),
 };
 
 const roomCodeEl = document.getElementById('roomCode');
@@ -425,6 +426,20 @@ document.getElementById('btnTutorialKeys').addEventListener('click', () => {
 
 document.getElementById('btnTutorialMouse').addEventListener('click', () => {
   enterSoloGame('tutorial', { noMouse: false, controlScheme: 'mouse_keys' });
+});
+
+document.getElementById('btnTrials').addEventListener('click', () => {
+  setError('');
+  showScreen('trials');
+});
+
+document.getElementById('btnBackTrials').addEventListener('click', () => {
+  setError('');
+  showScreen('single');
+});
+
+document.getElementById('btnTrial1').addEventListener('click', () => {
+  enterSoloGame('trials');
 });
 
 document.getElementById('btnFind').addEventListener('click', async () => {
