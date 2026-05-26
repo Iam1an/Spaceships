@@ -37,6 +37,11 @@ const migrations = [
   "ALTER TABLE pilots ADD COLUMN trial3_best REAL",
   "ALTER TABLE pilots ADD COLUMN trial4_best REAL",
   "ALTER TABLE pilots ADD COLUMN credits INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE pilots ADD COLUMN unlock_colors INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE pilots ADD COLUMN unlock_trail INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE pilots ADD COLUMN unlock_hull INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE pilots ADD COLUMN unlock_accent INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE pilots ADD COLUMN unlock_trail_shape INTEGER NOT NULL DEFAULT 0",
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch {}
@@ -248,7 +253,11 @@ export async function loginPilot(username, password) {
     trial2Best:   pilot.trial2_best,
     trial3Best:   pilot.trial3_best,
     trial4Best:   pilot.trial4_best,
-    credits:      pilot.credits,
+    credits:          pilot.credits,
+    unlockHull:       !!pilot.unlock_hull,
+    unlockAccent:     !!pilot.unlock_accent,
+    unlockTrail:      !!pilot.unlock_trail,
+    unlockTrailShape: !!pilot.unlock_trail_shape,
   };
 }
 
@@ -342,8 +351,12 @@ export function getPilotProfile(username) {
     trial3Best:   pilot.trial3_best,
     trial4Best:   pilot.trial4_best,
     achievements,
-    credits:      pilot.credits,
-    createdAt:    pilot.created_at,
+    credits:          pilot.credits,
+    unlockHull:       !!pilot.unlock_hull,
+    unlockAccent:     !!pilot.unlock_accent,
+    unlockTrail:      !!pilot.unlock_trail,
+    unlockTrailShape: !!pilot.unlock_trail_shape,
+    createdAt:        pilot.created_at,
   };
 }
 
@@ -362,6 +375,43 @@ export function getLeaderboard() {
     highScore:    p.high_score,
     kdr:          kdrStr(p.total_kills, p.total_deaths),
   }));
+}
+
+// ── Customization unlocks ─────────────────────────────────────────────────────
+
+export const UNLOCK_COSTS = { hull: 250, accent: 400, trail: 500, trail_shape: 200 };
+
+const stmtGetUnlocks = db.prepare(
+  'SELECT unlock_hull, unlock_accent, unlock_trail, unlock_trail_shape FROM pilots WHERE id = ?'
+);
+const stmtSetUnlock = {
+  hull:        db.prepare('UPDATE pilots SET unlock_hull        = 1 WHERE id = ?'),
+  accent:      db.prepare('UPDATE pilots SET unlock_accent      = 1 WHERE id = ?'),
+  trail:       db.prepare('UPDATE pilots SET unlock_trail       = 1 WHERE id = ?'),
+  trail_shape: db.prepare('UPDATE pilots SET unlock_trail_shape = 1 WHERE id = ?'),
+};
+
+export function getCustomizationUnlocks(pilotId) {
+  const r = stmtGetUnlocks.get(pilotId);
+  return {
+    unlockHull:       !!r?.unlock_hull,
+    unlockAccent:     !!r?.unlock_accent,
+    unlockTrail:      !!r?.unlock_trail,
+    unlockTrailShape: !!r?.unlock_trail_shape,
+  };
+}
+
+export function purchaseUnlock(pilotId, feature) {
+  const cost = UNLOCK_COSTS[feature];
+  if (!cost) return { ok: false, error: 'Unknown feature' };
+  const u = getCustomizationUnlocks(pilotId);
+  const already = (feature === 'hull' && u.unlockHull) || (feature === 'accent' && u.unlockAccent)
+    || (feature === 'trail' && u.unlockTrail) || (feature === 'trail_shape' && u.unlockTrailShape);
+  if (already) return { ok: true, alreadyOwned: true, balance: getCredits(pilotId) };
+  const result = spendCredits(pilotId, cost, `unlock:${feature}`);
+  if (!result.ok) return { ok: false, error: 'Insufficient credits', balance: result.balance };
+  stmtSetUnlock[feature].run(pilotId);
+  return { ok: true, alreadyOwned: false, balance: result.balance };
 }
 
 // ── Credits (public API) ──────────────────────────────────────────────────────

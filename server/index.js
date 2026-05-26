@@ -8,6 +8,7 @@ import {
   recordGamePlayed, recordHighScore, savePilotColors,
   recordMatchResult, recordTrialTime, getPilotProfile, getLeaderboard,
   getCredits, awardCredits, spendCredits, getCreditHistory,
+  getCustomizationUnlocks, purchaseUnlock, UNLOCK_COSTS,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -76,6 +77,26 @@ function extractPilotId(req) {
   if (!token) throw Object.assign(new Error('Not authenticated'), { status: 401 });
   return verifyToken(token).id;
 }
+
+app.get('/api/unlocks', (req, res) => {
+  try {
+    const id = extractPilotId(req);
+    res.json({ ok: true, costs: UNLOCK_COSTS, ...getCustomizationUnlocks(id) });
+  } catch (e) {
+    res.status(e.status ?? 401).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/unlock/:feature', (req, res) => {
+  try {
+    const id     = extractPilotId(req);
+    const result = purchaseUnlock(id, req.params.feature);
+    if (!result.ok) return res.status(result.balance !== undefined ? 402 : 400).json({ ok: false, error: result.error, balance: result.balance });
+    res.json({ ok: true, alreadyOwned: result.alreadyOwned, balance: result.balance });
+  } catch (e) {
+    res.status(e.status ?? 401).json({ ok: false, error: e.message });
+  }
+});
 
 app.get('/api/credits', (req, res) => {
   try {

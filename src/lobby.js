@@ -675,12 +675,9 @@ zoomEl.addEventListener('input', () => {
   if (custScene) custScene.setZoom(parseFloat(zoomEl.value));
 });
 
-// ── Customization credit costs ────────────────────────────────────────────────
-const COST_SAVE_COLORS  = 500;
-const COST_TRAIL_UNLOCK = 250;
-const COST_TRAIL_SHAPE  = 150;
-
-let trailTabUnlocked = false;
+// ── Customization unlock system ───────────────────────────────────────────────
+const UNLOCK_COSTS = { hull: 250, accent: 400, trail: 500, trail_shape: 200 };
+const COST_SAVE_COLORS = 50;
 
 const custCrStatusEl = document.getElementById('custCrStatus');
 let custCrTimer = null;
@@ -692,37 +689,84 @@ function showCustCrStatus(msg, color = '#ff8a8a') {
   custCrTimer = setTimeout(() => { custCrStatusEl.textContent = ''; }, 3000);
 }
 
-async function trySpendCredits(amount, reason) {
+function isUnlocked(feature) {
+  return localStorage.getItem(`spaceships:unlock_${feature}`) === '1';
+}
+function saveUnlockLocal(feature) {
+  localStorage.setItem(`spaceships:unlock_${feature}`, '1');
+}
+
+function updateCustUnlockUI() {
+  const badges = {
+    hull:        document.getElementById('hullTabCost'),
+    accent:      document.getElementById('accentTabCost'),
+    trail:       document.getElementById('trailTabCost'),
+    trail_shape: document.getElementById('trailShapeCost'),
+  };
+  for (const [feature, el] of Object.entries(badges)) {
+    if (!el) continue;
+    if (isUnlocked(feature)) {
+      el.textContent = '· ✓';
+      el.style.color = '#66ff88';
+    } else {
+      el.textContent = `· ${UNLOCK_COSTS[feature]} ⬡`;
+      el.style.color = '';
+    }
+  }
+}
+
+async function refreshUnlocks() {
   const token = getToken();
-  if (!token) return { ok: false, msg: 'Log in to use this feature' };
-  const cached = parseInt(localStorage.getItem('spaceships:credits') || '0', 10);
-  if (cached < amount) return { ok: false, msg: `Need ${amount - cached} more ⬡ (you have ${cached} ⬡)` };
+  if (!token) return;
   try {
-    const res  = await fetch('/spaceships/api/credits/spend', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-      body: JSON.stringify({ amount, reason }),
+    const res  = await fetch('/spaceships/api/unlocks', { headers: { 'Authorization': 'Bearer ' + token } });
+    const data = await res.json();
+    if (!data.ok) return;
+    if (data.unlockHull)       saveUnlockLocal('hull');
+    if (data.unlockAccent)     saveUnlockLocal('accent');
+    if (data.unlockTrail)      saveUnlockLocal('trail');
+    if (data.unlockTrailShape) saveUnlockLocal('trail_shape');
+    updateCustUnlockUI();
+  } catch {}
+}
+
+async function tryPurchaseUnlock(feature) {
+  const cost = UNLOCK_COSTS[feature];
+  if (!cost) return { ok: false, msg: 'Unknown feature' };
+  const token = getToken();
+  if (!token) return { ok: false, msg: 'Log in to unlock this feature' };
+  if (isUnlocked(feature)) return { ok: true, alreadyOwned: true };
+  const cached = parseInt(localStorage.getItem('spaceships:credits') || '0', 10);
+  if (cached < cost) return { ok: false, msg: `Need ${cost - cached} more ⬡ (you have ${cached} ⬡)` };
+  try {
+    const res  = await fetch(`/spaceships/api/unlock/${feature}`, {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + token },
     });
     const data = await res.json();
-    if (data.ok) { setCreditsDisplay(data.balance); return { ok: true }; }
-    return { ok: false, msg: `Not enough ⬡ (have ${data.balance ?? '?'})` };
+    if (data.ok) {
+      saveUnlockLocal(feature);
+      if (!data.alreadyOwned) setCreditsDisplay(data.balance);
+      updateCustUnlockUI();
+      return { ok: true, alreadyOwned: data.alreadyOwned };
+    }
+    return { ok: false, msg: `Not enough ⬡ (have ${data.balance ?? cached})` };
   } catch {
     return { ok: false, msg: 'Could not reach server' };
   }
 }
 
-document.getElementById('tabHull').addEventListener('click', () => setColorTarget('hull'));
-document.getElementById('tabAccent').addEventListener('click', () => setColorTarget('accent'));
-document.getElementById('tabTrail').addEventListener('click', async () => {
-  if (trailTabUnlocked) { setColorTarget('trail'); return; }
-  const r = await trySpendCredits(COST_TRAIL_UNLOCK, 'customize:trail_unlock');
-  if (!r.ok) { showCustCrStatus(`Trail editing costs ${COST_TRAIL_UNLOCK} ⬡ · ${r.msg}`); return; }
-  trailTabUnlocked = true;
-  const costBadge = document.getElementById('trailTabCost');
-  if (costBadge) costBadge.textContent = '· ✓';
-  showCustCrStatus(`Trail unlocked! −${COST_TRAIL_UNLOCK} ⬡`, '#66ff88');
-  setColorTarget('trail');
-});
+function makeTabHandler(id, feature) {
+  document.getElementById(id).addEventListener('click', async () => {
+    if (isUnlocked(feature)) { setColorTarget(feature === 'trail' ? 'trail' : feature); return; }
+    const r = await tryPurchaseUnlock(feature);
+    if (!r.ok) { showCustCrStatus(`${feature} unlock costs ${UNLOCK_COSTS[feature]} ⬡ · ${r.msg}`); return; }
+    showCustCrStatus(r.alreadyOwned ? 'Already unlocked!' : `Unlocked! −${UNLOCK_COSTS[feature]} ⬡`, '#66ff88');
+    setColorTarget(feature === 'trail' ? 'trail' : feature);
+  });
+}
+makeTabHandler('tabHull',   'hull');
+makeTabHandler('tabAccent', 'accent');
+makeTabHandler('tabTrail',  'trail');
 
 // Trail shape picker
 const TRAIL_SHAPE_KEY = 'spaceships:trailShape';
@@ -735,9 +779,10 @@ function setTrailShape(shape) {
 document.getElementById('trail-shape-picker').addEventListener('click', async (e) => {
   const btn = e.target.closest('.trail-shape-btn');
   if (!btn) return;
-  const r = await trySpendCredits(COST_TRAIL_SHAPE, 'customize:trail_shape');
-  if (!r.ok) { showCustCrStatus(`Changing shape costs ${COST_TRAIL_SHAPE} ⬡ · ${r.msg}`); return; }
-  showCustCrStatus(`Shape changed! −${COST_TRAIL_SHAPE} ⬡`, '#66ff88');
+  if (isUnlocked('trail_shape')) { setTrailShape(btn.dataset.shape); return; }
+  const r = await tryPurchaseUnlock('trail_shape');
+  if (!r.ok) { showCustCrStatus(`Trail shapes cost ${UNLOCK_COSTS.trail_shape} ⬡ to unlock · ${r.msg}`); return; }
+  showCustCrStatus(r.alreadyOwned ? 'Already unlocked!' : `Trail shapes unlocked! −${UNLOCK_COSTS.trail_shape} ⬡`, '#66ff88');
   setTrailShape(btn.dataset.shape);
 });
 setTrailShape(getSavedTrailShape());
@@ -775,9 +820,9 @@ async function saveColorsToServer() {
     saveColorsStatus.textContent = 'Log in to save to account';
     saveColorsStatus.style.color = '#ff8a8a';
   } else {
-    const cr = await trySpendCredits(COST_SAVE_COLORS, 'customize:save_colors');
-    if (!cr.ok) {
-      saveColorsStatus.textContent = `Costs ${COST_SAVE_COLORS} ⬡ · ${cr.msg}`;
+    const cached = parseInt(localStorage.getItem('spaceships:credits') || '0', 10);
+    if (cached < COST_SAVE_COLORS) {
+      saveColorsStatus.textContent = `Need ${COST_SAVE_COLORS - cached} more ⬡ to save (${COST_SAVE_COLORS} ⬡ per save)`;
       saveColorsStatus.style.color = '#ff8a8a';
       if (saveStatusTimer) clearTimeout(saveStatusTimer);
       saveStatusTimer = setTimeout(() => { saveColorsStatus.textContent = ''; }, 3500);
@@ -786,6 +831,20 @@ async function saveColorsToServer() {
     saveColorsStatus.textContent = 'Saving…';
     saveColorsStatus.style.color = '#c8e0ff';
     try {
+      const spendRes = await fetch('/spaceships/api/credits/spend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+        body: JSON.stringify({ amount: COST_SAVE_COLORS, reason: 'save_colors' }),
+      });
+      const spendData = await spendRes.json();
+      if (!spendData.ok) {
+        saveColorsStatus.textContent = spendData.error || 'Not enough ⬡';
+        saveColorsStatus.style.color = '#ff8a8a';
+        if (saveStatusTimer) clearTimeout(saveStatusTimer);
+        saveStatusTimer = setTimeout(() => { saveColorsStatus.textContent = ''; }, 3000);
+        return;
+      }
+      setCreditsDisplay(spendData.balance);
       const res = await fetch('/spaceships/api/colors', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
@@ -939,8 +998,9 @@ requireAuth().then(() => {
     nameInput.style.opacity = '0.55';
     nameInput.title = 'Your callsign is your account username and cannot be changed here';
   }
-  // Refresh credits and show any achievements earned in the last match.
+  // Refresh credits, unlocks, and show any achievements earned in the last match.
   refreshCredits();
+  refreshUnlocks();
   checkPendingAchievements();
 });
 

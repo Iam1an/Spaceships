@@ -890,9 +890,9 @@
       <canvas id="custCanvas"></canvas>
       <div id="cust-controls">
         <div id="cust-color-tabs">
-          <button class="cust-tab active" id="tabHull">HULL</button>
-          <button class="cust-tab" id="tabAccent">ACCENT</button>
-          <button class="cust-tab" id="tabTrail">TRAIL <span class="cr-cost-badge" id="trailTabCost">· 10 ⬡</span></button>
+          <button class="cust-tab active" id="tabHull">HULL <span class="cr-cost-badge" id="hullTabCost">· 250 ⬡</span></button>
+          <button class="cust-tab" id="tabAccent">ACCENT <span class="cr-cost-badge" id="accentTabCost">· 400 ⬡</span></button>
+          <button class="cust-tab" id="tabTrail">TRAIL <span class="cr-cost-badge" id="trailTabCost">· 500 ⬡</span></button>
         </div>
         <canvas id="colorWheel" width="200" height="200"></canvas>
         <div id="cust-brightness-row">
@@ -909,12 +909,12 @@
         </div>
         <span id="custCrStatus" style="font-size:12px;min-height:16px;letter-spacing:1px;text-align:center;width:100%;"></span>
         <div style="display:flex;gap:8px;margin-top:4px;width:100%;">
-          <button class="big" id="btnSaveColors" style="flex:1">Save Colors · <span class="cr-cost-badge">25 ⬡</span></button>
+          <button class="big" id="btnSaveColors" style="flex:1">Save Colors · <span class="cr-cost-badge">50 ⬡</span></button>
           <button class="big" id="btnResetColors" style="flex:0 0 auto;font-size:14px;padding:14px 16px;background:linear-gradient(180deg,#666 0%,#333 100%);border-color:#aaa;box-shadow:none;" title="Reset to default colors">↺</button>
         </div>
         <span id="saveColorsStatus" style="font-size:13px;color:#66ff88;min-height:18px;letter-spacing:1px;"></span>
         <div class="cust-divider"></div>
-        <div class="cust-label">TRAIL SHAPE · <span class="cr-cost-badge">10 ⬡ each</span></div>
+        <div class="cust-label">TRAIL SHAPE · <span class="cr-cost-badge" id="trailShapeCost">· 200 ⬡</span></div>
         <div id="trail-shape-picker" style="display:flex;gap:6px;flex-wrap:wrap;justify-content:center;">
           <button class="trail-shape-btn" data-shape="circle"   title="Circle">●</button>
           <button class="trail-shape-btn" data-shape="square"   title="Square">■</button>
