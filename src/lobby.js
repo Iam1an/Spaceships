@@ -409,6 +409,9 @@ document.getElementById('btnTrain').addEventListener('click', () => {
   enterSoloGame('train');
 });
 
+document.getElementById('btnSkirmish').addEventListener('click', () => {
+  enterSoloGame('skirmish');
+});
 
 document.getElementById('btnTutorial').addEventListener('click', () => {
   setError('');

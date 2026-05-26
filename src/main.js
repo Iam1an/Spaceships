@@ -2122,7 +2122,7 @@ export async function startGame(opts = {}) {
   // Train and any networked match show the team HUD + win banner. Solo ticks
   // the timer locally; MP receives match-state from the server. Tutorial is
   // excluded — it's a guided lesson, not a match.
-  const matchActive = SOLO_MODE === 'train' || !isSolo;
+  const matchActive = SOLO_MODE === 'skirmish' || SOLO_MODE === 'train' || !isSolo;
 
   function makeBotEntity(r) {
     return {
@@ -2193,6 +2193,18 @@ export async function startGame(opts = {}) {
       const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
       const pos = ship.position.clone().addScaledVector(fwd, 250);
       spawnBot(1, 1, pos, 'Bot');
+    } else if (SOLO_MODE === 'skirmish') {
+      const FRIENDLY_ANCHOR = new THREE.Vector3(0, 0, -540);
+      const ENEMY_ANCHOR = new THREE.Vector3(0, 0, 540);
+      const jitter = (range) => (Math.random() - 0.5) * range;
+      for (let i = 0; i < 4; i++) {
+        const pos = FRIENDLY_ANCHOR.clone().add(new THREE.Vector3(jitter(80), jitter(30), jitter(80)));
+        spawnBot(1 + i, 0, pos, `Ally ${i + 1}`);
+      }
+      for (let i = 0; i < 5; i++) {
+        const pos = ENEMY_ANCHOR.clone().add(new THREE.Vector3(jitter(80), jitter(30), jitter(80)));
+        spawnBot(5 + i, 1, pos, `Enemy ${i + 1}`);
+      }
     }
   }
   if (isSolo) spawnSoloEntities();
@@ -2406,9 +2418,16 @@ export async function startGame(opts = {}) {
   function reviveBotLocal(id) {
     const r = remotePlayers.get(id);
     if (!r) return;
-    const anchor = ship.position.clone().add(new THREE.Vector3(
-      (Math.random() * 2 - 1), 0, (Math.random() * 2 - 1),
-    ).normalize().multiplyScalar(280));
+    let anchor;
+    if (SOLO_MODE === 'skirmish') {
+      anchor = r.team === 0
+        ? new THREE.Vector3(0, 0, -540)
+        : new THREE.Vector3(0, 0, 540);
+    } else {
+      anchor = ship.position.clone().add(new THREE.Vector3(
+        (Math.random() * 2 - 1), 0, (Math.random() * 2 - 1),
+      ).normalize().multiplyScalar(280));
+    }
     r.ship.position.copy(anchor).add(new THREE.Vector3(
       (Math.random() - 0.5) * 60,
       (Math.random() - 0.5) * 20,
