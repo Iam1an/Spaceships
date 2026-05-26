@@ -7,6 +7,7 @@ import {
   registerPilot, loginPilot, verifyToken,
   recordGamePlayed, recordHighScore, savePilotColors,
   recordMatchResult, recordTrialTime, getPilotProfile, getLeaderboard,
+  getCredits, awardCredits, spendCredits, getCreditHistory,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -76,17 +77,50 @@ function extractPilotId(req) {
   return verifyToken(token).id;
 }
 
+app.get('/api/credits', (req, res) => {
+  try {
+    const id = extractPilotId(req);
+    res.json({ ok: true, credits: getCredits(id) });
+  } catch (e) {
+    res.status(e.status ?? 401).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/credits/history', (req, res) => {
+  try {
+    const id    = extractPilotId(req);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+    res.json({ ok: true, history: getCreditHistory(id, limit) });
+  } catch (e) {
+    res.status(e.status ?? 401).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/credits/spend', (req, res) => {
+  try {
+    const id     = extractPilotId(req);
+    const amount = Number(req.body?.amount) || 0;
+    const reason = String(req.body?.reason || 'purchase').slice(0, 120);
+    if (amount < 1) return res.status(400).json({ ok: false, error: 'Invalid amount' });
+    const result = spendCredits(id, amount, reason);
+    if (!result.ok) return res.status(402).json({ ok: false, error: 'Insufficient credits', balance: result.balance });
+    res.json({ ok: true, balance: result.balance });
+  } catch (e) {
+    res.status(e.status ?? 401).json({ ok: false, error: e.message });
+  }
+});
+
 app.post('/api/solo-result', (req, res) => {
   try {
     const pilotId = extractPilotId(req);
     const { kills = 0, deaths = 0, won = null, botsKilled = 0 } = req.body ?? {};
-    const newAchs = recordMatchResult(pilotId, {
+    const result = recordMatchResult(pilotId, {
       kills:      Math.max(0, Number(kills)      || 0),
       deaths:     Math.max(0, Number(deaths)     || 0),
       won:        won === true || won === false ? won : null,
       botsKilled: Math.max(0, Number(botsKilled) || 0),
     });
-    res.json({ ok: true, newAchievements: newAchs });
+    res.json({ ok: true, newAchievements: result.newAchievements, creditsEarned: result.creditsEarned, totalCredits: getCredits(pilotId) });
   } catch (e) {
     res.status(e.status ?? 500).json({ ok: false, error: e.message });
   }
@@ -101,8 +135,8 @@ app.post('/api/trial-result', (req, res) => {
     if (![1, 2, 3, 4].includes(num) || !Number.isFinite(t) || t <= 0) {
       return res.status(400).json({ ok: false, error: 'Invalid trial data' });
     }
-    const newAchs = recordTrialTime(pilotId, num, t);
-    res.json({ ok: true, newAchievements: newAchs });
+    const result = recordTrialTime(pilotId, num, t);
+    res.json({ ok: true, newAchievements: result.newAchievements, creditsEarned: result.creditsEarned, totalCredits: getCredits(pilotId) });
   } catch (e) {
     res.status(e.status ?? 500).json({ ok: false, error: e.message });
   }
@@ -384,9 +418,11 @@ function endMatch(room) {
     let won = null;
     if (winner !== -1) won = player.team === winner;
     try {
-      const newAchs = recordMatchResult(ws.pilotId, { kills, deaths, won, botsKilled: 0 });
-      if (newAchs.length > 0 && ws.open) {
-        ws.send(JSON.stringify({ type: 'achievements', earned: newAchs }));
+      const result = recordMatchResult(ws.pilotId, { kills, deaths, won, botsKilled: 0 });
+      if (ws.open) {
+        const payload = { type: 'match-credits', creditsEarned: result.creditsEarned, totalCredits: getCredits(ws.pilotId) };
+        if (result.newAchievements.length > 0) payload.earned = result.newAchievements;
+        ws.send(JSON.stringify(payload));
       }
     } catch (e) {
       console.warn(`stats save failed for pilot ${ws.pilotId}:`, e.message);

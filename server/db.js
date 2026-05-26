@@ -36,6 +36,7 @@ const migrations = [
   "ALTER TABLE pilots ADD COLUMN trial2_best REAL",
   "ALTER TABLE pilots ADD COLUMN trial3_best REAL",
   "ALTER TABLE pilots ADD COLUMN trial4_best REAL",
+  "ALTER TABLE pilots ADD COLUMN credits INTEGER NOT NULL DEFAULT 0",
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch {}
@@ -48,6 +49,17 @@ db.exec(`
     type      TEXT NOT NULL,
     earned_at INTEGER NOT NULL DEFAULT (unixepoch()),
     UNIQUE(pilot_id, type)
+  )
+`);
+try { db.exec("ALTER TABLE achievements ADD COLUMN credited INTEGER NOT NULL DEFAULT 0"); } catch {}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS credit_transactions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    pilot_id   INTEGER NOT NULL REFERENCES pilots(id),
+    amount     INTEGER NOT NULL,
+    reason     TEXT    NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
   )
 `);
 
@@ -64,46 +76,51 @@ function computeRank(totalKills) {
 
 // ── Achievement definitions ───────────────────────────────────────────────────
 
+// ── Credit rates ──────────────────────────────────────────────────────────────
+export const CR_PER_KILL     = 5;   // player kills in any match
+export const CR_PER_BOT_KILL = 2;   // bot kills in solo modes
+export const CR_WIN_BONUS    = 50;  // flat bonus for winning a match
+
 const ACHIEVEMENT_DEFS = [
   // ── Kill milestones ───────────────────────────────────────────────────────────
-  { type: 'first_kill',        label: 'First Blood',        icon: '🔫', desc: 'Get your first kill',                         check: p => p.total_kills >= 1,    progress: p => ({ current: Math.min(p.total_kills, 1),    target: 1 }) },
-  { type: 'kills_10',          label: 'Sharpshooter',       icon: '🎯', desc: 'Reach 10 total kills',                        check: p => p.total_kills >= 10,   progress: p => ({ current: Math.min(p.total_kills, 10),   target: 10 }) },
-  { type: 'kills_50',          label: 'Ace',                icon: '⚔',  desc: 'Reach 50 total kills',                        check: p => p.total_kills >= 50,   progress: p => ({ current: Math.min(p.total_kills, 50),   target: 50 }) },
-  { type: 'kills_100',         label: 'Veteran',            icon: '🏆', desc: 'Reach 100 total kills',                       check: p => p.total_kills >= 100,  progress: p => ({ current: Math.min(p.total_kills, 100),  target: 100 }) },
-  { type: 'kills_500',         label: 'Legend',             icon: '👑', desc: 'Reach 500 total kills',                       check: p => p.total_kills >= 500,  progress: p => ({ current: Math.min(p.total_kills, 500),  target: 500 }) },
-  { type: 'kills_1000',        label: 'Living Weapon',      icon: '☠',  desc: 'Reach 1000 total kills',                      check: p => p.total_kills >= 1000, progress: p => ({ current: Math.min(p.total_kills, 1000), target: 1000 }) },
+  { type: 'first_kill',        label: 'First Blood',        icon: '🔫', desc: 'Get your first kill',                         reward:   100, check: p => p.total_kills >= 1,    progress: p => ({ current: Math.min(p.total_kills, 1),    target: 1 }) },
+  { type: 'kills_10',          label: 'Sharpshooter',       icon: '🎯', desc: 'Reach 10 total kills',                        reward:   150, check: p => p.total_kills >= 10,   progress: p => ({ current: Math.min(p.total_kills, 10),   target: 10 }) },
+  { type: 'kills_50',          label: 'Ace',                icon: '⚔',  desc: 'Reach 50 total kills',                        reward:   350, check: p => p.total_kills >= 50,   progress: p => ({ current: Math.min(p.total_kills, 50),   target: 50 }) },
+  { type: 'kills_100',         label: 'Veteran',            icon: '🏆', desc: 'Reach 100 total kills',                       reward:   600, check: p => p.total_kills >= 100,  progress: p => ({ current: Math.min(p.total_kills, 100),  target: 100 }) },
+  { type: 'kills_500',         label: 'Legend',             icon: '👑', desc: 'Reach 500 total kills',                       reward:  2500, check: p => p.total_kills >= 500,  progress: p => ({ current: Math.min(p.total_kills, 500),  target: 500 }) },
+  { type: 'kills_1000',        label: 'Living Weapon',      icon: '☠',  desc: 'Reach 1000 total kills',                      reward:  5000, check: p => p.total_kills >= 1000, progress: p => ({ current: Math.min(p.total_kills, 1000), target: 1000 }) },
   // ── Best single-match kills ───────────────────────────────────────────────────
-  { type: 'highscore_5',       label: 'Hot Streak',         icon: '🌡', desc: '5 kills in a single match',                   check: p => p.high_score >= 5,     progress: p => ({ current: Math.min(p.high_score, 5),   target: 5 }) },
-  { type: 'highscore_10',      label: 'Unstoppable',        icon: '🌩', desc: '10 kills in a single match',                  check: p => p.high_score >= 10,    progress: p => ({ current: Math.min(p.high_score, 10),  target: 10 }) },
-  { type: 'highscore_20',      label: 'Killing Machine',    icon: '💣', desc: '20 kills in a single match',                  check: p => p.high_score >= 20,    progress: p => ({ current: Math.min(p.high_score, 20),  target: 20 }) },
+  { type: 'highscore_5',       label: 'Hot Streak',         icon: '🌡', desc: '5 kills in a single match',                   reward:   150, check: p => p.high_score >= 5,     progress: p => ({ current: Math.min(p.high_score, 5),   target: 5 }) },
+  { type: 'highscore_10',      label: 'Unstoppable',        icon: '🌩', desc: '10 kills in a single match',                  reward:   300, check: p => p.high_score >= 10,    progress: p => ({ current: Math.min(p.high_score, 10),  target: 10 }) },
+  { type: 'highscore_20',      label: 'Killing Machine',    icon: '💣', desc: '20 kills in a single match',                  reward:   750, check: p => p.high_score >= 20,    progress: p => ({ current: Math.min(p.high_score, 20),  target: 20 }) },
   // ── Match wins ────────────────────────────────────────────────────────────────
-  { type: 'first_win',         label: 'First Victory',      icon: '🥇', desc: 'Win your first match',                        check: p => p.matches_won >= 1,    progress: p => ({ current: Math.min(p.matches_won, 1),  target: 1 }) },
-  { type: 'wins_5',            label: 'On a Roll',          icon: '🔥', desc: 'Win 5 matches',                               check: p => p.matches_won >= 5,    progress: p => ({ current: Math.min(p.matches_won, 5),  target: 5 }) },
-  { type: 'wins_25',           label: 'Dominant Force',     icon: '💪', desc: 'Win 25 matches',                              check: p => p.matches_won >= 25,   progress: p => ({ current: Math.min(p.matches_won, 25), target: 25 }) },
-  { type: 'wins_50',           label: 'Warlord',            icon: '🎖', desc: 'Win 50 matches',                              check: p => p.matches_won >= 50,   progress: p => ({ current: Math.min(p.matches_won, 50), target: 50 }) },
+  { type: 'first_win',         label: 'First Victory',      icon: '🥇', desc: 'Win your first match',                        reward:   200, check: p => p.matches_won >= 1,    progress: p => ({ current: Math.min(p.matches_won, 1),  target: 1 }) },
+  { type: 'wins_5',            label: 'On a Roll',          icon: '🔥', desc: 'Win 5 matches',                               reward:   400, check: p => p.matches_won >= 5,    progress: p => ({ current: Math.min(p.matches_won, 5),  target: 5 }) },
+  { type: 'wins_25',           label: 'Dominant Force',     icon: '💪', desc: 'Win 25 matches',                              reward:  1500, check: p => p.matches_won >= 25,   progress: p => ({ current: Math.min(p.matches_won, 25), target: 25 }) },
+  { type: 'wins_50',           label: 'Warlord',            icon: '🎖', desc: 'Win 50 matches',                              reward:  3000, check: p => p.matches_won >= 50,   progress: p => ({ current: Math.min(p.matches_won, 50), target: 50 }) },
   // ── Matches played ────────────────────────────────────────────────────────────
-  { type: 'matches_10',        label: 'Frequent Flyer',     icon: '🚀', desc: 'Play 10 matches',                             check: p => p.games_played >= 10,  progress: p => ({ current: Math.min(p.games_played, 10),  target: 10 }) },
-  { type: 'matches_50',        label: 'Battle-Hardened',    icon: '🛡', desc: 'Play 50 matches',                             check: p => p.games_played >= 50,  progress: p => ({ current: Math.min(p.games_played, 50),  target: 50 }) },
-  { type: 'matches_100',       label: 'Iron Pilot',         icon: '🔩', desc: 'Play 100 matches',                            check: p => p.games_played >= 100, progress: p => ({ current: Math.min(p.games_played, 100), target: 100 }) },
+  { type: 'matches_10',        label: 'Frequent Flyer',     icon: '🚀', desc: 'Play 10 matches',                             reward:   100, check: p => p.games_played >= 10,  progress: p => ({ current: Math.min(p.games_played, 10),  target: 10 }) },
+  { type: 'matches_50',        label: 'Battle-Hardened',    icon: '🛡', desc: 'Play 50 matches',                             reward:   500, check: p => p.games_played >= 50,  progress: p => ({ current: Math.min(p.games_played, 50),  target: 50 }) },
+  { type: 'matches_100',       label: 'Iron Pilot',         icon: '🔩', desc: 'Play 100 matches',                            reward:  1500, check: p => p.games_played >= 100, progress: p => ({ current: Math.min(p.games_played, 100), target: 100 }) },
   // ── Bot kills ─────────────────────────────────────────────────────────────────
-  { type: 'bot_hunter',        label: 'Bot Hunter',         icon: '🤖', desc: 'Destroy 10 bots',                             check: p => p.bots_killed >= 10,   progress: p => ({ current: Math.min(p.bots_killed, 10),  target: 10 }) },
-  { type: 'bot_slayer',        label: 'Bot Slayer',         icon: '💀', desc: 'Destroy 100 bots',                            check: p => p.bots_killed >= 100,  progress: p => ({ current: Math.min(p.bots_killed, 100), target: 100 }) },
-  { type: 'bot_exterminator',  label: 'Bot Exterminator',   icon: '🔧', desc: 'Destroy 500 bots',                            check: p => p.bots_killed >= 500,  progress: p => ({ current: Math.min(p.bots_killed, 500), target: 500 }) },
+  { type: 'bot_hunter',        label: 'Bot Hunter',         icon: '🤖', desc: 'Destroy 10 bots',                             reward:   100, check: p => p.bots_killed >= 10,   progress: p => ({ current: Math.min(p.bots_killed, 10),  target: 10 }) },
+  { type: 'bot_slayer',        label: 'Bot Slayer',         icon: '💀', desc: 'Destroy 100 bots',                            reward:   500, check: p => p.bots_killed >= 100,  progress: p => ({ current: Math.min(p.bots_killed, 100), target: 100 }) },
+  { type: 'bot_exterminator',  label: 'Bot Exterminator',   icon: '🔧', desc: 'Destroy 500 bots',                            reward:  2000, check: p => p.bots_killed >= 500,  progress: p => ({ current: Math.min(p.bots_killed, 500), target: 500 }) },
   // ── KDR ───────────────────────────────────────────────────────────────────────
-  { type: 'kdr_positive',      label: 'Breaking Even',      icon: '⚖',  desc: 'Reach a 1.0+ KDR (min 10 deaths)',           check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths,     progress: null },
-  { type: 'kdr_2',             label: 'Skilled Hunter',     icon: '🦅', desc: 'Reach a 2.0+ KDR (min 10 deaths)',           check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 2, progress: null },
+  { type: 'kdr_positive',      label: 'Breaking Even',      icon: '⚖',  desc: 'Reach a 1.0+ KDR (min 10 deaths)',           reward:   750, check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths,     progress: null },
+  { type: 'kdr_2',             label: 'Skilled Hunter',     icon: '🦅', desc: 'Reach a 2.0+ KDR (min 10 deaths)',           reward:  2000, check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 2, progress: null },
   // ── Trials completion ─────────────────────────────────────────────────────────
-  { type: 'trial1_complete',   label: 'Trial Runner',       icon: '⏱', desc: 'Complete Trial 1',                            check: p => p.trial1_best !== null, progress: null },
-  { type: 'trial2_complete',   label: 'Speed Seeker',       icon: '🌀', desc: 'Complete Trial 2',                            check: p => p.trial2_best !== null, progress: null },
-  { type: 'trial3_complete',   label: 'Precision Pilot',    icon: '🔮', desc: 'Complete Trial 3',                            check: p => p.trial3_best !== null, progress: null },
-  { type: 'trial4_complete',   label: 'Elite Racer',        icon: '🏁', desc: 'Complete Trial 4',                            check: p => p.trial4_best !== null, progress: null },
-  { type: 'all_trials',        label: 'Grand Champion',     icon: '🌟', desc: 'Complete all 4 trials',                       check: p => p.trial1_best !== null && p.trial2_best !== null && p.trial3_best !== null && p.trial4_best !== null, progress: p => ({ current: [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].filter(t => t !== null).length, target: 4 }) },
+  { type: 'trial1_complete',   label: 'Trial Runner',       icon: '⏱', desc: 'Complete Trial 1',                            reward:   300, check: p => p.trial1_best !== null, progress: null },
+  { type: 'trial2_complete',   label: 'Speed Seeker',       icon: '🌀', desc: 'Complete Trial 2',                            reward:   400, check: p => p.trial2_best !== null, progress: null },
+  { type: 'trial3_complete',   label: 'Precision Pilot',    icon: '🔮', desc: 'Complete Trial 3',                            reward:   600, check: p => p.trial3_best !== null, progress: null },
+  { type: 'trial4_complete',   label: 'Elite Racer',        icon: '🏁', desc: 'Complete Trial 4',                            reward:   800, check: p => p.trial4_best !== null, progress: null },
+  { type: 'all_trials',        label: 'Grand Champion',     icon: '🌟', desc: 'Complete all 4 trials',                       reward:  2500, check: p => p.trial1_best !== null && p.trial2_best !== null && p.trial3_best !== null && p.trial4_best !== null, progress: p => ({ current: [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].filter(t => t !== null).length, target: 4 }) },
   // ── Trial time records ────────────────────────────────────────────────────────
-  { type: 'trial1_sub30',      label: 'Hypersonic',         icon: '💫', desc: 'Complete Trial 1 in under 30 seconds',        check: p => p.trial1_best !== null && p.trial1_best < 30, progress: p => p.trial1_best !== null ? { current: p.trial1_best, target: 30, isTime: true } : null },
-  { type: 'trial2_sub50',      label: 'Lightning Dash',     icon: '⚡', desc: 'Complete Trial 2 in under 50 seconds',        check: p => p.trial2_best !== null && p.trial2_best < 50, progress: p => p.trial2_best !== null ? { current: p.trial2_best, target: 50, isTime: true } : null },
-  { type: 'trial3_sub60',      label: 'Razor Edge',         icon: '🔪', desc: 'Complete Trial 3 in under 60 seconds',        check: p => p.trial3_best !== null && p.trial3_best < 60, progress: p => p.trial3_best !== null ? { current: p.trial3_best, target: 60, isTime: true } : null },
-  { type: 'trial4_sub70',      label: 'Beyond Limits',      icon: '🛸', desc: 'Complete Trial 4 in under 70 seconds',        check: p => p.trial4_best !== null && p.trial4_best < 70, progress: p => p.trial4_best !== null ? { current: p.trial4_best, target: 70, isTime: true } : null },
-  { type: 'speed_demon',       label: 'Speed Demon',        icon: '💨', desc: 'Complete any trial in under 30 seconds',      check: p => [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].some(t => t !== null && t < 30), progress: null },
+  { type: 'trial1_sub30',      label: 'Hypersonic',         icon: '💫', desc: 'Complete Trial 1 in under 30 seconds',        reward:  1500, check: p => p.trial1_best !== null && p.trial1_best < 30, progress: p => p.trial1_best !== null ? { current: p.trial1_best, target: 30, isTime: true } : null },
+  { type: 'trial2_sub50',      label: 'Lightning Dash',     icon: '⚡', desc: 'Complete Trial 2 in under 50 seconds',        reward:  2000, check: p => p.trial2_best !== null && p.trial2_best < 50, progress: p => p.trial2_best !== null ? { current: p.trial2_best, target: 50, isTime: true } : null },
+  { type: 'trial3_sub60',      label: 'Razor Edge',         icon: '🔪', desc: 'Complete Trial 3 in under 60 seconds',        reward:  2500, check: p => p.trial3_best !== null && p.trial3_best < 60, progress: p => p.trial3_best !== null ? { current: p.trial3_best, target: 60, isTime: true } : null },
+  { type: 'trial4_sub70',      label: 'Beyond Limits',      icon: '🛸', desc: 'Complete Trial 4 in under 70 seconds',        reward:  3000, check: p => p.trial4_best !== null && p.trial4_best < 70, progress: p => p.trial4_best !== null ? { current: p.trial4_best, target: 70, isTime: true } : null },
+  { type: 'speed_demon',       label: 'Speed Demon',        icon: '💨', desc: 'Complete any trial in under 30 seconds',      reward:  5000, check: p => [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].some(t => t !== null && t < 30), progress: null },
 ];
 
 const ACHIEVEMENT_MAP = Object.fromEntries(ACHIEVEMENT_DEFS.map(a => [a.type, a]));
@@ -138,8 +155,15 @@ const stmtTrialBests = [
   db.prepare('UPDATE pilots SET trial3_best = ? WHERE id = ? AND (trial3_best IS NULL OR trial3_best > ?)'),
   db.prepare('UPDATE pilots SET trial4_best = ? WHERE id = ? AND (trial4_best IS NULL OR trial4_best > ?)'),
 ];
-const stmtAwardAch = db.prepare('INSERT OR IGNORE INTO achievements (pilot_id, type) VALUES (?, ?)');
-const stmtGetAchs  = db.prepare('SELECT type, earned_at FROM achievements WHERE pilot_id = ? ORDER BY earned_at ASC');
+const stmtAwardAch      = db.prepare('INSERT OR IGNORE INTO achievements (pilot_id, type) VALUES (?, ?)');
+const stmtGetAchs       = db.prepare('SELECT type, earned_at, credited FROM achievements WHERE pilot_id = ? ORDER BY earned_at ASC');
+const stmtMarkCredited  = db.prepare('UPDATE achievements SET credited = 1 WHERE pilot_id = ? AND type = ?');
+const stmtAddCredits    = db.prepare('UPDATE pilots SET credits = credits + ? WHERE id = ?');
+const stmtSubCredits    = db.prepare('UPDATE pilots SET credits = MAX(0, credits - ?) WHERE id = ?');
+const stmtGetCredits    = db.prepare('SELECT credits FROM pilots WHERE id = ?');
+const stmtLogTx         = db.prepare('INSERT INTO credit_transactions (pilot_id, amount, reason) VALUES (?, ?, ?)');
+const stmtGetTxHistory  = db.prepare('SELECT amount, reason, created_at FROM credit_transactions WHERE pilot_id = ? ORDER BY created_at DESC LIMIT ?');
+const stmtUncredited    = db.prepare("SELECT pilot_id, type FROM achievements WHERE credited = 0");
 const stmtLeaderboard = db.prepare(`
   SELECT username, rank, total_kills, total_deaths, matches_won, matches_lost, games_played, high_score
   FROM pilots
@@ -149,13 +173,20 @@ const stmtLeaderboard = db.prepare(`
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+function _addCredits(pilotId, amount, reason) {
+  stmtAddCredits.run(amount, pilotId);
+  stmtLogTx.run(pilotId, amount, reason);
+}
+
 function checkAndAwardAchievements(pilotId, pilot) {
   const existing = new Set(stmtGetAchs.all(pilotId).map(r => r.type));
   const newlyEarned = [];
   for (const def of ACHIEVEMENT_DEFS) {
     if (def.check(pilot) && !existing.has(def.type)) {
       stmtAwardAch.run(pilotId, def.type);
-      newlyEarned.push({ type: def.type, label: def.label, icon: def.icon });
+      stmtMarkCredited.run(pilotId, def.type);
+      if (def.reward > 0) _addCredits(pilotId, def.reward, `achievement:${def.type}`);
+      newlyEarned.push({ type: def.type, label: def.label, icon: def.icon, reward: def.reward });
     }
   }
   return newlyEarned;
@@ -217,6 +248,7 @@ export async function loginPilot(username, password) {
     trial2Best:   pilot.trial2_best,
     trial3Best:   pilot.trial3_best,
     trial4Best:   pilot.trial4_best,
+    credits:      pilot.credits,
   };
 }
 
@@ -242,22 +274,37 @@ export function recordMatchResult(pilotId, { kills = 0, deaths = 0, won = null, 
   const wonInc  = won === true  ? 1 : 0;
   const lostInc = won === false ? 1 : 0;
   stmtMatchResult.run(kills, deaths, wonInc, lostInc, botsKilled, kills, kills, pilotId);
+
+  // Award match credits: kills + bot kills + win bonus
+  const matchCr = (kills * CR_PER_KILL) + (botsKilled * CR_PER_BOT_KILL) + (won === true ? CR_WIN_BONUS : 0);
+  if (matchCr > 0) {
+    const parts = [];
+    if (kills > 0)      parts.push(`kills(${kills})`);
+    if (botsKilled > 0) parts.push(`bots(${botsKilled})`);
+    if (won === true)    parts.push('win_bonus');
+    _addCredits(pilotId, matchCr, `match:${parts.join(',')}`);
+  }
+
   const pilot = stmtById.get(pilotId);
-  if (!pilot) return [];
+  if (!pilot) return { newAchievements: [], creditsEarned: matchCr };
   const newRank = computeRank(pilot.total_kills);
   if (newRank !== pilot.rank) stmtUpdateRank.run(newRank, pilotId);
-  return checkAndAwardAchievements(pilotId, pilot);
+  const newAchs = checkAndAwardAchievements(pilotId, pilot);
+  const achCr   = newAchs.reduce((s, a) => s + (a.reward || 0), 0);
+  return { newAchievements: newAchs, creditsEarned: matchCr + achCr };
 }
 
 // ── Trial time ────────────────────────────────────────────────────────────────
 
 export function recordTrialTime(pilotId, trialNum, time) {
   const idx = Number(trialNum) - 1;
-  if (idx < 0 || idx > 3) return [];
+  if (idx < 0 || idx > 3) return { newAchievements: [], creditsEarned: 0 };
   stmtTrialBests[idx].run(time, pilotId, time);
   const pilot = stmtById.get(pilotId);
-  if (!pilot) return [];
-  return checkAndAwardAchievements(pilotId, pilot);
+  if (!pilot) return { newAchievements: [], creditsEarned: 0 };
+  const newAchs = checkAndAwardAchievements(pilotId, pilot);
+  const achCr   = newAchs.reduce((s, a) => s + (a.reward || 0), 0);
+  return { newAchievements: newAchs, creditsEarned: achCr };
 }
 
 // ── Profile ───────────────────────────────────────────────────────────────────
@@ -295,6 +342,7 @@ export function getPilotProfile(username) {
     trial3Best:   pilot.trial3_best,
     trial4Best:   pilot.trial4_best,
     achievements,
+    credits:      pilot.credits,
     createdAt:    pilot.created_at,
   };
 }
@@ -316,6 +364,31 @@ export function getLeaderboard() {
   }));
 }
 
+// ── Credits (public API) ──────────────────────────────────────────────────────
+
+export function getCredits(pilotId) {
+  return stmtGetCredits.get(pilotId)?.credits ?? 0;
+}
+
+export function awardCredits(pilotId, amount, reason = 'admin') {
+  const safe = Math.max(1, Math.floor(Number(amount) || 0));
+  _addCredits(pilotId, safe, reason);
+  return getCredits(pilotId);
+}
+
+export function spendCredits(pilotId, amount, reason = 'purchase') {
+  const safe = Math.max(1, Math.floor(Number(amount) || 0));
+  const current = getCredits(pilotId);
+  if (current < safe) return { ok: false, balance: current };
+  stmtSubCredits.run(safe, pilotId);
+  stmtLogTx.run(pilotId, -safe, reason);
+  return { ok: true, balance: getCredits(pilotId) };
+}
+
+export function getCreditHistory(pilotId, limit = 50) {
+  return stmtGetTxHistory.all(pilotId, limit);
+}
+
 // ── Startup backfill ──────────────────────────────────────────────────────────
 // Awards any achievements that pilots already qualify for but were registered
 // before the achievement system existed. Safe to run on every server start
@@ -325,12 +398,25 @@ const stmtAllPilots = db.prepare('SELECT * FROM pilots');
 
 function backfillAchievements() {
   const pilots = stmtAllPilots.all();
-  let total = 0;
+  let newAchs = 0;
   for (const pilot of pilots) {
-    const newOnes = checkAndAwardAchievements(pilot.id, pilot);
-    total += newOnes.length;
+    const earned = checkAndAwardAchievements(pilot.id, pilot);
+    newAchs += earned.length;
   }
-  if (total > 0) console.log(`[achievements] backfill awarded ${total} achievement(s) to existing pilots`);
+  if (newAchs > 0) console.log(`[achievements] backfill awarded ${newAchs} achievement(s)`);
+
+  // Credit any achievements that pre-date the credits system (credited = 0).
+  const uncredited = stmtUncredited.all();
+  let crTotal = 0;
+  for (const row of uncredited) {
+    const def = ACHIEVEMENT_MAP[row.type];
+    if (def?.reward > 0) {
+      _addCredits(row.pilot_id, def.reward, `achievement:${row.type}`);
+      crTotal += def.reward;
+    }
+    stmtMarkCredited.run(row.pilot_id, row.type);
+  }
+  if (uncredited.length > 0) console.log(`[credits] credited ${uncredited.length} pre-existing achievement(s) (+${crTotal} CR total)`);
 }
 
 backfillAchievements();

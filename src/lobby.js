@@ -882,9 +882,39 @@ requireAuth().then(() => {
     nameInput.style.opacity = '0.55';
     nameInput.title = 'Your callsign is your account username and cannot be changed here';
   }
-  // Show any achievements earned in the last match.
+  // Refresh credits and show any achievements earned in the last match.
+  refreshCredits();
   checkPendingAchievements();
 });
+
+// ── Credits display ───────────────────────────────────────────────────────────
+
+const creditsAmountEl = document.getElementById('creditsAmount');
+
+function setCreditsDisplay(amount) {
+  if (creditsAmountEl) {
+    creditsAmountEl.textContent = Number.isFinite(amount)
+      ? amount.toLocaleString()
+      : '—';
+  }
+  localStorage.setItem('spaceships:credits', String(amount));
+}
+
+async function refreshCredits() {
+  const token = getToken();
+  if (!token) return;
+  try {
+    const res  = await fetch('/spaceships/api/credits', {
+      headers: { 'Authorization': 'Bearer ' + token },
+    });
+    const data = await res.json();
+    if (data.ok) setCreditsDisplay(data.credits);
+  } catch {}
+}
+
+// Seed from localStorage immediately so there's no blank flash on load.
+const _cachedCr = parseInt(localStorage.getItem('spaceships:credits'), 10);
+if (!isNaN(_cachedCr)) setCreditsDisplay(_cachedCr);
 
 // ── Online count ──────────────────────────────────────────────────────────────
 

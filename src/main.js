@@ -824,7 +824,8 @@ export async function startGame(opts = {}) {
           const o = msg.shots[0].pos;
           audio.play('shoot', distanceVol(new THREE.Vector3(o[0], o[1], o[2])));
         }
-      } else if (msg.type === 'achievements') {
+      } else if (msg.type === 'match-credits') {
+        updateCachedCredits(msg.totalCredits);
         if (Array.isArray(msg.earned) && msg.earned.length) {
           queueAchievementToasts(msg.earned);
           stashAchievementsForHangar(msg.earned);
@@ -2139,15 +2140,19 @@ export async function startGame(opts = {}) {
 
   function _flushAchQueue() {
     if (!_achQueue.length) { _achTimer = null; return; }
-    const { icon, label } = _achQueue.shift();
+    const { icon, label, reward } = _achQueue.shift();
     if (_achToastContainer) {
       const toast = document.createElement('div');
       toast.className = 'ach-toast';
+      const crLine = reward > 0
+        ? `<span class="ach-toast-cr">+${reward.toLocaleString()} ⬡</span>`
+        : '';
       toast.innerHTML =
         `<span class="ach-toast-icon">${icon}</span>` +
         `<div class="ach-toast-body">` +
           `<span class="ach-toast-title">ACHIEVEMENT UNLOCKED</span>` +
           `<span class="ach-toast-label">${label}</span>` +
+          crLine +
         `</div>`;
       _achToastContainer.appendChild(toast);
       setTimeout(() => toast.remove(), 3700);
@@ -2169,6 +2174,10 @@ export async function startGame(opts = {}) {
     } catch {}
   }
 
+  function updateCachedCredits(total) {
+    if (Number.isFinite(total)) localStorage.setItem('spaceships:credits', String(total));
+  }
+
   async function reportSoloResult(kills, deaths, won, botsKilled) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
@@ -2179,9 +2188,12 @@ export async function startGame(opts = {}) {
         body: JSON.stringify({ kills, deaths, won, botsKilled }),
       });
       const data = await res.json();
-      if (data.ok && data.newAchievements?.length) {
-        queueAchievementToasts(data.newAchievements);
-        stashAchievementsForHangar(data.newAchievements);
+      if (data.ok) {
+        if (data.newAchievements?.length) {
+          queueAchievementToasts(data.newAchievements);
+          stashAchievementsForHangar(data.newAchievements);
+        }
+        updateCachedCredits(data.totalCredits);
       }
     } catch (e) {
       console.warn('[solo-result] could not report:', e);
@@ -2198,9 +2210,12 @@ export async function startGame(opts = {}) {
         body: JSON.stringify({ trialNum, time }),
       });
       const data = await res.json();
-      if (data.ok && data.newAchievements?.length) {
-        queueAchievementToasts(data.newAchievements);
-        stashAchievementsForHangar(data.newAchievements);
+      if (data.ok) {
+        if (data.newAchievements?.length) {
+          queueAchievementToasts(data.newAchievements);
+          stashAchievementsForHangar(data.newAchievements);
+        }
+        updateCachedCredits(data.totalCredits);
       }
     } catch (e) {
       console.warn('[trial-result] could not report:', e);

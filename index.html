@@ -235,6 +235,21 @@
     #btnProfile:hover { color: #ffe07a; border-color: #ffd97a; }
     body.in-lobby #btnProfile { display: flex; }
 
+    /* ── Credits counter ─────────────────────────────────────────────── */
+    #credits-display {
+      position: fixed; top: 16px; left: max(16px, env(safe-area-inset-left, 16px));
+      display: none; align-items: center; gap: 6px;
+      background: rgba(8,14,28,0.82); border: 2px solid #44607f; border-radius: 20px;
+      padding: 6px 14px 6px 10px;
+      color: #ffe07a; font-size: 14px; letter-spacing: 1px;
+      box-shadow: 0 0 12px rgba(255,200,80,0.2); z-index: 11;
+      cursor: default; user-select: none;
+    }
+    body.in-lobby #credits-display { display: flex; }
+    #credits-display .cr-icon { font-size: 16px; line-height: 1; }
+    #credits-display .cr-amount { font-variant-numeric: tabular-nums; min-width: 40px; }
+    #credits-display:hover { border-color: #ffd97a; box-shadow: 0 0 16px rgba(255,200,80,0.35); }
+
     /* ── Achievement toasts ──────────────────────────────────────────── */
     #achievement-toasts {
       position: fixed; bottom: 80px; right: max(16px, env(safe-area-inset-right, 16px));
@@ -253,6 +268,7 @@
     .ach-toast-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
     .ach-toast-title { font-size: 9px; color: #ffe07a; letter-spacing: 3px; }
     .ach-toast-label { font-size: 13px; color: #e8f4ff; letter-spacing: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .ach-toast-cr    { font-size: 11px; color: #ffe07a; letter-spacing: 1px; }
     @keyframes ach-in  { from { transform: translateX(115%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
     @keyframes ach-out { from { transform: translateX(0);    opacity: 1; } to { transform: translateX(115%); opacity: 0; } }
 
@@ -659,6 +675,12 @@
   </style>
 </head>
 <body>
+  <!-- Credits counter (lobby-only, top-left). -->
+  <div id="credits-display" title="Credits">
+    <span class="cr-icon">⬡</span>
+    <span class="cr-amount" id="creditsAmount">—</span>
+  </div>
+
   <!-- Settings gear + panel (lobby-only, hidden once HUD shows). -->
   <button id="btnProfile" title="Pilot Profile">◉</button>
   <button id="btnCustomize" title="Customize Ship">✦</button>
