@@ -824,6 +824,11 @@ export async function startGame(opts = {}) {
           const o = msg.shots[0].pos;
           audio.play('shoot', distanceVol(new THREE.Vector3(o[0], o[1], o[2])));
         }
+      } else if (msg.type === 'achievements') {
+        if (Array.isArray(msg.earned) && msg.earned.length) {
+          queueAchievementToasts(msg.earned);
+          stashAchievementsForHangar(msg.earned);
+        }
       } else if (msg.type === 'asteroid-hp') {
         if (asteroids.setHp) asteroids.setHp(msg.id, msg.hp);
       } else if (msg.type === 'asteroid-destroyed') {
@@ -2127,15 +2132,57 @@ export async function startGame(opts = {}) {
   const matchActive = SOLO_MODE === 'skirmish' || SOLO_MODE === 'train' || !isSolo;
   let soloBotsKilled = 0;
 
+  // ── Achievement toast queue ───────────────────────────────────────────────
+  const _achToastContainer = document.getElementById('achievement-toasts');
+  let _achQueue = [];
+  let _achTimer = null;
+
+  function _flushAchQueue() {
+    if (!_achQueue.length) { _achTimer = null; return; }
+    const { icon, label } = _achQueue.shift();
+    if (_achToastContainer) {
+      const toast = document.createElement('div');
+      toast.className = 'ach-toast';
+      toast.innerHTML =
+        `<span class="ach-toast-icon">${icon}</span>` +
+        `<div class="ach-toast-body">` +
+          `<span class="ach-toast-title">ACHIEVEMENT UNLOCKED</span>` +
+          `<span class="ach-toast-label">${label}</span>` +
+        `</div>`;
+      _achToastContainer.appendChild(toast);
+      setTimeout(() => toast.remove(), 3700);
+    }
+    _achTimer = setTimeout(_flushAchQueue, 900);
+  }
+
+  function queueAchievementToasts(earned) {
+    if (!Array.isArray(earned) || !earned.length) return;
+    _achQueue.push(...earned);
+    if (!_achTimer) _flushAchQueue();
+  }
+
+  function stashAchievementsForHangar(earned) {
+    if (!Array.isArray(earned) || !earned.length) return;
+    try {
+      const existing = JSON.parse(localStorage.getItem('spaceships:pendingAchs') || '[]');
+      localStorage.setItem('spaceships:pendingAchs', JSON.stringify([...existing, ...earned]));
+    } catch {}
+  }
+
   async function reportSoloResult(kills, deaths, won, botsKilled) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
     try {
-      await fetch('/spaceships/api/solo-result', {
+      const res  = await fetch('/spaceships/api/solo-result', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
         body: JSON.stringify({ kills, deaths, won, botsKilled }),
       });
+      const data = await res.json();
+      if (data.ok && data.newAchievements?.length) {
+        queueAchievementToasts(data.newAchievements);
+        stashAchievementsForHangar(data.newAchievements);
+      }
     } catch (e) {
       console.warn('[solo-result] could not report:', e);
     }
@@ -2145,11 +2192,16 @@ export async function startGame(opts = {}) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
     try {
-      await fetch('/spaceships/api/trial-result', {
+      const res  = await fetch('/spaceships/api/trial-result', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
         body: JSON.stringify({ trialNum, time }),
       });
+      const data = await res.json();
+      if (data.ok && data.newAchievements?.length) {
+        queueAchievementToasts(data.newAchievements);
+        stashAchievementsForHangar(data.newAchievements);
+      }
     } catch (e) {
       console.warn('[trial-result] could not report:', e);
     }

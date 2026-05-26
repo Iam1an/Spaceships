@@ -831,6 +831,37 @@ document.getElementById('btnLogout').addEventListener('click', () => {
   location.reload();
 });
 
+// ── Hangar achievements summary ───────────────────────────────────────────────
+
+function checkPendingAchievements() {
+  try {
+    const raw = localStorage.getItem('spaceships:pendingAchs');
+    if (!raw) return;
+    const earned = JSON.parse(raw);
+    if (!Array.isArray(earned) || !earned.length) return;
+    localStorage.removeItem('spaceships:pendingAchs');
+
+    const list = document.getElementById('hangar-ach-list');
+    const overlay = document.getElementById('hangar-ach-overlay');
+    if (!list || !overlay) return;
+
+    list.innerHTML = earned.map(a =>
+      `<div class="hangar-ach-row">
+        <span class="ach-toast-icon">${esc(a.icon)}</span>
+        <div class="ach-toast-body">
+          <span class="ach-toast-title">ACHIEVEMENT UNLOCKED</span>
+          <span class="ach-toast-label">${esc(a.label)}</span>
+        </div>
+      </div>`
+    ).join('');
+
+    overlay.classList.remove('hidden');
+    document.getElementById('btnDismissHangarAch').onclick = () => {
+      overlay.classList.add('hidden');
+    };
+  } catch {}
+}
+
 // Gate the lobby behind auth. If the player already has a valid JWT this
 // resolves instantly (no overlay shown). Guests click through without a token.
 requireAuth().then(() => {
@@ -850,6 +881,8 @@ requireAuth().then(() => {
     nameInput.style.opacity = '0.55';
     nameInput.title = 'Your callsign is your account username and cannot be changed here';
   }
+  // Show any achievements earned in the last match.
+  checkPendingAchievements();
 });
 
 // ── Online count ──────────────────────────────────────────────────────────────

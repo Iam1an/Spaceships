@@ -384,7 +384,10 @@ function endMatch(room) {
     let won = null;
     if (winner !== -1) won = player.team === winner;
     try {
-      recordMatchResult(ws.pilotId, { kills, deaths, won, botsKilled: 0 });
+      const newAchs = recordMatchResult(ws.pilotId, { kills, deaths, won, botsKilled: 0 });
+      if (newAchs.length > 0 && ws.open) {
+        ws.send(JSON.stringify({ type: 'achievements', earned: newAchs }));
+      }
     } catch (e) {
       console.warn(`stats save failed for pilot ${ws.pilotId}:`, e.message);
     }

@@ -134,7 +134,7 @@ function checkAndAwardAchievements(pilotId, pilot) {
   for (const def of ACHIEVEMENT_DEFS) {
     if (def.check(pilot) && !existing.has(def.type)) {
       stmtAwardAch.run(pilotId, def.type);
-      newlyEarned.push(def.type);
+      newlyEarned.push({ type: def.type, label: def.label, icon: def.icon });
     }
   }
   return newlyEarned;

@@ -235,6 +235,67 @@
     #btnProfile:hover { color: #ffe07a; border-color: #ffd97a; }
     body.in-lobby #btnProfile { display: flex; }
 
+    /* ── Achievement toasts ──────────────────────────────────────────── */
+    #achievement-toasts {
+      position: fixed; bottom: 80px; right: max(16px, env(safe-area-inset-right, 16px));
+      display: flex; flex-direction: column; gap: 8px; z-index: 30;
+      pointer-events: none; max-width: min(300px, calc(100vw - 32px));
+    }
+    .ach-toast {
+      display: flex; align-items: center; gap: 10px;
+      background: rgba(8,14,28,0.97); border: 2px solid #ffd97a; border-radius: 14px;
+      padding: 10px 16px;
+      box-shadow: 0 0 24px rgba(255,200,80,0.45), 0 2px 8px rgba(0,0,0,0.6);
+      animation: ach-in 0.38s cubic-bezier(0.22,1,0.36,1) forwards,
+                 ach-out 0.4s ease 3.2s forwards;
+    }
+    .ach-toast-icon { font-size: 24px; line-height: 1; flex-shrink: 0; }
+    .ach-toast-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .ach-toast-title { font-size: 9px; color: #ffe07a; letter-spacing: 3px; }
+    .ach-toast-label { font-size: 13px; color: #e8f4ff; letter-spacing: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    @keyframes ach-in  { from { transform: translateX(115%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    @keyframes ach-out { from { transform: translateX(0);    opacity: 1; } to { transform: translateX(115%); opacity: 0; } }
+
+    /* ── Hangar achievements summary ─────────────────────────────────── */
+    #hangar-ach-overlay {
+      position: fixed; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(4,6,13,0.88); z-index: 25; padding: 16px;
+    }
+    #hangar-ach-overlay.hidden { display: none; }
+    #hangar-ach-box {
+      width: min(460px,100%); background: rgba(8,14,28,0.98);
+      border: 2px solid #ffd97a; border-radius: 18px;
+      padding: clamp(18px,3vw,28px);
+      box-shadow: 0 0 40px rgba(255,200,80,0.35);
+      display: flex; flex-direction: column; gap: 16px; align-items: center;
+    }
+    #hangar-ach-box h2 {
+      margin: 0; font-size: clamp(16px,3vw,22px); color: #ffd97a;
+      letter-spacing: 4px; text-shadow: 0 0 14px #ff9c3a; text-align: center;
+    }
+    #hangar-ach-box .hangar-sub {
+      font-size: 12px; color: #8fb6d6; letter-spacing: 2px; margin-top: -8px; text-align: center;
+    }
+    #hangar-ach-list { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+    .hangar-ach-row {
+      display: flex; align-items: center; gap: 12px;
+      background: rgba(255,200,80,0.07); border: 1.5px solid rgba(255,200,80,0.25);
+      border-radius: 10px; padding: 10px 14px;
+    }
+    .hangar-ach-row .ach-toast-icon { font-size: 26px; }
+    .hangar-ach-row .ach-toast-body { gap: 3px; }
+    .hangar-ach-row .ach-toast-title { font-size: 9px; }
+    .hangar-ach-row .ach-toast-label { font-size: 14px; }
+    .hangar-ach-row .ach-desc { font-size: 11px; color: #8fb6d6; letter-spacing: 0.5px; }
+    #btnDismissHangarAch {
+      font-family: inherit; font-size: 14px; letter-spacing: 2px; padding: 10px 28px;
+      color: #fff; background: linear-gradient(180deg,#4aa3ff 0%,#2867d0 100%);
+      border: 2px solid #b0e0ff; border-radius: 12px; cursor: pointer;
+      box-shadow: 0 0 16px rgba(80,160,255,0.35); transition: transform 0.08s;
+    }
+    #btnDismissHangarAch:hover { transform: scale(1.03); }
+
     /* ── Profile overlay ─────────────────────────────────────────────── */
     #profile-overlay {
       position: fixed; inset: 0;
@@ -863,6 +924,15 @@
     <div id="trials-checkpoint">CHECKPOINT 1 / 8</div>
     <div id="trials-best"></div>
     <div id="trials-last"></div>
+  </div>
+  <div id="achievement-toasts"></div>
+  <div id="hangar-ach-overlay" class="hidden">
+    <div id="hangar-ach-box">
+      <h2>ACHIEVEMENTS UNLOCKED</h2>
+      <div class="hangar-sub">From your last mission</div>
+      <div id="hangar-ach-list"></div>
+      <button id="btnDismissHangarAch">ACKNOWLEDGED</button>
+    </div>
   </div>
   <div id="matchresult" style="display:none"></div>
   <div id="scoreboard">
