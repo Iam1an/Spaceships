@@ -126,6 +126,8 @@ const ACHIEVEMENT_DEFS = [
   { type: 'trial3_sub60',      label: 'Razor Edge',         icon: '🔪', desc: 'Complete Trial 3 in under 60 seconds',        reward:  2500, check: p => p.trial3_best !== null && p.trial3_best < 60, progress: p => p.trial3_best !== null ? { current: p.trial3_best, target: 60, isTime: true } : null },
   { type: 'trial4_sub70',      label: 'Beyond Limits',      icon: '🛸', desc: 'Complete Trial 4 in under 70 seconds',        reward:  3000, check: p => p.trial4_best !== null && p.trial4_best < 70, progress: p => p.trial4_best !== null ? { current: p.trial4_best, target: 70, isTime: true } : null },
   { type: 'speed_demon',       label: 'Speed Demon',        icon: '💨', desc: 'Complete any trial in under 30 seconds',      reward:  5000, check: p => [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].some(t => t !== null && t < 30), progress: null },
+  // ── Customization ─────────────────────────────────────────────────────────────
+  { type: 'high_roller',       label: 'High Roller',        icon: '💎', desc: 'Unlock all customization features',            reward:  1000, check: p => !!p.unlock_hull && !!p.unlock_accent && !!p.unlock_trail && !!p.unlock_trail_shape, progress: p => ({ current: [p.unlock_hull, p.unlock_accent, p.unlock_trail, p.unlock_trail_shape].filter(Boolean).length, target: 4 }) },
 ];
 
 const ACHIEVEMENT_MAP = Object.fromEntries(ACHIEVEMENT_DEFS.map(a => [a.type, a]));
@@ -411,7 +413,9 @@ export function purchaseUnlock(pilotId, feature) {
   const result = spendCredits(pilotId, cost, `unlock:${feature}`);
   if (!result.ok) return { ok: false, error: 'Insufficient credits', balance: result.balance };
   stmtSetUnlock[feature].run(pilotId);
-  return { ok: true, alreadyOwned: false, balance: result.balance };
+  const updated = stmtById.get(pilotId);
+  const newAchs = updated ? checkAndAwardAchievements(pilotId, updated) : [];
+  return { ok: true, alreadyOwned: false, balance: result.balance, newAchievements: newAchs };
 }
 
 // ── Credits (public API) ──────────────────────────────────────────────────────

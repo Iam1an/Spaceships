@@ -92,7 +92,7 @@ app.post('/api/unlock/:feature', (req, res) => {
     const id     = extractPilotId(req);
     const result = purchaseUnlock(id, req.params.feature);
     if (!result.ok) return res.status(result.balance !== undefined ? 402 : 400).json({ ok: false, error: result.error, balance: result.balance });
-    res.json({ ok: true, alreadyOwned: result.alreadyOwned, balance: result.balance });
+    res.json({ ok: true, alreadyOwned: result.alreadyOwned, balance: result.balance, newAchievements: result.newAchievements ?? [] });
   } catch (e) {
     res.status(e.status ?? 401).json({ ok: false, error: e.message });
   }

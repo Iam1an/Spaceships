@@ -747,6 +747,13 @@ async function tryPurchaseUnlock(feature) {
       saveUnlockLocal(feature);
       if (!data.alreadyOwned) setCreditsDisplay(data.balance);
       updateCustUnlockUI();
+      if (data.newAchievements?.length) {
+        try {
+          const prev = JSON.parse(localStorage.getItem('spaceships:pendingAchs') || '[]');
+          localStorage.setItem('spaceships:pendingAchs', JSON.stringify([...prev, ...data.newAchievements]));
+        } catch {}
+        checkPendingAchievements();
+      }
       return { ok: true, alreadyOwned: data.alreadyOwned };
     }
     return { ok: false, msg: `Not enough ⬡ (have ${data.balance ?? cached})` };
