@@ -6,6 +6,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
   <title>Spaceships</title>
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="apple-touch-icon" href="favicon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;800&display=swap">
@@ -511,12 +513,6 @@
       letter-spacing: clamp(1px,0.5vw,4px); transform: rotate(-2deg); margin-bottom: 2px;
       flex-shrink: 0;
     }
-    #online-indicator {
-      font-size: 12px; letter-spacing: 1.5px; color: #7ab8e0;
-      margin-top: -4px; display: flex; align-items: center; gap: 5px;
-    }
-    #online-dot { color: #44ff88; font-size: 9px; animation: pulse-dot 2.4s ease-in-out infinite; }
-    @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
     .screen { display: flex; flex-direction: column; align-items: center; gap: clamp(7px,1.2vh,14px); width: 100%; max-width: 480px; }
     .screen.hidden { display: none; }
 
@@ -804,10 +800,6 @@
   <!-- Lobby overlay -->
   <div id="lobby">
     <div id="title">Spaceships</div>
-    <div id="online-indicator">
-      <span id="online-dot">●</span><span id="online-count">—</span> pilots online
-    </div>
-
     <div id="lobby-main" class="screen">
       <div class="prompt">Pilot Name</div>
       <input id="nameInput" maxlength="16" placeholder="Pilot" autocomplete="off" />

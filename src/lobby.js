@@ -973,20 +973,6 @@ async function refreshCredits() {
 const _cachedCr = parseInt(localStorage.getItem('spaceships:credits'), 10);
 if (!isNaN(_cachedCr)) setCreditsDisplay(_cachedCr);
 
-// ── Online count ──────────────────────────────────────────────────────────────
-
-const onlineCountEl = document.getElementById('online-count');
-async function refreshOnlineCount() {
-  try {
-    const res = await fetch('/spaceships/api/online');
-    if (!res.ok) return;
-    const data = await res.json();
-    if (onlineCountEl) onlineCountEl.textContent = data.count;
-  } catch { /* server unreachable — leave the dash */ }
-}
-refreshOnlineCount();
-setInterval(refreshOnlineCount, 30_000);
-
 // ── Controls popup ────────────────────────────────────────────────────────────
 
 const CONTROL_GUIDES = {

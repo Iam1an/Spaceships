@@ -353,15 +353,6 @@ server.on('upgrade', (req, socket, head) => {
   handleConnection(ws);
 });
 
-// --- Online presence -------------------------------------------------------
-// Every WebSocket client (lobby browsers + in-game players) is tracked here
-// so we can expose a live player count without joining a room.
-const connectedClients = new Set();
-
-app.get('/api/online', (_req, res) => {
-  res.json({ count: connectedClients.size });
-});
-
 // --- Lobby state -----------------------------------------------------------
 const rooms = new Map();
 let nextId = 1;
@@ -562,7 +553,6 @@ function leaveRoom(ws) {
 }
 
 function handleConnection(ws) {
-  connectedClients.add(ws);
   ws.id = nextId++;
   // Use the authenticated pilot's callsign as the default name when logged in.
   ws.name = ws.pilotUsername || ('Player ' + ws.id);
@@ -823,7 +813,6 @@ function handleConnection(ws) {
   });
 
   ws.on('close', () => {
-    connectedClients.delete(ws);
     const room = ws.room;
     const wasStarted = room && room.started;
     const id = ws.id;
