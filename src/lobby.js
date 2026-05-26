@@ -1061,13 +1061,25 @@ function renderMyProfile(p) {
       <div class="trial-row"><span>Trial 3</span><span>${fmtTrialTime(p.trial3Best)}</span></div>
       <div class="trial-row"><span>Trial 4</span><span>${fmtTrialTime(p.trial4Best)}</span></div>
     </div>
-    <div class="profile-section-title">ACHIEVEMENTS — ${earned.length} / ${p.achievements.length}</div>
-    <div class="achievements-grid">
+    <button class="ach-toggle-btn" id="achToggleBtn">
+      ACHIEVEMENTS — ${earned.length} / ${p.achievements.length}
+      <span class="ach-toggle-arrow">▾</span>
+    </button>
+    <div class="ach-collapsible" id="achContent">
       <div class="ach-section-label">UNLOCKED</div>
       ${earnedHtml}
       ${locked.length > 0 ? `<div class="ach-section-label locked-label">LOCKED</div>${locked.map(badgeHtml).join('')}` : ''}
     </div>
   `;
+
+  const toggleBtn = profilePaneMy.querySelector('#achToggleBtn');
+  const achContent = profilePaneMy.querySelector('#achContent');
+  if (toggleBtn && achContent) {
+    toggleBtn.addEventListener('click', () => {
+      const open = achContent.classList.toggle('ach-open');
+      toggleBtn.querySelector('.ach-toggle-arrow').textContent = open ? '▴' : '▾';
+    });
+  }
 }
 
 async function loadLeaderboard() {

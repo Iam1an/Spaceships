@@ -312,6 +312,25 @@ export function getLeaderboard() {
   }));
 }
 
+// ── Startup backfill ──────────────────────────────────────────────────────────
+// Awards any achievements that pilots already qualify for but were registered
+// before the achievement system existed. Safe to run on every server start
+// because INSERT OR IGNORE silently skips already-earned achievements.
+
+const stmtAllPilots = db.prepare('SELECT * FROM pilots');
+
+function backfillAchievements() {
+  const pilots = stmtAllPilots.all();
+  let total = 0;
+  for (const pilot of pilots) {
+    const newOnes = checkAndAwardAchievements(pilot.id, pilot);
+    total += newOnes.length;
+  }
+  if (total > 0) console.log(`[achievements] backfill awarded ${total} achievement(s) to existing pilots`);
+}
+
+backfillAchievements();
+
 // ── Colors ────────────────────────────────────────────────────────────────────
 
 export function savePilotColors(pilotId, shipColor, accentColor) {
