@@ -916,6 +916,158 @@ btnControlsPopup.addEventListener('click', () => {
   }
 });
 
+// ── Profile panel ────────────────────────────────────────────────────────────
+
+const profileOverlay = document.getElementById('profile-overlay');
+const profilePaneMy  = document.getElementById('profile-pane-my');
+const profilePaneLb  = document.getElementById('profile-pane-lb');
+let lbLoaded = false;
+
+document.getElementById('btnProfile').addEventListener('click', openProfilePanel);
+document.getElementById('btnCloseProfile').addEventListener('click', () => {
+  profileOverlay.classList.add('hidden');
+  lbLoaded = false;
+});
+
+document.getElementById('profile-tab-my').addEventListener('click', () => switchProfileTab('my'));
+document.getElementById('profile-tab-lb').addEventListener('click', async () => {
+  switchProfileTab('lb');
+  if (!lbLoaded) { lbLoaded = true; await loadLeaderboard(); }
+});
+
+function switchProfileTab(tab) {
+  document.getElementById('profile-tab-my').classList.toggle('active', tab === 'my');
+  document.getElementById('profile-tab-lb').classList.toggle('active', tab === 'lb');
+  profilePaneMy.classList.toggle('hidden', tab !== 'my');
+  profilePaneLb.classList.toggle('hidden', tab !== 'lb');
+}
+
+function fmtTrialTime(t) {
+  if (t === null || t === undefined) return '—';
+  const total = Math.max(0, parseFloat(t));
+  const m = Math.floor(total / 60);
+  const s = (total % 60).toFixed(3).padStart(6, '0');
+  return `${m}:${s}`;
+}
+
+function esc(str) {
+  return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function openProfilePanel() {
+  profileOverlay.classList.remove('hidden');
+  lbLoaded = false;
+  switchProfileTab('my');
+
+  const token = getToken();
+  if (!token) {
+    profilePaneMy.innerHTML = '<div class="profile-no-account">Log in to view your profile and stats.</div>';
+    return;
+  }
+
+  const username = localStorage.getItem('spaceships:pilotName');
+  if (!username) {
+    profilePaneMy.innerHTML = '<div class="profile-no-account">No pilot name found.</div>';
+    return;
+  }
+
+  profilePaneMy.innerHTML = '<div class="profile-loading">Loading…</div>';
+  try {
+    const res  = await fetch(`/spaceships/api/profile/${encodeURIComponent(username)}`);
+    const data = await res.json();
+    if (!data.ok) {
+      profilePaneMy.innerHTML = `<div class="profile-error">${esc(data.error || 'Failed to load profile')}</div>`;
+      return;
+    }
+    renderMyProfile(data.profile);
+  } catch {
+    profilePaneMy.innerHTML = '<div class="profile-error">Could not reach server.</div>';
+  }
+}
+
+function renderMyProfile(p) {
+  const draws   = Math.max(0, p.gamesPlayed - p.matchesWon - p.matchesLost);
+  const winRate = p.gamesPlayed > 0 ? Math.round(p.matchesWon / p.gamesPlayed * 100) : 0;
+
+  const achHtml = p.achievements.length > 0
+    ? p.achievements.map(a =>
+        `<div class="achievement-badge" title="${esc(a.desc)}">
+          <span class="ach-icon">${esc(a.icon)}</span>
+          <span class="ach-label">${esc(a.label)}</span>
+        </div>`
+      ).join('')
+    : '<div class="profile-no-ach">No achievements yet — get out there!</div>';
+
+  profilePaneMy.innerHTML = `
+    <div class="profile-header">
+      <div class="profile-callsign">${esc(p.username)}</div>
+      <div class="profile-rank">${esc(p.rank)}</div>
+    </div>
+    <div class="profile-stats-grid">
+      <div class="stat-card"><div class="stat-label">KDR</div><div class="stat-value">${esc(p.kdr)}</div></div>
+      <div class="stat-card"><div class="stat-label">KILLS</div><div class="stat-value">${p.totalKills}</div></div>
+      <div class="stat-card"><div class="stat-label">DEATHS</div><div class="stat-value">${p.totalDeaths}</div></div>
+      <div class="stat-card"><div class="stat-label">BOTS KILLED</div><div class="stat-value">${p.botsKilled}</div></div>
+      <div class="stat-card"><div class="stat-label">MATCHES</div><div class="stat-value">${p.gamesPlayed}</div></div>
+      <div class="stat-card"><div class="stat-label">WINS</div><div class="stat-value">${p.matchesWon}</div></div>
+      <div class="stat-card"><div class="stat-label">LOSSES</div><div class="stat-value">${p.matchesLost}</div></div>
+      <div class="stat-card"><div class="stat-label">WIN RATE</div><div class="stat-value">${winRate}%</div></div>
+      <div class="stat-card"><div class="stat-label">BEST MATCH</div><div class="stat-value">${p.highScore}</div></div>
+    </div>
+    <div class="profile-section-title">TIME TRIALS — PERSONAL BEST</div>
+    <div class="profile-trials">
+      <div class="trial-row"><span>Trial 1</span><span>${fmtTrialTime(p.trial1Best)}</span></div>
+      <div class="trial-row"><span>Trial 2</span><span>${fmtTrialTime(p.trial2Best)}</span></div>
+      <div class="trial-row"><span>Trial 3</span><span>${fmtTrialTime(p.trial3Best)}</span></div>
+      <div class="trial-row"><span>Trial 4</span><span>${fmtTrialTime(p.trial4Best)}</span></div>
+    </div>
+    <div class="profile-section-title">ACHIEVEMENTS (${p.achievements.length})</div>
+    <div class="achievements-grid">${achHtml}</div>
+  `;
+}
+
+async function loadLeaderboard() {
+  profilePaneLb.innerHTML = '<div class="profile-loading">Loading…</div>';
+  try {
+    const res  = await fetch('/spaceships/api/leaderboard');
+    const data = await res.json();
+    if (!data.ok) {
+      profilePaneLb.innerHTML = '<div class="profile-error">Failed to load leaderboard.</div>';
+      return;
+    }
+    renderLeaderboard(data.leaderboard);
+  } catch {
+    profilePaneLb.innerHTML = '<div class="profile-error">Could not reach server.</div>';
+  }
+}
+
+function renderLeaderboard(entries) {
+  if (!entries || entries.length === 0) {
+    profilePaneLb.innerHTML = '<div class="profile-no-account">No pilots on record yet.</div>';
+    return;
+  }
+  const myName = localStorage.getItem('spaceships:pilotName') || '';
+  const rows = entries.map((e, i) => `
+    <tr class="${e.username === myName ? 'lb-you' : ''}">
+      <td class="lb-rank">#${i + 1}</td>
+      <td class="lb-name">${esc(e.username)}</td>
+      <td class="lb-val">${esc(e.pilotRank)}</td>
+      <td class="lb-val">${e.totalKills}</td>
+      <td class="lb-val">${esc(e.kdr)}</td>
+      <td class="lb-val">${e.matchesWon}</td>
+      <td class="lb-val">${e.gamesPlayed}</td>
+    </tr>`).join('');
+  profilePaneLb.innerHTML = `
+    <table class="lb-table">
+      <thead>
+        <tr>
+          <th>#</th><th>PILOT</th><th>RANK</th><th>KILLS</th><th>KDR</th><th>WINS</th><th>PLAYED</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 // ── Stats toggle ──────────────────────────────────────────────────────────────
 
 const showStatsInput = document.getElementById('showStatsInput');

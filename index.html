@@ -223,6 +223,100 @@
     }
     #btnCustomize:hover { color: #ffe07a; border-color: #ffd97a; }
     body.in-lobby #btnCustomize { display: flex; }
+
+    #btnProfile {
+      position: fixed; top: 16px; right: calc(max(16px, env(safe-area-inset-right, 16px)) + 96px);
+      width: 40px; height: 40px; font-size: 18px;
+      display: none; align-items: center; justify-content: center;
+      background: rgba(8,14,28,0.78); color: #b0c8e0;
+      border: 2px solid #44607f; border-radius: 50%;
+      cursor: pointer; user-select: none; z-index: 11;
+    }
+    #btnProfile:hover { color: #ffe07a; border-color: #ffd97a; }
+    body.in-lobby #btnProfile { display: flex; }
+
+    /* ── Profile overlay ─────────────────────────────────────────────── */
+    #profile-overlay {
+      position: fixed; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      background: radial-gradient(ellipse at center,#1a2540 0%,#04060d 80%);
+      z-index: 20; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 16px;
+    }
+    #profile-overlay.hidden { display: none; }
+    #profile-box {
+      width: min(700px, 100%); max-height: calc(100vh - 32px);
+      background: rgba(8,14,28,0.96); border: 2px solid #44607f; border-radius: 18px;
+      padding: clamp(16px,3vw,28px); box-shadow: 0 0 40px rgba(80,160,255,0.2);
+      display: flex; flex-direction: column; gap: 14px; overflow-y: auto;
+    }
+    #profile-box h2 {
+      margin: 0; font-size: clamp(16px,2.5vw,24px); color: #ffd97a;
+      letter-spacing: 4px; text-shadow: 0 0 14px #ff9c3a; text-align: center;
+    }
+    .profile-tabs { display: flex; border-bottom: 2px solid #44607f; gap: 0; }
+    .profile-tab {
+      flex: 1; background: none; border: none; font-family: inherit; font-size: 13px;
+      letter-spacing: 2px; color: #8fb6d6; padding: 9px 0; cursor: pointer; transition: color 0.15s;
+    }
+    .profile-tab.active { color: #ffe07a; border-bottom: 2px solid #ffe07a; margin-bottom: -2px; }
+    .profile-tab:hover:not(.active) { color: #c8e0ff; }
+    .profile-pane.hidden { display: none; }
+    .profile-loading, .profile-error, .profile-no-account {
+      text-align: center; padding: 32px 0; color: #8fb6d6; font-size: 14px; letter-spacing: 1px;
+    }
+    .profile-error { color: #ff8a8a; }
+    .profile-header { text-align: center; padding: 8px 0 4px; }
+    .profile-callsign {
+      font-size: clamp(22px,4vw,36px); color: #ffe07a;
+      letter-spacing: 4px; text-shadow: 0 0 12px #ff9c3a;
+    }
+    .profile-rank { font-size: 13px; color: #9cf; letter-spacing: 3px; margin-top: 4px; }
+    .profile-stats-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px;
+    }
+    .stat-card {
+      background: rgba(80,160,255,0.07); border: 1.5px solid #2a4060; border-radius: 10px;
+      padding: 10px 12px; text-align: center;
+    }
+    .stat-label { font-size: 10px; color: #8fb6d6; letter-spacing: 2px; margin-bottom: 5px; }
+    .stat-value { font-size: clamp(18px,3vw,26px); color: #e8f4ff; font-variant-numeric: tabular-nums; }
+    .profile-section-title {
+      font-size: 11px; color: #9cf; letter-spacing: 3px;
+      border-bottom: 1px solid rgba(80,160,255,0.2); padding-bottom: 6px; margin-top: 4px;
+    }
+    .profile-trials { display: flex; flex-direction: column; gap: 4px; }
+    .trial-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 10px; background: rgba(80,160,255,0.05); border-radius: 7px;
+      font-size: 14px;
+    }
+    .trial-row span:first-child { color: #8fb6d6; letter-spacing: 1px; }
+    .trial-row span:last-child  { color: #ffe07a; font-variant-numeric: tabular-nums; }
+    .achievements-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+    .achievement-badge {
+      display: flex; align-items: center; gap: 7px;
+      background: rgba(80,160,255,0.09); border: 1.5px solid #2a5070; border-radius: 10px;
+      padding: 7px 12px; cursor: default;
+    }
+    .achievement-badge:hover { border-color: #4aa3ff; background: rgba(80,160,255,0.16); }
+    .ach-icon { font-size: 18px; line-height: 1; }
+    .ach-label { font-size: 12px; color: #c8e0ff; letter-spacing: 1px; white-space: nowrap; }
+    .profile-no-ach { color: #8fb6d6; font-size: 13px; letter-spacing: 1px; padding: 8px 0; }
+    .lb-table { width: 100%; border-collapse: collapse; font-size: clamp(11px,1.6vw,14px); }
+    .lb-table th { color: #9cf; text-align: left; padding: 6px 8px; border-bottom: 1px solid rgba(80,160,255,0.25); letter-spacing: 1px; font-size: 11px; }
+    .lb-table td { padding: 6px 8px; color: #c8e0ff; border-bottom: 1px solid rgba(80,160,255,0.08); }
+    .lb-table tr.lb-you td { color: #ffe07a; font-weight: bold; }
+    .lb-table tr:hover td { background: rgba(80,160,255,0.06); }
+    .lb-rank { color: #8fb6d6; min-width: 28px; }
+    .lb-name { color: #e8f4ff; }
+    .lb-val  { text-align: right; font-variant-numeric: tabular-nums; color: #ffe07a; }
+    #btnCloseProfile {
+      font-family: inherit; font-size: 13px; letter-spacing: 2px; padding: 9px 20px;
+      color: #c8e0ff; background: rgba(80,160,255,0.08); border: 2px solid #44607f;
+      border-radius: 10px; cursor: pointer; align-self: flex-start; margin-top: 4px;
+      transition: color 0.12s, border-color 0.12s;
+    }
+    #btnCloseProfile:hover { color: #ffe07a; border-color: #ffd97a; }
     #settingsPanel {
       position: fixed; top: 66px; right: max(16px, env(safe-area-inset-right, 16px));
       width: min(280px, calc(100vw - 32px));
@@ -479,6 +573,7 @@
 </head>
 <body>
   <!-- Settings gear + panel (lobby-only, hidden once HUD shows). -->
+  <button id="btnProfile" title="Pilot Profile">◉</button>
   <button id="btnCustomize" title="Customize Ship">✦</button>
   <button id="settingsBtn" title="Settings">⚙</button>
   <div id="settingsPanel" class="hidden">
@@ -528,6 +623,20 @@
     <div id="settingsLogoutRow" class="hidden">
       <div id="pilotLabel">Pilot: <span id="pilotLabelName"></span></div>
       <button type="button" id="btnLogout">Log Out</button>
+    </div>
+  </div>
+
+  <!-- Profile overlay -->
+  <div id="profile-overlay" class="hidden">
+    <div id="profile-box">
+      <h2>PILOT DOSSIER</h2>
+      <div class="profile-tabs">
+        <button class="profile-tab active" id="profile-tab-my">PROFILE</button>
+        <button class="profile-tab" id="profile-tab-lb">LEADERBOARD</button>
+      </div>
+      <div id="profile-pane-my" class="profile-pane"></div>
+      <div id="profile-pane-lb" class="profile-pane hidden"></div>
+      <button id="btnCloseProfile">← BACK</button>
     </div>
   </div>
 

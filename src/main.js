@@ -275,6 +275,7 @@ export async function startGame(opts = {}) {
     : opts.mode === 'trials3' ? 'spaceships:trial3Best'
     : opts.mode === 'trials2' ? 'spaceships:trial2Best'
     : 'spaceships:trial1Best';
+  const TRIAL_NUM = opts.mode === 'trials4' ? 4 : opts.mode === 'trials3' ? 3 : opts.mode === 'trials2' ? 2 : 1;
   const CP_TRIGGER_DIST = 55;
   const cpMeshes = [];
   const tracerDots = [];
@@ -1589,6 +1590,7 @@ export async function startGame(opts = {}) {
               if (trialsBestLap === null || trialsTimer < trialsBestLap) {
                 trialsBestLap = trialsTimer;
                 localStorage.setItem(TRIAL_BEST_KEY, trialsBestLap.toFixed(3));
+                reportTrialTime(TRIAL_NUM, trialsBestLap);
               }
               trialsTimer = 0;
               trialsLap++;
@@ -2123,6 +2125,35 @@ export async function startGame(opts = {}) {
   // the timer locally; MP receives match-state from the server. Tutorial is
   // excluded — it's a guided lesson, not a match.
   const matchActive = SOLO_MODE === 'skirmish' || SOLO_MODE === 'train' || !isSolo;
+  let soloBotsKilled = 0;
+
+  async function reportSoloResult(kills, deaths, won, botsKilled) {
+    const token = localStorage.getItem('spaceships:token');
+    if (!token) return;
+    try {
+      await fetch('/spaceships/api/solo-result', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+        body: JSON.stringify({ kills, deaths, won, botsKilled }),
+      });
+    } catch (e) {
+      console.warn('[solo-result] could not report:', e);
+    }
+  }
+
+  async function reportTrialTime(trialNum, time) {
+    const token = localStorage.getItem('spaceships:token');
+    if (!token) return;
+    try {
+      await fetch('/spaceships/api/trial-result', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+        body: JSON.stringify({ trialNum, time }),
+      });
+    } catch (e) {
+      console.warn('[trial-result] could not report:', e);
+    }
+  }
 
   function makeBotEntity(r) {
     return {
@@ -2383,6 +2414,7 @@ export async function startGame(opts = {}) {
         const ks = scores.get(killerId);
         if (ks) ks.kills += 1;
       }
+      if (isSolo && killerId === opts.you && r.isBot) soloBotsKilled++;
       const ds = scores.get(id);
       if (ds) ds.deaths += 1;
       renderScoreboard();
@@ -2527,6 +2559,13 @@ export async function startGame(opts = {}) {
 
   function endMatch() {
     matchOver = true;
+
+    if (isSolo && matchActive) {
+      const myScore = scores.get(opts.you) || { kills: 0, deaths: 0 };
+      const won = teamKills[0] > teamKills[1] ? true : teamKills[1] > teamKills[0] ? false : null;
+      reportSoloResult(myScore.kills, myScore.deaths, won, soloBotsKilled);
+    }
+
     let title;
     if (teamKills[0] > teamKills[1]) title = 'BLUE WINS';
     else if (teamKills[1] > teamKills[0]) title = 'RED WINS';

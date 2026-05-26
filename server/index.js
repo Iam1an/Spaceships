@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   registerPilot, loginPilot, verifyToken,
   recordGamePlayed, recordHighScore, savePilotColors,
+  recordMatchResult, recordTrialTime, getPilotProfile, getLeaderboard,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -47,6 +48,63 @@ app.put('/api/colors', (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(e.status ?? 401).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/profile/:username', (req, res) => {
+  try {
+    const profile = getPilotProfile(req.params.username);
+    if (!profile) return res.status(404).json({ ok: false, error: 'Pilot not found' });
+    res.json({ ok: true, profile });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/leaderboard', (_req, res) => {
+  try {
+    res.json({ ok: true, leaderboard: getLeaderboard() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+function extractPilotId(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!token) throw Object.assign(new Error('Not authenticated'), { status: 401 });
+  return verifyToken(token).id;
+}
+
+app.post('/api/solo-result', (req, res) => {
+  try {
+    const pilotId = extractPilotId(req);
+    const { kills = 0, deaths = 0, won = null, botsKilled = 0 } = req.body ?? {};
+    const newAchs = recordMatchResult(pilotId, {
+      kills:      Math.max(0, Number(kills)      || 0),
+      deaths:     Math.max(0, Number(deaths)     || 0),
+      won:        won === true || won === false ? won : null,
+      botsKilled: Math.max(0, Number(botsKilled) || 0),
+    });
+    res.json({ ok: true, newAchievements: newAchs });
+  } catch (e) {
+    res.status(e.status ?? 500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/trial-result', (req, res) => {
+  try {
+    const pilotId = extractPilotId(req);
+    const { trialNum, time } = req.body ?? {};
+    const num = Number(trialNum);
+    const t   = Number(time);
+    if (![1, 2, 3, 4].includes(num) || !Number.isFinite(t) || t <= 0) {
+      return res.status(400).json({ ok: false, error: 'Invalid trial data' });
+    }
+    const newAchs = recordTrialTime(pilotId, num, t);
+    res.json({ ok: true, newAchievements: newAchs });
+  } catch (e) {
+    res.status(e.status ?? 500).json({ ok: false, error: e.message });
   }
 });
 
@@ -321,10 +379,12 @@ function endMatch(room) {
     if (!ws.pilotId) continue;
     const player = room.players.get(ws.id);
     if (!player || player.isBot) continue;
-    const kills = player.kills || 0;
+    const kills  = player.kills  || 0;
+    const deaths = player.deaths || 0;
+    let won = null;
+    if (winner !== -1) won = player.team === winner;
     try {
-      recordGamePlayed(ws.pilotId);
-      recordHighScore(ws.pilotId, kills);
+      recordMatchResult(ws.pilotId, { kills, deaths, won, botsKilled: 0 });
     } catch (e) {
       console.warn(`stats save failed for pilot ${ws.pilotId}:`, e.message);
     }
