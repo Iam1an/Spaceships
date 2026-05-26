@@ -675,9 +675,54 @@ zoomEl.addEventListener('input', () => {
   if (custScene) custScene.setZoom(parseFloat(zoomEl.value));
 });
 
+// ── Customization credit costs ────────────────────────────────────────────────
+const COST_SAVE_COLORS  = 25;
+const COST_TRAIL_UNLOCK = 10;
+const COST_TRAIL_SHAPE  = 10;
+
+let trailTabUnlocked = false;
+
+const custCrStatusEl = document.getElementById('custCrStatus');
+let custCrTimer = null;
+function showCustCrStatus(msg, color = '#ff8a8a') {
+  if (!custCrStatusEl) return;
+  custCrStatusEl.textContent = msg;
+  custCrStatusEl.style.color = color;
+  if (custCrTimer) clearTimeout(custCrTimer);
+  custCrTimer = setTimeout(() => { custCrStatusEl.textContent = ''; }, 3000);
+}
+
+async function trySpendCredits(amount, reason) {
+  const token = getToken();
+  if (!token) return { ok: false, msg: 'Log in to use this feature' };
+  const cached = parseInt(localStorage.getItem('spaceships:credits') || '0', 10);
+  if (cached < amount) return { ok: false, msg: `Need ${amount - cached} more ⬡ (you have ${cached} ⬡)` };
+  try {
+    const res  = await fetch('/spaceships/api/credits/spend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ amount, reason }),
+    });
+    const data = await res.json();
+    if (data.ok) { setCreditsDisplay(data.balance); return { ok: true }; }
+    return { ok: false, msg: `Not enough ⬡ (have ${data.balance ?? '?'})` };
+  } catch {
+    return { ok: false, msg: 'Could not reach server' };
+  }
+}
+
 document.getElementById('tabHull').addEventListener('click', () => setColorTarget('hull'));
 document.getElementById('tabAccent').addEventListener('click', () => setColorTarget('accent'));
-document.getElementById('tabTrail').addEventListener('click', () => setColorTarget('trail'));
+document.getElementById('tabTrail').addEventListener('click', async () => {
+  if (trailTabUnlocked) { setColorTarget('trail'); return; }
+  const r = await trySpendCredits(COST_TRAIL_UNLOCK, 'customize:trail_unlock');
+  if (!r.ok) { showCustCrStatus(`Trail editing costs ${COST_TRAIL_UNLOCK} ⬡ · ${r.msg}`); return; }
+  trailTabUnlocked = true;
+  const costBadge = document.getElementById('trailTabCost');
+  if (costBadge) costBadge.textContent = '· ✓';
+  showCustCrStatus(`Trail unlocked! −${COST_TRAIL_UNLOCK} ⬡`, '#66ff88');
+  setColorTarget('trail');
+});
 
 // Trail shape picker
 const TRAIL_SHAPE_KEY = 'spaceships:trailShape';
@@ -687,9 +732,13 @@ function setTrailShape(shape) {
     btn.classList.toggle('active', btn.dataset.shape === shape);
   }
 }
-document.getElementById('trail-shape-picker').addEventListener('click', (e) => {
+document.getElementById('trail-shape-picker').addEventListener('click', async (e) => {
   const btn = e.target.closest('.trail-shape-btn');
-  if (btn) setTrailShape(btn.dataset.shape);
+  if (!btn) return;
+  const r = await trySpendCredits(COST_TRAIL_SHAPE, 'customize:trail_shape');
+  if (!r.ok) { showCustCrStatus(`Changing shape costs ${COST_TRAIL_SHAPE} ⬡ · ${r.msg}`); return; }
+  showCustCrStatus(`Shape changed! −${COST_TRAIL_SHAPE} ⬡`, '#66ff88');
+  setTrailShape(btn.dataset.shape);
 });
 setTrailShape(getSavedTrailShape());
 
@@ -726,6 +775,14 @@ async function saveColorsToServer() {
     saveColorsStatus.textContent = 'Log in to save to account';
     saveColorsStatus.style.color = '#ff8a8a';
   } else {
+    const cr = await trySpendCredits(COST_SAVE_COLORS, 'customize:save_colors');
+    if (!cr.ok) {
+      saveColorsStatus.textContent = `Costs ${COST_SAVE_COLORS} ⬡ · ${cr.msg}`;
+      saveColorsStatus.style.color = '#ff8a8a';
+      if (saveStatusTimer) clearTimeout(saveStatusTimer);
+      saveStatusTimer = setTimeout(() => { saveColorsStatus.textContent = ''; }, 3500);
+      return;
+    }
     saveColorsStatus.textContent = 'Saving…';
     saveColorsStatus.style.color = '#c8e0ff';
     try {
