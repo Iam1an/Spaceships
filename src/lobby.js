@@ -676,9 +676,9 @@ zoomEl.addEventListener('input', () => {
 });
 
 // ── Customization credit costs ────────────────────────────────────────────────
-const COST_SAVE_COLORS  = 25;
-const COST_TRAIL_UNLOCK = 10;
-const COST_TRAIL_SHAPE  = 10;
+const COST_SAVE_COLORS  = 500;
+const COST_TRAIL_UNLOCK = 250;
+const COST_TRAIL_SHAPE  = 150;
 
 let trailTabUnlocked = false;
 
