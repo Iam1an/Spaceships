@@ -360,8 +360,18 @@
       padding: 7px 12px; cursor: default;
     }
     .achievement-badge:hover { border-color: #4aa3ff; background: rgba(80,160,255,0.16); }
+    .achievement-badge.locked {
+      background: rgba(255,255,255,0.02); border-color: #1e2d3a;
+      opacity: 0.45; filter: grayscale(0.7);
+    }
+    .achievement-badge.locked:hover { border-color: #2a4060; background: rgba(255,255,255,0.03); opacity: 0.55; filter: grayscale(0.5); }
     .ach-icon { font-size: 18px; line-height: 1; }
     .ach-label { font-size: 12px; color: #c8e0ff; letter-spacing: 1px; white-space: nowrap; }
+    .ach-section-label {
+      width: 100%; font-size: 10px; letter-spacing: 3px; color: #8fb6d6;
+      padding: 6px 2px 2px; border-bottom: 1px solid rgba(80,160,255,0.12); margin-bottom: 2px;
+    }
+    .ach-section-label.locked-label { color: #3a5060; }
     .profile-no-ach { color: #8fb6d6; font-size: 13px; letter-spacing: 1px; padding: 8px 0; }
     .lb-table { width: 100%; border-collapse: collapse; font-size: clamp(11px,1.6vw,14px); }
     .lb-table th { color: #9cf; text-align: left; padding: 6px 8px; border-bottom: 1px solid rgba(80,160,255,0.25); letter-spacing: 1px; font-size: 11px; }

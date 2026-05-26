@@ -851,6 +851,7 @@ function checkPendingAchievements() {
         <div class="ach-toast-body">
           <span class="ach-toast-title">ACHIEVEMENT UNLOCKED</span>
           <span class="ach-toast-label">${esc(a.label)}</span>
+          <span class="ach-desc">${esc(a.desc)}</span>
         </div>
       </div>`
     ).join('');
@@ -1019,16 +1020,22 @@ async function openProfilePanel() {
 }
 
 function renderMyProfile(p) {
-  const draws   = Math.max(0, p.gamesPlayed - p.matchesWon - p.matchesLost);
   const winRate = p.gamesPlayed > 0 ? Math.round(p.matchesWon / p.gamesPlayed * 100) : 0;
 
-  const achHtml = p.achievements.length > 0
-    ? p.achievements.map(a =>
-        `<div class="achievement-badge" title="${esc(a.desc)}">
-          <span class="ach-icon">${esc(a.icon)}</span>
-          <span class="ach-label">${esc(a.label)}</span>
-        </div>`
-      ).join('')
+  const earned = p.achievements.filter(a => a.earned);
+  const locked = p.achievements.filter(a => !a.earned);
+
+  function badgeHtml(a) {
+    const cls  = a.earned ? 'achievement-badge' : 'achievement-badge locked';
+    const icon = a.earned ? esc(a.icon) : '🔒';
+    return `<div class="${cls}" title="${esc(a.desc)}">
+      <span class="ach-icon">${icon}</span>
+      <span class="ach-label">${esc(a.label)}</span>
+    </div>`;
+  }
+
+  const earnedHtml = earned.length > 0
+    ? earned.map(badgeHtml).join('')
     : '<div class="profile-no-ach">No achievements yet — get out there!</div>';
 
   profilePaneMy.innerHTML = `
@@ -1054,8 +1061,12 @@ function renderMyProfile(p) {
       <div class="trial-row"><span>Trial 3</span><span>${fmtTrialTime(p.trial3Best)}</span></div>
       <div class="trial-row"><span>Trial 4</span><span>${fmtTrialTime(p.trial4Best)}</span></div>
     </div>
-    <div class="profile-section-title">ACHIEVEMENTS (${p.achievements.length})</div>
-    <div class="achievements-grid">${achHtml}</div>
+    <div class="profile-section-title">ACHIEVEMENTS — ${earned.length} / ${p.achievements.length}</div>
+    <div class="achievements-grid">
+      <div class="ach-section-label">UNLOCKED</div>
+      ${earnedHtml}
+      ${locked.length > 0 ? `<div class="ach-section-label locked-label">LOCKED</div>${locked.map(badgeHtml).join('')}` : ''}
+    </div>
   `;
 }
 
