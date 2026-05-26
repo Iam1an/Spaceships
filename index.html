@@ -372,6 +372,12 @@
       padding: 6px 2px 2px; border-bottom: 1px solid rgba(80,160,255,0.12); margin-bottom: 2px;
     }
     .ach-section-label.locked-label { color: #3a5060; }
+    .ach-badge-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+    .ach-progress-row { display: flex; align-items: center; gap: 6px; width: 100%; }
+    .ach-progress-bar { flex: 1; height: 3px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden; min-width: 36px; }
+    .ach-progress-fill { height: 100%; background: linear-gradient(90deg,#4aa3ff,#66ddff); border-radius: 2px; transition: width 0.3s ease; }
+    .ach-progress-pct { font-size: 10px; color: #8fb6d6; white-space: nowrap; letter-spacing: 0.5px; flex-shrink: 0; }
+    .ach-time-hint { font-size: 10px; color: #8fb6d6; letter-spacing: 0.5px; white-space: nowrap; }
     .ach-toggle-btn {
       width: 100%; display: flex; justify-content: space-between; align-items: center;
       padding: 9px 4px; cursor: pointer; background: none; border: none; border-radius: 0;

@@ -66,44 +66,44 @@ function computeRank(totalKills) {
 
 const ACHIEVEMENT_DEFS = [
   // ── Kill milestones ───────────────────────────────────────────────────────────
-  { type: 'first_kill',        label: 'First Blood',        icon: '🔫', desc: 'Get your first kill',                         check: p => p.total_kills >= 1 },
-  { type: 'kills_10',          label: 'Sharpshooter',       icon: '🎯', desc: 'Reach 10 total kills',                        check: p => p.total_kills >= 10 },
-  { type: 'kills_50',          label: 'Ace',                icon: '⚔',  desc: 'Reach 50 total kills',                        check: p => p.total_kills >= 50 },
-  { type: 'kills_100',         label: 'Veteran',            icon: '🏆', desc: 'Reach 100 total kills',                       check: p => p.total_kills >= 100 },
-  { type: 'kills_500',         label: 'Legend',             icon: '👑', desc: 'Reach 500 total kills',                       check: p => p.total_kills >= 500 },
-  { type: 'kills_1000',        label: 'Living Weapon',      icon: '☠',  desc: 'Reach 1000 total kills',                      check: p => p.total_kills >= 1000 },
+  { type: 'first_kill',        label: 'First Blood',        icon: '🔫', desc: 'Get your first kill',                         check: p => p.total_kills >= 1,    progress: p => ({ current: Math.min(p.total_kills, 1),    target: 1 }) },
+  { type: 'kills_10',          label: 'Sharpshooter',       icon: '🎯', desc: 'Reach 10 total kills',                        check: p => p.total_kills >= 10,   progress: p => ({ current: Math.min(p.total_kills, 10),   target: 10 }) },
+  { type: 'kills_50',          label: 'Ace',                icon: '⚔',  desc: 'Reach 50 total kills',                        check: p => p.total_kills >= 50,   progress: p => ({ current: Math.min(p.total_kills, 50),   target: 50 }) },
+  { type: 'kills_100',         label: 'Veteran',            icon: '🏆', desc: 'Reach 100 total kills',                       check: p => p.total_kills >= 100,  progress: p => ({ current: Math.min(p.total_kills, 100),  target: 100 }) },
+  { type: 'kills_500',         label: 'Legend',             icon: '👑', desc: 'Reach 500 total kills',                       check: p => p.total_kills >= 500,  progress: p => ({ current: Math.min(p.total_kills, 500),  target: 500 }) },
+  { type: 'kills_1000',        label: 'Living Weapon',      icon: '☠',  desc: 'Reach 1000 total kills',                      check: p => p.total_kills >= 1000, progress: p => ({ current: Math.min(p.total_kills, 1000), target: 1000 }) },
   // ── Best single-match kills ───────────────────────────────────────────────────
-  { type: 'highscore_5',       label: 'Hot Streak',         icon: '🌡', desc: '5 kills in a single match',                   check: p => p.high_score >= 5 },
-  { type: 'highscore_10',      label: 'Unstoppable',        icon: '🌩', desc: '10 kills in a single match',                  check: p => p.high_score >= 10 },
-  { type: 'highscore_20',      label: 'Killing Machine',    icon: '💣', desc: '20 kills in a single match',                  check: p => p.high_score >= 20 },
+  { type: 'highscore_5',       label: 'Hot Streak',         icon: '🌡', desc: '5 kills in a single match',                   check: p => p.high_score >= 5,     progress: p => ({ current: Math.min(p.high_score, 5),   target: 5 }) },
+  { type: 'highscore_10',      label: 'Unstoppable',        icon: '🌩', desc: '10 kills in a single match',                  check: p => p.high_score >= 10,    progress: p => ({ current: Math.min(p.high_score, 10),  target: 10 }) },
+  { type: 'highscore_20',      label: 'Killing Machine',    icon: '💣', desc: '20 kills in a single match',                  check: p => p.high_score >= 20,    progress: p => ({ current: Math.min(p.high_score, 20),  target: 20 }) },
   // ── Match wins ────────────────────────────────────────────────────────────────
-  { type: 'first_win',         label: 'First Victory',      icon: '🥇', desc: 'Win your first match',                        check: p => p.matches_won >= 1 },
-  { type: 'wins_5',            label: 'On a Roll',          icon: '🔥', desc: 'Win 5 matches',                               check: p => p.matches_won >= 5 },
-  { type: 'wins_25',           label: 'Dominant Force',     icon: '💪', desc: 'Win 25 matches',                              check: p => p.matches_won >= 25 },
-  { type: 'wins_50',           label: 'Warlord',            icon: '🎖', desc: 'Win 50 matches',                              check: p => p.matches_won >= 50 },
+  { type: 'first_win',         label: 'First Victory',      icon: '🥇', desc: 'Win your first match',                        check: p => p.matches_won >= 1,    progress: p => ({ current: Math.min(p.matches_won, 1),  target: 1 }) },
+  { type: 'wins_5',            label: 'On a Roll',          icon: '🔥', desc: 'Win 5 matches',                               check: p => p.matches_won >= 5,    progress: p => ({ current: Math.min(p.matches_won, 5),  target: 5 }) },
+  { type: 'wins_25',           label: 'Dominant Force',     icon: '💪', desc: 'Win 25 matches',                              check: p => p.matches_won >= 25,   progress: p => ({ current: Math.min(p.matches_won, 25), target: 25 }) },
+  { type: 'wins_50',           label: 'Warlord',            icon: '🎖', desc: 'Win 50 matches',                              check: p => p.matches_won >= 50,   progress: p => ({ current: Math.min(p.matches_won, 50), target: 50 }) },
   // ── Matches played ────────────────────────────────────────────────────────────
-  { type: 'matches_10',        label: 'Frequent Flyer',     icon: '🚀', desc: 'Play 10 matches',                             check: p => p.games_played >= 10 },
-  { type: 'matches_50',        label: 'Battle-Hardened',    icon: '🛡', desc: 'Play 50 matches',                             check: p => p.games_played >= 50 },
-  { type: 'matches_100',       label: 'Iron Pilot',         icon: '🔩', desc: 'Play 100 matches',                            check: p => p.games_played >= 100 },
+  { type: 'matches_10',        label: 'Frequent Flyer',     icon: '🚀', desc: 'Play 10 matches',                             check: p => p.games_played >= 10,  progress: p => ({ current: Math.min(p.games_played, 10),  target: 10 }) },
+  { type: 'matches_50',        label: 'Battle-Hardened',    icon: '🛡', desc: 'Play 50 matches',                             check: p => p.games_played >= 50,  progress: p => ({ current: Math.min(p.games_played, 50),  target: 50 }) },
+  { type: 'matches_100',       label: 'Iron Pilot',         icon: '🔩', desc: 'Play 100 matches',                            check: p => p.games_played >= 100, progress: p => ({ current: Math.min(p.games_played, 100), target: 100 }) },
   // ── Bot kills ─────────────────────────────────────────────────────────────────
-  { type: 'bot_hunter',        label: 'Bot Hunter',         icon: '🤖', desc: 'Destroy 10 bots',                             check: p => p.bots_killed >= 10 },
-  { type: 'bot_slayer',        label: 'Bot Slayer',         icon: '💀', desc: 'Destroy 100 bots',                            check: p => p.bots_killed >= 100 },
-  { type: 'bot_exterminator',  label: 'Bot Exterminator',   icon: '🔧', desc: 'Destroy 500 bots',                            check: p => p.bots_killed >= 500 },
+  { type: 'bot_hunter',        label: 'Bot Hunter',         icon: '🤖', desc: 'Destroy 10 bots',                             check: p => p.bots_killed >= 10,   progress: p => ({ current: Math.min(p.bots_killed, 10),  target: 10 }) },
+  { type: 'bot_slayer',        label: 'Bot Slayer',         icon: '💀', desc: 'Destroy 100 bots',                            check: p => p.bots_killed >= 100,  progress: p => ({ current: Math.min(p.bots_killed, 100), target: 100 }) },
+  { type: 'bot_exterminator',  label: 'Bot Exterminator',   icon: '🔧', desc: 'Destroy 500 bots',                            check: p => p.bots_killed >= 500,  progress: p => ({ current: Math.min(p.bots_killed, 500), target: 500 }) },
   // ── KDR ───────────────────────────────────────────────────────────────────────
-  { type: 'kdr_positive',      label: 'Breaking Even',      icon: '⚖',  desc: 'Reach a 1.0+ KDR (min 10 deaths)',           check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths },
-  { type: 'kdr_2',             label: 'Skilled Hunter',     icon: '🦅', desc: 'Reach a 2.0+ KDR (min 10 deaths)',           check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 2 },
+  { type: 'kdr_positive',      label: 'Breaking Even',      icon: '⚖',  desc: 'Reach a 1.0+ KDR (min 10 deaths)',           check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths,     progress: null },
+  { type: 'kdr_2',             label: 'Skilled Hunter',     icon: '🦅', desc: 'Reach a 2.0+ KDR (min 10 deaths)',           check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 2, progress: null },
   // ── Trials completion ─────────────────────────────────────────────────────────
-  { type: 'trial1_complete',   label: 'Trial Runner',       icon: '⏱', desc: 'Complete Trial 1',                            check: p => p.trial1_best !== null },
-  { type: 'trial2_complete',   label: 'Speed Seeker',       icon: '🌀', desc: 'Complete Trial 2',                            check: p => p.trial2_best !== null },
-  { type: 'trial3_complete',   label: 'Precision Pilot',    icon: '🔮', desc: 'Complete Trial 3',                            check: p => p.trial3_best !== null },
-  { type: 'trial4_complete',   label: 'Elite Racer',        icon: '🏁', desc: 'Complete Trial 4',                            check: p => p.trial4_best !== null },
-  { type: 'all_trials',        label: 'Grand Champion',     icon: '🌟', desc: 'Complete all 4 trials',                       check: p => p.trial1_best !== null && p.trial2_best !== null && p.trial3_best !== null && p.trial4_best !== null },
+  { type: 'trial1_complete',   label: 'Trial Runner',       icon: '⏱', desc: 'Complete Trial 1',                            check: p => p.trial1_best !== null, progress: null },
+  { type: 'trial2_complete',   label: 'Speed Seeker',       icon: '🌀', desc: 'Complete Trial 2',                            check: p => p.trial2_best !== null, progress: null },
+  { type: 'trial3_complete',   label: 'Precision Pilot',    icon: '🔮', desc: 'Complete Trial 3',                            check: p => p.trial3_best !== null, progress: null },
+  { type: 'trial4_complete',   label: 'Elite Racer',        icon: '🏁', desc: 'Complete Trial 4',                            check: p => p.trial4_best !== null, progress: null },
+  { type: 'all_trials',        label: 'Grand Champion',     icon: '🌟', desc: 'Complete all 4 trials',                       check: p => p.trial1_best !== null && p.trial2_best !== null && p.trial3_best !== null && p.trial4_best !== null, progress: p => ({ current: [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].filter(t => t !== null).length, target: 4 }) },
   // ── Trial time records ────────────────────────────────────────────────────────
-  { type: 'trial1_sub30',      label: 'Hypersonic',         icon: '💫', desc: 'Complete Trial 1 in under 30 seconds',        check: p => p.trial1_best !== null && p.trial1_best < 30 },
-  { type: 'trial2_sub50',      label: 'Lightning Dash',     icon: '⚡', desc: 'Complete Trial 2 in under 50 seconds',        check: p => p.trial2_best !== null && p.trial2_best < 50 },
-  { type: 'trial3_sub60',      label: 'Razor Edge',         icon: '🔪', desc: 'Complete Trial 3 in under 60 seconds',        check: p => p.trial3_best !== null && p.trial3_best < 60 },
-  { type: 'trial4_sub70',      label: 'Beyond Limits',      icon: '🛸', desc: 'Complete Trial 4 in under 70 seconds',        check: p => p.trial4_best !== null && p.trial4_best < 70 },
-  { type: 'speed_demon',       label: 'Speed Demon',        icon: '💨', desc: 'Complete any trial in under 30 seconds',      check: p => [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].some(t => t !== null && t < 30) },
+  { type: 'trial1_sub30',      label: 'Hypersonic',         icon: '💫', desc: 'Complete Trial 1 in under 30 seconds',        check: p => p.trial1_best !== null && p.trial1_best < 30, progress: p => p.trial1_best !== null ? { current: p.trial1_best, target: 30, isTime: true } : null },
+  { type: 'trial2_sub50',      label: 'Lightning Dash',     icon: '⚡', desc: 'Complete Trial 2 in under 50 seconds',        check: p => p.trial2_best !== null && p.trial2_best < 50, progress: p => p.trial2_best !== null ? { current: p.trial2_best, target: 50, isTime: true } : null },
+  { type: 'trial3_sub60',      label: 'Razor Edge',         icon: '🔪', desc: 'Complete Trial 3 in under 60 seconds',        check: p => p.trial3_best !== null && p.trial3_best < 60, progress: p => p.trial3_best !== null ? { current: p.trial3_best, target: 60, isTime: true } : null },
+  { type: 'trial4_sub70',      label: 'Beyond Limits',      icon: '🛸', desc: 'Complete Trial 4 in under 70 seconds',        check: p => p.trial4_best !== null && p.trial4_best < 70, progress: p => p.trial4_best !== null ? { current: p.trial4_best, target: 70, isTime: true } : null },
+  { type: 'speed_demon',       label: 'Speed Demon',        icon: '💨', desc: 'Complete any trial in under 30 seconds',      check: p => [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].some(t => t !== null && t < 30), progress: null },
 ];
 
 const ACHIEVEMENT_MAP = Object.fromEntries(ACHIEVEMENT_DEFS.map(a => [a.type, a]));
@@ -267,14 +267,18 @@ export function getPilotProfile(username) {
   if (!pilot) return null;
   const achRows = stmtGetAchs.all(pilot.id);
   const earnedMap = new Map(achRows.map(r => [r.type, r.earned_at]));
-  const achievements = ACHIEVEMENT_DEFS.map(def => ({
-    type:     def.type,
-    label:    def.label,
-    icon:     def.icon,
-    desc:     def.desc,
-    earned:   earnedMap.has(def.type),
-    earnedAt: earnedMap.get(def.type) ?? null,
-  }));
+  const achievements = ACHIEVEMENT_DEFS.map(def => {
+    const earned = earnedMap.has(def.type);
+    return {
+      type:     def.type,
+      label:    def.label,
+      icon:     def.icon,
+      desc:     def.desc,
+      earned,
+      earnedAt: earnedMap.get(def.type) ?? null,
+      progress: (!earned && def.progress) ? def.progress(pilot) : null,
+    };
+  });
   return {
     username:     pilot.username,
     rank:         pilot.rank,

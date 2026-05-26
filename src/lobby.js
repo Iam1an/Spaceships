@@ -1028,9 +1028,29 @@ function renderMyProfile(p) {
   function badgeHtml(a) {
     const cls  = a.earned ? 'achievement-badge' : 'achievement-badge locked';
     const icon = a.earned ? esc(a.icon) : '🔒';
+
+    let progressHtml = '';
+    if (!a.earned && a.progress) {
+      const { current, target, isTime } = a.progress;
+      if (isTime) {
+        const curStr = current !== null ? parseFloat(current).toFixed(1) + 's' : '—';
+        progressHtml = `<span class="ach-time-hint">${curStr} / &lt;${target}s</span>`;
+      } else {
+        const pct = target > 0 ? Math.min(100, Math.round(current / target * 100)) : 0;
+        progressHtml = `
+          <div class="ach-progress-row">
+            <div class="ach-progress-bar"><div class="ach-progress-fill" style="width:${pct}%"></div></div>
+            <span class="ach-progress-pct">${current}/${target}</span>
+          </div>`;
+      }
+    }
+
     return `<div class="${cls}" title="${esc(a.desc)}">
       <span class="ach-icon">${icon}</span>
-      <span class="ach-label">${esc(a.label)}</span>
+      <div class="ach-badge-body">
+        <span class="ach-label">${esc(a.label)}</span>
+        ${progressHtml}
+      </div>
     </div>`;
   }
 
