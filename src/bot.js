@@ -16,6 +16,7 @@ export function createBotAI(record, deps) {
     faction = 'enemy',
     onFire,
     hardMode = false,
+    terrainHeightFn = null,
   } = deps;
   const ZERO_VEC = new THREE.Vector3();
 
@@ -250,6 +251,25 @@ export function createBotAI(record, deps) {
       desiredDir.addScaledVector(avoid, AVOID_WEIGHT).normalize();
     }
 
+    // Terrain map: pull up when close to the ground, and also sample ahead
+    // so bots don't fly nose-first into rising slopes.
+    if (terrainHeightFn !== null) {
+      const margin = 180;
+      // Sample directly below
+      const groundBelow = terrainHeightFn(botPos.x, botPos.z);
+      const clearanceBelow = botPos.y - groundBelow;
+      // Sample 1.5 s ahead along current heading
+      const ahead = botPos.clone().addScaledVector(tmpFwd, SPEED * 1.5);
+      const groundAhead = terrainHeightFn(ahead.x, ahead.z);
+      const clearanceAhead = botPos.y - groundAhead;
+      const clearance = Math.min(clearanceBelow, clearanceAhead);
+      if (clearance < margin) {
+        const pull = (margin - clearance) / margin;
+        desiredDir.y += pull * 6.0;
+        if (desiredDir.length() > 0.001) desiredDir.normalize();
+      }
+    }
+
     // Rotate toward desired
     rotateToward(record.ship.quaternion, tmpFwd, desiredDir, TURN_RATE * dt);
 
@@ -307,6 +327,15 @@ export function createBotAI(record, deps) {
           stateTimer = 0;
           evadeAxis = chooseEvadeDir();
         }
+      }
+    }
+
+    // Hard floor on terrain map — don't let bots clip into the ground.
+    if (terrainHeightFn !== null) {
+      const groundY = terrainHeightFn(botPos.x, botPos.z);
+      if (botPos.y < groundY + 5) {
+        botPos.y = groundY + 5;
+        if (record.vel.y < 0) record.vel.y *= -0.5;
       }
     }
 

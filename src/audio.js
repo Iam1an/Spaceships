@@ -17,7 +17,7 @@ const SOUNDS = {
 
 const VOLUMES = {
   shoot: 0.28,
-  shipdeath: 0.6,
+  shipdeath: 0.6,       
   move: 0.25,
   boost: 0.4,
   impact: 0.45,

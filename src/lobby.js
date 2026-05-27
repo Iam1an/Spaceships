@@ -32,6 +32,7 @@ let myId = null;
 let isHost = false;
 let mySpawn = null;
 let myAsteroids = null;
+let myMap = 'space';
 let lastPlayers = [];
 
 const nameInput = document.getElementById('nameInput');
@@ -274,6 +275,10 @@ function isPrivateRoom() {
   return document.getElementById('privacyPrivate')?.checked ?? false;
 }
 
+function selectedMap() {
+  return document.getElementById('mapTerrain')?.checked ? 'terrain' : 'space';
+}
+
 function handle(msg) {
   switch (msg.type) {
     case 'room':
@@ -298,6 +303,7 @@ function handle(msg) {
     case 'start':
       mySpawn = msg.spawns?.[myId] || null;
       myAsteroids = msg.asteroids || null;
+      myMap = msg.map || 'space';
       enterGame();
       break;
     case 'rooms-list':
@@ -351,7 +357,12 @@ function enterGame() {
     controlScheme: controlScheme(),
     hardMode: hardMode(),
     pilotName: pilotName(),
+    map: myMap,
   });
+}
+
+function soloSelectedMap() {
+  return document.getElementById('soloMapTerrain')?.checked ? 'terrain' : 'space';
 }
 
 function enterSoloGame(mode, opts = {}) {
@@ -364,6 +375,7 @@ function enterSoloGame(mode, opts = {}) {
     noMouse: opts.noMouse ?? (scheme === 'keyboard'),
     controlScheme: scheme,
     hardMode: hardMode(),
+    map: opts.map ?? soloSelectedMap(),
   });
 }
 
@@ -391,7 +403,7 @@ document.getElementById('btnPlay').addEventListener('click', async () => {
   setError('Connecting…');
   try { await connect(); } catch (e) { setError(e.message); return; }
   send({ type: 'name', name: pilotName() });
-  send({ type: 'create', private: isPrivateRoom() });
+  send({ type: 'create', private: isPrivateRoom(), map: selectedMap() });
 });
 
 

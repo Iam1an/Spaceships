@@ -449,11 +449,28 @@ const TEAM_SPAWNS = [
   { z: +540, quat: [0, 1, 0, 0] },          // team 1: 180° around Y, facing -Z
 ];
 
+// Terrain map: airfields at z=±1500, spawn above runway (y=40).
+const TERRAIN_TEAM_SPAWNS = [
+  { z: -1400, y: 40, quat: [0, 0, 0, 1] },
+  { z:  1400, y: 40, quat: [0, 1, 0, 0] },
+];
+
 function teamForId(id) {
   return id % 2;
 }
 
-function spawnForTeam(team) {
+function spawnForTeam(team, map = 'space') {
+  if (map === 'terrain') {
+    const t = TERRAIN_TEAM_SPAWNS[team];
+    return {
+      pos: [
+        (Math.random() - 0.5) * 60,
+        t.y + (Math.random() - 0.5) * 10,
+        t.z + (Math.random() - 0.5) * 40,
+      ],
+      quat: t.quat,
+    };
+  }
   const t = TEAM_SPAWNS[team];
   return {
     pos: [
@@ -626,10 +643,12 @@ function handleConnection(ws) {
       if (ws.room) leaveRoom(ws);
       const code = genCode();
       const isPrivate = !!msg.private;
+      const map = msg.map === 'terrain' ? 'terrain' : 'space';
       const room = {
         code,
         hostId: ws.id,
         isPrivate,
+        map,
         sockets: new Set([ws]),
         players: new Map([[ws.id, { name: ws.name, hp: SHIP_MAX_HP, alive: true, kills: 0, deaths: 0 }]]),
         started: false,
@@ -679,9 +698,9 @@ function handleConnection(ws) {
         p.kills = 0;
         p.deaths = 0;
         p.invulnUntil = Date.now() + 2000;
-        spawns[id] = { team: p.team, ...spawnForTeam(p.team) };
+        spawns[id] = { team: p.team, ...spawnForTeam(p.team, room.map) };
       }
-      room.asteroids = generateAsteroidField(60, 400);
+      room.asteroids = room.map === 'terrain' ? [] : generateAsteroidField(60, 400);
       room.matchOver = false;
       room.teamKills = [0, 0];
       room.matchEnd = Date.now() + MATCH_DURATION_MS;
@@ -691,7 +710,7 @@ function handleConnection(ws) {
         const remaining = Math.max(0, (room.matchEnd - Date.now()) / 1000);
         broadcast(room, { type: 'match-state', timer: remaining, teamKills: room.teamKills });
       }, 1000);
-      broadcast(room, { type: 'start', spawns, asteroids: room.asteroids });
+      broadcast(room, { type: 'start', spawns, asteroids: room.asteroids, map: room.map });
       broadcastRoom(room);
       return;
     }
@@ -765,7 +784,7 @@ function handleConnection(ws) {
           stillIn.hp = SHIP_MAX_HP;
           stillIn.alive = true;
           stillIn.invulnUntil = Date.now() + 2000;
-          const sp = spawnForTeam(stillIn.team ?? 0);
+          const sp = spawnForTeam(stillIn.team ?? 0, room.map);
           broadcast(room, { type: 'respawn', id: sid, pos: sp.pos, quat: sp.quat });
         }, RESPAWN_DELAY_MS);
       }
@@ -803,7 +822,7 @@ function handleConnection(ws) {
           stillIn.hp = SHIP_MAX_HP;
           stillIn.alive = true;
           stillIn.invulnUntil = Date.now() + 2000;
-          const sp = spawnForTeam(stillIn.team ?? 0);
+          const sp = spawnForTeam(stillIn.team ?? 0, room.map);
           broadcast(room, { type: 'respawn', id: targetId, pos: sp.pos, quat: sp.quat });
         }, RESPAWN_DELAY_MS);
       }

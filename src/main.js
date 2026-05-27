@@ -7,6 +7,10 @@ import { createBeams } from './beams.js';
 import { createTrails } from './trails.js';
 import { createMothership } from './mothership.js';
 import { createMoon } from './moon.js';
+import { createAirfield, AIRFIELD_HALF } from './airfield.js';
+import { createTerrain, getTerrainHeight, TERRAIN_KILL_CLEARANCE } from './terrain.js';
+import { createTrees } from './trees.js';
+import { createClouds } from './clouds.js';
 import { ThirdPersonCamera } from './camera.js';
 import { Input } from './input.js';
 import { createAudio } from './audio.js';
@@ -40,6 +44,8 @@ export async function startGame(opts = {}) {
   // fragment cost scales quadratically. Big win on integrated GPUs.
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
   renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.BasicShadowMap;
   document.body.appendChild(renderer.domElement);
 
   // Far plane sized to fit the gameplay world (motherships at z=±600 +
@@ -87,56 +93,98 @@ export async function startGame(opts = {}) {
     }
   }
 
-  scene.add(new THREE.AmbientLight(0xffffff, 0.35));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.1);
-  sun.position.set(200, 300, 100);
-  scene.add(sun);
+  const MAP_TYPE = opts.map || 'space';
+  const isTerrainMap = MAP_TYPE === 'terrain';
 
-  scene.background = createSkybox();
+  // Bump far plane for terrain map (3× larger world).
+  if (isTerrainMap) camera.far = 5000;
+  camera.updateProjectionMatrix();
 
-  // Two motherships, facing each other across the field. AABBs are kept
-  // separately for collision (rotating only changes orientation, since the
-  // hull is symmetric in X/Z the world-aligned box stays valid).
-  const MOTHERSHIP_HALF = new THREE.Vector3(45, 18, 35);
-  const mothershipA = createMothership();
-  mothershipA.position.set(0, 0, -600);
-  scene.add(mothershipA);
-
-  const mothershipB = createMothership();
-  mothershipB.position.set(0, 0, 600);
-  mothershipB.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
-  scene.add(mothershipB);
-
-  const motherships = [
-    { pos: mothershipA.position, halfSize: MOTHERSHIP_HALF },
-    { pos: mothershipB.position, halfSize: MOTHERSHIP_HALF },
-  ];
-  const isTrialsMode = !!(opts.solo && opts.mode && opts.mode.startsWith('trials'));
-  if (isTrialsMode) {
-    mothershipA.visible = false;
-    mothershipB.visible = false;
+  let terrainSun = null;
+  if (isTerrainMap) {
+    scene.add(new THREE.AmbientLight(0xfff8e8, 0.60));
+    terrainSun = new THREE.DirectionalLight(0xfff5cc, 1.4);
+    terrainSun.position.set(0, 500, 0);
+    terrainSun.castShadow = true;
+    terrainSun.shadow.mapSize.set(1024, 1024);
+    terrainSun.shadow.camera.left   = -150;
+    terrainSun.shadow.camera.right  =  150;
+    terrainSun.shadow.camera.top    =  150;
+    terrainSun.shadow.camera.bottom = -150;
+    terrainSun.shadow.camera.near   = 1;
+    terrainSun.shadow.camera.far    = 700;
+    scene.add(terrainSun.target);
+    scene.add(terrainSun);
+    scene.background = new THREE.Color(0x6fa8d4);
+    scene.fog = new THREE.Fog(0xbbd5f0, 1400, 4800);
+  } else {
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+    sun.position.set(200, 300, 100);
+    scene.add(sun);
+    scene.background = createSkybox();
   }
 
-  // Indestructible obstacle at the origin: blocks line of sight between
-  // the two motherships and acts as a sphere for ship collision, bullets,
-  // beams, and aim-assist LOS. Added to `obstacles` (passed everywhere
-  // that needs to consider it).
+  const isTrialsMode = !!(opts.solo && opts.mode && opts.mode.startsWith('trials'));
+
+  // Base platforms: motherships for space, airfields for terrain. AABBs kept
+  // separately for collision — same world-aligned box approach either way.
+  const MOTHERSHIP_HALF = new THREE.Vector3(45, 18, 35);
+
+  let platformA, platformB, platformHalf;
+  if (isTerrainMap) {
+    platformHalf = AIRFIELD_HALF;
+    platformA = createAirfield(0);
+    platformA.position.set(0, 0, -1500);
+    scene.add(platformA);
+    platformB = createAirfield(1);
+    platformB.position.set(0, 0, 1500);
+    platformB.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
+    scene.add(platformB);
+  } else {
+    platformHalf = MOTHERSHIP_HALF;
+    platformA = createMothership();
+    platformA.position.set(0, 0, -600);
+    scene.add(platformA);
+    platformB = createMothership();
+    platformB.position.set(0, 0, 600);
+    platformB.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
+    scene.add(platformB);
+  }
+
+  // Keep legacy name alias so all downstream collision code is unchanged.
+  const mothershipA = platformA;
+  const mothershipB = platformB;
+
+  const motherships = [
+    { pos: platformA.position, halfSize: platformHalf },
+    { pos: platformB.position, halfSize: platformHalf },
+  ];
+
+  if (isTrialsMode) {
+    platformA.visible = false;
+    platformB.visible = false;
+  }
+
+  // Terrain map: heightmap ground, trees, clouds.
+  const terrainMesh = isTerrainMap ? createTerrain() : null;
+  if (terrainMesh) {
+    terrainMesh.receiveShadow = true;
+    scene.add(terrainMesh);
+  }
+  if (isTerrainMap) createTrees(scene);
+  const clouds = isTerrainMap ? createClouds(scene) : null;
+
+
+
+  // Indestructible obstacle at the origin (space only).
   const MOON_RADIUS = 80;
-  const moon = createMoon({ radius: MOON_RADIUS, position: [0, 0, 0] });
-  scene.add(moon.mesh);
-  // Aggregated list for raycasts / bullets / aim assist. Currently just
-  // the moon, but the shape (array of {pos, radius}) leaves room for any
-  // future static spheres without rewiring callers.
-  const obstacles = [{ pos: moon.pos, radius: MOON_RADIUS }];
-  // For the solo asteroid generator, fake the moon as a halfSize AABB so
-  // `clipsAvoidance` keeps random rocks from spawning inside it. MP gets
-  // its field from the server, which doesn't know about the moon — a
-  // future server-side change can fix that; visual overlap is harmless
-  // because the moon still blocks collision and shots locally.
-  const moonAvoid = {
-    pos: moon.pos,
-    halfSize: new THREE.Vector3(MOON_RADIUS, MOON_RADIUS, MOON_RADIUS),
-  };
+  const moon = isTerrainMap ? null : createMoon({ radius: MOON_RADIUS, position: [0, 0, 0] });
+  if (moon) scene.add(moon.mesh);
+  const obstacles = moon ? [{ pos: moon.pos, radius: MOON_RADIUS }] : [];
+  const moonAvoid = moon
+    ? { pos: moon.pos, halfSize: new THREE.Vector3(MOON_RADIUS, MOON_RADIUS, MOON_RADIUS) }
+    : null;
 
   const SHIP_SCALE = 1.5;
   const savedHull   = parseInt(getSavedShipColor().replace('#', ''), 16);
@@ -176,10 +224,13 @@ export async function startGame(opts = {}) {
     ship.quaternion.fromArray(opts.spawn.quat);
   } else if (isTrialsMode) {
     ship.position.set(0, 20, -510);
+  } else if (isTerrainMap) {
+    ship.position.set(0, 40, -1400);
   } else {
     ship.position.set(0, 0, -540);
   }
   scene.add(ship);
+  if (isTerrainMap) ship.traverse((o) => { if (o.isMesh) o.castShadow = true; });
 
   // Prefer the server-authoritative field if it was sent in the start
   // message; fall back to local random generation for offline runs.
@@ -187,9 +238,12 @@ export async function startGame(opts = {}) {
     : opts.mode === 'trials3' ? 180
     : opts.mode === 'trials2' ? 150
     : isTrialsMode ? 120 : 60;
-  const asteroids = opts.asteroids
-    ? createAsteroidFieldFromData(opts.asteroids)
-    : createAsteroidField({ count: _trialRockCount, radius: 400, avoid: [...motherships, moonAvoid] });
+  const _avoidList = moonAvoid ? [...motherships, moonAvoid] : [...motherships];
+  const asteroids = isTerrainMap
+    ? createAsteroidFieldFromData([])
+    : (opts.asteroids
+      ? createAsteroidFieldFromData(opts.asteroids)
+      : createAsteroidField({ count: _trialRockCount, radius: 400, avoid: _avoidList }));
   scene.add(asteroids.group);
 
   // ── Time Trials checkpoint data ─────────────────────────────────────────
@@ -560,6 +614,7 @@ export async function startGame(opts = {}) {
     document.body.appendChild(lead);
 
     scene.add(remoteShip);
+    if (isTerrainMap) remoteShip.traverse((o) => { if (o.isMesh) o.castShadow = true; });
     r = {
       id,
       ship: remoteShip,
@@ -778,7 +833,7 @@ export async function startGame(opts = {}) {
         }
         endMatch();
       } else if (msg.type === 'hp') {
-        if (msg.id === myId) myHp = msg.hp;
+        if (msg.id === myId) { if (msg.hp < myHp) healthIdleDamage = 0; myHp = msg.hp; }
         else {
           const r = remotePlayers.get(msg.id);
           if (r) {
@@ -1057,6 +1112,14 @@ export async function startGame(opts = {}) {
   const BOOST_REGEN_DELAY = 1.0;
   let boostMeter = MAX_BOOST;
   let boostIdle = REGEN_DELAY;
+
+  // Health regeneration: after 2s out of combat (no damage taken, no shots
+  // fired) regen ticks +1 HP every 0.1s until full.
+  const HEALTH_REGEN_DELAY    = 2.0;
+  const HEALTH_REGEN_INTERVAL = 0.1;
+  let healthIdleDamage = HEALTH_REGEN_DELAY; // time since last damage received
+  let healthIdleShot   = HEALTH_REGEN_DELAY; // time since last shot fired
+  let healthRegenTick  = 0;                  // accumulator for 0.1s ticks
 
   const boostBar = document.getElementById('boostbar');
   const boostFill = document.getElementById('boostbar-fill');
@@ -1405,10 +1468,26 @@ export async function startGame(opts = {}) {
       audio.play('shoot');
       ammo = Math.max(0, ammo - ammoCost);
       ammoIdle = 0;
+      healthIdleShot = 0;
       fireTimer = gunMode === 'beam' ? BEAM_COOLDOWN : BULLET_COOLDOWN;
     }
     if (ammo < MAX_AMMO && ammoIdle >= REGEN_DELAY) {
       ammo = Math.min(MAX_AMMO, ammo + AMMO_REGEN * dt);
+    }
+
+    // Health regen: tick idle timers; regenerate 1 HP per 0.1s after 2s out of combat.
+    if (myAlive) {
+      healthIdleDamage += dt;
+      healthIdleShot   += dt;
+      if (healthIdleDamage >= HEALTH_REGEN_DELAY && healthIdleShot >= HEALTH_REGEN_DELAY && myHp < SHIP_MAX_HP) {
+        healthRegenTick += dt;
+        if (healthRegenTick >= HEALTH_REGEN_INTERVAL) {
+          healthRegenTick -= HEALTH_REGEN_INTERVAL;
+          myHp = Math.min(SHIP_MAX_HP, myHp + 1);
+        }
+      } else {
+        healthRegenTick = 0;
+      }
     }
 
     // Pick which engine emission profile applies this frame. Brake takes
@@ -1501,7 +1580,7 @@ export async function startGame(opts = {}) {
     }
 
     asteroids.update(dt);
-    moon.update(dt);
+    if (moon) moon.update(dt);
     beams.update(dt);
     bullets.update(
       dt,
@@ -1525,6 +1604,15 @@ export async function startGame(opts = {}) {
       obstacles,
     );
     trails.update(dt, camera);
+    if (clouds) clouds.update(dt);
+
+    // Keep shadow light directly above the player so the frustum stays tight
+    // and the shadow falls straight down regardless of world position.
+    if (terrainSun) {
+      terrainSun.target.position.copy(ship.position);
+      terrainSun.target.updateMatrixWorld();
+      terrainSun.position.set(ship.position.x, ship.position.y + 500, ship.position.z);
+    }
     if (myAlive) {
       resolveCollisions();
       resolveMothershipCollisions();
@@ -2037,6 +2125,7 @@ export async function startGame(opts = {}) {
   // death (the ship is teleported out of contact anyway).
   const touchingAsteroids = new Set();
   let touchingMoon = false;
+  let touchingWater = false;
   function dealSelfDamage(dmg) {
     // Respect spawn protection here as well as in applyPlayerDamageLocal
     // (the server doesn't know about invuln for self-damage messages, so
@@ -2114,6 +2203,22 @@ export async function startGame(opts = {}) {
       }
     }
     touchingMoon = moonContactThisFrame;
+
+    // Terrain map: ground surface is an instant-kill floor.
+    if (isTerrainMap) {
+      const groundY = getTerrainHeight(ship.position.x, ship.position.z);
+      const killY   = groundY + TERRAIN_KILL_CLEARANCE;
+      if (ship.position.y < killY) {
+        ship.position.y = killY;
+        if (shipVelocity.y < 0) shipVelocity.y *= -0.5;
+        if (!touchingWater && SOLO_MODE !== 'tutorial') {
+          dealSelfDamage(SHIP_MAX_HP);
+        }
+        touchingWater = true; // reuse rising-edge flag
+      } else {
+        touchingWater = false;
+      }
+    }
   }
 
   // --- Solo mode wiring -------------------------------------------------
@@ -2271,6 +2376,7 @@ export async function startGame(opts = {}) {
       audio,
       distanceVol,
       hardMode: !!opts.hardMode,
+      terrainHeightFn: isTerrainMap ? getTerrainHeight : null,
       getOpponents: () => {
         const out = [];
         if (playerEntity.team !== team) out.push(playerEntity);
@@ -2292,8 +2398,8 @@ export async function startGame(opts = {}) {
       const pos = ship.position.clone().addScaledVector(fwd, 250);
       spawnBot(1, 1, pos, 'Bot');
     } else if (SOLO_MODE === 'skirmish') {
-      const FRIENDLY_ANCHOR = new THREE.Vector3(0, 0, -540);
-      const ENEMY_ANCHOR = new THREE.Vector3(0, 0, 540);
+      const FRIENDLY_ANCHOR = isTerrainMap ? new THREE.Vector3(0, 40, -1400) : new THREE.Vector3(0, 0, -540);
+      const ENEMY_ANCHOR    = isTerrainMap ? new THREE.Vector3(0, 40,  1400) : new THREE.Vector3(0, 0,  540);
       const jitter = (range) => (Math.random() - 0.5) * range;
       for (let i = 0; i < 4; i++) {
         const pos = FRIENDLY_ANCHOR.clone().add(new THREE.Vector3(jitter(80), jitter(30), jitter(80)));
@@ -2495,6 +2601,7 @@ export async function startGame(opts = {}) {
   function applyPlayerDamageLocal(dmg, killerId, killerTeam) {
     if (!myAlive) return;
     if (myInvulnTimer > 0) return; // spawn protection
+    healthIdleDamage = 0;
     myHp = Math.max(0, myHp - dmg);
     if (myHp <= 0) {
       audio.play('shipdeath');
@@ -2520,8 +2627,8 @@ export async function startGame(opts = {}) {
     let anchor;
     if (SOLO_MODE === 'skirmish') {
       anchor = r.team === 0
-        ? new THREE.Vector3(0, 0, -540)
-        : new THREE.Vector3(0, 0, 540);
+        ? (isTerrainMap ? new THREE.Vector3(0, 40, -1400) : new THREE.Vector3(0, 0, -540))
+        : (isTerrainMap ? new THREE.Vector3(0, 40,  1400) : new THREE.Vector3(0, 0,  540));
     } else {
       anchor = ship.position.clone().add(new THREE.Vector3(
         (Math.random() * 2 - 1), 0, (Math.random() * 2 - 1),
@@ -2561,10 +2668,12 @@ export async function startGame(opts = {}) {
         for (const d of tracerDots) d.visible = false;
         updateTrialsHud();
       } else {
+        const spawnZ = isTerrainMap ? -1400 : -540;
+        const spawnY = isTerrainMap ? 40     : 0;
         pos = [
           (Math.random() - 0.5) * 60,
-          (Math.random() - 0.5) * 20,
-          -540 + (Math.random() - 0.5) * 60,
+          spawnY + (Math.random() - 0.5) * 20,
+          spawnZ + (Math.random() - 0.5) * 60,
         ];
         quat = [0, 0, 0, 1];
       }

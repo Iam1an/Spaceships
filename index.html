@@ -828,12 +828,36 @@
           <span>Private — code only</span>
         </label>
       </div>
+      <div class="privacy-options" style="margin-top:10px">
+        <label class="privacy-option">
+          <input type="radio" name="roomMap" value="space" id="mapSpace" checked />
+          <span class="radio-dot"></span>
+          <span>Space — asteroid field</span>
+        </label>
+        <label class="privacy-option">
+          <input type="radio" name="roomMap" value="terrain" id="mapTerrain" />
+          <span class="radio-dot"></span>
+          <span>Sierras — canyon dogfight</span>
+        </label>
+      </div>
       <button class="big" id="btnPlay">Recruit Players</button>
       <button class="link" id="btnBackCreate">← Back</button>
     </div>
 
     <div id="lobby-single" class="screen hidden">
       <div class="prompt">Single Player</div>
+      <div class="privacy-options" style="margin-bottom:10px">
+        <label class="privacy-option">
+          <input type="radio" name="soloMap" value="space" id="soloMapSpace" checked />
+          <span class="radio-dot"></span>
+          <span>Space</span>
+        </label>
+        <label class="privacy-option">
+          <input type="radio" name="soloMap" value="terrain" id="soloMapTerrain" />
+          <span class="radio-dot"></span>
+          <span>Sierras</span>
+        </label>
+      </div>
       <button class="big" id="btnTutorial">Tutorial</button>
       <button class="big" id="btnTrain">Train with Robot (1v1)</button>
       <button class="big" id="btnSkirmish">Skirmish (5v5)</button>
