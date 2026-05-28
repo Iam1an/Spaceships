@@ -21,9 +21,10 @@ const DETONATE_MARGIN      = 2.0;
 
 // ── Flare countermeasure constants ────────────────────────────────────────────
 const FLARE_SPEED          = 140;   // units/second initial eject speed (fast pop, then hover)
-const FLARE_LIFE           = 4.5;   // seconds before burning out
+const FLARE_LIFE           = 1.8;   // seconds before burning out (short & punchy)
+const FLARE_COUNT          = 20;    // flares ejected per Q press
 const FLARE_SEDUCTION_DIST = 180;   // missile within this range diverts to nearest flare
-const FLARE_TRAIL_INTERVAL = 0.015; // seconds between flare trail particle spawns
+const FLARE_TRAIL_INTERVAL = 0.030; // seconds between flare trail particle spawns
 
 // ── Missile silhouette dimensions (everything along local +Z) ──────────────
 const BODY_LEN  = 3.5;
@@ -288,23 +289,27 @@ export function createMissiles() {
     }
   }
 
-  // Eject two flares: one to port, one to starboard — both angled backward.
-  // Each flare acts as a homing decoy: any missile within FLARE_SEDUCTION_DIST
-  // will divert from its current target onto the nearest flare.
-  function deployFlare(origin, shipQuaternion) {
-    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(shipQuaternion);
-    const up    = new THREE.Vector3(0, 1, 0).applyQuaternion(shipQuaternion);
-    const back  = new THREE.Vector3(0, 0, -1).applyQuaternion(shipQuaternion);
-
-    // Ejection charge pop at the ship.
+  // Eject FLARE_COUNT flares in a full-sphere burst — each in a random direction
+  // so the ship is surrounded by a cloud of decoys. ownerId prevents the
+  // shooter's own in-flight missiles from being seduced by their own flares.
+  function deployFlare(origin, shipQuaternion, ownerId) {
+    // Single ejection-charge burst at the ship centre.
     spawnFlareBurst(origin);
 
-    // Port and starboard flares, angled backward and slightly upward.
-    const spreadDirs = [
-      back.clone().addScaledVector(right,  1.4).addScaledVector(up, 0.5).normalize(),
-      back.clone().addScaledVector(right, -1.4).addScaledVector(up, 0.5).normalize(),
-    ];
-    for (const dir of spreadDirs) {
+    for (let i = 0; i < FLARE_COUNT; i++) {
+      // Uniformly random direction across the full sphere.
+      const theta  = Math.random() * Math.PI * 2;
+      const cosP   = Math.random() * 2 - 1;
+      const sinP   = Math.sqrt(1 - cosP * cosP);
+      const dir    = new THREE.Vector3(
+        sinP * Math.cos(theta),
+        sinP * Math.sin(theta),
+        cosP,
+      ).applyQuaternion(shipQuaternion);
+
+      // Speed variance so flares don't all arrive at the same ring.
+      const speed = FLARE_SPEED * (0.65 + Math.random() * 0.70);
+
       // Bright white-hot inner core.
       const coreMat = new THREE.MeshBasicMaterial({
         color: 0xffffff, transparent: true, opacity: 1.0,
@@ -330,11 +335,12 @@ export function createMissiles() {
         group: flareGroup,
         coreMesh, coreMat,
         glowMesh, glowMat,
-        vel:  dir.clone().multiplyScalar(FLARE_SPEED),
+        vel:  dir.clone().multiplyScalar(speed),
         life: FLARE_LIFE,
         age:  0,
         trailTimer: 0,
         alive: true,
+        ownerId: ownerId ?? null,
       };
       // Self-referencing target record — missiles home onto flareGroup.position.
       flare.targetRecord = {
@@ -357,7 +363,7 @@ export function createMissiles() {
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
-  function fire(origin, direction, targetRecord) {
+  function fire(origin, direction, targetRecord, ownerId) {
     const normDir = direction.clone().normalize();
     const { root, nozzle, glowMat } = makeMissileMesh();
     root.position.copy(origin);
@@ -372,6 +378,7 @@ export function createMissiles() {
       life:       LIFE,
       age:        0,
       trailTimer: 0,
+      ownerId:    ownerId ?? null,
     });
   }
 
@@ -399,6 +406,9 @@ export function createMissiles() {
           let nearestFlareDist = FLARE_SEDUCTION_DIST;
           for (const f of flares) {
             if (!f.alive) continue;
+            // Never let a missile home onto flares deployed by the same player
+            // who fired it — you shouldn't be able to intercept your own shots.
+            if (m.ownerId && f.ownerId && m.ownerId === f.ownerId) continue;
             const fd = m.mesh.position.distanceTo(f.group.position);
             if (fd < nearestFlareDist) { nearestFlareDist = fd; nearestFlare = f; }
           }

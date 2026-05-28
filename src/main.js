@@ -934,7 +934,7 @@ export async function startGame(opts = {}) {
             const targetRecord = (shot.targetId === myId)
               ? localShipRecord
               : (remotePlayers.get(shot.targetId) ?? null);
-            missileSystem.fire(origin, dir, targetRecord);
+            missileSystem.fire(origin, dir, targetRecord, msg.id);
           }
         } else {
           for (const shot of msg.shots) {
@@ -953,7 +953,7 @@ export async function startGame(opts = {}) {
         // missiles running on this client (e.g. missiles we fired at that player).
         const fPos  = new THREE.Vector3().fromArray(msg.pos);
         const fQuat = new THREE.Quaternion().fromArray(msg.quat);
-        missileSystem.deployFlare(fPos, fQuat);
+        missileSystem.deployFlare(fPos, fQuat, msg.id);
       } else if (msg.type === 'match-credits') {
         updateCachedCredits(msg.totalCredits);
         if (Array.isArray(msg.earned) && msg.earned.length) {
@@ -1563,7 +1563,7 @@ export async function startGame(opts = {}) {
       if (closestRecord !== null) {
         const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
         const mslOrigin = ship.position.clone().addScaledVector(fwd, 6);
-        missileSystem.fire(mslOrigin, fwd, closestRecord);
+        missileSystem.fire(mslOrigin, fwd, closestRecord, myId);
         missilesLeft--;
         audio.play('shoot');
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1584,7 +1584,7 @@ export async function startGame(opts = {}) {
     // Q: deploy flares (key-down edge). Hold still activates arrow-key fine-aim.
     const nowKeyQ = input.keys.has('KeyQ');
     if (nowKeyQ && !prevKeyQ && myAlive && flaresLeft > 0) {
-      missileSystem.deployFlare(ship.position.clone(), ship.quaternion);
+      missileSystem.deployFlare(ship.position.clone(), ship.quaternion, myId);
       flaresLeft--;
       audio.play('shoot');
       if (ws && ws.readyState === WebSocket.OPEN) {
