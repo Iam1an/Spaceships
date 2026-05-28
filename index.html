@@ -108,6 +108,33 @@
 
     #deathbanner { position: fixed; left: 50%; top: 38%; color: #ff8a8a; font-size: clamp(28px,6vw,48px); text-shadow: 0 0 12px #ff2a2a,3px 3px 0 #2a0000; transform: translateX(-50%) rotate(-2deg); pointer-events: none; display: none; }
 
+    /* ── Killfeed ────────────────────────────────────────────────────── */
+    #killfeed {
+      position: fixed; top: 44px; left: 10px;
+      display: flex; flex-direction: column; gap: 4px;
+      pointer-events: none; z-index: 4;
+      max-width: min(260px, 70vw);
+    }
+    .kf-entry {
+      display: flex; align-items: center; gap: 6px;
+      padding: 4px 10px 4px 8px;
+      background: rgba(4,10,22,0.84);
+      border-left: 2px solid #4aa3ff;
+      border-radius: 0 7px 7px 0;
+      font-size: 11px; letter-spacing: 0.5px;
+      white-space: nowrap; overflow: hidden;
+      box-shadow: 0 1px 8px rgba(0,0,0,0.5);
+      animation: kf-in 0.22s cubic-bezier(0.22,1,0.36,1) forwards;
+    }
+    .kf-entry.kf-fading { animation: kf-out 0.4s ease forwards; }
+    .kf-killer { color: #66ddff; font-weight: 600; max-width: 90px; overflow: hidden; text-overflow: ellipsis; }
+    .kf-killer.kf-you { color: #ffe07a; }
+    .kf-icon { color: rgba(176,200,255,0.55); font-size: 9px; flex-shrink: 0; }
+    .kf-victim { color: #8fb6d6; max-width: 90px; overflow: hidden; text-overflow: ellipsis; }
+    .kf-victim.kf-you { color: #ff8a8a; }
+    @keyframes kf-in  { from { transform: translateX(-110%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    @keyframes kf-out { from { transform: translateX(0); opacity: 1; } to { transform: translateX(-110%); opacity: 0; } }
+
     #tutorial-panel {
       position: fixed; left: 50%; top: 72px; transform: translateX(-50%);
       width: min(90vw, 540px);
@@ -953,6 +980,7 @@
 
   <!-- In-game HUD (hidden until game starts) -->
   <div id="hud-stats" style="display:none"></div>
+  <div id="killfeed"></div>
   <div id="reticle" style="display:none"></div>
   <div id="healthbar" style="display:none">
     <div id="healthbar-fill"></div>

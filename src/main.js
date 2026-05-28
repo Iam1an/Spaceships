@@ -851,6 +851,11 @@ export async function startGame(opts = {}) {
         audio.play('shipdeath', distanceVol(deathPos));
         if (msg.id === myId) killSelf();
         else killRemote(msg.id);
+        if (msg.killerId) {
+          const kn = scores.get(msg.killerId)?.name || 'Pilot';
+          const vn = scores.get(msg.id)?.name || 'Pilot';
+          pushKillFeed(kn, vn, msg.killerId === myId, msg.id === myId);
+        }
       } else if (msg.type === 'respawn') {
         if (msg.id === myId) {
           myInvulnTimer = SPAWN_INVULN_DURATION;
@@ -1924,6 +1929,36 @@ export async function startGame(opts = {}) {
     }, 1500);
   }
 
+  const killfeedEl = document.getElementById('killfeed');
+  function pushKillFeed(killerName, victimName, isYouKiller, isYouVictim) {
+    if (!killfeedEl) return;
+    const entry = document.createElement('div');
+    entry.className = 'kf-entry';
+
+    const kEl = document.createElement('span');
+    kEl.className = 'kf-killer' + (isYouKiller ? ' kf-you' : '');
+    kEl.textContent = killerName;
+
+    const iEl = document.createElement('span');
+    iEl.className = 'kf-icon';
+    iEl.textContent = '→';
+
+    const vEl = document.createElement('span');
+    vEl.className = 'kf-victim' + (isYouVictim ? ' kf-you' : '');
+    vEl.textContent = victimName;
+
+    entry.appendChild(kEl);
+    entry.appendChild(iEl);
+    entry.appendChild(vEl);
+    killfeedEl.insertBefore(entry, killfeedEl.firstChild);
+    while (killfeedEl.children.length > 5) killfeedEl.removeChild(killfeedEl.lastChild);
+
+    setTimeout(() => {
+      entry.classList.add('kf-fading');
+      setTimeout(() => { if (entry.parentNode) entry.parentNode.removeChild(entry); }, 420);
+    }, 3600);
+  }
+
   // Aim assist: damped magnetic pull toward closest enemy in the forward
   // cone. Two layers of smoothing prevent jank:
   //   1. assistStrengthSmoothed ramps up/down as targets enter/exit cone.
@@ -2590,6 +2625,11 @@ export async function startGame(opts = {}) {
       if (isSolo && killerId === opts.you && r.isBot) soloBotsKilled++;
       const ds = scores.get(id);
       if (ds) ds.deaths += 1;
+      if (killerId !== undefined && killerId !== null) {
+        const kn = scores.get(killerId)?.name || 'Pilot';
+        const vn = scores.get(id)?.name || 'Bot';
+        pushKillFeed(kn, vn, killerId === opts.you, false);
+      }
       renderScoreboard();
       renderMatchHud();
     } else {
@@ -2616,6 +2656,11 @@ export async function startGame(opts = {}) {
       }
       const me = scores.get(opts.you);
       if (me) me.deaths += 1;
+      if (killerId !== undefined && killerId !== null) {
+        const kn = scores.get(killerId)?.name || 'Bot';
+        const vn = scores.get(opts.you)?.name || opts.pilotName || 'Pilot';
+        pushKillFeed(kn, vn, false, true);
+      }
       renderScoreboard();
       renderMatchHud();
     }
