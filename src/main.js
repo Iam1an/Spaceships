@@ -880,7 +880,12 @@ export async function startGame(opts = {}) {
           const r = remotePlayers.get(msg.id);
           if (r) {
             // HP drop = trigger hit flash before overwriting.
-            if (msg.hp < r.hp) r.hitFlash = 1;
+            if (msg.hp < r.hp) {
+              r.hitFlash = 1;
+              // Tell mpBot AI it was hit so it can switch to evasion.
+              const mpb = mpBots.find(b => b.id === msg.id);
+              if (mpb) mpb.ai.notifyHit();
+            }
             r.hp = msg.hp;
           }
         }
@@ -906,6 +911,9 @@ export async function startGame(opts = {}) {
           reviveSelf(msg.pos, msg.quat);
         } else {
           reviveRemote(msg.id, msg.pos, msg.quat);
+          // Reset mpBot AI state so it starts fresh from the new spawn point.
+          const mpb = mpBots.find(b => b.id === msg.id);
+          if (mpb) mpb.ai.notifyRespawn();
         }
       } else if (msg.type === 'fire' && msg.id !== myId) {
         const shooterTeam = scores.get(msg.id)?.team ?? null;
@@ -1821,11 +1829,29 @@ export async function startGame(opts = {}) {
         }));
       }
     }
+    // Tick host-driven multiplayer bots and broadcast their positions.
+    if (!isSolo && mpBots.length > 0 && !matchOver) {
+      mpBotStateTimer += dt;
+      const sendBotState = mpBotStateTimer >= STATE_INTERVAL;
+      if (sendBotState) mpBotStateTimer = 0;
+      for (const b of mpBots) {
+        b.ai.update(dt);
+        if (sendBotState && b.record.alive && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'bot-state',
+            botId: b.id,
+            pos: b.record.ship.position.toArray(),
+            quat: b.record.ship.quaternion.toArray(),
+          }));
+        }
+      }
+    }
+
     // Smooth remote players toward their last reported pose.
     const remoteLerp = 1 - Math.pow(0.001, dt * 8);
     for (const r of remotePlayers.values()) {
-      // Solo bots write ship.position directly each frame; lerp is for remote players only.
-      if (r.isBot && isSolo) continue;
+      // Solo bots and host-driven mp bots write position directly; lerp is for network players only.
+      if (r.isBot && (isSolo || r.isMpBot)) continue;
       r.ship.position.lerp(r.targetPos, remoteLerp);
       r.ship.quaternion.slerp(r.targetQuat, remoteLerp);
     }
@@ -2578,6 +2604,8 @@ export async function startGame(opts = {}) {
   };
 
   const bots = []; // { id, team, record, ai, entity }
+  const mpBots = []; // host-driven hard-mode bots for multiplayer team balance
+  let mpBotStateTimer = 0;
   function spawnBot(id, team, position, name) {
     const r = getOrCreateRemote(id);
     r.isBot = true;
@@ -2639,6 +2667,88 @@ export async function startGame(opts = {}) {
     }
   }
   if (isSolo) spawnSoloEntities();
+
+  // Spawn host-driven bots for multiplayer team balancing.
+  function spawnMultiplayerBot(id, team, spawnPos, spawnQuat) {
+    scores.set(id, { name: 'Bot [Hard]', team, kills: 0, deaths: 0 });
+    const r = getOrCreateRemote(id);
+    r.isBot = true;
+    r.isMpBot = true;
+    r.team = team;
+    refreshMarker(r);
+    r.alive = true;
+    r.hp = SHIP_MAX_HP;
+    r.ship.position.copy(spawnPos);
+    r.ship.quaternion.copy(spawnQuat);
+    r.targetPos.copy(spawnPos);
+    r.targetQuat.copy(spawnQuat);
+    r.hasTarget = true;
+
+    // Entities for opponent lookup — takeHit routes damage through the server.
+    const localOpponent = {
+      id: myId,
+      get team() { return myTeam; },
+      get position() { return ship.position; },
+      get velocity() { return shipVelocity; },
+      get alive() { return myAlive; },
+      takeHit(_dmg, killerBotId) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'hit', targetId: myId, fromBotId: killerBotId, kind: 'bullet' }));
+        }
+      },
+    };
+    function makeRemoteOpponent(rp) {
+      return {
+        id: rp.id,
+        get team() { return rp.team; },
+        get position() { return rp.ship.position; },
+        get velocity() { return rp.vel; },
+        get alive() { return rp.alive; },
+        takeHit(_dmg, killerBotId) {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'hit', targetId: rp.id, fromBotId: killerBotId, kind: 'bullet' }));
+          }
+        },
+      };
+    }
+
+    const ai = createBotAI(r, {
+      team,
+      faction: team === myTeam ? 'ally' : 'enemy',
+      beams, bullets, asteroids, obstacles,
+      solveIntercept, raySphereDist, audio, distanceVol,
+      hardMode: true,
+      terrainHeightFn: isTerrainMap ? getTerrainHeight : null,
+      onFire: (start, dir) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'bot-fire',
+            botId: id,
+            kind: 'bullet',
+            shots: [{ pos: [start.x, start.y, start.z], dir: [dir.x, dir.y, dir.z] }],
+          }));
+        }
+      },
+      getOpponents: () => {
+        const out = [];
+        if (localOpponent.team !== team) out.push(localOpponent);
+        for (const [, rp] of remotePlayers) {
+          if (rp.alive && rp.team !== team) out.push(makeRemoteOpponent(rp));
+        }
+        return out;
+      },
+    });
+
+    mpBots.push({ id, team, record: r, ai });
+  }
+
+  if (!isSolo && opts.host && Array.isArray(opts.botAssignments)) {
+    for (const ba of opts.botAssignments) {
+      const pos = new THREE.Vector3().fromArray(ba.pos || [0, 0, 0]);
+      const quat = new THREE.Quaternion().fromArray(ba.quat || [0, 0, 0, 1]);
+      spawnMultiplayerBot(ba.id, ba.team, pos, quat);
+    }
+  }
 
   // ---- Tutorial mode ---------------------------------------------------
   // Step machine that gates progression on real input/state changes, with

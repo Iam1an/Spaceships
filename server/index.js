@@ -572,6 +572,13 @@ function leaveRoom(ws) {
   room.sockets.delete(ws);
   room.players.delete(ws.id);
   ws.room = null;
+  // If the bot host leaves, evict their bots — nobody drives them anymore.
+  if (room.botHostId === ws.id) {
+    for (const [id, p] of [...room.players]) {
+      if (p.isBot) room.players.delete(id);
+    }
+    room.botHostId = null;
+  }
   // Count humans separately from bots — a room of only bots has nobody
   // to listen to broadcasts, so it should be torn down.
   let nextHostId = null;
@@ -700,6 +707,28 @@ function handleConnection(ws) {
         p.invulnUntil = Date.now() + 2000;
         spawns[id] = { team: p.team, ...spawnForTeam(p.team, room.map) };
       }
+      // Balance teams: add a hard-mode bot to the smaller team if uneven.
+      const team0Count = [...room.players.values()].filter(p => p.team === 0).length;
+      const team1Count = [...room.players.values()].filter(p => p.team === 1).length;
+      const botAssignments = [];
+      if (team0Count !== team1Count) {
+        const smallerTeam = team0Count < team1Count ? 0 : 1;
+        const botId = -(nextId++);
+        const sp = spawnForTeam(smallerTeam, room.map);
+        room.players.set(botId, {
+          name: 'Bot [Hard]',
+          hp: SHIP_MAX_HP,
+          alive: true,
+          kills: 0,
+          deaths: 0,
+          team: smallerTeam,
+          isBot: true,
+          invulnUntil: Date.now() + 2000,
+        });
+        spawns[botId] = { team: smallerTeam, ...sp };
+        room.botHostId = ws.id;
+        botAssignments.push({ id: botId, team: smallerTeam, pos: sp.pos, quat: sp.quat });
+      }
       room.asteroids = room.map === 'terrain' ? [] : generateAsteroidField(60, 400);
       room.matchOver = false;
       room.teamKills = [0, 0];
@@ -710,8 +739,40 @@ function handleConnection(ws) {
         const remaining = Math.max(0, (room.matchEnd - Date.now()) / 1000);
         broadcast(room, { type: 'match-state', timer: remaining, teamKills: room.teamKills });
       }, 1000);
-      broadcast(room, { type: 'start', spawns, asteroids: room.asteroids, map: room.map });
+      broadcast(room, { type: 'start', spawns, asteroids: room.asteroids, map: room.map, botAssignments });
       broadcastRoom(room);
+      return;
+    }
+
+    if (msg.type === 'bot-state') {
+      const room = ws.room;
+      if (!room || !room.started) return;
+      if (ws.id !== room.botHostId) return;
+      const bot = room.players.get(msg.botId);
+      if (!bot || !bot.isBot) return;
+      const out = JSON.stringify({
+        type: 'state',
+        id: msg.botId,
+        pos: msg.pos,
+        quat: msg.quat,
+        boost: false,
+      });
+      for (const c of room.sockets) {
+        if (c !== ws && c.open) c.send(out);
+      }
+      return;
+    }
+
+    if (msg.type === 'bot-fire') {
+      const room = ws.room;
+      if (!room || !room.started) return;
+      if (ws.id !== room.botHostId) return;
+      const bot = room.players.get(msg.botId);
+      if (!bot || !bot.isBot || !bot.alive) return;
+      const out = JSON.stringify({ type: 'fire', id: msg.botId, kind: 'bullet', shots: msg.shots });
+      for (const c of room.sockets) {
+        if (c !== ws && c.open) c.send(out);
+      }
       return;
     }
 
@@ -807,14 +868,23 @@ function handleConnection(ws) {
       const room = ws.room;
       if (!room || !room.started) return;
       const target = room.players.get(msg.targetId);
-      const shooter = room.players.get(ws.id);
       if (!target || !target.alive) return;
+      // Determine the effective shooter: either the sender or a bot they drive.
+      let effectiveShooterId = ws.id;
+      if (msg.fromBotId !== undefined && msg.fromBotId !== null) {
+        if (ws.id !== room.botHostId) return; // only bot host may report bot hits
+        const botShooter = room.players.get(msg.fromBotId);
+        if (!botShooter || !botShooter.isBot || !botShooter.alive) return;
+        effectiveShooterId = msg.fromBotId;
+      }
+      const shooter = room.players.get(effectiveShooterId);
       if (!shooter) return;
       // Guns (bullet/beam) require the shooter to be alive — you can't fire
       // after death. Missiles are already in-flight when they hit, so a
       // shooter who died mid-flight still gets credit and the hit lands.
       if (!shooter.alive && msg.kind !== 'missile') return;
-      if (msg.targetId === ws.id) return;           // no self-damage
+      // No self-damage, but a bot driving the host can hit the host's ship.
+      if (msg.targetId === ws.id && !msg.fromBotId) return;
       if (target.team !== undefined && target.team === shooter.team) return; // no friendly fire
       if (target.invulnUntil && Date.now() < target.invulnUntil) return; // spawn protection
       // Per-weapon damage. Buffed bullets to match beam at 10 per hit so
@@ -829,7 +899,7 @@ function handleConnection(ws) {
         if (room.teamKills && shooter.team !== undefined) {
           room.teamKills[shooter.team] = (room.teamKills[shooter.team] || 0) + 1;
         }
-        broadcast(room, { type: 'death', id: msg.targetId, killerId: ws.id });
+        broadcast(room, { type: 'death', id: msg.targetId, killerId: effectiveShooterId });
         broadcastRoom(room);
         const targetId = msg.targetId;
         setTimeout(() => {

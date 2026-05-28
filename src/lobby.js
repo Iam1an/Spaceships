@@ -33,6 +33,7 @@ let isHost = false;
 let mySpawn = null;
 let myAsteroids = null;
 let myMap = 'space';
+let myBotAssignments = [];
 let lastPlayers = [];
 
 const nameInput = document.getElementById('nameInput');
@@ -304,6 +305,7 @@ function handle(msg) {
       mySpawn = msg.spawns?.[myId] || null;
       myAsteroids = msg.asteroids || null;
       myMap = msg.map || 'space';
+      myBotAssignments = isHost ? (msg.botAssignments || []) : [];
       enterGame();
       break;
     case 'rooms-list':
@@ -360,6 +362,7 @@ function enterGame() {
     hardMode: hardMode(),
     pilotName: pilotName(),
     map: myMap,
+    botAssignments: myBotAssignments,
   });
 }
 
