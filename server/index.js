@@ -797,7 +797,11 @@ function handleConnection(ws) {
       const target = room.players.get(msg.targetId);
       const shooter = room.players.get(ws.id);
       if (!target || !target.alive) return;
-      if (!shooter || !shooter.alive) return;       // dead players can't damage
+      if (!shooter) return;
+      // Guns (bullet/beam) require the shooter to be alive — you can't fire
+      // after death. Missiles are already in-flight when they hit, so a
+      // shooter who died mid-flight still gets credit and the hit lands.
+      if (!shooter.alive && msg.kind !== 'missile') return;
       if (msg.targetId === ws.id) return;           // no self-damage
       if (target.team !== undefined && target.team === shooter.team) return; // no friendly fire
       if (target.invulnUntil && Date.now() < target.invulnUntil) return; // spawn protection
