@@ -71,11 +71,19 @@ db.exec(`
 // ── Rank thresholds ───────────────────────────────────────────────────────────
 
 function computeRank(totalKills) {
-  if (totalKills >= 500) return 'Admiral';
-  if (totalKills >= 250) return 'Commander';
-  if (totalKills >= 100) return 'Veteran';
-  if (totalKills >= 50)  return 'Ace';
-  if (totalKills >= 10)  return 'Pilot';
+  if (totalKills >= 10000) return 'Grand Admiral';
+  if (totalKills >= 5000)  return 'Fleet Admiral';
+  if (totalKills >= 2500)  return 'Vice Admiral';
+  if (totalKills >= 1500)  return 'Rear Admiral';
+  if (totalKills >= 1000)  return 'Commodore';
+  if (totalKills >= 750)   return 'Captain';
+  if (totalKills >= 500)   return 'Admiral';
+  if (totalKills >= 250)   return 'Commander';
+  if (totalKills >= 100)   return 'Veteran';
+  if (totalKills >= 50)    return 'Ace';
+  if (totalKills >= 25)    return 'Flight Officer';
+  if (totalKills >= 10)    return 'Pilot';
+  if (totalKills >= 5)     return 'Recruit';
   return 'Cadet';
 }
 
@@ -93,27 +101,49 @@ const ACHIEVEMENT_DEFS = [
   { type: 'kills_50',          label: 'Ace',                icon: '⚔',  desc: 'Reach 50 total kills',                        reward:   350, check: p => p.total_kills >= 50,   progress: p => ({ current: Math.min(p.total_kills, 50),   target: 50 }) },
   { type: 'kills_100',         label: 'Veteran',            icon: '🏆', desc: 'Reach 100 total kills',                       reward:   600, check: p => p.total_kills >= 100,  progress: p => ({ current: Math.min(p.total_kills, 100),  target: 100 }) },
   { type: 'kills_500',         label: 'Legend',             icon: '👑', desc: 'Reach 500 total kills',                       reward:  2500, check: p => p.total_kills >= 500,  progress: p => ({ current: Math.min(p.total_kills, 500),  target: 500 }) },
-  { type: 'kills_1000',        label: 'Living Weapon',      icon: '☠',  desc: 'Reach 1000 total kills',                      reward:  5000, check: p => p.total_kills >= 1000, progress: p => ({ current: Math.min(p.total_kills, 1000), target: 1000 }) },
+  { type: 'kills_1000',        label: 'Living Weapon',      icon: '☠',  desc: 'Reach 1000 total kills',                      reward:  5000, check: p => p.total_kills >= 1000,  progress: p => ({ current: Math.min(p.total_kills, 1000),  target: 1000 }) },
+  { type: 'kills_2500',        label: 'Destroyer',          icon: '🌑', desc: 'Reach 2500 total kills',                      reward: 10000, check: p => p.total_kills >= 2500,  progress: p => ({ current: Math.min(p.total_kills, 2500),  target: 2500 }) },
+  { type: 'kills_5000',        label: 'Apocalypse',         icon: '🌋', desc: 'Reach 5000 total kills',                      reward: 25000, check: p => p.total_kills >= 5000,  progress: p => ({ current: Math.min(p.total_kills, 5000),  target: 5000 }) },
+  { type: 'kills_10000',       label: 'God of War',         icon: '🔱', desc: 'Reach 10000 total kills',                     reward: 50000, check: p => p.total_kills >= 10000, progress: p => ({ current: Math.min(p.total_kills, 10000), target: 10000 }) },
   // ── Best single-match kills ───────────────────────────────────────────────────
   { type: 'highscore_5',       label: 'Hot Streak',         icon: '🌡', desc: '5 kills in a single match',                   reward:   150, check: p => p.high_score >= 5,     progress: p => ({ current: Math.min(p.high_score, 5),   target: 5 }) },
   { type: 'highscore_10',      label: 'Unstoppable',        icon: '🌩', desc: '10 kills in a single match',                  reward:   300, check: p => p.high_score >= 10,    progress: p => ({ current: Math.min(p.high_score, 10),  target: 10 }) },
   { type: 'highscore_20',      label: 'Killing Machine',    icon: '💣', desc: '20 kills in a single match',                  reward:   750, check: p => p.high_score >= 20,    progress: p => ({ current: Math.min(p.high_score, 20),  target: 20 }) },
+  { type: 'highscore_30',      label: 'Rampage',            icon: '🌪', desc: '30 kills in a single match',                  reward:  1500, check: p => p.high_score >= 30,    progress: p => ({ current: Math.min(p.high_score, 30),  target: 30 }) },
+  { type: 'highscore_50',      label: 'Obliterator',        icon: '💥', desc: '50 kills in a single match',                  reward:  3500, check: p => p.high_score >= 50,    progress: p => ({ current: Math.min(p.high_score, 50),  target: 50 }) },
   // ── Match wins ────────────────────────────────────────────────────────────────
-  { type: 'first_win',         label: 'First Victory',      icon: '🥇', desc: 'Win your first match',                        reward:   200, check: p => p.matches_won >= 1,    progress: p => ({ current: Math.min(p.matches_won, 1),  target: 1 }) },
-  { type: 'wins_5',            label: 'On a Roll',          icon: '🔥', desc: 'Win 5 matches',                               reward:   400, check: p => p.matches_won >= 5,    progress: p => ({ current: Math.min(p.matches_won, 5),  target: 5 }) },
-  { type: 'wins_25',           label: 'Dominant Force',     icon: '💪', desc: 'Win 25 matches',                              reward:  1500, check: p => p.matches_won >= 25,   progress: p => ({ current: Math.min(p.matches_won, 25), target: 25 }) },
-  { type: 'wins_50',           label: 'Warlord',            icon: '🎖', desc: 'Win 50 matches',                              reward:  3000, check: p => p.matches_won >= 50,   progress: p => ({ current: Math.min(p.matches_won, 50), target: 50 }) },
+  { type: 'first_win',         label: 'First Victory',      icon: '🥇', desc: 'Win your first match',                        reward:   200, check: p => p.matches_won >= 1,    progress: p => ({ current: Math.min(p.matches_won, 1),   target: 1 }) },
+  { type: 'wins_5',            label: 'On a Roll',          icon: '🔥', desc: 'Win 5 matches',                               reward:   400, check: p => p.matches_won >= 5,    progress: p => ({ current: Math.min(p.matches_won, 5),   target: 5 }) },
+  { type: 'wins_25',           label: 'Dominant Force',     icon: '💪', desc: 'Win 25 matches',                              reward:  1500, check: p => p.matches_won >= 25,   progress: p => ({ current: Math.min(p.matches_won, 25),  target: 25 }) },
+  { type: 'wins_50',           label: 'Warlord',            icon: '🎖', desc: 'Win 50 matches',                              reward:  3000, check: p => p.matches_won >= 50,   progress: p => ({ current: Math.min(p.matches_won, 50),  target: 50 }) },
+  { type: 'wins_100',          label: 'Conqueror',          icon: '🏅', desc: 'Win 100 matches',                             reward:  5000, check: p => p.matches_won >= 100,  progress: p => ({ current: Math.min(p.matches_won, 100), target: 100 }) },
+  { type: 'wins_250',          label: 'Supreme Commander',  icon: '🌠', desc: 'Win 250 matches',                             reward: 15000, check: p => p.matches_won >= 250,  progress: p => ({ current: Math.min(p.matches_won, 250), target: 250 }) },
+  { type: 'wins_500',          label: 'Overlord',           icon: '🏛', desc: 'Win 500 matches',                             reward: 30000, check: p => p.matches_won >= 500,  progress: p => ({ current: Math.min(p.matches_won, 500), target: 500 }) },
   // ── Matches played ────────────────────────────────────────────────────────────
-  { type: 'matches_10',        label: 'Frequent Flyer',     icon: '🚀', desc: 'Play 10 matches',                             reward:   100, check: p => p.games_played >= 10,  progress: p => ({ current: Math.min(p.games_played, 10),  target: 10 }) },
-  { type: 'matches_50',        label: 'Battle-Hardened',    icon: '🛡', desc: 'Play 50 matches',                             reward:   500, check: p => p.games_played >= 50,  progress: p => ({ current: Math.min(p.games_played, 50),  target: 50 }) },
-  { type: 'matches_100',       label: 'Iron Pilot',         icon: '🔩', desc: 'Play 100 matches',                            reward:  1500, check: p => p.games_played >= 100, progress: p => ({ current: Math.min(p.games_played, 100), target: 100 }) },
+  { type: 'matches_10',        label: 'Frequent Flyer',     icon: '🚀', desc: 'Play 10 matches',                             reward:   100, check: p => p.games_played >= 10,   progress: p => ({ current: Math.min(p.games_played, 10),   target: 10 }) },
+  { type: 'matches_50',        label: 'Battle-Hardened',    icon: '🛡', desc: 'Play 50 matches',                             reward:   500, check: p => p.games_played >= 50,   progress: p => ({ current: Math.min(p.games_played, 50),   target: 50 }) },
+  { type: 'matches_100',       label: 'Iron Pilot',         icon: '🔩', desc: 'Play 100 matches',                            reward:  1500, check: p => p.games_played >= 100,  progress: p => ({ current: Math.min(p.games_played, 100),  target: 100 }) },
+  { type: 'matches_250',       label: 'Seasoned Pilot',     icon: '🗺', desc: 'Play 250 matches',                            reward:  2500, check: p => p.games_played >= 250,  progress: p => ({ current: Math.min(p.games_played, 250),  target: 250 }) },
+  { type: 'matches_500',       label: 'War Machine',        icon: '🌍', desc: 'Play 500 matches',                            reward:  6000, check: p => p.games_played >= 500,  progress: p => ({ current: Math.min(p.games_played, 500),  target: 500 }) },
+  { type: 'matches_1000',      label: 'Eternal Pilot',      icon: '🌌', desc: 'Play 1000 matches',                           reward: 15000, check: p => p.games_played >= 1000, progress: p => ({ current: Math.min(p.games_played, 1000), target: 1000 }) },
   // ── Bot kills ─────────────────────────────────────────────────────────────────
-  { type: 'bot_hunter',        label: 'Bot Hunter',         icon: '🤖', desc: 'Destroy 10 bots',                             reward:   100, check: p => p.bots_killed >= 10,   progress: p => ({ current: Math.min(p.bots_killed, 10),  target: 10 }) },
-  { type: 'bot_slayer',        label: 'Bot Slayer',         icon: '💀', desc: 'Destroy 100 bots',                            reward:   500, check: p => p.bots_killed >= 100,  progress: p => ({ current: Math.min(p.bots_killed, 100), target: 100 }) },
-  { type: 'bot_exterminator',  label: 'Bot Exterminator',   icon: '🔧', desc: 'Destroy 500 bots',                            reward:  2000, check: p => p.bots_killed >= 500,  progress: p => ({ current: Math.min(p.bots_killed, 500), target: 500 }) },
+  { type: 'bot_hunter',        label: 'Bot Hunter',         icon: '🤖', desc: 'Destroy 10 bots',                             reward:   100, check: p => p.bots_killed >= 10,    progress: p => ({ current: Math.min(p.bots_killed, 10),    target: 10 }) },
+  { type: 'bot_slayer',        label: 'Bot Slayer',         icon: '💀', desc: 'Destroy 100 bots',                            reward:   500, check: p => p.bots_killed >= 100,   progress: p => ({ current: Math.min(p.bots_killed, 100),   target: 100 }) },
+  { type: 'bot_exterminator',  label: 'Bot Exterminator',   icon: '🔧', desc: 'Destroy 500 bots',                            reward:  2000, check: p => p.bots_killed >= 500,   progress: p => ({ current: Math.min(p.bots_killed, 500),   target: 500 }) },
+  { type: 'bot_overlord',      label: 'Bot Overlord',       icon: '🦾', desc: 'Destroy 1000 bots',                           reward:  4000, check: p => p.bots_killed >= 1000,  progress: p => ({ current: Math.min(p.bots_killed, 1000),  target: 1000 }) },
+  { type: 'bot_apocalypse',    label: 'Bot Apocalypse',     icon: '🤯', desc: 'Destroy 5000 bots',                           reward: 15000, check: p => p.bots_killed >= 5000,  progress: p => ({ current: Math.min(p.bots_killed, 5000),  target: 5000 }) },
   // ── KDR ───────────────────────────────────────────────────────────────────────
-  { type: 'kdr_positive',      label: 'Breaking Even',      icon: '⚖',  desc: 'Reach a 1.0+ KDR (min 10 deaths)',           reward:   750, check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths,     progress: null },
-  { type: 'kdr_2',             label: 'Skilled Hunter',     icon: '🦅', desc: 'Reach a 2.0+ KDR (min 10 deaths)',           reward:  2000, check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 2, progress: null },
+  { type: 'kdr_positive',      label: 'Breaking Even',      icon: '⚖',  desc: 'Reach a 1.0+ KDR (min 10 deaths)',           reward:   750, check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths,          progress: null },
+  { type: 'kdr_2',             label: 'Skilled Hunter',     icon: '🦅', desc: 'Reach a 2.0+ KDR (min 10 deaths)',           reward:  2000, check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 2,      progress: null },
+  { type: 'kdr_3',             label: 'Deadeye',            icon: '🐺', desc: 'Reach a 3.0+ KDR (min 10 deaths)',           reward:  3500, check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 3,      progress: null },
+  { type: 'kdr_5',             label: 'Ghost',              icon: '👁', desc: 'Reach a 5.0+ KDR (min 10 deaths)',           reward:  8000, check: p => p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 5,      progress: null },
+  // ── Deaths (perseverance) ─────────────────────────────────────────────────────
+  { type: 'deaths_10',         label: 'First Casualty',     icon: '🩹', desc: 'Die 10 times',                               reward:    25, check: p => p.total_deaths >= 10,  progress: p => ({ current: Math.min(p.total_deaths, 10),  target: 10 }) },
+  { type: 'deaths_100',        label: 'Crash Test Pilot',   icon: '⚰', desc: 'Die 100 times',                              reward:   100, check: p => p.total_deaths >= 100, progress: p => ({ current: Math.min(p.total_deaths, 100), target: 100 }) },
+  { type: 'deaths_500',        label: 'Sacrifice',          icon: '🕯', desc: 'Die 500 times',                              reward:   250, check: p => p.total_deaths >= 500, progress: p => ({ current: Math.min(p.total_deaths, 500), target: 500 }) },
+  // ── Losses (perseverance) ─────────────────────────────────────────────────────
+  { type: 'losses_10',         label: 'Learning Curve',     icon: '📉', desc: 'Lose 10 matches',                            reward:    50, check: p => p.matches_lost >= 10,  progress: p => ({ current: Math.min(p.matches_lost, 10),  target: 10 }) },
+  { type: 'losses_50',         label: 'Punching Bag',       icon: '😤', desc: 'Lose 50 matches',                            reward:   150, check: p => p.matches_lost >= 50,  progress: p => ({ current: Math.min(p.matches_lost, 50),  target: 50 }) },
   // ── Trials completion ─────────────────────────────────────────────────────────
   { type: 'trial1_complete',   label: 'Trial Runner',       icon: '⏱', desc: 'Complete Trial 1',                            reward:   300, check: p => p.trial1_best !== null, progress: null },
   { type: 'trial2_complete',   label: 'Speed Seeker',       icon: '🌀', desc: 'Complete Trial 2',                            reward:   400, check: p => p.trial2_best !== null, progress: null },
@@ -126,6 +156,13 @@ const ACHIEVEMENT_DEFS = [
   { type: 'trial3_sub60',      label: 'Razor Edge',         icon: '🔪', desc: 'Complete Trial 3 in under 60 seconds',        reward:  2500, check: p => p.trial3_best !== null && p.trial3_best < 60, progress: p => p.trial3_best !== null ? { current: p.trial3_best, target: 60, isTime: true } : null },
   { type: 'trial4_sub70',      label: 'Beyond Limits',      icon: '🛸', desc: 'Complete Trial 4 in under 70 seconds',        reward:  3000, check: p => p.trial4_best !== null && p.trial4_best < 70, progress: p => p.trial4_best !== null ? { current: p.trial4_best, target: 70, isTime: true } : null },
   { type: 'speed_demon',       label: 'Speed Demon',        icon: '💨', desc: 'Complete any trial in under 30 seconds',      reward:  5000, check: p => [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].some(t => t !== null && t < 30), progress: null },
+  // ── Combo / milestone ────────────────────────────────────────────────────────
+  { type: 'grinder',           label: 'Grinder',            icon: '⚙',  desc: '200+ kills with a 2.0+ KDR (min 10 deaths)',  reward:  5000, check: p => p.total_deaths >= 10 && p.total_kills >= 200 && p.total_kills >= p.total_deaths * 2, progress: null },
+  { type: 'well_rounded',      label: 'Well Rounded',       icon: '🌐', desc: 'Play 50 matches, get 50 kills, complete Trial 1', reward: 3000, check: p => p.games_played >= 50 && p.total_kills >= 50 && p.trial1_best !== null, progress: p => ({ current: (p.games_played >= 50 ? 1 : 0) + (p.total_kills >= 50 ? 1 : 0) + (p.trial1_best !== null ? 1 : 0), target: 3 }) },
+  { type: 'veteran_touch',     label: "Veteran's Touch",    icon: '🗡', desc: '500+ kills and 100+ match wins',               reward:  8000, check: p => p.total_kills >= 500 && p.matches_won >= 100, progress: p => ({ current: (p.total_kills >= 500 ? 1 : 0) + (p.matches_won >= 100 ? 1 : 0), target: 2 }) },
+  { type: 'perfectionist',     label: 'Perfectionist',      icon: '🎭', desc: 'Complete all 4 trials with a 2.0+ KDR',       reward:  7500, check: p => p.trial1_best !== null && p.trial2_best !== null && p.trial3_best !== null && p.trial4_best !== null && p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 2, progress: p => ({ current: [p.trial1_best !== null, p.trial2_best !== null, p.trial3_best !== null, p.trial4_best !== null, p.total_deaths >= 10 && p.total_kills >= p.total_deaths * 2].filter(Boolean).length, target: 5 }) },
+  { type: 'jack_of_all',       label: 'Jack of All Trades', icon: '🃏', desc: '100+ player kills, 100+ bot kills, 10+ wins',  reward:  4000, check: p => p.total_kills >= 100 && p.bots_killed >= 100 && p.matches_won >= 10, progress: p => ({ current: (p.total_kills >= 100 ? 1 : 0) + (p.bots_killed >= 100 ? 1 : 0) + (p.matches_won >= 10 ? 1 : 0), target: 3 }) },
+  { type: 'the_grind',         label: 'The Grind',          icon: '⛏', desc: '1000 matches, 1000 kills, 1000 bots destroyed', reward: 20000, check: p => p.games_played >= 1000 && p.total_kills >= 1000 && p.bots_killed >= 1000, progress: p => ({ current: (p.games_played >= 1000 ? 1 : 0) + (p.total_kills >= 1000 ? 1 : 0) + (p.bots_killed >= 1000 ? 1 : 0), target: 3 }) },
   // ── Customization ─────────────────────────────────────────────────────────────
   { type: 'high_roller',       label: 'High Roller',        icon: '💎', desc: 'Unlock all customization features',            reward:  1000, check: p => !!p.unlock_hull && !!p.unlock_accent && !!p.unlock_trail && !!p.unlock_trail_shape, progress: p => ({ current: [p.unlock_hull, p.unlock_accent, p.unlock_trail, p.unlock_trail_shape].filter(Boolean).length, target: 4 }) },
 ];
