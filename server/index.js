@@ -763,6 +763,18 @@ function handleConnection(ws) {
       return;
     }
 
+    if (msg.type === 'flare') {
+      const room = ws.room;
+      if (!room || !room.started) return;
+      const shooter = room.players.get(ws.id);
+      if (!shooter || !shooter.alive) return;
+      const out = JSON.stringify({ type: 'flare', id: ws.id, pos: msg.pos, quat: msg.quat });
+      for (const c of room.sockets) {
+        if (c !== ws && c.open) c.send(out);
+      }
+      return;
+    }
+
     if (msg.type === 'self-damage') {
       const room = ws.room;
       if (!room || !room.started) return;

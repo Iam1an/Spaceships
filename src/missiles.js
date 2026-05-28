@@ -20,10 +20,10 @@ const AVOID_WEIGHT         = 4.0;   // how strongly avoidance blends into homing
 const DETONATE_MARGIN      = 2.0;
 
 // ── Flare countermeasure constants ────────────────────────────────────────────
-const FLARE_SPEED          = 90;    // units/second initial eject speed
+const FLARE_SPEED          = 140;   // units/second initial eject speed (fast pop, then hover)
 const FLARE_LIFE           = 4.5;   // seconds before burning out
 const FLARE_SEDUCTION_DIST = 180;   // missile within this range diverts to nearest flare
-const FLARE_TRAIL_INTERVAL = 0.018; // seconds between flare trail particle spawns
+const FLARE_TRAIL_INTERVAL = 0.015; // seconds between flare trail particle spawns
 
 // ── Missile silhouette dimensions (everything along local +Z) ──────────────
 const BODY_LEN  = 3.5;
@@ -75,9 +75,10 @@ const nozzleGlowGeo = (() => {
   return g;
 })();
 
-const trailGeo     = new THREE.SphereGeometry(0.5, 6, 4);
-const explosionGeo = new THREE.SphereGeometry(1.0, 10, 7);
-const flareGeo     = new THREE.SphereGeometry(0.7, 8, 6);
+const trailGeo          = new THREE.SphereGeometry(0.5, 6, 4);
+const explosionGeo      = new THREE.SphereGeometry(1.0, 10, 7);
+const flareCoreSphereGeo = new THREE.SphereGeometry(0.30, 8, 6);  // hot white inner core
+const flareGlowSphereGeo = new THREE.SphereGeometry(1.10, 10, 8); // soft outer halo
 
 const TRAIL_INTERVAL = 0.028;   // seconds between trail particle spawns
 
@@ -209,24 +210,41 @@ export function createMissiles() {
     const s = 0.45 + Math.random() * 0.65;
     mesh.scale.setScalar(s);
     group.add(mesh);
-    trailParticles.push({ mesh, age: 0, life: 0.30 + Math.random() * 0.12, initScale: s });
+    trailParticles.push({ mesh, age: 0, life: 0.30 + Math.random() * 0.12, initScale: s, maxOpacity: 0.72 });
   }
 
-  // Flare trail: denser, brighter, larger than missile trail — white/gold/orange mix.
+  // Flare trail: two-type particles — a tight bright hot streak near the flare
+  // core, and a large soft orange-red ember puff for the outer haze.
   function emitFlareTrail(pos) {
-    const col = Math.random() > 0.45
-      ? 0xffffff
-      : (Math.random() > 0.5 ? 0xffee55 : 0xff8811);
+    const isBright = Math.random() > 0.38; // 62% bright, 38% soft
+    const col = isBright
+      ? (Math.random() > 0.5 ? 0xffffff : 0xffee66)   // white / pale-yellow
+      : (Math.random() > 0.5 ? 0xff9922 : 0xff5500);   // orange / deep-orange
+    const maxOp = isBright ? 0.92 : 0.68;
     const mat = new THREE.MeshBasicMaterial({
-      color: col, transparent: true, opacity: 0.88,
+      color: col, transparent: true, opacity: maxOp,
       blending: THREE.AdditiveBlending, depthWrite: false,
     });
     const mesh = new THREE.Mesh(trailGeo, mat);
-    mesh.position.copy(pos);
-    const s = 1.0 + Math.random() * 1.6;
+    // Small random spray so the trail has natural width.
+    mesh.position.set(
+      pos.x + (Math.random() - 0.5) * 0.5,
+      pos.y + (Math.random() - 0.5) * 0.5,
+      pos.z + (Math.random() - 0.5) * 0.5,
+    );
+    const s = isBright
+      ? 1.0 + Math.random() * 1.2   // 1.0–2.2 for the tight bright streak
+      : 2.0 + Math.random() * 1.8;  // 2.0–3.8 for the big soft ember puff
     mesh.scale.setScalar(s);
     group.add(mesh);
-    trailParticles.push({ mesh, age: 0, life: 0.48 + Math.random() * 0.22, initScale: s });
+    trailParticles.push({
+      mesh, age: 0,
+      life: isBright
+        ? 0.22 + Math.random() * 0.14  // short-lived bright sparks
+        : 0.38 + Math.random() * 0.20, // longer ember puffs
+      initScale: s,
+      maxOpacity: maxOp,
+    });
   }
 
   function spawnExplosion(pos) {
@@ -249,6 +267,27 @@ export function createMissiles() {
   }
 
   // ── Flare countermeasures ─────────────────────────────────────────────────
+  // Brief bright pop at the ejection point — two expanding rings of light
+  // that fade in ~0.25s to sell the "pyrotechnic charge fired" look.
+  function spawnFlareBurst(pos) {
+    const burstData = [
+      { color: 0xffffff, from: 0.15, to: 3.5,  life: 0.18 },
+      { color: 0xffee44, from: 0.40, to: 6.5,  life: 0.26 },
+      { color: 0xff8800, from: 0.70, to: 10.0, life: 0.32 },
+    ];
+    for (const l of burstData) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: l.color, transparent: true, opacity: 0.95,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(explosionGeo, mat);
+      mesh.position.copy(pos);
+      mesh.scale.setScalar(l.from);
+      group.add(mesh);
+      explosions.push({ mesh, age: 0, life: l.life, from: l.from, to: l.to });
+    }
+  }
+
   // Eject two flares: one to port, one to starboard — both angled backward.
   // Each flare acts as a homing decoy: any missile within FLARE_SEDUCTION_DIST
   // will divert from its current target onto the nearest flare.
@@ -256,32 +295,52 @@ export function createMissiles() {
     const right = new THREE.Vector3(1, 0, 0).applyQuaternion(shipQuaternion);
     const up    = new THREE.Vector3(0, 1, 0).applyQuaternion(shipQuaternion);
     const back  = new THREE.Vector3(0, 0, -1).applyQuaternion(shipQuaternion);
+
+    // Ejection charge pop at the ship.
+    spawnFlareBurst(origin);
+
+    // Port and starboard flares, angled backward and slightly upward.
     const spreadDirs = [
       back.clone().addScaledVector(right,  1.4).addScaledVector(up, 0.5).normalize(),
       back.clone().addScaledVector(right, -1.4).addScaledVector(up, 0.5).normalize(),
     ];
     for (const dir of spreadDirs) {
-      const mat = new THREE.MeshBasicMaterial({
-        color: 0xffee88, transparent: true, opacity: 0.95,
+      // Bright white-hot inner core.
+      const coreMat = new THREE.MeshBasicMaterial({
+        color: 0xffffff, transparent: true, opacity: 1.0,
         blending: THREE.AdditiveBlending, depthWrite: false,
       });
-      const mesh = new THREE.Mesh(flareGeo, mat);
-      mesh.position.copy(origin);
-      mesh.scale.setScalar(1.6);
-      group.add(mesh);
+      const coreMesh = new THREE.Mesh(flareCoreSphereGeo, coreMat);
+
+      // Soft orange-yellow outer halo.
+      const glowMat = new THREE.MeshBasicMaterial({
+        color: 0xffcc22, transparent: true, opacity: 0.70,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      });
+      const glowMesh = new THREE.Mesh(flareGlowSphereGeo, glowMat);
+
+      // Group so both meshes share one world position — missiles home on group.position.
+      const flareGroup = new THREE.Group();
+      flareGroup.position.copy(origin);
+      flareGroup.add(coreMesh);
+      flareGroup.add(glowMesh);
+      group.add(flareGroup);
+
       const flare = {
-        mesh, mat,
+        group: flareGroup,
+        coreMesh, coreMat,
+        glowMesh, glowMat,
         vel:  dir.clone().multiplyScalar(FLARE_SPEED),
         life: FLARE_LIFE,
         age:  0,
         trailTimer: 0,
         alive: true,
       };
-      // Self-referencing target record — missiles home onto mesh.position.
+      // Self-referencing target record — missiles home onto flareGroup.position.
       flare.targetRecord = {
         isFlare: true,
         get alive() { return flare.alive; },
-        ship: mesh,  // mesh.position is the live world position
+        ship: flareGroup,
       };
       flares.push(flare);
     }
@@ -340,7 +399,7 @@ export function createMissiles() {
           let nearestFlareDist = FLARE_SEDUCTION_DIST;
           for (const f of flares) {
             if (!f.alive) continue;
-            const fd = m.mesh.position.distanceTo(f.mesh.position);
+            const fd = m.mesh.position.distanceTo(f.group.position);
             if (fd < nearestFlareDist) { nearestFlareDist = fd; nearestFlare = f; }
           }
           if (nearestFlare) m.target = nearestFlare.targetRecord;
@@ -417,14 +476,15 @@ export function createMissiles() {
           for (let fi = flares.length - 1; fi >= 0; fi--) {
             const f = flares[fi];
             if (!f.alive) continue;
-            const fdx = m.mesh.position.x - f.mesh.position.x;
-            const fdy = m.mesh.position.y - f.mesh.position.y;
-            const fdz = m.mesh.position.z - f.mesh.position.z;
+            const fdx = m.mesh.position.x - f.group.position.x;
+            const fdy = m.mesh.position.y - f.group.position.y;
+            const fdz = m.mesh.position.z - f.group.position.z;
             if (fdx * fdx + fdy * fdy + fdz * fdz < HIT_RADIUS * HIT_RADIUS) {
               spawnExplosion(m.mesh.position.clone());
               f.alive = false;
-              group.remove(f.mesh);
-              f.mat.dispose();
+              group.remove(f.group);
+              f.coreMat.dispose();
+              f.glowMat.dispose();
               flares.splice(fi, 1);
               consumed = true;
               break;
@@ -463,7 +523,7 @@ export function createMissiles() {
       p.age += dt;
       const t = p.age / p.life;
       p.mesh.scale.setScalar(p.initScale * (1.0 + t * 2.8));
-      p.mesh.material.opacity = (1 - t) * 0.72;
+      p.mesh.material.opacity = (1 - t) * (p.maxOpacity ?? 0.72);
       if (t >= 1) {
         group.remove(p.mesh);
         p.mesh.material.dispose();
@@ -486,35 +546,46 @@ export function createMissiles() {
     }
 
     // ── Flare lifecycle ───────────────────────────────────────────────────────
-    // Flares: eject from ship, decelerate rapidly, flicker and burn out.
-    // Their trail is denser and brighter than the missile trail.
+    // Shoot out fast, bleed to a near-hover, then burn for ~4.5s with a bright
+    // two-layer glow (white inner core + soft orange halo) that flickers and
+    // fades as the pyrotechnic charge depletes.
     for (let i = flares.length - 1; i >= 0; i--) {
       const f = flares[i];
       f.age  += dt;
       f.life -= dt;
       if (f.life <= 0) {
         f.alive = false;
-        group.remove(f.mesh);
-        f.mat.dispose();
+        group.remove(f.group);
+        f.coreMat.dispose();
+        f.glowMat.dispose();
         flares.splice(i, 1);
         continue;
       }
-      // Move + decelerate: rapid initial ejection that bleeds off to a near-hover.
-      f.mesh.position.addScaledVector(f.vel, dt);
-      f.vel.multiplyScalar(Math.pow(0.25, dt)); // after ~1s, ~25% of initial speed
+      // Move + rapid deceleration → the flare "pops" out then hangs in space.
+      f.group.position.addScaledVector(f.vel, dt);
+      f.vel.multiplyScalar(Math.pow(0.22, dt)); // ~22% speed remaining after 1s
 
-      // Flicker: simulate a hot burning pyrotechnic.
-      const tLife = 1.0 - f.life / FLARE_LIFE; // 0 → 1 over lifetime
-      const flicker = 0.60 + 0.40 * Math.abs(Math.sin(f.age * 29.0 + i * 2.3));
-      f.mat.opacity = (1.0 - tLife * 0.55) * flicker;
-      const baseScale = THREE.MathUtils.lerp(1.8, 0.5, tLife);
-      f.mesh.scale.setScalar(baseScale * (0.85 + 0.20 * flicker));
+      // Two independent flickers for core vs halo — offset phases so they
+      // don't pulse together, giving a more organic burning look.
+      const tLife  = 1.0 - f.life / FLARE_LIFE;           // 0→1 over lifetime
+      const cFlick = 0.70 + 0.30 * Math.abs(Math.sin(f.age * 34.0 + i * 1.7));
+      const gFlick = 0.55 + 0.45 * Math.abs(Math.sin(f.age * 19.0 + i * 3.1));
 
-      // Dense bright trail.
+      // Core: stays intensely bright, shrinks gradually as fuel depletes.
+      const coreScale = THREE.MathUtils.lerp(1.4, 0.20, tLife) * cFlick;
+      f.coreMesh.scale.setScalar(Math.max(0.05, coreScale));
+      f.coreMat.opacity = Math.min(1.0, (1.0 - tLife * 0.45) * cFlick);
+
+      // Outer halo: starts large and expands gently while fading.
+      const glowScale = THREE.MathUtils.lerp(2.2, 0.8, tLife) * (0.9 + 0.1 * gFlick);
+      f.glowMesh.scale.setScalar(Math.max(0.1, glowScale));
+      f.glowMat.opacity = (1.0 - tLife * 0.75) * gFlick * 0.70;
+
+      // Dense trail of hot sparks.
       f.trailTimer += dt;
       while (f.trailTimer >= FLARE_TRAIL_INTERVAL) {
         f.trailTimer -= FLARE_TRAIL_INTERVAL;
-        emitFlareTrail(f.mesh.position.clone());
+        emitFlareTrail(f.group.position.clone());
       }
     }
   }
