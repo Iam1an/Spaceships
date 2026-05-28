@@ -237,6 +237,16 @@
     #scoreboard th { color: #9cf; border-bottom: 1px solid rgba(176,224,255,0.3); }
     #scoreboard td.num { text-align: right; color: #ffe07a; font-variant-numeric: tabular-nums; }
     #scoreboard tr.you td { color: #ffd97a; font-weight: bold; }
+    /* Team colour accents on scoreboard rows */
+    #scoreboard tr.team0 td:first-child { color: #66ddff; }
+    #scoreboard tr.team1 td:first-child { color: #ff8a8a; }
+    #scoreboard tr.team0 td:first-child::before { content: '▶ '; font-size: 8px; opacity: 0.7; color: #66ddff; }
+    #scoreboard tr.team1 td:first-child::before { content: '▶ '; font-size: 8px; opacity: 0.7; color: #ff5566; }
+    #scoreboard tr.you.team0 td { color: #66ddff; font-weight: bold; text-shadow: 0 0 8px rgba(102,221,255,0.55); }
+    #scoreboard tr.you.team1 td { color: #ff8a8a; font-weight: bold; text-shadow: 0 0 8px rgba(255,85,102,0.55); }
+    #scoreboard .sb-team-header td { font-size: 9px; letter-spacing: 3px; padding: 6px 12px 2px; border-bottom: 1px solid; opacity: 0.75; }
+    #scoreboard .sb-team-header.t0 td { color: #66ddff; border-color: rgba(102,221,255,0.35); }
+    #scoreboard .sb-team-header.t1 td { color: #ff8a8a; border-color: rgba(255,85,102,0.35); }
 
     /* ── Settings gear + panel ────────────────────────────────────────── */
     #settingsBtn {

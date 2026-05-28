@@ -553,11 +553,35 @@ export async function startGame(opts = {}) {
     if (!scoreboardBody) return;
     const rows = [...scores.entries()]
       .map(([id, s]) => ({ id, ...s }))
-      .sort((a, b) => b.kills - a.kills || a.deaths - b.deaths);
+      .sort((a, b) => {
+        // Group by team first (0 before 1 before null), then kills desc, deaths asc
+        const ta = a.team ?? 99, tb = b.team ?? 99;
+        if (ta !== tb) return ta - tb;
+        return b.kills - a.kills || a.deaths - b.deaths;
+      });
+
+    const hasTeams = rows.some(r => r.team !== null && r.team !== undefined);
     scoreboardBody.innerHTML = '';
+    let lastTeam = undefined;
+
     for (const r of rows) {
+      // Insert a team-header divider row when the team changes
+      if (hasTeams && r.team !== lastTeam) {
+        const header = document.createElement('tr');
+        header.className = `sb-team-header t${r.team ?? 'x'}`;
+        const label = r.team === 0 ? 'TEAM BLUE' : r.team === 1 ? 'TEAM RED' : 'NO TEAM';
+        header.innerHTML = `<td colspan="3">${label}</td>`;
+        scoreboardBody.appendChild(header);
+        lastTeam = r.team;
+      }
+
       const tr = document.createElement('tr');
-      if (r.id === myId) tr.className = 'you';
+      const classes = [];
+      if (r.id === myId) classes.push('you');
+      if (r.team === 0) classes.push('team0');
+      if (r.team === 1) classes.push('team1');
+      if (classes.length) tr.className = classes.join(' ');
+
       tr.innerHTML = `<td></td><td class="num">${r.kills}</td><td class="num">${r.deaths}</td>`;
       tr.children[0].textContent = r.name + (r.id === myId ? ' (you)' : '');
       scoreboardBody.appendChild(tr);
