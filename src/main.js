@@ -1697,6 +1697,8 @@ export async function startGame(opts = {}) {
         }
       },
       myTeam,
+      asteroids,
+      obstacles,
     );
     trails.update(dt, camera);
     if (clouds) clouds.update(dt);
