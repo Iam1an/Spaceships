@@ -739,6 +739,7 @@ export async function startGame(opts = {}) {
     myAlive = true;
     myHp = SHIP_MAX_HP;
     missilesLeft = MISSILE_MAX;
+    flaresLeft = FLARE_MAX;
     ship.position.fromArray(pos);
     ship.quaternion.fromArray(quat);
     shipVelocity.set(0, 0, 0);
@@ -939,6 +940,12 @@ export async function startGame(opts = {}) {
           const o = msg.shots[0].pos;
           audio.play('shoot', distanceVol(new THREE.Vector3(o[0], o[1], o[2])));
         }
+      } else if (msg.type === 'flare' && msg.id !== myId) {
+        // Remote player deployed flares — create them locally so they can divert
+        // missiles running on this client (e.g. missiles we fired at that player).
+        const fPos  = new THREE.Vector3().fromArray(msg.pos);
+        const fQuat = new THREE.Quaternion().fromArray(msg.quat);
+        missileSystem.deployFlare(fPos, fQuat);
       } else if (msg.type === 'match-credits') {
         updateCachedCredits(msg.totalCredits);
         if (Array.isArray(msg.earned) && msg.earned.length) {
@@ -1173,6 +1180,15 @@ export async function startGame(opts = {}) {
     document.getElementById('msl-pip-2'),
     document.getElementById('msl-pip-3'),
     document.getElementById('msl-pip-4'),
+  ];
+
+  const FLARE_MAX = 3;
+  let flaresLeft = FLARE_MAX;
+  let prevKeyQ = false;
+  const flarePips = [
+    document.getElementById('fla-pip-1'),
+    document.getElementById('fla-pip-2'),
+    document.getElementById('fla-pip-3'),
   ];
 
   // Shift-boost fuel: 10 seconds at full, drains while held.
@@ -1448,6 +1464,13 @@ export async function startGame(opts = {}) {
     for (let _pi = 0; _pi < mslPips.length; _pi++) {
       if (mslPips[_pi]) mslPips[_pi].classList.toggle('empty', _pi >= missilesLeft);
     }
+    for (let _pi = 0; _pi < flarePips.length; _pi++) {
+      if (flarePips[_pi]) flarePips[_pi].classList.toggle('empty', _pi >= flaresLeft);
+    }
+    // Missile lock-on warning: flashes when any hostile missile is homing on you.
+    const _missileLocked = missileSystem.isTargetingLocal(localShipRecord) && myAlive;
+    const _lockWarnEl = document.getElementById('missile-lock-warning');
+    if (_lockWarnEl) _lockWarnEl.style.display = _missileLocked ? '' : 'none';
 
     // P: toggle gun mode (bullet ↔ beam) on key-down edge.
     const nowKeyP = input.keys.has('KeyP');
@@ -1549,6 +1572,22 @@ export async function startGame(opts = {}) {
       }
     }
     prevKeyE = nowKeyE;
+
+    // Q: deploy flares (key-down edge). Hold still activates arrow-key fine-aim.
+    const nowKeyQ = input.keys.has('KeyQ');
+    if (nowKeyQ && !prevKeyQ && myAlive && flaresLeft > 0) {
+      missileSystem.deployFlare(ship.position.clone(), ship.quaternion);
+      flaresLeft--;
+      audio.play('shoot');
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'flare',
+          pos:  [ship.position.x, ship.position.y, ship.position.z],
+          quat: [ship.quaternion.x, ship.quaternion.y, ship.quaternion.z, ship.quaternion.w],
+        }));
+      }
+    }
+    prevKeyQ = nowKeyQ;
 
     fireTimer -= dt;
     ammoIdle += dt;

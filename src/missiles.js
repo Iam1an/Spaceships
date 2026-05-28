@@ -19,6 +19,12 @@ const AVOID_WEIGHT         = 4.0;   // how strongly avoidance blends into homing
 // Slightly larger than the missile body so fast approaches don't tunnel through.
 const DETONATE_MARGIN      = 2.0;
 
+// ── Flare countermeasure constants ────────────────────────────────────────────
+const FLARE_SPEED          = 90;    // units/second initial eject speed
+const FLARE_LIFE           = 4.5;   // seconds before burning out
+const FLARE_SEDUCTION_DIST = 180;   // missile within this range diverts to nearest flare
+const FLARE_TRAIL_INTERVAL = 0.018; // seconds between flare trail particle spawns
+
 // ── Missile silhouette dimensions (everything along local +Z) ──────────────
 const BODY_LEN  = 3.5;
 const BODY_RAD  = 0.28;
@@ -71,6 +77,7 @@ const nozzleGlowGeo = (() => {
 
 const trailGeo     = new THREE.SphereGeometry(0.5, 6, 4);
 const explosionGeo = new THREE.SphereGeometry(1.0, 10, 7);
+const flareGeo     = new THREE.SphereGeometry(0.7, 8, 6);
 
 const TRAIL_INTERVAL = 0.028;   // seconds between trail particle spawns
 
@@ -86,6 +93,7 @@ export function createMissiles() {
   const missiles       = [];
   const trailParticles = [];
   const explosions     = [];
+  const flares         = [];
 
   // ── Scratch vectors (reused every frame, safe because JS is single-threaded) ──
   const _fwd      = new THREE.Vector3(0, 0, 1);
@@ -204,6 +212,23 @@ export function createMissiles() {
     trailParticles.push({ mesh, age: 0, life: 0.30 + Math.random() * 0.12, initScale: s });
   }
 
+  // Flare trail: denser, brighter, larger than missile trail — white/gold/orange mix.
+  function emitFlareTrail(pos) {
+    const col = Math.random() > 0.45
+      ? 0xffffff
+      : (Math.random() > 0.5 ? 0xffee55 : 0xff8811);
+    const mat = new THREE.MeshBasicMaterial({
+      color: col, transparent: true, opacity: 0.88,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(trailGeo, mat);
+    mesh.position.copy(pos);
+    const s = 1.0 + Math.random() * 1.6;
+    mesh.scale.setScalar(s);
+    group.add(mesh);
+    trailParticles.push({ mesh, age: 0, life: 0.48 + Math.random() * 0.22, initScale: s });
+  }
+
   function spawnExplosion(pos) {
     const layers = [
       { color: 0xffffff, from: 0.8,  to:  5.0, life: 0.30 },
@@ -221,6 +246,55 @@ export function createMissiles() {
       group.add(mesh);
       explosions.push({ mesh, age: 0, life: l.life, from: l.from, to: l.to });
     }
+  }
+
+  // ── Flare countermeasures ─────────────────────────────────────────────────
+  // Eject two flares: one to port, one to starboard — both angled backward.
+  // Each flare acts as a homing decoy: any missile within FLARE_SEDUCTION_DIST
+  // will divert from its current target onto the nearest flare.
+  function deployFlare(origin, shipQuaternion) {
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(shipQuaternion);
+    const up    = new THREE.Vector3(0, 1, 0).applyQuaternion(shipQuaternion);
+    const back  = new THREE.Vector3(0, 0, -1).applyQuaternion(shipQuaternion);
+    const spreadDirs = [
+      back.clone().addScaledVector(right,  1.4).addScaledVector(up, 0.5).normalize(),
+      back.clone().addScaledVector(right, -1.4).addScaledVector(up, 0.5).normalize(),
+    ];
+    for (const dir of spreadDirs) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffee88, transparent: true, opacity: 0.95,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(flareGeo, mat);
+      mesh.position.copy(origin);
+      mesh.scale.setScalar(1.6);
+      group.add(mesh);
+      const flare = {
+        mesh, mat,
+        vel:  dir.clone().multiplyScalar(FLARE_SPEED),
+        life: FLARE_LIFE,
+        age:  0,
+        trailTimer: 0,
+        alive: true,
+      };
+      // Self-referencing target record — missiles home onto mesh.position.
+      flare.targetRecord = {
+        isFlare: true,
+        get alive() { return flare.alive; },
+        ship: mesh,  // mesh.position is the live world position
+      };
+      flares.push(flare);
+    }
+  }
+
+  // Returns true if any currently-flying missile is locked onto localRecord.
+  // Used by main.js to drive the HUD missile-lock warning.
+  function isTargetingLocal(localRecord) {
+    if (!localRecord) return false;
+    for (const m of missiles) {
+      if (m.target === localRecord) return true;
+    }
+    return false;
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
@@ -257,7 +331,22 @@ export function createMissiles() {
         // ① Current forward direction in world space.
         _currDir.set(0, 0, 1).applyQuaternion(m.mesh.quaternion);
 
-        // ② Homing: desired direction toward live target.
+        // ② Flare seduction: if a flare is within range and the missile has a
+        //    non-flare target, divert it onto the nearest flare. Once seduced
+        //    (!m.target.isFlare is false) the missile stays on the flare until
+        //    it hits it or the flare burns out.
+        if (m.target && !m.target.isFlare && flares.length > 0) {
+          let nearestFlare = null;
+          let nearestFlareDist = FLARE_SEDUCTION_DIST;
+          for (const f of flares) {
+            if (!f.alive) continue;
+            const fd = m.mesh.position.distanceTo(f.mesh.position);
+            if (fd < nearestFlareDist) { nearestFlareDist = fd; nearestFlare = f; }
+          }
+          if (nearestFlare) m.target = nearestFlare.targetRecord;
+        }
+
+        // ④ Homing: desired direction toward live target (ship or flare).
         let hasTarget = false;
         const tgt = m.target;
         if (tgt) {
@@ -278,13 +367,13 @@ export function createMissiles() {
         // Fall back to flying straight on last heading if lock is gone.
         _desired.copy(hasTarget ? _toTgt : _currDir);
 
-        // ③ Obstacle avoidance: blend a perpendicular push into the desired dir.
+        // ⑤ Obstacle avoidance: blend a perpendicular push into the desired dir.
         const avoid = computeAvoidance(m.mesh.position, _currDir, asteroids, obstacles);
         if (avoid !== null) {
           _desired.addScaledVector(avoid, AVOID_WEIGHT).normalize();
         }
 
-        // ④ Apply turn-rate limit: rotate toward _desired by at most TURN_RATE*dt.
+        // ⑥ Apply turn-rate limit: rotate toward _desired by at most TURN_RATE*dt.
         const dot = Math.max(-1, Math.min(1, _currDir.dot(_desired)));
         const angleDiff = Math.acos(dot);
         if (angleDiff > 0.001) {
@@ -294,10 +383,10 @@ export function createMissiles() {
           m.vel.copy(_newDir).multiplyScalar(MISSILE_SPEED);
         }
 
-        // ⑤ Integrate position.
+        // ⑦ Integrate position.
         m.mesh.position.addScaledVector(m.vel, dt);
 
-        // ⑥ Hard detonation: missile has entered an obstacle despite avoidance.
+        // ⑧ Hard detonation: missile has entered an obstacle despite avoidance.
         if (insideObstacle(m.mesh.position, asteroids, obstacles)) {
           spawnExplosion(m.mesh.position.clone());
           consumed = true;
@@ -323,8 +412,28 @@ export function createMissiles() {
           emitTrail(_tailWS);
         }
 
+        // Flare hit detection — intercepts the missile before it reaches a ship.
+        if (flares.length > 0) {
+          for (let fi = flares.length - 1; fi >= 0; fi--) {
+            const f = flares[fi];
+            if (!f.alive) continue;
+            const fdx = m.mesh.position.x - f.mesh.position.x;
+            const fdy = m.mesh.position.y - f.mesh.position.y;
+            const fdz = m.mesh.position.z - f.mesh.position.z;
+            if (fdx * fdx + fdy * fdy + fdz * fdz < HIT_RADIUS * HIT_RADIUS) {
+              spawnExplosion(m.mesh.position.clone());
+              f.alive = false;
+              group.remove(f.mesh);
+              f.mat.dispose();
+              flares.splice(fi, 1);
+              consumed = true;
+              break;
+            }
+          }
+        }
+
         // Ship hit detection.
-        if (remoteShips) {
+        if (remoteShips && !consumed) {
           for (const [id, r] of remoteShips) {
             if (!r.alive) continue;
             if (shooterTeam !== undefined && shooterTeam !== null && r.team === shooterTeam) continue;
@@ -375,7 +484,40 @@ export function createMissiles() {
         explosions.splice(i, 1);
       }
     }
+
+    // ── Flare lifecycle ───────────────────────────────────────────────────────
+    // Flares: eject from ship, decelerate rapidly, flicker and burn out.
+    // Their trail is denser and brighter than the missile trail.
+    for (let i = flares.length - 1; i >= 0; i--) {
+      const f = flares[i];
+      f.age  += dt;
+      f.life -= dt;
+      if (f.life <= 0) {
+        f.alive = false;
+        group.remove(f.mesh);
+        f.mat.dispose();
+        flares.splice(i, 1);
+        continue;
+      }
+      // Move + decelerate: rapid initial ejection that bleeds off to a near-hover.
+      f.mesh.position.addScaledVector(f.vel, dt);
+      f.vel.multiplyScalar(Math.pow(0.25, dt)); // after ~1s, ~25% of initial speed
+
+      // Flicker: simulate a hot burning pyrotechnic.
+      const tLife = 1.0 - f.life / FLARE_LIFE; // 0 → 1 over lifetime
+      const flicker = 0.60 + 0.40 * Math.abs(Math.sin(f.age * 29.0 + i * 2.3));
+      f.mat.opacity = (1.0 - tLife * 0.55) * flicker;
+      const baseScale = THREE.MathUtils.lerp(1.8, 0.5, tLife);
+      f.mesh.scale.setScalar(baseScale * (0.85 + 0.20 * flicker));
+
+      // Dense bright trail.
+      f.trailTimer += dt;
+      while (f.trailTimer >= FLARE_TRAIL_INTERVAL) {
+        f.trailTimer -= FLARE_TRAIL_INTERVAL;
+        emitFlareTrail(f.mesh.position.clone());
+      }
+    }
   }
 
-  return { group, fire, update };
+  return { group, fire, update, deployFlare, isTargetingLocal };
 }

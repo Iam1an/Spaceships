@@ -329,6 +329,7 @@ function showHud() {
   document.getElementById('boostbar').style.display = '';
   document.getElementById('heatbar').style.display = '';
   document.getElementById('missilehud').style.display = '';
+  document.getElementById('flarehud').style.display = '';
   // Settings gear stays visible in-game so the volume sliders work
   // during a match. Panel collapses so it doesn't float over the HUD.
   settingsPanel.classList.add('hidden');
