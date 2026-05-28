@@ -280,6 +280,10 @@ function selectedMap() {
   return document.getElementById('mapTerrain')?.checked ? 'terrain' : 'space';
 }
 
+function autoBotEnabled() {
+  return document.getElementById('autoBotInput')?.checked ?? true;
+}
+
 function handle(msg) {
   switch (msg.type) {
     case 'room':
@@ -408,7 +412,7 @@ document.getElementById('btnPlay').addEventListener('click', async () => {
   setError('Connecting…');
   try { await connect(); } catch (e) { setError(e.message); return; }
   send({ type: 'name', name: pilotName() });
-  send({ type: 'create', private: isPrivateRoom(), map: selectedMap() });
+  send({ type: 'create', private: isPrivateRoom(), map: selectedMap(), allowBot: autoBotEnabled() });
 });
 
 

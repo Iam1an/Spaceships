@@ -651,11 +651,13 @@ function handleConnection(ws) {
       const code = genCode();
       const isPrivate = !!msg.private;
       const map = msg.map === 'terrain' ? 'terrain' : 'space';
+      const allowBot = msg.allowBot !== false; // default on
       const room = {
         code,
         hostId: ws.id,
         isPrivate,
         map,
+        allowBot,
         sockets: new Set([ws]),
         players: new Map([[ws.id, { name: ws.name, hp: SHIP_MAX_HP, alive: true, kills: 0, deaths: 0 }]]),
         started: false,
@@ -711,7 +713,7 @@ function handleConnection(ws) {
       const team0Count = [...room.players.values()].filter(p => p.team === 0).length;
       const team1Count = [...room.players.values()].filter(p => p.team === 1).length;
       const botAssignments = [];
-      if (team0Count !== team1Count) {
+      if (room.allowBot && team0Count !== team1Count) {
         const smallerTeam = team0Count < team1Count ? 0 : 1;
         const botId = -(nextId++);
         const sp = spawnForTeam(smallerTeam, room.map);
