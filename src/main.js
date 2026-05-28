@@ -915,6 +915,18 @@ export async function startGame(opts = {}) {
             const end = new THREE.Vector3().fromArray(shot.end);
             beams.fire(origin, end, faction);
           }
+        } else if (msg.kind === 'missile') {
+          for (const shot of (msg.shots || [])) {
+            const origin = new THREE.Vector3().fromArray(shot.pos);
+            const dir    = new THREE.Vector3().fromArray(shot.dir);
+            // Resolve the homing target on this client:
+            //   - shot.targetId === myId  → missile is chasing the local player
+            //   - otherwise               → look up the remote player record
+            const targetRecord = (shot.targetId === myId)
+              ? localShipRecord
+              : (remotePlayers.get(shot.targetId) ?? null);
+            missileSystem.fire(origin, dir, targetRecord);
+          }
         } else {
           for (const shot of msg.shots) {
             const origin = new THREE.Vector3().fromArray(shot.pos);
@@ -1493,6 +1505,17 @@ export async function startGame(opts = {}) {
         missileSystem.fire(mslOrigin, fwd, closestRecord);
         missilesLeft--;
         audio.play('shoot');
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'fire',
+            kind: 'missile',
+            shots: [{
+              pos: [mslOrigin.x, mslOrigin.y, mslOrigin.z],
+              dir: [fwd.x, fwd.y, fwd.z],
+              targetId: closestRecord.id,
+            }],
+          }));
+        }
       }
     }
     prevKeyE = nowKeyE;
@@ -2475,6 +2498,14 @@ export async function startGame(opts = {}) {
     takeHit(dmg, killerId, killerTeam) {
       applyPlayerDamageLocal(dmg, killerId, killerTeam);
     },
+  };
+
+  // Minimal record used by remote missiles that are targeting the local player.
+  // The missile system reads .alive and .ship.position each frame, so getters
+  // ensure it always reflects current state without any per-frame updates.
+  const localShipRecord = {
+    get alive() { return myAlive; },
+    ship,  // ship.position is the live Three.js position
   };
 
   const bots = []; // { id, team, record, ai, entity }
