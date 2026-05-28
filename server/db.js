@@ -490,11 +490,19 @@ const stmtAllPilots = db.prepare('SELECT * FROM pilots');
 function backfillAchievements() {
   const pilots = stmtAllPilots.all();
   let newAchs = 0;
+  let rankFixes = 0;
   for (const pilot of pilots) {
     const earned = checkAndAwardAchievements(pilot.id, pilot);
     newAchs += earned.length;
+    // Recalculate rank in case thresholds changed.
+    const correct = computeRank(pilot.total_kills);
+    if (correct !== pilot.rank) {
+      stmtUpdateRank.run(correct, pilot.id);
+      rankFixes++;
+    }
   }
-  if (newAchs > 0) console.log(`[achievements] backfill awarded ${newAchs} achievement(s)`);
+  if (newAchs > 0)   console.log(`[achievements] backfill awarded ${newAchs} achievement(s)`);
+  if (rankFixes > 0) console.log(`[ranks] corrected ${rankFixes} pilot rank(s)`);
 
   // Credit any achievements that pre-date the credits system (credited = 0).
   const uncredited = stmtUncredited.all();
