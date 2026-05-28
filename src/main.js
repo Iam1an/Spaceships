@@ -3,6 +3,7 @@ import { createSkybox } from './skybox.js';
 import { createShip, loadShipModel, applyColorsToShip, isModelCached } from './ship.js';
 import { createAsteroidField, createAsteroidFieldFromData } from './asteroids.js';
 import { createBullets, BULLET_SPEED } from './bullets.js';
+import { createMissiles } from './missiles.js';
 import { createBeams } from './beams.js';
 import { createTrails } from './trails.js';
 import { createMothership } from './mothership.js';
@@ -397,6 +398,9 @@ export async function startGame(opts = {}) {
   const beams = createBeams();
   scene.add(beams.group);
 
+  const missileSystem = createMissiles();
+  scene.add(missileSystem.group);
+
   const trails = createTrails();
   scene.add(trails.group);
 
@@ -710,6 +714,7 @@ export async function startGame(opts = {}) {
   function reviveSelf(pos, quat) {
     myAlive = true;
     myHp = SHIP_MAX_HP;
+    missilesLeft = MISSILE_MAX;
     ship.position.fromArray(pos);
     ship.quaternion.fromArray(quat);
     shipVelocity.set(0, 0, 0);
@@ -1124,6 +1129,16 @@ export async function startGame(opts = {}) {
   let ammo = MAX_AMMO;
   let ammoIdle = REGEN_DELAY; // start full, eligible to regen immediately
 
+  const MISSILE_MAX = 4;
+  let missilesLeft = MISSILE_MAX;
+  let prevKeyE = false;
+  const mslPips = [
+    document.getElementById('msl-pip-1'),
+    document.getElementById('msl-pip-2'),
+    document.getElementById('msl-pip-3'),
+    document.getElementById('msl-pip-4'),
+  ];
+
   // Shift-boost fuel: 10 seconds at full, drains while held.
   const MAX_BOOST = 10;
   const BOOST_DRAIN = 2;
@@ -1394,6 +1409,9 @@ export async function startGame(opts = {}) {
       // shot — visual cue that you have to wait for regen.
       heatBar.classList.toggle('overheated', ammo < (gunMode === 'beam' ? 3 : 1));
     }
+    for (let _pi = 0; _pi < mslPips.length; _pi++) {
+      if (mslPips[_pi]) mslPips[_pi].classList.toggle('empty', _pi >= missilesLeft);
+    }
 
     // P: toggle gun mode (bullet ↔ beam) on key-down edge.
     const nowKeyP = input.keys.has('KeyP');
@@ -1433,6 +1451,27 @@ export async function startGame(opts = {}) {
       }
     }
     prevKeyL = nowKeyL;
+
+    // E: fire a homing missile at the closest enemy.
+    const nowKeyE = input.keys.has('KeyE');
+    if (nowKeyE && !prevKeyE && myAlive && missilesLeft > 0) {
+      let closestRecord = null;
+      let closestDist = Infinity;
+      for (const r of remotePlayers.values()) {
+        if (!r.alive || !r.hasTarget) continue;
+        if (myTeam !== undefined && myTeam !== null && r.team === myTeam) continue;
+        const d = ship.position.distanceTo(r.ship.position);
+        if (d < closestDist) { closestDist = d; closestRecord = r; }
+      }
+      if (closestRecord !== null) {
+        const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
+        const mslOrigin = ship.position.clone().addScaledVector(fwd, 6);
+        missileSystem.fire(mslOrigin, fwd, closestRecord);
+        missilesLeft--;
+        audio.play('shoot');
+      }
+    }
+    prevKeyE = nowKeyE;
 
     fireTimer -= dt;
     ammoIdle += dt;
@@ -1621,6 +1660,19 @@ export async function startGame(opts = {}) {
       },
       myTeam,
       obstacles,
+    );
+    missileSystem.update(
+      dt,
+      remotePlayers,
+      (targetId) => {
+        audio.play('hitmarker_2');
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'hit', targetId, kind: 'missile' }));
+        } else if (isSolo) {
+          applyHitToBot(targetId, 50, opts.you, myTeam);
+        }
+      },
+      myTeam,
     );
     trails.update(dt, camera);
     if (clouds) clouds.update(dt);

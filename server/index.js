@@ -803,7 +803,7 @@ function handleConnection(ws) {
       if (target.invulnUntil && Date.now() < target.invulnUntil) return; // spawn protection
       // Per-weapon damage. Buffed bullets to match beam at 10 per hit so
       // arrow-key pilots aren't punished for the beam's easier upkeep.
-      const dmg = msg.kind === 'beam' ? 10 : 10;
+      const dmg = msg.kind === 'missile' ? 50 : 10;
       target.hp = Math.max(0, target.hp - dmg);
       broadcast(room, { type: 'hp', id: msg.targetId, hp: target.hp });
       if (target.hp === 0) {

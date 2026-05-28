@@ -106,6 +106,11 @@
     #heatbar.overheated { border-color: #ff4040; box-shadow: 0 0 18px #ff2a2a; animation: heatpulse 0.4s linear infinite alternate; }
     @keyframes heatpulse { from { box-shadow: 0 0 12px #ff2a2a; } to { box-shadow: 0 0 26px #ff8a8a; } }
 
+    #missilehud { position: fixed; left: 50%; transform: translateX(-50%); bottom: 112px; display: flex; align-items: center; gap: 7px; pointer-events: none; font-family: 'Orbitron', sans-serif; }
+    #missilehud .msl-label { font-size: 11px; color: rgba(255,255,255,0.85); text-shadow: 1px 1px 0 #000; }
+    .msl-pip { width: 11px; height: 11px; border-radius: 2px; background: #ff6600; box-shadow: 0 0 7px #ff6600; transition: background 0.1s, box-shadow 0.1s; }
+    .msl-pip.empty { background: rgba(255,100,0,0.15); box-shadow: none; border: 1px solid rgba(255,100,0,0.35); }
+
     #deathbanner { position: fixed; left: 50%; top: 38%; color: #ff8a8a; font-size: clamp(28px,6vw,48px); text-shadow: 0 0 12px #ff2a2a,3px 3px 0 #2a0000; transform: translateX(-50%) rotate(-2deg); pointer-events: none; display: none; }
 
     /* ── Killfeed ────────────────────────────────────────────────────── */
@@ -996,6 +1001,13 @@
   <div id="heatbar" class="meterbar" style="display:none">
     <div class="meterbar-label">GUN</div>
     <div id="heatbar-fill"></div>
+  </div>
+  <div id="missilehud" style="display:none">
+    <span class="msl-label">MSL</span>
+    <span class="msl-pip" id="msl-pip-1"></span>
+    <span class="msl-pip" id="msl-pip-2"></span>
+    <span class="msl-pip" id="msl-pip-3"></span>
+    <span class="msl-pip" id="msl-pip-4"></span>
   </div>
   <div id="deathbanner">DESTROYED</div>
   <div id="hit-vignette"></div>
