@@ -260,15 +260,22 @@ export function createMissiles() {
         // ② Homing: desired direction toward live target.
         let hasTarget = false;
         const tgt = m.target;
-        if (tgt && tgt.alive && tgt.ship) {
-          _toTgt.copy(tgt.ship.position).sub(m.mesh.position);
-          const d = _toTgt.length();
-          if (d > 0.5) {
-            _toTgt.divideScalar(d);   // normalise in-place
-            hasTarget = true;
+        if (tgt) {
+          if (!tgt.alive) {
+            // Target died while missile was in-flight — permanently drop the
+            // lock so the missile doesn't re-acquire them the moment they
+            // respawn at their spawn point.
+            m.target = null;
+          } else if (tgt.ship) {
+            _toTgt.copy(tgt.ship.position).sub(m.mesh.position);
+            const d = _toTgt.length();
+            if (d > 0.5) {
+              _toTgt.divideScalar(d);
+              hasTarget = true;
+            }
           }
         }
-        // Fall back to flying straight if target is gone.
+        // Fall back to flying straight on last heading if lock is gone.
         _desired.copy(hasTarget ? _toTgt : _currDir);
 
         // ③ Obstacle avoidance: blend a perpendicular push into the desired dir.
