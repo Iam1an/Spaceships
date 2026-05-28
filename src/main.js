@@ -527,8 +527,20 @@ export async function startGame(opts = {}) {
       });
     }
   }
+  // Always ensure the local player has the correct display name in scores.
+  // In solo mode this is the only population; in multiplayer it may already
+  // exist from opts.players but we want to prefer opts.pilotName (the
+  // client-side callsign) and preserve any team/kill/death data already set.
+  {
+    const existing = scores.get(opts.you);
+    scores.set(opts.you, {
+      name: opts.pilotName || existing?.name || 'Pilot',
+      team: existing?.team ?? null,
+      kills: existing?.kills || 0,
+      deaths: existing?.deaths || 0,
+    });
+  }
   if (isSolo) {
-    scores.set(opts.you, { name: opts.pilotName || 'Pilot', kills: 0, deaths: 0 });
     // Bot entries are seeded by spawnBot() when the solo mode is wired below.
   }
   const scoreboardEl = document.getElementById('scoreboard');
@@ -851,9 +863,11 @@ export async function startGame(opts = {}) {
         audio.play('shipdeath', distanceVol(deathPos));
         if (msg.id === myId) killSelf();
         else killRemote(msg.id);
-        if (msg.killerId) {
-          const kn = scores.get(msg.killerId)?.name || 'Pilot';
-          const vn = scores.get(msg.id)?.name || 'Pilot';
+        if (msg.killerId != null) {
+          const kn = scores.get(msg.killerId)?.name
+                  || (msg.killerId === myId ? (opts.pilotName || 'Pilot') : 'Pilot');
+          const vn = scores.get(msg.id)?.name
+                  || (msg.id === myId ? (opts.pilotName || 'Pilot') : 'Pilot');
           pushKillFeed(kn, vn, msg.killerId === myId, msg.id === myId);
         }
       } else if (msg.type === 'respawn') {
