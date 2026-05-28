@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 
-const MISSILE_SPEED = 280;   // units/second
-const TURN_RATE     = 1.8;   // radians/second angular limit
+const MISSILE_SPEED = 160;   // units/second
+const TURN_RATE     = 1.4;   // radians/second angular limit
 const LIFE          = 8.0;   // seconds before self-destruct
 const HIT_RADIUS    = 6.0;   // ship hit-detection sphere radius
 

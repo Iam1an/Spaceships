@@ -1488,7 +1488,10 @@ export async function startGame(opts = {}) {
     }
     prevKeyL = nowKeyL;
 
-    // E: fire a homing missile at the closest enemy.
+    // E: fire a homing missile at the closest VISIBLE enemy.
+    // LOS is checked at the moment of firing using the same asteroid + obstacle
+    // raycast the targeting computer uses. Once airborne the missile tracks
+    // freely — the target can duck behind cover after launch.
     const nowKeyE = input.keys.has('KeyE');
     if (nowKeyE && !prevKeyE && myAlive && missilesLeft > 0) {
       let closestRecord = null;
@@ -1497,7 +1500,34 @@ export async function startGame(opts = {}) {
         if (!r.alive || !r.hasTarget) continue;
         if (myTeam !== undefined && myTeam !== null && r.team === myTeam) continue;
         const d = ship.position.distanceTo(r.ship.position);
-        if (d < closestDist) { closestDist = d; closestRecord = r; }
+        if (d >= closestDist) continue; // already have a closer candidate
+        // Line-of-sight check — same logic as the targeting computer.
+        const lx = (r.ship.position.x - ship.position.x) / d;
+        const ly = (r.ship.position.y - ship.position.y) / d;
+        const lz = (r.ship.position.z - ship.position.z) / d;
+        let occluded = false;
+        for (const a of asteroids.list) {
+          const hit = raySphereDist(
+            ship.position.x, ship.position.y, ship.position.z,
+            lx, ly, lz,
+            a.mesh.position.x, a.mesh.position.y, a.mesh.position.z,
+            a.radius,
+          );
+          if (hit !== null && hit < d) { occluded = true; break; }
+        }
+        if (!occluded) {
+          for (const o of obstacles) {
+            const hit = raySphereDist(
+              ship.position.x, ship.position.y, ship.position.z,
+              lx, ly, lz,
+              o.pos.x, o.pos.y, o.pos.z, o.radius,
+            );
+            if (hit !== null && hit < d) { occluded = true; break; }
+          }
+        }
+        if (occluded) continue;
+        closestDist = d;
+        closestRecord = r;
       }
       if (closestRecord !== null) {
         const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
