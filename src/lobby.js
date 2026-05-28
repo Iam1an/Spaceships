@@ -434,6 +434,10 @@ document.getElementById('btnSkirmish').addEventListener('click', () => {
   enterSoloGame('skirmish');
 });
 
+document.getElementById('btnCampaign').addEventListener('click', () => {
+  enterSoloGame('campaign', { map: 'space' });
+});
+
 document.getElementById('btnTutorial').addEventListener('click', () => {
   setError('');
   showScreen('tutorial');

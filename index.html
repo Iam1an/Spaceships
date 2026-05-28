@@ -230,6 +230,50 @@
       letter-spacing: 4px;
     }
 
+    /* ── Campaign Mode HUD ────────────────────────────────────────── */
+    #campaign-hud {
+      position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+      display: none; flex-direction: column; align-items: center; gap: 4px;
+      padding: 10px 26px; background: rgba(8,14,28,0.78);
+      border: 2px solid #cc4422; border-radius: 12px;
+      box-shadow: 0 0 14px rgba(220,70,30,0.38);
+      z-index: 4; pointer-events: none; text-align: center;
+    }
+    #campaign-wave { font-size: 11px; color: #ff9966; letter-spacing: 3px; text-transform: uppercase; }
+    #campaign-objective { font-size: 13px; color: #eef; letter-spacing: 1px; max-width: 320px; }
+    #campaign-enemies { font-size: 11px; color: #ffcc66; letter-spacing: 1px; min-height: 14px; }
+    #campaign-boss-bar {
+      position: fixed; bottom: 64px; left: 50%; transform: translateX(-50%);
+      display: none; flex-direction: column; align-items: center; gap: 5px;
+      width: min(380px, 82vw); padding: 10px 18px;
+      background: rgba(8,14,28,0.88); border: 2px solid #aa2200; border-radius: 10px;
+      box-shadow: 0 0 22px rgba(200,30,10,0.48); z-index: 4; pointer-events: none;
+    }
+    #boss-name { font-size: 12px; color: #ff5533; letter-spacing: 3px; font-family: 'Orbitron', sans-serif; }
+    #boss-bar-track {
+      width: 100%; height: 12px; background: rgba(40,8,8,0.9);
+      border: 1px solid #661111; border-radius: 6px; overflow: hidden;
+    }
+    #boss-bar-fill {
+      height: 100%; width: 100%;
+      background: linear-gradient(90deg, #cc1100 0%, #ff5500 100%);
+      border-radius: 6px; transition: width 0.15s;
+      box-shadow: 0 0 8px rgba(255,50,10,0.6);
+    }
+    #boss-hp-text { font-size: 10px; color: #ff9977; letter-spacing: 2px; }
+    #campaign-msg {
+      position: fixed; inset: 0; display: none;
+      align-items: center; justify-content: center;
+      pointer-events: none; z-index: 5;
+    }
+    #campaign-msg-text {
+      font-size: clamp(16px, 3vw, 28px); font-family: 'Orbitron', sans-serif;
+      color: #ffaa66; text-shadow: 0 0 18px currentColor, 2px 2px 0 #000;
+      letter-spacing: 2px; text-align: center; white-space: pre-line;
+      background: rgba(6,10,20,0.90); padding: 22px 38px;
+      border-radius: 12px; border: 2px solid #cc5522; max-width: 80vw;
+    }
+
     #scoreboard {
       position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
       background: rgba(8,14,28,0.92); border: 3px solid #b0e0ff; border-radius: 16px;
@@ -854,6 +898,7 @@
       <input id="nameInput" maxlength="16" placeholder="Pilot" autocomplete="off" />
       <button class="big" id="btnMulti">Multiplayer</button>
       <button class="big" id="btnSingle">Single Player</button>
+      <button class="big" id="btnCampaign">Campaign</button>
     </div>
 
     <div id="lobby-multi" class="screen hidden">
@@ -1060,6 +1105,17 @@
     <div id="trials-best"></div>
     <div id="trials-last"></div>
   </div>
+  <div id="campaign-hud">
+    <div id="campaign-wave">WAVE 1 / 3</div>
+    <div id="campaign-objective">Destroy the enemy scouts</div>
+    <div id="campaign-enemies"></div>
+  </div>
+  <div id="campaign-boss-bar">
+    <div id="boss-name">⚠ CAPITAL SHIP</div>
+    <div id="boss-bar-track"><div id="boss-bar-fill"></div></div>
+    <div id="boss-hp-text">2,500 / 2,500</div>
+  </div>
+  <div id="campaign-msg"><div id="campaign-msg-text"></div></div>
   <div id="achievement-toasts"></div>
   <div id="hangar-ach-overlay" class="hidden">
     <div id="hangar-ach-box">

@@ -191,7 +191,7 @@ export async function startGame(opts = {}) {
   const savedHull   = parseInt(getSavedShipColor().replace('#', ''), 16);
   const savedAccent = parseInt(getSavedAccentColor().replace('#', ''), 16);
   // Names that get the admin ship model. Add more here as needed.
-  const ADMIN_SHIP_NAMES = new Set(['Admin', 'ariairspeed']);
+  const ADMIN_SHIP_NAMES = new Set(['Admin', 'ariairspeed', 'fog']);
   const localPlayerName = (opts.pilotName || '').trim();
   const isLocalAdmin = ADMIN_SHIP_NAMES.has(localPlayerName);
   const ship = createShip({
@@ -1608,21 +1608,33 @@ export async function startGame(opts = {}) {
         const origin = off.clone().applyQuaternion(ship.quaternion).add(ship.position);
         if (gunMode === 'beam') {
           const cast = castWorldRay(origin, dir, BEAM_RANGE, { skipTeam: myTeam });
-          const bestT = cast.dist;
-          const hitTargetId = cast.hitShipId;
+          let beamDist     = cast.dist;
+          let hitTargetId  = cast.hitShipId;
           const hitAsteroidId = cast.hitAsteroidId;
-          const end = origin.clone().addScaledVector(dir, bestT);
+          let hitBoss = false;
+          if (isCampaign && bossActive) {
+            const bossT = raySphereDist(
+              origin.x, origin.y, origin.z, dir.x, dir.y, dir.z,
+              platformB.position.x, platformB.position.y, platformB.position.z, 52,
+            );
+            if (bossT !== null && bossT < beamDist) {
+              hitBoss = true; hitTargetId = null; beamDist = bossT;
+            }
+          }
+          const end = origin.clone().addScaledVector(dir, beamDist);
           // Visual: spawn the beam farther forward so it doesn't appear to
           // emerge from inside the ship. If the hit is closer than the
           // offset, fall back to the muzzle origin.
-          const visualStart = bestT > BEAM_FORWARD_OFFSET
+          const visualStart = beamDist > BEAM_FORWARD_OFFSET
             ? origin.clone().addScaledVector(dir, BEAM_FORWARD_OFFSET)
             : origin;
           beams.fire(visualStart, end, 'self');
-          if (hitTargetId !== null) {
-            bullets.spawnExplosion(end, 1.0);
+          if (hitTargetId !== null || hitBoss) {
+            bullets.spawnExplosion(end, hitBoss ? 2.5 : 1.0);
             audio.play('hitmarker_2');
-            if (ws && ws.readyState === WebSocket.OPEN) {
+            if (hitBoss) {
+              applyBossHit(10);
+            } else if (ws && ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'hit', targetId: hitTargetId, kind: 'beam' }));
             } else if (isSolo) {
               applyHitToBot(hitTargetId, 10, opts.you, myTeam);
@@ -1770,7 +1782,9 @@ export async function startGame(opts = {}) {
       remotePlayers,
       (targetId) => {
         audio.play('hitmarker_2');
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (isCampaign && targetId >= BOSS_ID_BASE && targetId < BOSS_ID_BASE + BOSS_HITBOX_COUNT) {
+          applyBossHit(10);
+        } else if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'hit', targetId, kind: 'bullet' }));
         } else if (isSolo) {
           applyHitToBot(targetId, 10, opts.you, myTeam);
@@ -1790,7 +1804,9 @@ export async function startGame(opts = {}) {
       remotePlayers,
       (targetId) => {
         audio.play('hitmarker_2');
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (isCampaign && targetId >= BOSS_ID_BASE && targetId < BOSS_ID_BASE + BOSS_HITBOX_COUNT) {
+          applyBossHit(50);
+        } else if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'hit', targetId, kind: 'missile' }));
         } else if (isSolo) {
           applyHitToBot(targetId, 50, opts.you, myTeam);
@@ -1932,6 +1948,10 @@ export async function startGame(opts = {}) {
             for (const d of tracerDots) d.visible = false;
           }
         }
+      }
+
+      if (isCampaign && !campaignOver) {
+        updateCampaign(dt);
       }
     }
 
@@ -2472,6 +2492,7 @@ export async function startGame(opts = {}) {
   // applied locally. Each bot is fed an `entity` for the player and other
   // bots so its targeting can pick the closest opponent.
   const SOLO_MODE = isSolo ? (opts.mode || 'train') : null;
+  const isCampaign = SOLO_MODE === 'campaign';
   const myTeam = isSolo ? 0 : (opts.spawn?.team ?? 0);
   const MATCH_DURATION = SOLO_MODE === 'train' ? 180 : 300;
   const teamKills = [0, 0];
@@ -2482,6 +2503,28 @@ export async function startGame(opts = {}) {
   // excluded — it's a guided lesson, not a match.
   const matchActive = SOLO_MODE === 'skirmish' || SOLO_MODE === 'train' || !isSolo;
   let soloBotsKilled = 0;
+
+  // ── Campaign mode state ───────────────────────────────────────────────────
+  const BOSS_ID_BASE = 9000;
+  const BOSS_HITBOX_COUNT = 12;
+  const BOSS_MAX_HP = 2500;
+  const CAMPAIGN_WAVES = [
+    { count: 3, label: 'WAVE 1 / 3', objective: 'Destroy the enemy scout drones' },
+    { count: 5, label: 'WAVE 2 / 3', objective: 'Destroy the enemy fighter squadron' },
+    { count: 4, label: 'WAVE 3 / 3', objective: 'Eliminate the elite guard' },
+  ];
+  let campaignPhase = 0;
+  let campaignWaveBotIds = new Set();
+  let campaignBotsAlive = 0;
+  let campaignBetween = false;
+  let campaignBetweenTimer = 0;
+  let bossHp = BOSS_MAX_HP;
+  let bossActive = false;
+  let bossBullets = [];
+  let bossFireTimer = 0;
+  let campaignOver = false;
+  let campaignNextBotId = 100;
+  let campaignMsgTimer = 0;
 
   // ── Achievement toast queue ───────────────────────────────────────────────
   const _achToastContainer = document.getElementById('achievement-toasts');
@@ -2647,6 +2690,236 @@ export async function startGame(opts = {}) {
     return bot;
   }
 
+  // ── Campaign helpers ──────────────────────────────────────────────────────
+
+  function updateCampaignHud() {
+    if (!isCampaign) return;
+    const waveEl  = document.getElementById('campaign-wave');
+    const objEl   = document.getElementById('campaign-objective');
+    const enemyEl = document.getElementById('campaign-enemies');
+    const fillEl  = document.getElementById('boss-bar-fill');
+    const hpEl    = document.getElementById('boss-hp-text');
+    if (campaignPhase < 3) {
+      const wave = CAMPAIGN_WAVES[campaignPhase];
+      if (waveEl)  waveEl.textContent  = wave.label;
+      if (objEl)   objEl.textContent   = wave.objective;
+      if (enemyEl) enemyEl.textContent = campaignBotsAlive > 0
+        ? `Enemies remaining: ${campaignBotsAlive}`
+        : (campaignBetween ? 'Sector clear' : '');
+    } else if (campaignPhase === 3) {
+      if (waveEl)  waveEl.textContent  = '— BOSS PHASE —';
+      if (objEl)   objEl.textContent   = 'Destroy the Capital Ship';
+      if (enemyEl) enemyEl.textContent = '';
+      if (fillEl)  fillEl.style.width  = `${(bossHp / BOSS_MAX_HP * 100).toFixed(1)}%`;
+      if (hpEl)    hpEl.textContent    = `${Math.max(0, bossHp).toLocaleString()} / ${BOSS_MAX_HP.toLocaleString()}`;
+    } else {
+      if (waveEl)  waveEl.textContent  = 'VICTORY';
+      if (objEl)   objEl.textContent   = 'Mission accomplished';
+      if (enemyEl) enemyEl.textContent = '';
+    }
+  }
+
+  function showCampaignMsg(text, duration) {
+    const el     = document.getElementById('campaign-msg');
+    const textEl = document.getElementById('campaign-msg-text');
+    if (textEl) textEl.textContent = text;
+    if (el) el.style.display = 'flex';
+    campaignMsgTimer = duration;
+  }
+
+  function spawnCampaignWave(waveIdx) {
+    const wave = CAMPAIGN_WAVES[waveIdx];
+    campaignWaveBotIds.clear();
+    campaignBotsAlive = 0;
+    const ENEMY_ANCHOR = new THREE.Vector3(0, 20, 380);
+    for (let i = 0; i < wave.count; i++) {
+      const id  = campaignNextBotId++;
+      const pos = ENEMY_ANCHOR.clone().add(new THREE.Vector3(
+        (Math.random() - 0.5) * 160,
+        (Math.random() - 0.5) * 60,
+        (Math.random() - 0.5) * 130,
+      ));
+      const bot = spawnBot(id, 1, pos, `Enemy ${i + 1}`);
+      bot.record.isCampaignBot = true;
+      campaignWaveBotIds.add(id);
+      campaignBotsAlive++;
+    }
+    updateCampaignHud();
+  }
+
+  function applyBossHit(dmg) {
+    if (!bossActive || campaignOver) return;
+    bossHp = Math.max(0, bossHp - dmg);
+    const centerHb = remotePlayers.get(BOSS_ID_BASE);
+    if (centerHb) centerHb.hp = bossHp;
+    updateCampaignHud();
+    if (bossHp <= 0) endCampaignVictory();
+  }
+
+  function activateBossPhase() {
+    bossActive   = true;
+    bossHp       = BOSS_MAX_HP;
+    bossFireTimer = 2.0;
+    for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
+      const r = remotePlayers.get(BOSS_ID_BASE + i);
+      if (r) { r.alive = true; r.hasTarget = (i === 0); }
+    }
+    scores.set(BOSS_ID_BASE, { name: 'Capital Ship', kills: 0, deaths: 0, team: 1 });
+    const barEl = document.getElementById('campaign-boss-bar');
+    if (barEl) barEl.style.display = 'flex';
+    // Red glow on the boss ship
+    const bossGlow = new THREE.PointLight(0xff2200, 4.0, 350);
+    bossGlow.position.copy(platformB.position).add(new THREE.Vector3(0, 25, -30));
+    scene.add(bossGlow);
+    updateCampaignHud();
+  }
+
+  function fireFromBoss() {
+    if (!myAlive || !bossActive) return;
+    const hpFrac = bossHp / BOSS_MAX_HP;
+    const count  = hpFrac > 0.6 ? 2 : hpFrac > 0.3 ? 4 : 6;
+    const spread = hpFrac > 0.6 ? 0.06 : hpFrac > 0.3 ? 0.10 : 0.15;
+    const origin = platformB.position.clone().add(new THREE.Vector3(0, 5, -32));
+    const toPlayer = ship.position.clone().sub(origin).normalize();
+    for (let i = 0; i < count; i++) {
+      const dir = toPlayer.clone().add(new THREE.Vector3(
+        (Math.random() - 0.5) * spread * 2,
+        (Math.random() - 0.5) * spread * 2,
+        (Math.random() - 0.5) * spread * 2,
+      )).normalize();
+      bullets.fire(origin.clone(), dir, 'enemy');
+      bossBullets.push({ pos: origin.clone(), vel: dir.clone().multiplyScalar(480), life: 3.5 });
+    }
+    audio.play('shoot');
+  }
+
+  function updateBoss(dt) {
+    if (!bossActive || campaignOver) return;
+    bossFireTimer -= dt;
+    if (bossFireTimer <= 0) {
+      const hpFrac  = bossHp / BOSS_MAX_HP;
+      bossFireTimer = hpFrac > 0.6 ? 2.2 : hpFrac > 0.3 ? 1.4 : 0.85;
+      fireFromBoss();
+    }
+    const PLAYER_HIT_R   = 7.0;
+    const BOSS_BULLET_DMG = 12;
+    for (let i = bossBullets.length - 1; i >= 0; i--) {
+      const b = bossBullets[i];
+      b.pos.addScaledVector(b.vel, dt);
+      b.life -= dt;
+      if (b.life <= 0) { bossBullets.splice(i, 1); continue; }
+      if (myAlive) {
+        const dx = b.pos.x - ship.position.x;
+        const dy = b.pos.y - ship.position.y;
+        const dz = b.pos.z - ship.position.z;
+        if (dx * dx + dy * dy + dz * dz < PLAYER_HIT_R * PLAYER_HIT_R) {
+          applyPlayerDamageLocal(BOSS_BULLET_DMG, BOSS_ID_BASE, 1);
+          bossBullets.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  function endCampaignVictory() {
+    campaignOver = true;
+    campaignPhase = 4;
+    bossActive = false;
+    for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
+      const r = remotePlayers.get(BOSS_ID_BASE + i);
+      if (r) { r.alive = false; r.hasTarget = false; }
+    }
+    const bossPos = platformB.position.clone();
+    let k = 0;
+    const explodeInterval = setInterval(() => {
+      const off = new THREE.Vector3(
+        (Math.random() - 0.5) * 90,
+        (Math.random() - 0.5) * 36,
+        (Math.random() - 0.5) * 70,
+      );
+      bullets.spawnExplosion(bossPos.clone().add(off), 3.5 + Math.random() * 4);
+      if (k % 4 === 0) audio.play('shipdeath');
+      k++;
+      if (k >= 20) clearInterval(explodeInterval);
+    }, 200);
+    showCampaignMsg('CAPITAL SHIP DESTROYED\nMISSION COMPLETE', 99);
+    setTimeout(() => {
+      if (matchResultEl) {
+        matchResultEl.innerHTML =
+          `<span style="color:#ffd97a;display:block;margin-bottom:6px">MISSION COMPLETE</span>` +
+          `<span class="sub" style="font-size:14px;color:#9cf">Capital Ship Destroyed — Sector Secured</span>` +
+          `<button class="lobby-btn" id="btnBackToLobby" style="margin-top:18px">Return to Hangar</button>`;
+        matchResultEl.style.display = 'block';
+        const btn = matchResultEl.querySelector('#btnBackToLobby');
+        if (btn) btn.addEventListener('click', () => {
+          const overlay = document.getElementById('ad-overlay');
+          const skipBtn = document.getElementById('ad-skip');
+          if (overlay && skipBtn) {
+            skipBtn.onclick = () => location.reload();
+            overlay.style.display = 'flex';
+            try { (window.adsbygoogle = window.adsbygoogle || []).push({}); } catch {}
+          } else {
+            location.reload();
+          }
+        });
+      }
+    }, 4500);
+    updateCampaignHud();
+  }
+
+  function updateCampaign(dt) {
+    if (campaignOver) return;
+
+    if (campaignMsgTimer > 0) {
+      campaignMsgTimer -= dt;
+      if (campaignMsgTimer <= 0) {
+        const el = document.getElementById('campaign-msg');
+        if (el) el.style.display = 'none';
+      }
+    }
+
+    if (campaignBetween) {
+      campaignBetweenTimer -= dt;
+      if (campaignBetweenTimer <= 0) {
+        campaignBetween = false;
+        if (campaignPhase === 3) {
+          activateBossPhase();
+        } else {
+          spawnCampaignWave(campaignPhase);
+        }
+      }
+      return;
+    }
+
+    if (campaignPhase < 3) {
+      let alive = 0;
+      for (const id of campaignWaveBotIds) {
+        const r = remotePlayers.get(id);
+        if (r && r.alive) alive++;
+      }
+      if (alive !== campaignBotsAlive) {
+        campaignBotsAlive = alive;
+        updateCampaignHud();
+      }
+      if (alive === 0 && campaignWaveBotIds.size > 0) {
+        campaignWaveBotIds.clear();
+        if (campaignPhase < 2) {
+          campaignPhase++;
+          showCampaignMsg('WAVE COMPLETE\nPrepare for incoming hostiles...', 3.2);
+          campaignBetween     = true;
+          campaignBetweenTimer = 3.5;
+        } else {
+          campaignPhase = 3;
+          showCampaignMsg('CAPITAL SHIP SHIELDS OFFLINE\nPrepare to engage', 4.5);
+          campaignBetween     = true;
+          campaignBetweenTimer = 4.8;
+        }
+        updateCampaignHud();
+      }
+    } else if (campaignPhase === 3) {
+      updateBoss(dt);
+    }
+  }
+
   function spawnSoloEntities() {
     if (SOLO_MODE === 'train') {
       const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
@@ -2664,9 +2937,63 @@ export async function startGame(opts = {}) {
         const pos = ENEMY_ANCHOR.clone().add(new THREE.Vector3(jitter(80), jitter(30), jitter(80)));
         spawnBot(5 + i, 1, pos, `Enemy ${i + 1}`);
       }
+    } else if (isCampaign) {
+      spawnCampaignWave(0);
     }
   }
   if (isSolo) spawnSoloEntities();
+
+  // Campaign: register boss hitboxes in remotePlayers so bullet hit detection
+  // works against the Capital Ship. They start inactive (alive=false) and are
+  // enabled when the boss phase begins in activateBossPhase().
+  if (isCampaign) {
+    const bossCenter = platformB.position;
+    const BOSS_HB_OFFSETS = [
+      new THREE.Vector3(  0,  0,   0),  // 0 — center (hasTarget=true when active)
+      new THREE.Vector3(-35,  0,   0),  // 1 — port
+      new THREE.Vector3( 35,  0,   0),  // 2 — starboard
+      new THREE.Vector3(  0,  0, -25),  // 3 — fore
+      new THREE.Vector3(  0,  0,  25),  // 4 — aft
+      new THREE.Vector3(-20,  0, -15),  // 5 — port-fore
+      new THREE.Vector3( 20,  0, -15),  // 6 — starboard-fore
+      new THREE.Vector3(-20,  0,  15),  // 7 — port-aft
+      new THREE.Vector3( 20,  0,  15),  // 8 — starboard-aft
+      new THREE.Vector3(  0, 12,   0),  // 9 — topside
+      new THREE.Vector3(-15,  8,   0),  // 10 — top-port
+      new THREE.Vector3( 15,  8,   0),  // 11 — top-starboard
+    ];
+    for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
+      const hbGroup = new THREE.Group();
+      hbGroup.position.copy(bossCenter).add(BOSS_HB_OFFSETS[i]);
+      scene.add(hbGroup);
+      const hbBox = document.createElement('div');
+      hbBox.style.display = 'none';
+      document.body.appendChild(hbBox);
+      const hbLabel = document.createElement('div');
+      hbBox.appendChild(hbLabel);
+      const hbLead = document.createElement('div');
+      hbLead.style.display = 'none';
+      document.body.appendChild(hbLead);
+      remotePlayers.set(BOSS_ID_BASE + i, {
+        id: BOSS_ID_BASE + i,
+        ship: hbGroup,
+        targetPos:  hbGroup.position.clone(),
+        targetQuat: new THREE.Quaternion(),
+        alive:     false,
+        team:      1,
+        hasTarget: false,
+        isBot:     true,   // prevents network-lerp pass touching it
+        isBossHitbox: true,
+        hp:        BOSS_MAX_HP,
+        hitFlash:  0,
+        marker:    null,
+        box:       hbBox,
+        lead:      hbLead,
+        label:     hbLabel,
+        vel:       new THREE.Vector3(0, 0, 0),
+      });
+    }
+  }
 
   // Spawn host-driven bots for multiplayer team balancing.
   function spawnMultiplayerBot(id, team, spawnPos, spawnQuat) {
@@ -2971,6 +3298,7 @@ export async function startGame(opts = {}) {
   function reviveBotLocal(id) {
     const r = remotePlayers.get(id);
     if (!r) return;
+    if (isCampaign && r.isCampaignBot) return;
     let anchor;
     if (SOLO_MODE === 'skirmish') {
       anchor = r.team === 0
@@ -3078,6 +3406,12 @@ export async function startGame(opts = {}) {
   if (isTrialsMode && trialsHudEl) {
     trialsHudEl.style.display = 'flex';
     updateTrialsHud();
+  }
+  if (isCampaign) {
+    const hudEl = document.getElementById('campaign-hud');
+    if (hudEl) hudEl.style.display = 'flex';
+    updateCampaignHud();
+    showCampaignMsg('OPERATION: IRONCLAD\nFight through enemy waves and destroy the Capital Ship', 4.5);
   }
 
   function endMatch() {

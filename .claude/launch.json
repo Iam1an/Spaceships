@@ -5,7 +5,8 @@
       "name": "spaceships",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
-      "port": 4000
+      "port": 4000,
+      "autoPort": false
     }
   ]
 }
