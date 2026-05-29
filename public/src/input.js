@@ -68,10 +68,12 @@ export class Input {
       fire: false,     // RT or A
       drift: false,    // LT
       boost: false,    // LB
+      menuBtn: false,  // Start (button 9) — edge-detected, true for one frame
     };
-    this._gpPrevMissile = false;
-    this._gpPrevFlare = false;
+    this._gpPrevMissile   = false;
+    this._gpPrevFlare     = false;
     this._gpPrevGunToggle = false;
+    this._gpPrevMenuBtn   = false;
 
     window.addEventListener('keydown', (e) => {
       this.keys.add(e.code);
@@ -275,5 +277,10 @@ export class Input {
     this._gpPrevMissile   = gpMissile;
     this._gpPrevFlare     = gpFlare;
     this._gpPrevGunToggle = gpGunToggle;
+
+    // Start / Menu button (9) → edge-detected open/close for the pause overlay
+    const gpMenuBtn = btn(9);
+    this.gp.menuBtn = gpMenuBtn && !this._gpPrevMenuBtn;
+    this._gpPrevMenuBtn = gpMenuBtn;
   }
 }

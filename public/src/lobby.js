@@ -1425,3 +1425,129 @@ showStatsInput.addEventListener('change', () => {
 
 // Remove intro animation class so menus don't re-animate when navigating back
 setTimeout(() => document.body.classList.remove('intro-active'), 3500);
+
+// ── Gamepad menu navigation ───────────────────────────────────────────────────
+// Polls the first connected gamepad in a rAF loop while the lobby is active.
+//
+// Controls:
+//   D-pad up / Left-stick up   → move focus up
+//   D-pad down / Left-stick down → move focus down
+//   A (button 0)               → confirm / click focused element
+//   B (button 1)               → back (clicks the current screen's ← back btn)
+//   Start (button 9)           → back to main screen from any sub-screen
+//
+// A small CSS block is injected once to give focused buttons a visible
+// controller-style highlight ring that matches the game's blue theme.
+(function startGamepadMenuNav() {
+  // Inject focus style once
+  const focusStyle = document.createElement('style');
+  focusStyle.textContent = `
+    .big:focus-visible, .link:focus-visible,
+    .campaign-mission-btn:focus-visible, .trial-btn:focus-visible {
+      outline: 2px solid #4aa3ff;
+      outline-offset: 3px;
+      box-shadow: 0 0 0 5px rgba(74,163,255,0.28), 0 0 18px rgba(74,163,255,0.35);
+    }`;
+  document.head.appendChild(focusStyle);
+
+  // Maps screen element IDs → the ID of the "go back" button for that screen.
+  const BACK_BTNS = {
+    'lobby-multi':    'btnBackMulti',
+    'lobby-create':   'btnBackCreate',
+    'lobby-find':     'btnBackFind',
+    'lobby-room':     'btnLeave',
+    'lobby-single':   'btnBackSingle',
+    'lobby-tutorial': 'btnBackTutorial',
+    'lobby-trials':   'btnBackTrials',
+    'lobby-campaign': 'btnBackCampaign',
+  };
+
+  function getActiveScreen() {
+    return document.querySelector('.screen:not(.hidden)');
+  }
+
+  function getMenuFocusables() {
+    const screen = getActiveScreen();
+    if (!screen) return [];
+    // Buttons (excluding locked/disabled), radios, checkboxes — not text inputs
+    // since those require a keyboard; players can still click them with mouse.
+    return [...screen.querySelectorAll(
+      'button:not(.locked):not([disabled]), input[type="radio"], input[type="checkbox"]'
+    )].filter(el => el.offsetParent !== null);
+  }
+
+  let navCooldown  = 0;
+  let prevNavUp    = false, prevNavDown  = false;
+  let prevA        = false, prevB        = false, prevStart = false;
+  let lastTs       = null;
+
+  function loop(ts) {
+    // Stop the loop once the game has started (lobby hidden)
+    if (!document.body.classList.contains('in-lobby')) return;
+
+    const dt = lastTs == null ? 0 : Math.min((ts - lastTs) / 1000, 0.1);
+    lastTs = ts;
+    navCooldown = Math.max(0, navCooldown - dt);
+
+    const rawGp = [...(navigator.getGamepads?.() ?? [])].find(g => g?.connected);
+    if (!rawGp) { requestAnimationFrame(loop); return; }
+
+    const bt  = rawGp.buttons;
+    const ax  = rawGp.axes;
+    const btn = (i) => bt[i]?.pressed ?? false;
+
+    const DEAD    = 0.5;
+    const navUp   = btn(12) || (ax[1] ?? 0) < -DEAD;
+    const navDown = btn(13) || (ax[1] ?? 0) > DEAD;
+    const pressA  = btn(0);
+    const pressB  = btn(1);
+    const pressStart = btn(9);
+
+    const focusables = getMenuFocusables();
+
+    // If nothing on the current screen is focused (e.g. just navigated here),
+    // auto-focus the first focusable element so the player has a starting point.
+    if (focusables.length > 0 && !focusables.includes(document.activeElement)) {
+      focusables[0].focus();
+    }
+
+    // Up / down navigation with initial delay + held-repeat
+    if (navCooldown === 0 && (navUp || navDown)) {
+      const dir  = navUp ? -1 : 1;
+      const cur  = focusables.indexOf(document.activeElement);
+      const next = ((cur < 0 ? 0 : cur) + dir + focusables.length) % focusables.length;
+      focusables[next].focus();
+      // First press: 280 ms delay before repeat; while held: 120 ms repeat
+      navCooldown = (prevNavUp || prevNavDown) ? 0.12 : 0.28;
+    }
+
+    // A → confirm (click)
+    if (pressA && !prevA) {
+      const el = document.activeElement;
+      if (el && focusables.includes(el)) el.click();
+    }
+
+    // B → back
+    if (pressB && !prevB) {
+      const screen = getActiveScreen();
+      const backId = screen && BACK_BTNS[screen.id];
+      if (backId) document.getElementById(backId)?.click();
+    }
+
+    // Start → back to main from any sub-screen
+    if (pressStart && !prevStart) {
+      const screen = getActiveScreen();
+      if (screen && screen.id !== 'lobby-main') {
+        const backId = BACK_BTNS[screen.id];
+        if (backId) document.getElementById(backId)?.click();
+      }
+    }
+
+    prevNavUp = navUp; prevNavDown = navDown;
+    prevA = pressA; prevB = pressB; prevStart = pressStart;
+
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame(loop);
+}());

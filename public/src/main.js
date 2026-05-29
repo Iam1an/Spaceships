@@ -1327,6 +1327,32 @@ export async function startGame(opts = {}) {
 
   function update(dt) {
     input.pollGamepad();
+
+    // ── Gamepad pause overlay handling ──────────────────────────────────────
+    if (input.gp.menuBtn) {
+      if (pauseOpen) closePause(); else openPause();
+    }
+    if (pauseOpen) {
+      // Navigate the two pause buttons with D-pad / left stick
+      pauseNavCooldown = Math.max(0, pauseNavCooldown - dt);
+      const rawGp = [...(navigator.getGamepads?.() ?? [])].find(g => g?.connected);
+      if (rawGp) {
+        const navUp   = rawGp.buttons[12]?.pressed || rawGp.axes[1] < -0.5;
+        const navDown = rawGp.buttons[13]?.pressed || rawGp.axes[1] > 0.5;
+        const confirm = rawGp.buttons[0]?.pressed;
+        if (pauseNavCooldown === 0 && (navUp || navDown)) {
+          pauseFocusIdx = pauseFocusIdx === 0 ? 1 : 0;
+          pauseBtns[pauseFocusIdx].focus();
+          pauseNavCooldown = (pausePrevNavUp || pausePrevNavDown) ? 0.12 : 0.25;
+        }
+        if (confirm && !pausePrevConfirm) pauseBtns[pauseFocusIdx].click();
+        pausePrevNavUp   = navUp;
+        pausePrevNavDown = navDown;
+        pausePrevConfirm = confirm;
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     warpEffect.update(dt);
     // Trials 3-2-1-GO countdown: freeze the ship, update the overlay, then release.
     if (isTrialsMode && trialsCountdownActive) {
@@ -3807,6 +3833,52 @@ export async function startGame(opts = {}) {
       });
     }
   }
+
+  // ── Gamepad pause overlay ────────────────────────────────────────────────
+  // The Start / Menu button (button 9) toggles this overlay during gameplay.
+  // D-pad or left stick up/down moves focus; A confirms; Start again closes.
+  let pauseOpen = false;
+  let pauseFocusIdx = 0;   // 0 = Resume, 1 = Back to Lobby
+  let pauseNavCooldown = 0;
+  let pausePrevNavUp = false, pausePrevNavDown = false, pausePrevConfirm = false;
+
+  const pauseOverlay = document.createElement('div');
+  Object.assign(pauseOverlay.style, {
+    position: 'fixed', inset: '0', display: 'none',
+    flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+    gap: '14px', zIndex: '9999', pointerEvents: 'auto',
+    background: 'rgba(4,8,18,0.85)', backdropFilter: 'blur(14px)',
+  });
+  pauseOverlay.innerHTML = `
+    <div style="font-family:'Orbitron',sans-serif;font-size:clamp(14px,2.5vw,22px);
+      color:#4aa3ff;letter-spacing:8px;text-transform:uppercase;font-weight:800;
+      margin-bottom:8px;text-shadow:0 0 24px rgba(74,163,255,0.55)">PAUSED</div>
+    <button id="pauseResume"    class="big" style="min-width:220px">▶ &nbsp;RESUME</button>
+    <button id="pauseBackLobby" class="big" style="min-width:220px">← &nbsp;BACK TO LOBBY</button>
+    <div style="font-family:'Orbitron',sans-serif;font-size:10px;color:#3a5070;
+      margin-top:10px;letter-spacing:2px;text-transform:uppercase">
+      A / Click — confirm &nbsp;·&nbsp; Start — close
+    </div>`;
+  document.body.appendChild(pauseOverlay);
+
+  const pauseResumeBtn    = document.getElementById('pauseResume');
+  const pauseBackLobbyBtn = document.getElementById('pauseBackLobby');
+  const pauseBtns = [pauseResumeBtn, pauseBackLobbyBtn];
+
+  function openPause() {
+    pauseOpen = true;
+    pauseOverlay.style.display = 'flex';
+    pauseFocusIdx = 0;
+    pauseResumeBtn.focus();
+  }
+  function closePause() {
+    pauseOpen = false;
+    pauseOverlay.style.display = 'none';
+  }
+  pauseResumeBtn.addEventListener('click', closePause);
+  pauseBackLobbyBtn.addEventListener('click', () => {
+    if (window.confirm('Leave match and return to menu?')) window.location.reload();
+  });
 
   // TAB toggles the scoreboard. One press shows; press again hides. Key
   // repeat is ignored so holding doesn't ping-pong. Listener is in capture

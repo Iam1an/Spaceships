@@ -183,7 +183,7 @@ app.post('/api/campaign-result', (req, res) => {
 
 // During dev iteration we want every reload to fetch fresh assets so HTML/CSS
 // edits show up without needing a hard refresh.
-app.use(express.static(root, {
+app.use(express.static(path.join(root, 'public'), {
   etag: false,
   lastModified: false,
   setHeaders: (res) => res.set('Cache-Control', 'no-store'),
@@ -270,6 +270,13 @@ class WSConn {
         off += 4;
       }
       if (this.buffer.length < off + len) return;
+
+      // FIX: Prevent OOM DoS by enforcing a maximum payload size (1MB)
+      if (len > 1048576) {
+        this.fail(new Error('Payload too large'));
+        return;
+      }
+
       let payload = this.buffer.subarray(off, off + len);
       if (masked) {
         const out = Buffer.allocUnsafe(payload.length);

@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, '..', 'pilots.db');
 
+if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+  throw new Error("FATAL: JWT_SECRET must be defined in production environment!");
+}
 export const JWT_SECRET = process.env.JWT_SECRET || 'spaceships-dev-secret-change-in-prod';
 
 const db = new Database(DB_PATH);
@@ -308,7 +311,9 @@ export async function registerPilot(username, password) {
 
 export async function loginPilot(username, password) {
   const pilot = stmtByUsername.get(String(username ?? ''));
-  const hash = pilot?.hashed_password ?? '$2b$10$invalidhashpaddingtoconstanttime';
+  // Use a valid (but dummy) bcrypt hash so the compare time is consistent
+  // This is the hash for "dummy_fallback_password"
+  const hash = pilot?.hashed_password ?? '$2a$10$wT0E8K.01.t7VqgLwA9xDuw16x5lH.98889Z2f/gB17vR6g5p3uO2';
   const ok = await bcrypt.compare(String(password ?? ''), hash);
   if (!pilot || !ok) throw apiError('Invalid callsign or password', 401);
   const token = jwt.sign(
