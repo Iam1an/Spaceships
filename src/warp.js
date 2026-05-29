@@ -1,56 +1,61 @@
 import * as THREE from 'three';
 
 export function createWarpEffect(scene, camera) {
-  const WARP_DURATION = 2.5; // seconds
+  const WARP_DURATION = 3.0; // slightly longer for more impact
   let warpTimer = WARP_DURATION;
 
-  const starCount = 800;
-  const lineGeo = new THREE.BufferGeometry();
-  const linePos = new Float32Array(starCount * 6); // 2 vertices per line segment
-  const velocities = new Float32Array(starCount);
-
-  for (let i = 0; i < starCount; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const radius = 25 + Math.random() * 150;
-    
-    const x = Math.cos(angle) * radius;
-    const y = Math.sin(angle) * radius;
-    const z = (Math.random() - 0.5) * 800; // Initial Z spread
-    
-    linePos[i * 6 + 0] = x;
-    linePos[i * 6 + 1] = y;
-    linePos[i * 6 + 2] = z;
-    
-    linePos[i * 6 + 3] = x;
-    linePos[i * 6 + 4] = y;
-    linePos[i * 6 + 5] = z + 20; // Length
-    
-    velocities[i] = 1500 + Math.random() * 1500;
-  }
+  const starCount = 3000; // More lines
+  const geometry = new THREE.BoxGeometry(0.4, 0.4, 1); // Thicker lines
   
-  lineGeo.setAttribute('position', new THREE.BufferAttribute(linePos, 3));
-
-  const material = new THREE.LineBasicMaterial({
-    color: 0xaaddff,
+  // Bright glowing material
+  const material = new THREE.MeshBasicMaterial({
+    color: 0xccffff,
     transparent: true,
     opacity: 1.0,
     blending: THREE.AdditiveBlending,
     depthWrite: false
   });
 
-  const lines = new THREE.LineSegments(lineGeo, material);
-  scene.add(lines);
+  const instancedMesh = new THREE.InstancedMesh(geometry, material, starCount);
+  instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  
+  const dummy = new THREE.Object3D();
+  const velocities = new Float32Array(starCount);
+  const phases = new Float32Array(starCount); // Random offset for organic feel
+
+  for (let i = 0; i < starCount; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const radius = 10 + Math.random() * 200; // Tighter center, wider spread
+    
+    const x = Math.cos(angle) * radius;
+    const y = Math.sin(angle) * radius;
+    const z = (Math.random() - 0.5) * 1000;
+    
+    dummy.position.set(x, y, z);
+    
+    // Scale Z to make them look like lines, length based on speed later
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    instancedMesh.setMatrixAt(i, dummy.matrix);
+    
+    velocities[i] = 2000 + Math.random() * 3000;
+    phases[i] = Math.random();
+  }
+  
+  instancedMesh.instanceMatrix.needsUpdate = true;
+  scene.add(instancedMesh);
 
   const baseFov = camera.fov;
-  const maxFov = 115;
+  // Extreme FOV to naturally cause a fish-eye / screen warp effect
+  const maxFov = 160; 
   camera.fov = maxFov;
   camera.updateProjectionMatrix();
 
   return {
     update: (dt) => {
       if (warpTimer <= 0) {
-        if (lines.visible) {
-          lines.visible = false;
+        if (instancedMesh.visible) {
+          instancedMesh.visible = false;
           camera.fov = baseFov;
           camera.updateProjectionMatrix();
         }
@@ -62,42 +67,49 @@ export function createWarpEffect(scene, camera) {
       if (progress < 0) progress = 0;
       if (progress > 1) progress = 1;
 
-      // Opacity fades out heavily towards the end
-      const opacity = warpTimer < 0.6 ? (warpTimer / 0.6) : 1.0;
+      // Flash brightly at the start, fade out at the end
+      const opacity = warpTimer < 0.8 ? (warpTimer / 0.8) : 
+                     (progress < 0.2 ? (progress / 0.2) : 1.0);
       material.opacity = opacity;
 
-      // Smoothly reduce FOV
-      // fovProgress goes from 0 to 1 with an ease-out curve
-      const fovProgress = 1.0 - Math.pow(1.0 - progress, 3);
+      // Extreme screen warp effect using FOV
+      // We keep it extremely high for the first half, then snap it back
+      const fovProgress = 1.0 - Math.pow(1.0 - progress, 4); // sharp ease out
       camera.fov = THREE.MathUtils.lerp(maxFov, baseFov, fovProgress);
       camera.updateProjectionMatrix();
 
-      // Lock stars to camera position and orientation
-      lines.position.copy(camera.position);
-      lines.quaternion.copy(camera.quaternion);
+      instancedMesh.position.copy(camera.position);
+      instancedMesh.quaternion.copy(camera.quaternion);
 
-      const posAttr = lineGeo.attributes.position;
-      const arr = posAttr.array;
-      
-      // Speed multiplier slows down as we exit warp
-      const speedMult = THREE.MathUtils.lerp(2.5, 0.1, progress);
+      // We need to decode the matrices to update positions
+      // A faster way is to just use a custom shader, but InstancedMesh is okay for 3000
+      const speedMult = THREE.MathUtils.lerp(2.0, 0.05, progress);
+      const position = new THREE.Vector3();
+      const quaternion = new THREE.Quaternion();
+      const scale = new THREE.Vector3();
 
       for (let i = 0; i < starCount; i++) {
-        let z1 = arr[i * 6 + 2];
-        let z2 = arr[i * 6 + 5];
+        instancedMesh.getMatrixAt(i, dummy.matrix);
+        dummy.matrix.decompose(position, quaternion, scale);
 
         const speed = velocities[i] * dt * speedMult;
-        z1 += speed;
-        
-        // Wrap stars from behind the camera back to far front
-        if (z1 > 50) {
-          z1 -= 800;
+        position.z += speed;
+
+        // Wrap around from behind camera to far away
+        if (position.z > 100) {
+          position.z -= 1000;
         }
 
-        arr[i * 6 + 2] = z1;
-        arr[i * 6 + 5] = z1 + speed * 0.15 + 10; // Dynamic stretching
+        // Stretch line based on speed so they look like thick laser bolts
+        scale.z = Math.max(1, speed * 0.5 + 20);
+
+        dummy.position.copy(position);
+        dummy.scale.copy(scale);
+        dummy.updateMatrix();
+        instancedMesh.setMatrixAt(i, dummy.matrix);
       }
-      posAttr.needsUpdate = true;
+      
+      instancedMesh.instanceMatrix.needsUpdate = true;
     }
   };
 }
