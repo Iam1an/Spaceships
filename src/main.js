@@ -127,6 +127,9 @@ export async function startGame(opts = {}) {
   }
 
   const isTrialsMode = !!(opts.solo && opts.mode && opts.mode.startsWith('trials'));
+  // Hoisted early so platform/asteroid setup can branch on campaign mode
+  const isCampaign = !!(opts.solo && opts.mode === 'campaign');
+  const CAMPAIGN_MISSION = isCampaign ? (opts.missionId ?? 1) : 1;
 
   // Base platforms: motherships for space, airfields for terrain. AABBs kept
   // separately for collision — same world-aligned box approach either way.
@@ -2533,8 +2536,7 @@ export async function startGame(opts = {}) {
   // applied locally. Each bot is fed an `entity` for the player and other
   // bots so its targeting can pick the closest opponent.
   const SOLO_MODE = isSolo ? (opts.mode || 'train') : null;
-  const isCampaign = SOLO_MODE === 'campaign';
-  const CAMPAIGN_MISSION = isCampaign ? (opts.missionId ?? 1) : 1;
+  // isCampaign and CAMPAIGN_MISSION are hoisted near the top of startGame
   const myTeam = isSolo ? 0 : (opts.spawn?.team ?? 0);
   const MATCH_DURATION = SOLO_MODE === 'train' ? 180 : 300;
   const teamKills = [0, 0];
