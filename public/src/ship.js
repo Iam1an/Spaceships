@@ -7,7 +7,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 const modelCache = new Map();   // url → THREE.Group
 const loadPromises = new Map(); // url → Promise<THREE.Group>
 
-export function loadShipModel(url = 'public/spaceship.glb') {
+export function loadShipModel(url = 'spaceship.glb') {
   if (modelCache.has(url)) return Promise.resolve(modelCache.get(url));
   if (loadPromises.has(url)) return loadPromises.get(url);
   const loader = new GLTFLoader();
@@ -44,11 +44,11 @@ function isAccentMesh(o) {
   return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b < 0.35;
 }
 
-export function createShip({ tint, hullColor, accentColor, modelUrl = 'public/spaceship.glb', doubleSided = false } = {}) {
+export function createShip({ tint, hullColor, accentColor, modelUrl = 'spaceship.glb', doubleSided = false } = {}) {
   const ship = new THREE.Group();
   ship.name = 'Ship';
 
-  const cachedModel = modelCache.get(modelUrl) ?? modelCache.get('public/spaceship.glb');
+  const cachedModel = modelCache.get(modelUrl) ?? modelCache.get('spaceship.glb');
   if (cachedModel) {
     const model = cachedModel.clone(true);
     model.rotation.y = -Math.PI / 2;

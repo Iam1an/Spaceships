@@ -106,7 +106,7 @@ export async function startGame(opts = {}) {
   // registered without delay. We save the promise so getOrCreateRemote can
   // swap the model in-place if it finishes after a remote admin ship was
   // already created with the regular-model fallback.
-  const ADMIN_MODEL_URL = 'public/spaceshipADMIN.glb';
+  const ADMIN_MODEL_URL = 'spaceshipADMIN.glb';
   const adminModelReady = loadShipModel(ADMIN_MODEL_URL).catch(() => null);
 
   const MAP_TYPE = opts.map || 'space';
@@ -218,7 +218,7 @@ export async function startGame(opts = {}) {
   const ship = createShip({
     hullColor: savedHull,
     accentColor: savedAccent,
-    modelUrl: isLocalAdmin ? ADMIN_MODEL_URL : 'public/spaceship.glb',
+    modelUrl: isLocalAdmin ? ADMIN_MODEL_URL : 'spaceship.glb',
     doubleSided: isLocalAdmin,
   });
   // If we're admin but the model wasn't cached yet (still downloading),
@@ -682,7 +682,7 @@ export async function startGame(opts = {}) {
     const colors = remoteColors.get(id);
     const remoteName = (scores.get(id)?.name || '').trim();
     const isRemoteAdmin = remoteModels.get(id) === ADMIN_MODEL_URL || ADMIN_SHIP_NAMES.has(remoteName);
-    const remoteModelUrl = isRemoteAdmin ? ADMIN_MODEL_URL : 'public/spaceship.glb';
+    const remoteModelUrl = isRemoteAdmin ? ADMIN_MODEL_URL : 'spaceship.glb';
     const remoteShip = colors
       ? createShip({ hullColor: colors.hullColor, accentColor: colors.accentColor, modelUrl: remoteModelUrl, doubleSided: isRemoteAdmin })
       : createShip({ tint: PALETTE[id % PALETTE.length], modelUrl: remoteModelUrl, doubleSided: isRemoteAdmin });
