@@ -21,7 +21,9 @@ export function createWarpEffect(scene, camera) {
   
   const dummy = new THREE.Object3D();
   const velocities = new Float32Array(starCount);
-  const phases = new Float32Array(starCount); // Random offset for organic feel
+  const posX = new Float32Array(starCount);
+  const posY = new Float32Array(starCount);
+  const posZ = new Float32Array(starCount);
 
   for (let i = 0; i < starCount; i++) {
     const angle = Math.random() * Math.PI * 2;
@@ -31,6 +33,10 @@ export function createWarpEffect(scene, camera) {
     const y = Math.sin(angle) * radius;
     const z = (Math.random() - 0.5) * 1000;
     
+    posX[i] = x;
+    posY[i] = y;
+    posZ[i] = z;
+
     dummy.position.set(x, y, z);
     
     // Scale Z to make them look like lines, length based on speed later
@@ -39,7 +45,6 @@ export function createWarpEffect(scene, camera) {
     instancedMesh.setMatrixAt(i, dummy.matrix);
     
     velocities[i] = 2000 + Math.random() * 3000;
-    phases[i] = Math.random();
   }
   
   instancedMesh.instanceMatrix.needsUpdate = true;
@@ -84,27 +89,19 @@ export function createWarpEffect(scene, camera) {
       // We need to decode the matrices to update positions
       // A faster way is to just use a custom shader, but InstancedMesh is okay for 3000
       const speedMult = THREE.MathUtils.lerp(2.0, 0.05, progress);
-      const position = new THREE.Vector3();
-      const quaternion = new THREE.Quaternion();
-      const scale = new THREE.Vector3();
 
       for (let i = 0; i < starCount; i++) {
-        instancedMesh.getMatrixAt(i, dummy.matrix);
-        dummy.matrix.decompose(position, quaternion, scale);
-
         const speed = velocities[i] * dt * speedMult;
-        position.z += speed;
+        posZ[i] += speed;
 
         // Wrap around from behind camera to far away
-        if (position.z > 100) {
-          position.z -= 1000;
+        if (posZ[i] > 100) {
+          posZ[i] -= 1000;
         }
 
         // Stretch line based on speed so they look like thick laser bolts
-        scale.z = Math.max(1, speed * 0.5 + 20);
-
-        dummy.position.copy(position);
-        dummy.scale.copy(scale);
+        dummy.position.set(posX[i], posY[i], posZ[i]);
+        dummy.scale.set(1, 1, Math.max(1, speed * 0.5 + 20));
         dummy.updateMatrix();
         instancedMesh.setMatrixAt(i, dummy.matrix);
       }
