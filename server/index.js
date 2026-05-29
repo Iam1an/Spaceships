@@ -909,6 +909,16 @@ function handleConnection(ws) {
       }
       const shooter = room.players.get(effectiveShooterId);
       if (!shooter) return;
+      // Rate-limit hits per effective shooter + weapon kind so a missile
+      // landing right after a bullet isn't incorrectly dropped.
+      // Bullets/beams: 40ms min (bullet cooldown is 50ms; 10ms jitter headroom).
+      // Missiles: 400ms min (one in-flight at a time, slow travel).
+      if (!ws.hitTimes) ws.hitTimes = new Map();
+      const _now = Date.now();
+      const _hitKey = `${effectiveShooterId}:${msg.kind ?? 'bullet'}`;
+      const _minInterval = msg.kind === 'missile' ? 400 : 40;
+      if (_now - (ws.hitTimes.get(_hitKey) ?? 0) < _minInterval) return;
+      ws.hitTimes.set(_hitKey, _now);
       // Guns (bullet/beam) require the shooter to be alive — you can't fire
       // after death. Missiles are already in-flight when they hit, so a
       // shooter who died mid-flight still gets credit and the hit lands.
