@@ -307,7 +307,10 @@
     /* Profile Overlay */
     #profile-overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(4,6,13,0.85); backdrop-filter: blur(12px); z-index: 20; padding: 24px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
     #profile-overlay.hidden { display: none; }
-    #profile-box { width: min(760px, 100%); max-height: calc(100vh - 48px); background: var(--glass-bg); backdrop-filter: var(--glass-blur); border: var(--glass-border); border-radius: 16px; padding: clamp(24px,5vw,40px); box-shadow: var(--glass-shadow); display: flex; flex-direction: column; gap: 24px; overflow-y: auto; font-family: 'Orbitron', sans-serif; }
+    #profile-box { width: min(1000px, 100%); max-height: calc(100vh - 48px); background: var(--glass-bg); backdrop-filter: var(--glass-blur); border: var(--glass-border); border-radius: 16px; padding: clamp(24px,5vw,40px); box-shadow: var(--glass-shadow); display: flex; flex-direction: column; gap: 24px; overflow-y: auto; font-family: 'Orbitron', sans-serif; }
+    #profile-box::-webkit-scrollbar { width: 8px; }
+    #profile-box::-webkit-scrollbar-thumb { background: rgba(102,221,255,0.3); border-radius: 4px; }
+    #profile-box::-webkit-scrollbar-track { background: rgba(0,0,0,0.3); }
     #profile-box h2 { margin: 0; font-size: clamp(22px,3vw,32px); color: var(--color-gold); letter-spacing: 8px; font-weight: 800; text-align: center; text-shadow: 0 0 16px rgba(255,217,122,0.4); }
     
     .profile-tabs { display: flex; border-bottom: 2px solid rgba(102,221,255,0.2); gap: 24px; margin-bottom: 12px; }
