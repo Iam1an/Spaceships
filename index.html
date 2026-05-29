@@ -275,19 +275,26 @@
       border-radius: 12px; border: 2px solid #cc5522; max-width: 80vw;
     }
     #campaign-lives { font-size: 18px; letter-spacing: 5px; color: #ff4444; margin-top: 2px; min-height: 20px; }
-    #lobby-campaign { max-width: 700px; }
+    #lobby-campaign { max-width: 720px; }
     .campaign-mission-btn {
+      font-family: inherit; cursor: pointer;
       display: flex; flex-direction: row; align-items: center;
-      gap: 20px; width: min(660px, 100%); white-space: normal; text-align: left;
-      font-size: clamp(12px, 1.5vw, 17px);
-      padding: clamp(10px,1.4vw,16px) clamp(18px,2vw,28px);
+      gap: 24px; width: 100%; white-space: normal;
+      font-size: clamp(13px, 1.5vw, 17px);
+      padding: 16px 28px;
+      color: #fff; background: linear-gradient(180deg,#4aa3ff 0%,#2867d0 100%);
+      border: 3px solid #b0e0ff; border-radius: 16px;
+      box-shadow: 0 0 20px rgba(80,160,255,0.4); text-shadow: 1px 1px 0 #000;
+      transition: transform 0.08s ease;
     }
+    .campaign-mission-btn:hover { transform: scale(1.02); }
+    .campaign-mission-btn:active { transform: scale(0.97); }
     .campaign-mission-title {
-      flex-shrink: 0; max-width: 50%; display: flex; flex-direction: column; gap: 3px;
+      flex: 0 0 auto; max-width: 48%; display: flex; flex-direction: column; gap: 4px; text-align: left;
     }
     .campaign-mission-sub {
-      flex: 1; min-width: 0; font-size: clamp(10px,1.1vw,13px); color: rgba(255,255,255,0.72);
-      letter-spacing: 1px; text-align: right; white-space: normal;
+      flex: 1; min-width: 0; font-size: clamp(11px, 1.1vw, 13px); color: rgba(255,255,255,0.75);
+      letter-spacing: 0.5px; text-align: right; white-space: normal; line-height: 1.4;
     }
     .campaign-mission-status { font-size: 10px; color: #66ffaa; letter-spacing: 2px; }
     .campaign-mission-btn.locked {
@@ -295,6 +302,7 @@
       background: linear-gradient(180deg,#3a4a5f 0%,#1a2530 100%);
       border-color: #44607f; box-shadow: none;
     }
+    .campaign-mission-btn.locked:hover { transform: none; }
     #campaign-warp-flash {
       position: fixed; inset: 0; z-index: 20; pointer-events: none; opacity: 0;
       background: radial-gradient(ellipse at center, #aaccff 0%, #2244cc 55%, transparent 80%);
@@ -1020,15 +1028,15 @@
 
     <div id="lobby-campaign" class="screen hidden">
       <div class="prompt">Campaign</div>
-      <button class="big campaign-mission-btn" id="btnMission1">
+      <button class="campaign-mission-btn" id="btnMission1">
         <span class="campaign-mission-title">Mission 1: Operation Ironclad<span class="campaign-mission-status" id="mission1Status"></span></span>
         <span class="campaign-mission-sub">Fight through scouts and fighters, then destroy the Capital Ship</span>
       </button>
-      <button class="big campaign-mission-btn" id="btnMission2">
+      <button class="campaign-mission-btn" id="btnMission2">
         <span class="campaign-mission-title">Mission 2: Operation Stormfront<span class="campaign-mission-status" id="mission2Status"></span></span>
         <span class="campaign-mission-sub">Heavier waves — elite escorts protect the dreadnought</span>
       </button>
-      <button class="big campaign-mission-btn" id="btnMission3">
+      <button class="campaign-mission-btn" id="btnMission3">
         <span class="campaign-mission-title">Mission 3: Final Siege<span class="campaign-mission-status" id="mission3Status"></span></span>
         <span class="campaign-mission-sub">Everything at once — survive the onslaught and destroy the flagship</span>
       </button>
