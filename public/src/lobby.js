@@ -358,6 +358,7 @@ document.getElementById('btnBackToMenu').addEventListener('click', () => {
 function hardMode() { return hardModeInput.checked; }
 
 function enterGame() {
+  closeCustomization();
   showHud();
   startGame({
     ws, you: myId, host: isHost, spawn: mySpawn,
@@ -376,6 +377,7 @@ function soloSelectedMap() {
 }
 
 function enterSoloGame(mode, opts = {}) {
+  closeCustomization();
   showHud();
   // Tutorial buttons can force a scheme (keyboard-only vs mouse+keys) for
   // their lesson; everything else takes the lobby's saved choice.
