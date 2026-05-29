@@ -273,6 +273,38 @@
       background: rgba(6,10,20,0.90); padding: 22px 38px;
       border-radius: 12px; border: 2px solid #cc5522; max-width: 80vw;
     }
+    #campaign-lives { font-size: 18px; letter-spacing: 5px; color: #ff4444; margin-top: 2px; min-height: 20px; }
+    .mission-card {
+      display: flex; flex-direction: column; gap: 4px;
+      padding: 14px 22px; background: rgba(10,18,35,0.85);
+      border: 1.5px solid #334466; border-radius: 10px;
+      cursor: pointer; text-align: left; width: 100%;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      font-family: 'Orbitron', sans-serif; margin-bottom: 4px;
+      color: inherit;
+    }
+    .mission-card:hover:not(.locked) { border-color: #ff7744; box-shadow: 0 0 12px rgba(255,100,60,0.4); }
+    .mission-card.locked { opacity: 0.4; cursor: not-allowed; border-color: #223; }
+    .mission-card-title { font-size: 13px; color: #ffaa66; letter-spacing: 2px; }
+    .mission-card-desc  { font-size: 10px; color: #8899bb; letter-spacing: 1px; margin-top: 2px; }
+    .mission-card-status { font-size: 10px; color: #66ffaa; letter-spacing: 2px; min-height: 12px; margin-top: 2px; }
+    #campaign-warp-flash {
+      position: fixed; inset: 0; z-index: 20; pointer-events: none; opacity: 0;
+      background: radial-gradient(ellipse at center, #aaccff 0%, #2244cc 55%, transparent 80%);
+    }
+    #campaign-warp-flash.active { animation: warpFlash 1.5s ease-out forwards; }
+    @keyframes warpFlash {
+      0%   { opacity: 1; transform: scaleX(0.2); }
+      18%  { opacity: 1; transform: scaleX(1.06); }
+      100% { opacity: 0; transform: scaleX(1); }
+    }
+    #campaign-failed {
+      position: fixed; inset: 0; z-index: 12; display: none;
+      flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+      background: rgba(4,6,13,0.93);
+    }
+    #campaign-failed-title { font-size: clamp(22px,5vw,38px); color: #ff3322; letter-spacing: 5px; font-family: 'Orbitron',sans-serif; text-shadow: 0 0 24px #ff1100; }
+    #campaign-failed-sub   { font-size: 13px; color: #99aabb; letter-spacing: 2px; }
 
     #scoreboard {
       position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
@@ -979,6 +1011,26 @@
       <button class="link" id="btnBackTrials">← Back</button>
     </div>
 
+    <div id="lobby-campaign" class="screen hidden">
+      <div class="prompt">Campaign</div>
+      <button class="mission-card" id="btnMission1">
+        <div class="mission-card-title">Mission 1: Operation Ironclad</div>
+        <div class="mission-card-desc">Engage enemy scout forces and destroy the Capital Ship</div>
+        <div class="mission-card-status" id="mission1Status"></div>
+      </button>
+      <button class="mission-card" id="btnMission2">
+        <div class="mission-card-title">Mission 2: Operation Stormfront</div>
+        <div class="mission-card-desc">Heavier defenses — elite fighters protect the dreadnought</div>
+        <div class="mission-card-status" id="mission2Status"></div>
+      </button>
+      <button class="mission-card" id="btnMission3">
+        <div class="mission-card-title">Mission 3: Final Siege</div>
+        <div class="mission-card-desc">Everything at once — survive the assault and destroy the flagship</div>
+        <div class="mission-card-status" id="mission3Status"></div>
+      </button>
+      <button class="link" id="btnBackCampaign">← Back</button>
+    </div>
+
     <div id="lobby-find" class="screen hidden">
       <div class="prompt">Open Rooms</div>
       <div id="roomList">
@@ -1109,6 +1161,7 @@
     <div id="campaign-wave">WAVE 1 / 3</div>
     <div id="campaign-objective">Destroy the enemy scouts</div>
     <div id="campaign-enemies"></div>
+    <div id="campaign-lives">❤❤❤</div>
   </div>
   <div id="campaign-boss-bar">
     <div id="boss-name">⚠ CAPITAL SHIP</div>
@@ -1116,6 +1169,13 @@
     <div id="boss-hp-text">2,500 / 2,500</div>
   </div>
   <div id="campaign-msg"><div id="campaign-msg-text"></div></div>
+  <div id="campaign-warp-flash"></div>
+  <div id="campaign-failed">
+    <div id="campaign-failed-title">MISSION FAILED</div>
+    <div id="campaign-failed-sub">All pilots lost. Mission aborted.</div>
+    <button class="lobby-btn" id="btnRetryMission" style="margin-top:18px">Try Again</button>
+    <button class="lobby-btn" id="btnFailedReturn" style="margin-top:6px">Return to Hangar</button>
+  </div>
   <div id="achievement-toasts"></div>
   <div id="hangar-ach-overlay" class="hidden">
     <div id="hangar-ach-box">

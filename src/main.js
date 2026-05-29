@@ -166,6 +166,9 @@ export async function startGame(opts = {}) {
     platformA.visible = false;
     platformB.visible = false;
   }
+  if (isCampaign) {
+    platformB.visible = false; // replaced by custom capital ship
+  }
 
   // Terrain map: heightmap ground, trees, clouds.
   const terrainMesh = isTerrainMap ? createTerrain() : null;
@@ -240,10 +243,47 @@ export async function startGame(opts = {}) {
     : opts.mode === 'trials2' ? 150
     : isTrialsMode ? 120 : 60;
   const _avoidList = moonAvoid ? [...motherships, moonAvoid] : [...motherships];
+  function genCampaignAsteroids() {
+    const data = [];
+    let id = 1;
+    const ZONES = [
+      { zMin: -520, zMax: -150, count: 90,  xRange: 110, yRange: 55 },
+      { zMin: -180, zMax: 200,  count: 100, xRange: 130, yRange: 65 },
+      { zMin: 160,  zMax: 540,  count: 90,  xRange: 110, yRange: 55 },
+    ];
+    const TIERS_LOCAL = [
+      { name: 'small',  minSize: 5,  maxSize: 7,  hp: 5,  w: 0.45 },
+      { name: 'medium', minSize: 9,  maxSize: 15, hp: 10, w: 0.30 },
+      { name: 'big',    minSize: 18, maxSize: 30, hp: 30, w: 0.18 },
+      { name: 'huge',   minSize: 38, maxSize: 55, hp: 50, w: 0.07 },
+    ];
+    for (const zone of ZONES) {
+      for (let i = 0; i < zone.count; i++) {
+        const r = Math.random();
+        let acc = 0; let tier = TIERS_LOCAL[0];
+        for (const t of TIERS_LOCAL) { acc += t.w; if (r < acc) { tier = t; break; } }
+        const size = tier.minSize + Math.random() * (tier.maxSize - tier.minSize);
+        data.push({
+          id: id++, size,
+          pos: [
+            (Math.random() - 0.5) * 2 * zone.xRange,
+            (Math.random() - 0.5) * 2 * zone.yRange,
+            zone.zMin + Math.random() * (zone.zMax - zone.zMin),
+          ],
+          rot: [Math.random() * Math.PI * 2, Math.random() * Math.PI * 2, 0],
+          spin: [(Math.random()-0.5)*0.4, (Math.random()-0.5)*0.4, (Math.random()-0.5)*0.2],
+          hp: tier.hp, tier: tier.name, variant: Math.floor(Math.random() * 6),
+        });
+      }
+    }
+    return data;
+  }
   const asteroids = isTerrainMap
     ? createAsteroidFieldFromData([])
     : (opts.asteroids
       ? createAsteroidFieldFromData(opts.asteroids)
+      : isCampaign
+      ? createAsteroidFieldFromData(genCampaignAsteroids())
       : createAsteroidField({ count: _trialRockCount, radius: 400, avoid: _avoidList }));
   scene.add(asteroids.group);
 
@@ -1613,9 +1653,10 @@ export async function startGame(opts = {}) {
           const hitAsteroidId = cast.hitAsteroidId;
           let hitBoss = false;
           if (isCampaign && bossActive) {
+            const capPos = capitalShipMesh ? capitalShipMesh.position : platformB.position;
             const bossT = raySphereDist(
               origin.x, origin.y, origin.z, dir.x, dir.y, dir.z,
-              platformB.position.x, platformB.position.y, platformB.position.z, 52,
+              capPos.x, capPos.y, capPos.z, 68,
             );
             if (bossT !== null && bossT < beamDist) {
               hitBoss = true; hitTargetId = null; beamDist = bossT;
@@ -2493,6 +2534,7 @@ export async function startGame(opts = {}) {
   // bots so its targeting can pick the closest opponent.
   const SOLO_MODE = isSolo ? (opts.mode || 'train') : null;
   const isCampaign = SOLO_MODE === 'campaign';
+  const CAMPAIGN_MISSION = isCampaign ? (opts.missionId ?? 1) : 1;
   const myTeam = isSolo ? 0 : (opts.spawn?.team ?? 0);
   const MATCH_DURATION = SOLO_MODE === 'train' ? 180 : 300;
   const teamKills = [0, 0];
@@ -2508,10 +2550,43 @@ export async function startGame(opts = {}) {
   const BOSS_ID_BASE = 9000;
   const BOSS_HITBOX_COUNT = 12;
   const BOSS_MAX_HP = 2500;
-  const CAMPAIGN_WAVES = [
-    { count: 3, label: 'WAVE 1 / 3', objective: 'Destroy the enemy scout drones' },
-    { count: 5, label: 'WAVE 2 / 3', objective: 'Destroy the enemy fighter squadron' },
-    { count: 4, label: 'WAVE 3 / 3', objective: 'Eliminate the elite guard' },
+  const CAMPAIGN_WAVES = CAMPAIGN_MISSION === 3
+    ? [
+        { count: 5, label: 'WAVE 1 / 3', objective: 'Destroy the assault wing', spawnZ: -280 },
+        { count: 7, label: 'WAVE 2 / 3', objective: 'Eliminate the heavy fighters', spawnZ: 20 },
+        { count: 6, label: 'WAVE 3 / 3', objective: 'Crush the elite vanguard', spawnZ: 330 },
+      ]
+    : CAMPAIGN_MISSION === 2
+    ? [
+        { count: 4, label: 'WAVE 1 / 3', objective: 'Destroy the patrol fleet', spawnZ: -280 },
+        { count: 6, label: 'WAVE 2 / 3', objective: 'Eliminate the fighter escort', spawnZ: 20 },
+        { count: 5, label: 'WAVE 3 / 3', objective: 'Break through the elite guard', spawnZ: 330 },
+      ]
+    : [
+        { count: 3, label: 'WAVE 1 / 3', objective: 'Destroy the enemy scout drones', spawnZ: -280 },
+        { count: 5, label: 'WAVE 2 / 3', objective: 'Destroy the enemy fighter squadron', spawnZ: 20 },
+        { count: 4, label: 'WAVE 3 / 3', objective: 'Eliminate the elite guard', spawnZ: 330 },
+      ];
+  const MISSION_BRIEFINGS = [
+    '',
+    'OPERATION: IRONCLAD\nFight through enemy waves and destroy the Capital Ship',
+    'OPERATION: STORMFRONT\nHeavier defenses stand between you and the dreadnought',
+    'OPERATION: FINAL SIEGE\nEverything or nothing — destroy the flagship and end it',
+  ];
+  // Hoisted offsets used both in hitbox setup and in updateCapitalShip
+  const BOSS_HB_OFFSETS_WORLD = [
+    new THREE.Vector3(  0,  0,   0),
+    new THREE.Vector3(-35,  0,   0),
+    new THREE.Vector3( 35,  0,   0),
+    new THREE.Vector3(  0,  0, -25),
+    new THREE.Vector3(  0,  0,  25),
+    new THREE.Vector3(-20,  0, -15),
+    new THREE.Vector3( 20,  0, -15),
+    new THREE.Vector3(-20,  0,  15),
+    new THREE.Vector3( 20,  0,  15),
+    new THREE.Vector3(  0, 12,   0),
+    new THREE.Vector3(-15,  8,   0),
+    new THREE.Vector3( 15,  8,   0),
   ];
   let campaignPhase = 0;
   let campaignWaveBotIds = new Set();
@@ -2525,6 +2600,14 @@ export async function startGame(opts = {}) {
   let campaignOver = false;
   let campaignNextBotId = 100;
   let campaignMsgTimer = 0;
+  let campaignLives = 3;
+  let campaignCheckpointPos = [0, 0, -540];
+  let campaignWarpActive = false;
+  let campaignWarpTimer = 0;
+  let capitalShipMesh = null;
+  let capitalShipTurrets = [];
+  let capitalShipTime = 0;
+  const CAPITAL_SHIP_BASE_POS = new THREE.Vector3(0, 0, 600);
 
   // ── Achievement toast queue ───────────────────────────────────────────────
   const _achToastContainer = document.getElementById('achievement-toasts');
@@ -2727,11 +2810,165 @@ export async function startGame(opts = {}) {
     campaignMsgTimer = duration;
   }
 
+  function updateCampaignLivesDisplay() {
+    const el = document.getElementById('campaign-lives');
+    if (!el) return;
+    el.textContent = '❤'.repeat(Math.max(0, campaignLives));
+  }
+
+  function buildCapitalShip() {
+    const group = new THREE.Group();
+    const hullMat   = new THREE.MeshStandardMaterial({ color: 0x18202e, metalness: 0.7, roughness: 0.4 });
+    const accentMat = new THREE.MeshStandardMaterial({ color: 0x3a0808, metalness: 0.5, roughness: 0.6 });
+    const glowMat   = new THREE.MeshBasicMaterial({ color: 0xff3300 });
+    const turretMat = new THREE.MeshStandardMaterial({ color: 0x252c3a, metalness: 0.8, roughness: 0.3 });
+    const barrelMat = new THREE.MeshStandardMaterial({ color: 0x3a4050, metalness: 0.9, roughness: 0.2 });
+
+    // Main hull
+    const hull = new THREE.Mesh(new THREE.BoxGeometry(140, 26, 260), hullMat);
+    group.add(hull);
+    // Side wings
+    for (const sx of [-76, 76]) {
+      const wing = new THREE.Mesh(new THREE.BoxGeometry(26, 12, 200), hullMat);
+      wing.position.set(sx, -4, 0);
+      group.add(wing);
+      const stripe = new THREE.Mesh(new THREE.BoxGeometry(28, 2, 200), accentMat);
+      stripe.position.set(sx, 5, 0);
+      group.add(stripe);
+    }
+    // Superstructure / bridge
+    const bridge = new THREE.Mesh(new THREE.BoxGeometry(50, 22, 88), hullMat);
+    bridge.position.set(0, 24, 40);
+    group.add(bridge);
+    const dome = new THREE.Mesh(new THREE.SphereGeometry(13, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.5), hullMat);
+    dome.position.set(0, 36, 48);
+    group.add(dome);
+    // Accent stripes along hull length
+    for (const z of [-70, 0, 70]) {
+      const acc = new THREE.Mesh(new THREE.BoxGeometry(142, 2.5, 3), accentMat);
+      acc.position.set(0, 8, z);
+      group.add(acc);
+    }
+    // Engines at rear (local -Z is the front when ship faces +Z; ship is flipped π so local -Z = world -Z)
+    for (const [ex, ey] of [[-38, -4], [0, -4], [38, -4], [-20, 8], [20, 8]]) {
+      const ring = new THREE.Mesh(new THREE.CylinderGeometry(6, 6, 4, 8), accentMat);
+      ring.rotation.x = Math.PI / 2;
+      ring.position.set(ex, ey, -132);
+      group.add(ring);
+      const glow = new THREE.Mesh(new THREE.CircleGeometry(5.4, 8), glowMat);
+      glow.position.set(ex, ey, -134.2);
+      glow.rotation.y = Math.PI;
+      group.add(glow);
+    }
+    const engLight = new THREE.PointLight(0xff3300, 3.0, 180);
+    engLight.position.set(0, 0, -140);
+    group.add(engLight);
+    // Running lights
+    const runMat = new THREE.MeshBasicMaterial({ color: 0xffaa22 });
+    for (let i = -5; i <= 5; i++) {
+      if (i === 0) continue;
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(0.9, 4, 3), runMat);
+      dot.position.set((i / 5) * 68, 13.5, 120);
+      group.add(dot);
+    }
+    // 4 turrets: top-front ×2, top-aft ×2
+    const turretLocalPositions = [
+      new THREE.Vector3(-42, 16,  82),
+      new THREE.Vector3( 42, 16,  82),
+      new THREE.Vector3(-42, 16, -82),
+      new THREE.Vector3( 42, 16, -82),
+    ];
+    capitalShipTurrets = [];
+    for (let i = 0; i < turretLocalPositions.length; i++) {
+      const tPos = turretLocalPositions[i];
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(6, 7, 4, 8), turretMat);
+      base.position.copy(tPos);
+      group.add(base);
+      const pivot = new THREE.Group();
+      pivot.position.copy(tPos).add(new THREE.Vector3(0, 3.5, 0));
+      group.add(pivot);
+      const head = new THREE.Mesh(new THREE.CylinderGeometry(5, 5.5, 5, 8), turretMat);
+      pivot.add(head);
+      const barrel = new THREE.Mesh(new THREE.BoxGeometry(1.6, 1.6, 22), barrelMat);
+      barrel.position.set(0, 1.8, 11);
+      pivot.add(barrel);
+      const muzzleLight = new THREE.PointLight(0xff6600, 0, 35);
+      muzzleLight.position.set(0, 1.8, 22);
+      pivot.add(muzzleLight);
+      capitalShipTurrets.push({
+        pivot,
+        muzzleLight,
+        localPos: tPos.clone(),
+        fireTimer: i * 0.85 + 0.4,
+      });
+    }
+    group.position.copy(CAPITAL_SHIP_BASE_POS);
+    group.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
+    scene.add(group);
+    return group;
+  }
+
+  function updateCapitalShip(dt) {
+    if (!capitalShipMesh || !bossActive || campaignOver) return;
+    capitalShipTime += dt;
+    // Slow patrol drift
+    capitalShipMesh.position.x = CAPITAL_SHIP_BASE_POS.x + 88 * Math.sin(capitalShipTime * 0.09);
+    capitalShipMesh.position.y = CAPITAL_SHIP_BASE_POS.y + 9 * Math.sin(capitalShipTime * 0.055);
+
+    // Sync hitbox world positions to follow the ship
+    for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
+      const r = remotePlayers.get(BOSS_ID_BASE + i);
+      if (r) {
+        r.ship.position.copy(capitalShipMesh.position).add(BOSS_HB_OFFSETS_WORLD[i]);
+        r.targetPos.copy(r.ship.position);
+      }
+    }
+
+    // Turrets: aim and fire
+    const invQ = capitalShipMesh.quaternion.clone().invert();
+    for (const t of capitalShipTurrets) {
+      // World position of turret muzzle
+      const muzzleWorld = new THREE.Vector3(0, 1.8, 22).applyQuaternion(t.pivot.quaternion);
+      muzzleWorld.add(t.pivot.position).applyQuaternion(capitalShipMesh.quaternion).add(capitalShipMesh.position);
+
+      // Direction from turret pivot to player (in world space)
+      const pivotWorld = t.pivot.position.clone().applyQuaternion(capitalShipMesh.quaternion).add(capitalShipMesh.position);
+      const toPlayer = ship.position.clone().sub(pivotWorld);
+      // Convert to ship local space for pivot rotation
+      const localDir = toPlayer.clone().applyQuaternion(invQ);
+      const yaw = Math.atan2(localDir.x, localDir.z);
+      const horizDist = Math.sqrt(localDir.x * localDir.x + localDir.z * localDir.z);
+      const pitch = -Math.atan2(localDir.y, horizDist);
+      t.pivot.rotation.y = yaw;
+      t.pivot.rotation.x = Math.max(-0.7, Math.min(0.7, pitch));
+
+      // Fire
+      if (myAlive) {
+        t.fireTimer -= dt;
+        if (t.fireTimer <= 0) {
+          const fireDir = ship.position.clone().sub(muzzleWorld).normalize();
+          fireDir.x += (Math.random() - 0.5) * 0.09;
+          fireDir.y += (Math.random() - 0.5) * 0.09;
+          fireDir.normalize();
+          bullets.fire(muzzleWorld.clone(), fireDir, 'enemy');
+          bossBullets.push({ pos: muzzleWorld.clone(), vel: fireDir.clone().multiplyScalar(430), life: 4.2 });
+          t.muzzleLight.intensity = 7;
+          setTimeout(() => { if (t.muzzleLight) t.muzzleLight.intensity = 0; }, 65);
+          const hpFrac = bossHp / BOSS_MAX_HP;
+          t.fireTimer = hpFrac > 0.65 ? 2.8 + Math.random() * 0.7
+                      : hpFrac > 0.35 ? 1.6 + Math.random() * 0.5
+                      : 0.9 + Math.random() * 0.3;
+          audio.play('shoot');
+        }
+      }
+    }
+  }
+
   function spawnCampaignWave(waveIdx) {
     const wave = CAMPAIGN_WAVES[waveIdx];
     campaignWaveBotIds.clear();
     campaignBotsAlive = 0;
-    const ENEMY_ANCHOR = new THREE.Vector3(0, 20, 380);
+    const ENEMY_ANCHOR = new THREE.Vector3(0, 20, wave.spawnZ ?? 380);
     for (let i = 0; i < wave.count; i++) {
       const id  = campaignNextBotId++;
       const pos = ENEMY_ANCHOR.clone().add(new THREE.Vector3(
@@ -2757,20 +2994,27 @@ export async function startGame(opts = {}) {
   }
 
   function activateBossPhase() {
-    bossActive   = true;
-    bossHp       = BOSS_MAX_HP;
+    bossActive    = true;
+    bossHp        = BOSS_MAX_HP;
     bossFireTimer = 2.0;
+    // Sync hitbox world positions with capital ship current position
     for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
       const r = remotePlayers.get(BOSS_ID_BASE + i);
-      if (r) { r.alive = true; r.hasTarget = (i === 0); }
+      if (r) {
+        const shipPos = capitalShipMesh ? capitalShipMesh.position : platformB.position;
+        r.ship.position.copy(shipPos).add(BOSS_HB_OFFSETS_WORLD[i]);
+        r.targetPos.copy(r.ship.position);
+        r.alive = true;
+        r.hasTarget = (i === 0);
+      }
     }
     scores.set(BOSS_ID_BASE, { name: 'Capital Ship', kills: 0, deaths: 0, team: 1 });
     const barEl = document.getElementById('campaign-boss-bar');
     if (barEl) barEl.style.display = 'flex';
-    // Red glow on the boss ship
-    const bossGlow = new THREE.PointLight(0xff2200, 4.0, 350);
-    bossGlow.position.copy(platformB.position).add(new THREE.Vector3(0, 25, -30));
-    scene.add(bossGlow);
+    // Red ambient glow — attach as child of capital ship so it follows
+    const bossGlow = new THREE.PointLight(0xff2200, 3.5, 320);
+    bossGlow.position.set(0, 30, -20);
+    if (capitalShipMesh) capitalShipMesh.add(bossGlow); else scene.add(bossGlow);
     updateCampaignHud();
   }
 
@@ -2795,14 +3039,9 @@ export async function startGame(opts = {}) {
 
   function updateBoss(dt) {
     if (!bossActive || campaignOver) return;
-    bossFireTimer -= dt;
-    if (bossFireTimer <= 0) {
-      const hpFrac  = bossHp / BOSS_MAX_HP;
-      bossFireTimer = hpFrac > 0.6 ? 2.2 : hpFrac > 0.3 ? 1.4 : 0.85;
-      fireFromBoss();
-    }
-    const PLAYER_HIT_R   = 7.0;
-    const BOSS_BULLET_DMG = 12;
+    // Turrets handle firing; updateBoss only sweeps boss bullets for player hits
+    const PLAYER_HIT_R    = 7.0;
+    const BOSS_BULLET_DMG = 14;
     for (let i = bossBullets.length - 1; i >= 0; i--) {
       const b = bossBullets[i];
       b.pos.addScaledVector(b.vel, dt);
@@ -2828,7 +3067,8 @@ export async function startGame(opts = {}) {
       const r = remotePlayers.get(BOSS_ID_BASE + i);
       if (r) { r.alive = false; r.hasTarget = false; }
     }
-    const bossPos = platformB.position.clone();
+    localStorage.setItem(`spaceships:campaign${CAMPAIGN_MISSION}Beat`, '1');
+    const bossPos = (capitalShipMesh ? capitalShipMesh.position : platformB.position).clone();
     let k = 0;
     const explodeInterval = setInterval(() => {
       const off = new THREE.Vector3(
@@ -2903,20 +3143,35 @@ export async function startGame(opts = {}) {
       if (alive === 0 && campaignWaveBotIds.size > 0) {
         campaignWaveBotIds.clear();
         if (campaignPhase < 2) {
+          // Save checkpoint ahead of the next wave zone
+          const nextWave = CAMPAIGN_WAVES[campaignPhase + 1];
+          campaignCheckpointPos = [0, 20, (nextWave?.spawnZ ?? 20) - 80];
           campaignPhase++;
           showCampaignMsg('WAVE COMPLETE\nPrepare for incoming hostiles...', 3.2);
-          campaignBetween     = true;
+          campaignBetween      = true;
           campaignBetweenTimer = 3.5;
         } else {
+          campaignCheckpointPos = [0, 10, 450]; // near boss entrance
           campaignPhase = 3;
           showCampaignMsg('CAPITAL SHIP SHIELDS OFFLINE\nPrepare to engage', 4.5);
-          campaignBetween     = true;
+          campaignBetween      = true;
           campaignBetweenTimer = 4.8;
         }
         updateCampaignHud();
       }
     } else if (campaignPhase === 3) {
       updateBoss(dt);
+      updateCapitalShip(dt);
+    }
+
+    // Warp-flash fade timer
+    if (campaignWarpActive) {
+      campaignWarpTimer -= dt;
+      if (campaignWarpTimer <= 0) {
+        campaignWarpActive = false;
+        const flashEl = document.getElementById('campaign-warp-flash');
+        if (flashEl) flashEl.classList.remove('active');
+      }
     }
   }
 
@@ -2943,28 +3198,14 @@ export async function startGame(opts = {}) {
   }
   if (isSolo) spawnSoloEntities();
 
-  // Campaign: register boss hitboxes in remotePlayers so bullet hit detection
-  // works against the Capital Ship. They start inactive (alive=false) and are
-  // enabled when the boss phase begins in activateBossPhase().
+  // Campaign: build the custom capital ship mesh and register boss hitboxes.
+  // Hitboxes start inactive (alive=false) and are enabled in activateBossPhase().
   if (isCampaign) {
-    const bossCenter = platformB.position;
-    const BOSS_HB_OFFSETS = [
-      new THREE.Vector3(  0,  0,   0),  // 0 — center (hasTarget=true when active)
-      new THREE.Vector3(-35,  0,   0),  // 1 — port
-      new THREE.Vector3( 35,  0,   0),  // 2 — starboard
-      new THREE.Vector3(  0,  0, -25),  // 3 — fore
-      new THREE.Vector3(  0,  0,  25),  // 4 — aft
-      new THREE.Vector3(-20,  0, -15),  // 5 — port-fore
-      new THREE.Vector3( 20,  0, -15),  // 6 — starboard-fore
-      new THREE.Vector3(-20,  0,  15),  // 7 — port-aft
-      new THREE.Vector3( 20,  0,  15),  // 8 — starboard-aft
-      new THREE.Vector3(  0, 12,   0),  // 9 — topside
-      new THREE.Vector3(-15,  8,   0),  // 10 — top-port
-      new THREE.Vector3( 15,  8,   0),  // 11 — top-starboard
-    ];
+    capitalShipMesh = buildCapitalShip();
+    const bossCenter = CAPITAL_SHIP_BASE_POS; // use constant start pos for initial hitbox placement
     for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
       const hbGroup = new THREE.Group();
-      hbGroup.position.copy(bossCenter).add(BOSS_HB_OFFSETS[i]);
+      hbGroup.position.copy(bossCenter).add(BOSS_HB_OFFSETS_WORLD[i]);
       scene.add(hbGroup);
       const hbBox = document.createElement('div');
       hbBox.style.display = 'none';
@@ -3275,7 +3516,29 @@ export async function startGame(opts = {}) {
     if (myHp <= 0) {
       audio.play('shipdeath');
       killSelf();
-      myRespawnTimer = RESPAWN_DELAY;
+      if (isCampaign && !campaignOver) {
+        campaignLives = Math.max(0, campaignLives - 1);
+        updateCampaignLivesDisplay();
+        if (campaignLives <= 0) {
+          campaignOver = true;
+          myRespawnTimer = 0;
+          const failEl = document.getElementById('campaign-failed');
+          if (failEl) failEl.style.display = 'flex';
+          const retryBtn = document.getElementById('btnRetryMission');
+          if (retryBtn) retryBtn.onclick = () => location.reload();
+          const returnBtn = document.getElementById('btnFailedReturn');
+          if (returnBtn) returnBtn.onclick = () => location.reload();
+        } else {
+          // Warp back to last checkpoint
+          campaignWarpActive = true;
+          campaignWarpTimer  = 1.5;
+          myRespawnTimer     = 1.5;
+          const flashEl = document.getElementById('campaign-warp-flash');
+          if (flashEl) { flashEl.classList.remove('active'); void flashEl.offsetWidth; flashEl.classList.add('active'); }
+        }
+      } else {
+        myRespawnTimer = RESPAWN_DELAY;
+      }
       if (matchActive && killerTeam !== undefined && killerTeam !== null) {
         teamKills[killerTeam] = (teamKills[killerTeam] || 0) + 1;
       }
@@ -3342,6 +3605,9 @@ export async function startGame(opts = {}) {
         }
         for (const d of tracerDots) d.visible = false;
         updateTrialsHud();
+      } else if (isCampaign) {
+        pos  = campaignCheckpointPos.slice();
+        quat = [0, 0, 0, 1];
       } else {
         const spawnZ = isTerrainMap ? -1400 : -540;
         const spawnY = isTerrainMap ? 40     : 0;
@@ -3357,6 +3623,9 @@ export async function startGame(opts = {}) {
       quat = opts.spawn?.quat ?? [0, 0, 0, 1];
     }
     reviveSelf(pos, quat);
+    if (isCampaign) {
+      myHp = Math.floor(SHIP_MAX_HP * 0.55); // respawn at 55% HP
+    }
   }
 
   // --- Match HUD (timer + team score) ---
@@ -3411,7 +3680,8 @@ export async function startGame(opts = {}) {
     const hudEl = document.getElementById('campaign-hud');
     if (hudEl) hudEl.style.display = 'flex';
     updateCampaignHud();
-    showCampaignMsg('OPERATION: IRONCLAD\nFight through enemy waves and destroy the Capital Ship', 4.5);
+    updateCampaignLivesDisplay();
+    showCampaignMsg(MISSION_BRIEFINGS[CAMPAIGN_MISSION] || MISSION_BRIEFINGS[1], 4.5);
   }
 
   function endMatch() {

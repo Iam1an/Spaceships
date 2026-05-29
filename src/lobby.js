@@ -18,6 +18,7 @@ const screens = {
   single: document.getElementById('lobby-single'),
   tutorial: document.getElementById('lobby-tutorial'),
   trials: document.getElementById('lobby-trials'),
+  campaign: document.getElementById('lobby-campaign'),
 };
 
 const roomCodeEl = document.getElementById('roomCode');
@@ -385,6 +386,7 @@ function enterSoloGame(mode, opts = {}) {
     controlScheme: scheme,
     hardMode: hardMode(),
     map: opts.map ?? soloSelectedMap(),
+    missionId: opts.missionId,
   });
 }
 
@@ -435,7 +437,44 @@ document.getElementById('btnSkirmish').addEventListener('click', () => {
 });
 
 document.getElementById('btnCampaign').addEventListener('click', () => {
-  enterSoloGame('campaign', { map: 'space' });
+  setError('');
+  refreshCampaignButtons();
+  showScreen('campaign');
+});
+
+document.getElementById('btnBackCampaign').addEventListener('click', () => {
+  setError('');
+  showScreen('main');
+});
+
+function refreshCampaignButtons() {
+  const locks = [
+    { id: 'btnMission2', reqKey: 'spaceships:campaign1Beat', statusId: 'mission2Status' },
+    { id: 'btnMission3', reqKey: 'spaceships:campaign2Beat', statusId: 'mission3Status' },
+  ];
+  for (const def of locks) {
+    const el = document.getElementById(def.id);
+    if (!el) continue;
+    const unlocked = localStorage.getItem(def.reqKey) !== null;
+    el.classList.toggle('locked', !unlocked);
+  }
+  const statusKeys = ['spaceships:campaign1Beat', 'spaceships:campaign2Beat', 'spaceships:campaign3Beat'];
+  for (let i = 1; i <= 3; i++) {
+    const el = document.getElementById(`mission${i}Status`);
+    if (el) el.textContent = localStorage.getItem(statusKeys[i - 1]) ? '✓ COMPLETED' : '';
+  }
+}
+
+document.getElementById('btnMission1').addEventListener('click', () => {
+  enterSoloGame('campaign', { map: 'space', missionId: 1 });
+});
+document.getElementById('btnMission2').addEventListener('click', () => {
+  if (document.getElementById('btnMission2').classList.contains('locked')) return;
+  enterSoloGame('campaign', { map: 'space', missionId: 2 });
+});
+document.getElementById('btnMission3').addEventListener('click', () => {
+  if (document.getElementById('btnMission3').classList.contains('locked')) return;
+  enterSoloGame('campaign', { map: 'space', missionId: 3 });
 });
 
 document.getElementById('btnTutorial').addEventListener('click', () => {
