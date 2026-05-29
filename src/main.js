@@ -18,6 +18,7 @@ import { createAudio } from './audio.js';
 import { createBotAI } from './bot.js';
 import { createTouchHud } from './touchhud.js';
 import { getSavedShipColor, getSavedAccentColor, getSavedTrailColor, getSavedTrailShape } from './customization.js';
+import { createWarpEffect } from './warp.js';
 
 // Game entry point. Called by the lobby once the host clicks Start (or a
 // non-host receives the `start` broadcast). The `opts.ws` socket is kept
@@ -1311,8 +1312,10 @@ export async function startGame(opts = {}) {
   const zAxis = new THREE.Vector3(0, 0, 1);
 
   const clock = new THREE.Clock();
+  const warpEffect = createWarpEffect(scene, camera);
 
   function update(dt) {
+    warpEffect.update(dt);
     // Trials 3-2-1-GO countdown: freeze the ship, update the overlay, then release.
     if (isTrialsMode && trialsCountdownActive) {
       trialsCountdown -= dt;
