@@ -253,10 +253,10 @@ function renderRoomList(rooms) {
       entry.className = 'room-entry';
       entry.innerHTML = `
         <div class="room-entry-info">
-          <div class="room-entry-code">${room.code}</div>
-          <div class="room-entry-meta">${room.hostName} · ${room.playerCount} player${room.playerCount !== 1 ? 's' : ''}</div>
+          <div class="room-entry-code">${esc(room.code)}</div>
+          <div class="room-entry-meta">${esc(room.hostName)} · ${room.playerCount} player${room.playerCount !== 1 ? 's' : ''}</div>
         </div>
-        <button class="btn-join-room" data-code="${room.code}">Join</button>
+        <button class="btn-join-room" data-code="${esc(room.code)}">Join</button>
       `;
       entry.querySelector('.btn-join-room').addEventListener('click', () => {
         joinRoom(room.code);

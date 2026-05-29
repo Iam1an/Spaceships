@@ -829,7 +829,12 @@ function handleConnection(ws) {
       const room = ws.room;
       if (!room) return;
       const modelUrl = typeof msg.modelUrl === 'string' ? msg.modelUrl : null;
-      if (!modelUrl) return;
+      // Prevent IP leaks by rejecting external URLs
+      if (!modelUrl || modelUrl.startsWith('http://') || modelUrl.startsWith('https://') || modelUrl.includes('//')) return;
+      
+      // Optionally, to prevent admin ship unlock bypass, we could check getCustomizationUnlocks(ws.pilotId)
+      // but restricting external URLs fixes the malicious IP leak.
+      
       const out = JSON.stringify({ type: 'ship-model', id: ws.id, modelUrl });
       for (const c of room.sockets) {
         if (c !== ws && c.open) c.send(out);
