@@ -1659,7 +1659,7 @@ export async function startGame(opts = {}) {
             const capPos = capitalShipMesh ? capitalShipMesh.position : platformB.position;
             const bossT = raySphereDist(
               origin.x, origin.y, origin.z, dir.x, dir.y, dir.z,
-              capPos.x, capPos.y, capPos.z, 68,
+              capPos.x, capPos.y, capPos.z, 95,
             );
             if (bossT !== null && bossT < beamDist) {
               hitBoss = true; hitTargetId = null; beamDist = bossT;
@@ -2550,7 +2550,7 @@ export async function startGame(opts = {}) {
 
   // ── Campaign mode state ───────────────────────────────────────────────────
   const BOSS_ID_BASE = 9000;
-  const BOSS_HITBOX_COUNT = 12;
+  const BOSS_HITBOX_COUNT = 20;
   const BOSS_MAX_HP = 2500;
   const CAMPAIGN_WAVES = CAMPAIGN_MISSION === 3
     ? [
@@ -2575,20 +2575,35 @@ export async function startGame(opts = {}) {
     'OPERATION: STORMFRONT\nHeavier defenses stand between you and the dreadnought',
     'OPERATION: FINAL SIEGE\nEverything or nothing — destroy the flagship and end it',
   ];
-  // Hoisted offsets used both in hitbox setup and in updateCapitalShip
+  // 20 hitboxes in a 4×5 grid covering the full 200W × 360L ship footprint.
+  // X: ±85, ±28  |  Z: ±150, ±75, 0  (+bridge row at top)
   const BOSS_HB_OFFSETS_WORLD = [
-    new THREE.Vector3(  0,  0,   0),
-    new THREE.Vector3(-35,  0,   0),
-    new THREE.Vector3( 35,  0,   0),
-    new THREE.Vector3(  0,  0, -25),
-    new THREE.Vector3(  0,  0,  25),
-    new THREE.Vector3(-20,  0, -15),
-    new THREE.Vector3( 20,  0, -15),
-    new THREE.Vector3(-20,  0,  15),
-    new THREE.Vector3( 20,  0,  15),
-    new THREE.Vector3(  0, 12,   0),
-    new THREE.Vector3(-15,  8,   0),
-    new THREE.Vector3( 15,  8,   0),
+    // stern row  (z = -150)
+    new THREE.Vector3(-85,  0, -150),
+    new THREE.Vector3(-28,  0, -150),
+    new THREE.Vector3( 28,  0, -150),
+    new THREE.Vector3( 85,  0, -150),
+    // mid-stern  (z = -75)
+    new THREE.Vector3(-85,  0,  -75),
+    new THREE.Vector3(-28,  0,  -75),
+    new THREE.Vector3( 28,  0,  -75),
+    new THREE.Vector3( 85,  0,  -75),
+    // centre     (z = 0)
+    new THREE.Vector3(-85,  0,    0),
+    new THREE.Vector3(  0,  0,    0),
+    new THREE.Vector3( 85,  0,    0),
+    // mid-bow    (z = +75)
+    new THREE.Vector3(-85,  0,   75),
+    new THREE.Vector3(-28,  0,   75),
+    new THREE.Vector3( 28,  0,   75),
+    new THREE.Vector3( 85,  0,   75),
+    // bow row    (z = +150)
+    new THREE.Vector3(-85,  0,  150),
+    new THREE.Vector3(-28,  0,  150),
+    new THREE.Vector3( 28,  0,  150),
+    new THREE.Vector3( 85,  0,  150),
+    // bridge     (top superstructure)
+    new THREE.Vector3(  0, 30,   50),
   ];
   let campaignPhase = 0;
   let campaignWaveBotIds = new Set();
@@ -2820,90 +2835,114 @@ export async function startGame(opts = {}) {
 
   function buildCapitalShip() {
     const group = new THREE.Group();
-    const hullMat   = new THREE.MeshStandardMaterial({ color: 0x18202e, metalness: 0.7, roughness: 0.4 });
-    const accentMat = new THREE.MeshStandardMaterial({ color: 0x3a0808, metalness: 0.5, roughness: 0.6 });
+    const hullMat   = new THREE.MeshStandardMaterial({ color: 0x16192a, metalness: 0.75, roughness: 0.38 });
+    const accentMat = new THREE.MeshStandardMaterial({ color: 0x3d0909, metalness: 0.5,  roughness: 0.6 });
     const glowMat   = new THREE.MeshBasicMaterial({ color: 0xff3300 });
-    const turretMat = new THREE.MeshStandardMaterial({ color: 0x252c3a, metalness: 0.8, roughness: 0.3 });
-    const barrelMat = new THREE.MeshStandardMaterial({ color: 0x3a4050, metalness: 0.9, roughness: 0.2 });
+    const turretMat = new THREE.MeshStandardMaterial({ color: 0x20283a, metalness: 0.85, roughness: 0.28 });
+    const barrelMat = new THREE.MeshStandardMaterial({ color: 0x343d50, metalness: 0.92, roughness: 0.18 });
 
-    // Main hull
-    const hull = new THREE.Mesh(new THREE.BoxGeometry(140, 26, 260), hullMat);
+    // ── Main hull (200 W × 30 H × 360 L) ──────────────────────────────
+    const hull = new THREE.Mesh(new THREE.BoxGeometry(200, 30, 360), hullMat);
     group.add(hull);
-    // Side wings
-    for (const sx of [-76, 76]) {
-      const wing = new THREE.Mesh(new THREE.BoxGeometry(26, 12, 200), hullMat);
-      wing.position.set(sx, -4, 0);
+
+    // Raised spine along the top
+    const spine = new THREE.Mesh(new THREE.BoxGeometry(40, 10, 340), hullMat);
+    spine.position.set(0, 20, 0);
+    group.add(spine);
+
+    // Side wing pods (extend hull width to ~280 at mid-ship)
+    for (const sx of [-115, 115]) {
+      const wing = new THREE.Mesh(new THREE.BoxGeometry(36, 16, 260), hullMat);
+      wing.position.set(sx, -5, 0);
       group.add(wing);
-      const stripe = new THREE.Mesh(new THREE.BoxGeometry(28, 2, 200), accentMat);
-      stripe.position.set(sx, 5, 0);
+      // Red accent stripe on each wing
+      const stripe = new THREE.Mesh(new THREE.BoxGeometry(38, 3, 260), accentMat);
+      stripe.position.set(sx, 7, 0);
       group.add(stripe);
+      // Wingtip lights
+      const tipMat = new THREE.MeshBasicMaterial({ color: 0xff2200 });
+      const tipLight = new THREE.Mesh(new THREE.SphereGeometry(2.5, 6, 4), tipMat);
+      tipLight.position.set(sx, 0, 0);
+      group.add(tipLight);
     }
-    // Superstructure / bridge
-    const bridge = new THREE.Mesh(new THREE.BoxGeometry(50, 22, 88), hullMat);
-    bridge.position.set(0, 24, 40);
+
+    // ── Superstructure / bridge tower ─────────────────────────────────
+    const bridge = new THREE.Mesh(new THREE.BoxGeometry(60, 30, 110), hullMat);
+    bridge.position.set(0, 30, 55);
     group.add(bridge);
-    const dome = new THREE.Mesh(new THREE.SphereGeometry(13, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.5), hullMat);
-    dome.position.set(0, 36, 48);
+    const dome = new THREE.Mesh(
+      new THREE.SphereGeometry(18, 10, 6, 0, Math.PI * 2, 0, Math.PI * 0.5), hullMat,
+    );
+    dome.position.set(0, 46, 65);
     group.add(dome);
-    // Accent stripes along hull length
-    for (const z of [-70, 0, 70]) {
-      const acc = new THREE.Mesh(new THREE.BoxGeometry(142, 2.5, 3), accentMat);
-      acc.position.set(0, 8, z);
+    // Bridge windows (emissive cyan strips)
+    const winMat = new THREE.MeshBasicMaterial({ color: 0x44aaff, transparent: true, opacity: 0.8 });
+    const winRow = new THREE.Mesh(new THREE.BoxGeometry(52, 4, 2), winMat);
+    winRow.position.set(0, 32, 112);
+    group.add(winRow);
+
+    // ── Red accent stripes across hull ────────────────────────────────
+    for (const z of [-120, -40, 40, 120]) {
+      const acc = new THREE.Mesh(new THREE.BoxGeometry(202, 3, 4), accentMat);
+      acc.position.set(0, 10, z);
       group.add(acc);
     }
-    // Engines at rear (local -Z is the front when ship faces +Z; ship is flipped π so local -Z = world -Z)
-    for (const [ex, ey] of [[-38, -4], [0, -4], [38, -4], [-20, 8], [20, 8]]) {
-      const ring = new THREE.Mesh(new THREE.CylinderGeometry(6, 6, 4, 8), accentMat);
+
+    // ── Rear engine bank (8 engines spread across width) ──────────────
+    const enginePositions = [
+      [-80, -4], [-48, -4], [-16, -4], [16, -4], [48, -4], [80, -4],
+      [-38, 10], [38, 10],
+    ];
+    for (const [ex, ey] of enginePositions) {
+      const ring = new THREE.Mesh(new THREE.CylinderGeometry(7, 7, 5, 10), accentMat);
       ring.rotation.x = Math.PI / 2;
-      ring.position.set(ex, ey, -132);
+      ring.position.set(ex, ey, -183);
       group.add(ring);
-      const glow = new THREE.Mesh(new THREE.CircleGeometry(5.4, 8), glowMat);
-      glow.position.set(ex, ey, -134.2);
+      const glow = new THREE.Mesh(new THREE.CircleGeometry(6.5, 10), glowMat);
+      glow.position.set(ex, ey, -186);
       glow.rotation.y = Math.PI;
       group.add(glow);
     }
-    const engLight = new THREE.PointLight(0xff3300, 3.0, 180);
-    engLight.position.set(0, 0, -140);
+    const engLight = new THREE.PointLight(0xff3300, 4.5, 240);
+    engLight.position.set(0, 0, -195);
     group.add(engLight);
-    // Running lights
+
+    // ── Running lights ────────────────────────────────────────────────
     const runMat = new THREE.MeshBasicMaterial({ color: 0xffaa22 });
-    for (let i = -5; i <= 5; i++) {
+    for (let i = -6; i <= 6; i++) {
       if (i === 0) continue;
-      const dot = new THREE.Mesh(new THREE.SphereGeometry(0.9, 4, 3), runMat);
-      dot.position.set((i / 5) * 68, 13.5, 120);
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(1.2, 5, 3), runMat);
+      dot.position.set((i / 6) * 95, 16, 170);
       group.add(dot);
     }
-    // 4 turrets: top-front ×2, top-aft ×2
+
+    // ── 4 turrets: outer-front ×2 and outer-aft ×2 ───────────────────
     const turretLocalPositions = [
-      new THREE.Vector3(-42, 16,  82),
-      new THREE.Vector3( 42, 16,  82),
-      new THREE.Vector3(-42, 16, -82),
-      new THREE.Vector3( 42, 16, -82),
+      new THREE.Vector3(-80, 18,  110),
+      new THREE.Vector3( 80, 18,  110),
+      new THREE.Vector3(-80, 18, -110),
+      new THREE.Vector3( 80, 18, -110),
     ];
     capitalShipTurrets = [];
     for (let i = 0; i < turretLocalPositions.length; i++) {
       const tPos = turretLocalPositions[i];
-      const base = new THREE.Mesh(new THREE.CylinderGeometry(6, 7, 4, 8), turretMat);
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(7, 8, 5, 8), turretMat);
       base.position.copy(tPos);
       group.add(base);
       const pivot = new THREE.Group();
-      pivot.position.copy(tPos).add(new THREE.Vector3(0, 3.5, 0));
+      pivot.position.copy(tPos).add(new THREE.Vector3(0, 4, 0));
       group.add(pivot);
-      const head = new THREE.Mesh(new THREE.CylinderGeometry(5, 5.5, 5, 8), turretMat);
+      const head = new THREE.Mesh(new THREE.CylinderGeometry(6, 7, 6, 8), turretMat);
       pivot.add(head);
-      const barrel = new THREE.Mesh(new THREE.BoxGeometry(1.6, 1.6, 22), barrelMat);
-      barrel.position.set(0, 1.8, 11);
+      const barrel = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 28), barrelMat);
+      barrel.position.set(0, 2, 14);
       pivot.add(barrel);
-      const muzzleLight = new THREE.PointLight(0xff6600, 0, 35);
-      muzzleLight.position.set(0, 1.8, 22);
+      const muzzleLight = new THREE.PointLight(0xff6600, 0, 45);
+      muzzleLight.position.set(0, 2, 28);
       pivot.add(muzzleLight);
-      capitalShipTurrets.push({
-        pivot,
-        muzzleLight,
-        localPos: tPos.clone(),
-        fireTimer: i * 0.85 + 0.4,
-      });
+      capitalShipTurrets.push({ pivot, muzzleLight, localPos: tPos.clone(), fireTimer: i * 0.85 + 0.4 });
     }
+
     group.position.copy(CAPITAL_SHIP_BASE_POS);
     group.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
     scene.add(group);
@@ -3229,6 +3268,7 @@ export async function startGame(opts = {}) {
         isBossHitbox: true,
         hp:        BOSS_MAX_HP,
         hitFlash:  0,
+        hitRadius: 28,
         marker:    null,
         box:       hbBox,
         lead:      hbLead,

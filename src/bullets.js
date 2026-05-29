@@ -187,7 +187,7 @@ export function createBullets({ shipHitRadius = 5.0 } = {}) {
           const dx = b.mesh.position.x - r.ship.position.x;
           const dy = b.mesh.position.y - r.ship.position.y;
           const dz = b.mesh.position.z - r.ship.position.z;
-          const reach = SHIP_HIT_RADIUS + RADIUS;
+          const reach = (r.hitRadius !== undefined ? r.hitRadius : SHIP_HIT_RADIUS) + RADIUS;
           if (dx * dx + dy * dy + dz * dz < reach * reach) {
             spawnExplosion(b.mesh.position, 1.0);
             if (onHitRemote) onHitRemote(id);

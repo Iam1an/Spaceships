@@ -274,20 +274,20 @@
       border-radius: 12px; border: 2px solid #cc5522; max-width: 80vw;
     }
     #campaign-lives { font-size: 18px; letter-spacing: 5px; color: #ff4444; margin-top: 2px; min-height: 20px; }
-    .mission-card {
-      display: flex; flex-direction: column; gap: 4px;
-      padding: 14px 22px; background: rgba(10,18,35,0.85);
-      border: 1.5px solid #334466; border-radius: 10px;
-      cursor: pointer; text-align: left; width: 100%;
-      transition: border-color 0.15s, box-shadow 0.15s;
-      font-family: 'Orbitron', sans-serif; margin-bottom: 4px;
-      color: inherit;
+    .campaign-mission-btn {
+      display: flex; flex-direction: column; align-items: flex-start;
+      gap: 3px; width: min(360px, 100%); white-space: normal; text-align: left;
     }
-    .mission-card:hover:not(.locked) { border-color: #ff7744; box-shadow: 0 0 12px rgba(255,100,60,0.4); }
-    .mission-card.locked { opacity: 0.4; cursor: not-allowed; border-color: #223; }
-    .mission-card-title { font-size: 13px; color: #ffaa66; letter-spacing: 2px; }
-    .mission-card-desc  { font-size: 10px; color: #8899bb; letter-spacing: 1px; margin-top: 2px; }
-    .mission-card-status { font-size: 10px; color: #66ffaa; letter-spacing: 2px; min-height: 12px; margin-top: 2px; }
+    .campaign-mission-sub {
+      font-size: clamp(10px,1.3vw,13px); color: rgba(255,255,255,0.72);
+      letter-spacing: 1px; text-align: left; white-space: normal;
+    }
+    .campaign-mission-status { font-size: 10px; color: #66ffaa; letter-spacing: 2px; min-height: 12px; }
+    .campaign-mission-btn.locked {
+      opacity: 0.42; cursor: not-allowed; pointer-events: none;
+      background: linear-gradient(180deg,#3a4a5f 0%,#1a2530 100%);
+      border-color: #44607f; box-shadow: none;
+    }
     #campaign-warp-flash {
       position: fixed; inset: 0; z-index: 20; pointer-events: none; opacity: 0;
       background: radial-gradient(ellipse at center, #aaccff 0%, #2244cc 55%, transparent 80%);
@@ -1013,20 +1013,20 @@
 
     <div id="lobby-campaign" class="screen hidden">
       <div class="prompt">Campaign</div>
-      <button class="mission-card" id="btnMission1">
-        <div class="mission-card-title">Mission 1: Operation Ironclad</div>
-        <div class="mission-card-desc">Engage enemy scout forces and destroy the Capital Ship</div>
-        <div class="mission-card-status" id="mission1Status"></div>
+      <button class="big campaign-mission-btn" id="btnMission1">
+        Mission 1: Operation Ironclad
+        <span class="campaign-mission-sub">Fight through scouts and fighters, then destroy the Capital Ship</span>
+        <span class="campaign-mission-status" id="mission1Status"></span>
       </button>
-      <button class="mission-card" id="btnMission2">
-        <div class="mission-card-title">Mission 2: Operation Stormfront</div>
-        <div class="mission-card-desc">Heavier defenses — elite fighters protect the dreadnought</div>
-        <div class="mission-card-status" id="mission2Status"></div>
+      <button class="big campaign-mission-btn" id="btnMission2">
+        Mission 2: Operation Stormfront
+        <span class="campaign-mission-sub">Heavier waves — elite escorts protect the dreadnought</span>
+        <span class="campaign-mission-status" id="mission2Status"></span>
       </button>
-      <button class="mission-card" id="btnMission3">
-        <div class="mission-card-title">Mission 3: Final Siege</div>
-        <div class="mission-card-desc">Everything at once — survive the assault and destroy the flagship</div>
-        <div class="mission-card-status" id="mission3Status"></div>
+      <button class="big campaign-mission-btn" id="btnMission3">
+        Mission 3: Final Siege
+        <span class="campaign-mission-sub">Everything at once — survive the onslaught and destroy the flagship</span>
+        <span class="campaign-mission-status" id="mission3Status"></span>
       </button>
       <button class="link" id="btnBackCampaign">← Back</button>
     </div>
