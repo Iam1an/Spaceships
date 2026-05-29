@@ -86,7 +86,7 @@ export async function startGame(opts = {}) {
 
   const clock = new THREE.Clock();
   const warpEffect = createWarpEffect(scene, camera);
-  
+
   let isLoading = true;
   function loadingLoop() {
     if (!isLoading) return;
@@ -123,12 +123,12 @@ export async function startGame(opts = {}) {
     terrainSun.position.set(0, 500, 0);
     terrainSun.castShadow = true;
     terrainSun.shadow.mapSize.set(1024, 1024);
-    terrainSun.shadow.camera.left   = -150;
-    terrainSun.shadow.camera.right  =  150;
-    terrainSun.shadow.camera.top    =  150;
+    terrainSun.shadow.camera.left = -150;
+    terrainSun.shadow.camera.right = 150;
+    terrainSun.shadow.camera.top = 150;
     terrainSun.shadow.camera.bottom = -150;
-    terrainSun.shadow.camera.near   = 1;
-    terrainSun.shadow.camera.far    = 700;
+    terrainSun.shadow.camera.near = 1;
+    terrainSun.shadow.camera.far = 700;
     scene.add(terrainSun.target);
     scene.add(terrainSun);
     scene.background = new THREE.Color(0x6fa8d4);
@@ -209,10 +209,10 @@ export async function startGame(opts = {}) {
     : null;
 
   const SHIP_SCALE = 1.5;
-  const savedHull   = parseInt(getSavedShipColor().replace('#', ''), 16);
+  const savedHull = parseInt(getSavedShipColor().replace('#', ''), 16);
   const savedAccent = parseInt(getSavedAccentColor().replace('#', ''), 16);
   // Names that get the admin ship model. Add more here as needed.
-  const ADMIN_SHIP_NAMES = new Set(['Admin', 'ariairspeed', 'fog']);
+  const ADMIN_SHIP_NAMES = new Set(['Admin', 'ariairspeed']);
   const localPlayerName = (opts.pilotName || '').trim();
   const isLocalAdmin = ADMIN_SHIP_NAMES.has(localPlayerName);
   const ship = createShip({
@@ -258,22 +258,22 @@ export async function startGame(opts = {}) {
   // message; fall back to local random generation for offline runs.
   const _trialRockCount = opts.mode === 'trials4' ? 210
     : opts.mode === 'trials3' ? 180
-    : opts.mode === 'trials2' ? 150
-    : isTrialsMode ? 120 : 60;
+      : opts.mode === 'trials2' ? 150
+        : isTrialsMode ? 120 : 60;
   const _avoidList = moonAvoid ? [...motherships, moonAvoid] : [...motherships];
   function genCampaignAsteroids() {
     const data = [];
     let id = 1;
     const ZONES = [
-      { zMin: -520, zMax: -150, count: 90,  xRange: 110, yRange: 55 },
-      { zMin: -180, zMax: 200,  count: 100, xRange: 130, yRange: 65 },
-      { zMin: 160,  zMax: 540,  count: 90,  xRange: 110, yRange: 55 },
+      { zMin: -520, zMax: -150, count: 90, xRange: 110, yRange: 55 },
+      { zMin: -180, zMax: 200, count: 100, xRange: 130, yRange: 65 },
+      { zMin: 160, zMax: 540, count: 90, xRange: 110, yRange: 55 },
     ];
     const TIERS_LOCAL = [
-      { name: 'small',  minSize: 5,  maxSize: 7,  hp: 5,  w: 0.45 },
-      { name: 'medium', minSize: 9,  maxSize: 15, hp: 10, w: 0.30 },
-      { name: 'big',    minSize: 18, maxSize: 30, hp: 30, w: 0.18 },
-      { name: 'huge',   minSize: 38, maxSize: 55, hp: 50, w: 0.07 },
+      { name: 'small', minSize: 5, maxSize: 7, hp: 5, w: 0.45 },
+      { name: 'medium', minSize: 9, maxSize: 15, hp: 10, w: 0.30 },
+      { name: 'big', minSize: 18, maxSize: 30, hp: 30, w: 0.18 },
+      { name: 'huge', minSize: 38, maxSize: 55, hp: 50, w: 0.07 },
     ];
     for (const zone of ZONES) {
       for (let i = 0; i < zone.count; i++) {
@@ -289,7 +289,7 @@ export async function startGame(opts = {}) {
             zone.zMin + Math.random() * (zone.zMax - zone.zMin),
           ],
           rot: [Math.random() * Math.PI * 2, Math.random() * Math.PI * 2, 0],
-          spin: [(Math.random()-0.5)*0.4, (Math.random()-0.5)*0.4, (Math.random()-0.5)*0.2],
+          spin: [(Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.2],
           hp: tier.hp, tier: tier.name, variant: Math.floor(Math.random() * 6),
         });
       }
@@ -301,8 +301,8 @@ export async function startGame(opts = {}) {
     : (opts.asteroids
       ? createAsteroidFieldFromData(opts.asteroids)
       : isCampaign
-      ? createAsteroidFieldFromData(genCampaignAsteroids())
-      : createAsteroidField({ count: _trialRockCount, radius: 400, avoid: _avoidList }));
+        ? createAsteroidFieldFromData(genCampaignAsteroids())
+        : createAsteroidField({ count: _trialRockCount, radius: 400, avoid: _avoidList }));
   scene.add(asteroids.group);
 
   // ── Time Trials checkpoint data ─────────────────────────────────────────
@@ -310,84 +310,84 @@ export async function startGame(opts = {}) {
   // meshes oriented perpendicular to the path. Timer begins on the first
   // crossing of CP0 (start/finish); each full circuit records a lap time.
   const TRIAL1_CPS = [
-    new THREE.Vector3(   0,  20, -380),  // CP0  start / finish
-    new THREE.Vector3( 180,  60, -260),  // CP1  climb right
-    new THREE.Vector3( 340,   0,  -80),  // CP2  east entry
-    new THREE.Vector3( 360, -50,  120),  // CP3  east exit
-    new THREE.Vector3( 220,  80,  280),  // CP4  back-right high
-    new THREE.Vector3(  60, -60,  370),  // CP5  back centre low
-    new THREE.Vector3(-150,  40,  360),  // CP6  back left
-    new THREE.Vector3(-320, -40,  180),  // CP7  west entry
-    new THREE.Vector3(-370,  60,  -60),  // CP8  west exit
+    new THREE.Vector3(0, 20, -380),  // CP0  start / finish
+    new THREE.Vector3(180, 60, -260),  // CP1  climb right
+    new THREE.Vector3(340, 0, -80),  // CP2  east entry
+    new THREE.Vector3(360, -50, 120),  // CP3  east exit
+    new THREE.Vector3(220, 80, 280),  // CP4  back-right high
+    new THREE.Vector3(60, -60, 370),  // CP5  back centre low
+    new THREE.Vector3(-150, 40, 360),  // CP6  back left
+    new THREE.Vector3(-320, -40, 180),  // CP7  west entry
+    new THREE.Vector3(-370, 60, -60),  // CP8  west exit
     new THREE.Vector3(-260, -80, -240),  // CP9  south-west deep
-    new THREE.Vector3(-100,  30, -360),  // CP10 approach left
-    new THREE.Vector3( 100, -40, -350),  // CP11 final approach
+    new THREE.Vector3(-100, 30, -360),  // CP10 approach left
+    new THREE.Vector3(100, -40, -350),  // CP11 final approach
   ];
   // Trial 2 — 14 CPs, tighter turns, closes in on the moon
   const TRIAL2_CPS = [
-    new THREE.Vector3(   0,  20, -360),  // CP0  start
-    new THREE.Vector3( 160,  80, -220),  // CP1
-    new THREE.Vector3( 290, -40,  -80),  // CP2  tighter east entry
-    new THREE.Vector3( 310, -80,  100),  // CP3
-    new THREE.Vector3( 190, 100,  270),  // CP4
-    new THREE.Vector3(  40, -90,  330),  // CP5  low back
-    new THREE.Vector3(-120,  70,  310),  // CP6
-    new THREE.Vector3(-270, -60,  190),  // CP7
-    new THREE.Vector3(-300,  90,   20),  // CP8  close west pass
-    new THREE.Vector3(-270,-100, -170),  // CP9
-    new THREE.Vector3(-120,  60, -310),  // CP10
-    new THREE.Vector3(  20, -80, -310),  // CP11
-    new THREE.Vector3( 140,  90, -240),  // CP12
-    new THREE.Vector3( 260, -60, -120),  // CP13 final
+    new THREE.Vector3(0, 20, -360),  // CP0  start
+    new THREE.Vector3(160, 80, -220),  // CP1
+    new THREE.Vector3(290, -40, -80),  // CP2  tighter east entry
+    new THREE.Vector3(310, -80, 100),  // CP3
+    new THREE.Vector3(190, 100, 270),  // CP4
+    new THREE.Vector3(40, -90, 330),  // CP5  low back
+    new THREE.Vector3(-120, 70, 310),  // CP6
+    new THREE.Vector3(-270, -60, 190),  // CP7
+    new THREE.Vector3(-300, 90, 20),  // CP8  close west pass
+    new THREE.Vector3(-270, -100, -170),  // CP9
+    new THREE.Vector3(-120, 60, -310),  // CP10
+    new THREE.Vector3(20, -80, -310),  // CP11
+    new THREE.Vector3(140, 90, -240),  // CP12
+    new THREE.Vector3(260, -60, -120),  // CP13 final
   ];
   // Trial 3 — 16 CPs, extreme height variation, very tight
   const TRIAL3_CPS = [
-    new THREE.Vector3(   0, -30, -370),  // CP0  start
-    new THREE.Vector3( 150, 100, -240),  // CP1  climb
-    new THREE.Vector3( 300, -80,  -60),  // CP2  dive
-    new THREE.Vector3( 350, 100,  120),  // CP3  climb
-    new THREE.Vector3( 220,-110,  280),  // CP4  deep dive
-    new THREE.Vector3(  60, 100,  350),  // CP5  high climb
-    new THREE.Vector3( -80,-110,  300),  // CP6  deep dive
-    new THREE.Vector3(-240, 100,  160),  // CP7  climb
-    new THREE.Vector3(-330, -90,    0),  // CP8  close left of moon
+    new THREE.Vector3(0, -30, -370),  // CP0  start
+    new THREE.Vector3(150, 100, -240),  // CP1  climb
+    new THREE.Vector3(300, -80, -60),  // CP2  dive
+    new THREE.Vector3(350, 100, 120),  // CP3  climb
+    new THREE.Vector3(220, -110, 280),  // CP4  deep dive
+    new THREE.Vector3(60, 100, 350),  // CP5  high climb
+    new THREE.Vector3(-80, -110, 300),  // CP6  deep dive
+    new THREE.Vector3(-240, 100, 160),  // CP7  climb
+    new THREE.Vector3(-330, -90, 0),  // CP8  close left of moon
     new THREE.Vector3(-260, 110, -180),  // CP9  climb
-    new THREE.Vector3(-120,-100, -290),  // CP10 dive
-    new THREE.Vector3(  20, 110, -350),  // CP11 climb
-    new THREE.Vector3( 170,-100, -250),  // CP12 dive
-    new THREE.Vector3( 310, 100,  -70),  // CP13 climb
-    new THREE.Vector3( 220,-110,  120),  // CP14 dive
-    new THREE.Vector3(  80,  80, -200),  // CP15 final approach
+    new THREE.Vector3(-120, -100, -290),  // CP10 dive
+    new THREE.Vector3(20, 110, -350),  // CP11 climb
+    new THREE.Vector3(170, -100, -250),  // CP12 dive
+    new THREE.Vector3(310, 100, -70),  // CP13 climb
+    new THREE.Vector3(220, -110, 120),  // CP14 dive
+    new THREE.Vector3(80, 80, -200),  // CP15 final approach
   ];
   // Trial 4 — 18 CPs, closest moon passes, maximum difficulty
   const TRIAL4_CPS = [
-    new THREE.Vector3(   0,  50, -370),  // CP0  start
-    new THREE.Vector3( 180,-100, -210),  // CP1
-    new THREE.Vector3( 340, 110,  -40),  // CP2
-    new THREE.Vector3( 210,-110,  240),  // CP3
-    new THREE.Vector3(  40, 110,  340),  // CP4
-    new THREE.Vector3(-180,-110,  210),  // CP5
-    new THREE.Vector3(-160,  80,    0),  // CP6  close left of moon
-    new THREE.Vector3(-200,-100, -210),  // CP7
-    new THREE.Vector3(   0, 110, -180),  // CP8  above front of moon
-    new THREE.Vector3( 200,-100,  -40),  // CP9
-    new THREE.Vector3( 300, 100,  180),  // CP10
-    new THREE.Vector3(  80,-110,  320),  // CP11
-    new THREE.Vector3(-200, 100,  180),  // CP12
-    new THREE.Vector3(-320,-100,  -40),  // CP13
+    new THREE.Vector3(0, 50, -370),  // CP0  start
+    new THREE.Vector3(180, -100, -210),  // CP1
+    new THREE.Vector3(340, 110, -40),  // CP2
+    new THREE.Vector3(210, -110, 240),  // CP3
+    new THREE.Vector3(40, 110, 340),  // CP4
+    new THREE.Vector3(-180, -110, 210),  // CP5
+    new THREE.Vector3(-160, 80, 0),  // CP6  close left of moon
+    new THREE.Vector3(-200, -100, -210),  // CP7
+    new THREE.Vector3(0, 110, -180),  // CP8  above front of moon
+    new THREE.Vector3(200, -100, -40),  // CP9
+    new THREE.Vector3(300, 100, 180),  // CP10
+    new THREE.Vector3(80, -110, 320),  // CP11
+    new THREE.Vector3(-200, 100, 180),  // CP12
+    new THREE.Vector3(-320, -100, -40),  // CP13
     new THREE.Vector3(-200, 100, -220),  // CP14
-    new THREE.Vector3(   0,-110, -340),  // CP15 south close
-    new THREE.Vector3( 200, 100, -220),  // CP16
-    new THREE.Vector3( 100, -80, -330),  // CP17 final
+    new THREE.Vector3(0, -110, -340),  // CP15 south close
+    new THREE.Vector3(200, 100, -220),  // CP16
+    new THREE.Vector3(100, -80, -330),  // CP17 final
   ];
   const TRIAL_CPS = opts.mode === 'trials4' ? TRIAL4_CPS
     : opts.mode === 'trials3' ? TRIAL3_CPS
-    : opts.mode === 'trials2' ? TRIAL2_CPS
-    : TRIAL1_CPS;
+      : opts.mode === 'trials2' ? TRIAL2_CPS
+        : TRIAL1_CPS;
   const TRIAL_BEST_KEY = opts.mode === 'trials4' ? 'spaceships:trial4Best'
     : opts.mode === 'trials3' ? 'spaceships:trial3Best'
-    : opts.mode === 'trials2' ? 'spaceships:trial2Best'
-    : 'spaceships:trial1Best';
+      : opts.mode === 'trials2' ? 'spaceships:trial2Best'
+        : 'spaceships:trial1Best';
   const TRIAL_NUM = opts.mode === 'trials4' ? 4 : opts.mode === 'trials3' ? 3 : opts.mode === 'trials2' ? 2 : 1;
   const CP_TRIGGER_DIST = 55;
   const cpMeshes = [];
@@ -440,9 +440,9 @@ export async function startGame(opts = {}) {
     trialsCountdown = 3.0;
     trialsCountdownActive = true;
     const _cdWrap = document.getElementById('trials-countdown');
-    const _cdNum  = document.getElementById('trials-countdown-num');
+    const _cdNum = document.getElementById('trials-countdown-num');
     if (_cdWrap) _cdWrap.style.display = 'flex';
-    if (_cdNum)  { _cdNum.textContent = '3'; _cdNum.style.color = '#ff5566'; }
+    if (_cdNum) { _cdNum.textContent = '3'; _cdNum.style.color = '#ff5566'; }
   }
 
   // Bullet hit-sphere is generous in both modes — mouse 6.0 (slight
@@ -820,7 +820,7 @@ export async function startGame(opts = {}) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
       type: 'colors',
-      hullColor:   parseInt(getSavedShipColor().replace('#', ''), 16),
+      hullColor: parseInt(getSavedShipColor().replace('#', ''), 16),
       accentColor: parseInt(getSavedAccentColor().replace('#', ''), 16),
     }));
     if (isLocalAdmin) {
@@ -833,7 +833,7 @@ export async function startGame(opts = {}) {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
       if (msg.type === 'colors' && msg.id !== myId) {
-        const hull   = typeof msg.hullColor   === 'number' ? msg.hullColor   : parseInt(String(msg.hullColor).replace('#', ''), 16);
+        const hull = typeof msg.hullColor === 'number' ? msg.hullColor : parseInt(String(msg.hullColor).replace('#', ''), 16);
         const accent = typeof msg.accentColor === 'number' ? msg.accentColor : parseInt(String(msg.accentColor).replace('#', ''), 16);
         remoteColors.set(msg.id, { hullColor: hull, accentColor: accent });
         const r = remotePlayers.get(msg.id);
@@ -958,9 +958,9 @@ export async function startGame(opts = {}) {
         else killRemote(msg.id);
         if (msg.killerId != null) {
           const kn = scores.get(msg.killerId)?.name
-                  || (msg.killerId === myId ? (opts.pilotName || 'Pilot') : 'Pilot');
+            || (msg.killerId === myId ? (opts.pilotName || 'Pilot') : 'Pilot');
           const vn = scores.get(msg.id)?.name
-                  || (msg.id === myId ? (opts.pilotName || 'Pilot') : 'Pilot');
+            || (msg.id === myId ? (opts.pilotName || 'Pilot') : 'Pilot');
           pushKillFeed(kn, vn, msg.killerId === myId, msg.id === myId);
         }
       } else if (msg.type === 'respawn') {
@@ -985,7 +985,7 @@ export async function startGame(opts = {}) {
         } else if (msg.kind === 'missile') {
           for (const shot of (msg.shots || [])) {
             const origin = new THREE.Vector3().fromArray(shot.pos);
-            const dir    = new THREE.Vector3().fromArray(shot.dir);
+            const dir = new THREE.Vector3().fromArray(shot.dir);
             // Resolve the homing target on this client:
             //   - shot.targetId === myId  → missile is chasing the local player
             //   - otherwise               → look up the remote player record
@@ -1009,7 +1009,7 @@ export async function startGame(opts = {}) {
       } else if (msg.type === 'flare' && msg.id !== myId) {
         // Remote player deployed flares — create them locally so they can divert
         // missiles running on this client (e.g. missiles we fired at that player).
-        const fPos  = new THREE.Vector3().fromArray(msg.pos);
+        const fPos = new THREE.Vector3().fromArray(msg.pos);
         const fQuat = new THREE.Quaternion().fromArray(msg.quat);
         missileSystem.deployFlare(fPos, fQuat, msg.id);
       } else if (msg.type === 'match-credits') {
@@ -1267,11 +1267,11 @@ export async function startGame(opts = {}) {
 
   // Health regeneration: after 2s out of combat (no damage taken, no shots
   // fired) regen ticks +1 HP every 0.1s until full.
-  const HEALTH_REGEN_DELAY    = 2.0;
+  const HEALTH_REGEN_DELAY = 2.0;
   const HEALTH_REGEN_INTERVAL = 0.1;
   let healthIdleDamage = HEALTH_REGEN_DELAY; // time since last damage received
-  let healthIdleShot   = HEALTH_REGEN_DELAY; // time since last shot fired
-  let healthRegenTick  = 0;                  // accumulator for 0.1s ticks
+  let healthIdleShot = HEALTH_REGEN_DELAY; // time since last shot fired
+  let healthRegenTick = 0;                  // accumulator for 0.1s ticks
 
   const boostBar = document.getElementById('boostbar');
   const boostFill = document.getElementById('boostbar-fill');
@@ -1287,12 +1287,12 @@ export async function startGame(opts = {}) {
 
   const TRAIL_OFFSETS = [
     new THREE.Vector3(-2.2, -0.05, -1.8),
-    new THREE.Vector3( 2.2, -0.05, -1.8),
+    new THREE.Vector3(2.2, -0.05, -1.8),
   ];
   // Admin model has jets closer together and further back.
   const ADMIN_TRAIL_OFFSETS = [
     new THREE.Vector3(-0.9, -0.05, -2.4),
-    new THREE.Vector3( 0.9, -0.05, -2.4),
+    new THREE.Vector3(0.9, -0.05, -2.4),
   ];
   const localTrailOffsets = isLocalAdmin ? ADMIN_TRAIL_OFFSETS : TRAIL_OFFSETS;
   // Enemy/remote-ship trails. Default on; users on low-end devices can
@@ -1302,7 +1302,7 @@ export async function startGame(opts = {}) {
   // Per-state emission profile: rate (puffs/sec/engine), particle scale
   // range, color palette, position jitter, and lifetime range.
   const EMIT_CONFIG = {
-    move:  { rate: 18, scale: [0.16, 0.28], colors: [0xffffff],         jitter: 0.05, life: [0.18, 0.30] },
+    move: { rate: 18, scale: [0.16, 0.28], colors: [0xffffff], jitter: 0.05, life: [0.18, 0.30] },
     boost: { rate: 45, scale: [0.50, 0.85], colors: [0x66ddff, 0xffffff], jitter: 0.13, life: [0.45, 0.65] },
     brake: { rate: 35, scale: [0.36, 0.60], colors: [0xffd933, 0xffaa33], jitter: 0.10, life: [0.28, 0.45] },
   };
@@ -1310,7 +1310,7 @@ export async function startGame(opts = {}) {
   // Read trail customization once at game start; captured so mid-match changes
   // apply on the next match (consistent with how pixel filter / enemy trails work).
   const savedTrailColorHex = parseInt(getSavedTrailColor().replace('#', ''), 16);
-  const savedTrailShape    = getSavedTrailShape();
+  const savedTrailShape = getSavedTrailShape();
 
   let targetThrottle = 0;
   let throttle = 0;
@@ -1331,7 +1331,7 @@ export async function startGame(opts = {}) {
     if (isTrialsMode && trialsCountdownActive) {
       trialsCountdown -= dt;
       const cdWrap = document.getElementById('trials-countdown');
-      const cdNum  = document.getElementById('trials-countdown-num');
+      const cdNum = document.getElementById('trials-countdown-num');
       const n = Math.ceil(Math.max(0, trialsCountdown));
       if (cdNum) {
         if (n > 0) {
@@ -1380,10 +1380,10 @@ export async function startGame(opts = {}) {
       // toward ±1 via damp so deflection is smooth, not a snap. Held key
       // = analog-feeling input; release returns toward 0.
       let kxTarget = 0, kyTarget = 0;
-      if (input.keys.has('ArrowLeft'))  kxTarget -= 1;
+      if (input.keys.has('ArrowLeft')) kxTarget -= 1;
       if (input.keys.has('ArrowRight')) kxTarget += 1;
-      if (input.keys.has('ArrowUp'))    kyTarget -= 1;
-      if (input.keys.has('ArrowDown'))  kyTarget += 1;
+      if (input.keys.has('ArrowUp')) kyTarget -= 1;
+      if (input.keys.has('ArrowDown')) kyTarget += 1;
       // Slow ramp on press, fast decay on release — taps stay micro.
       // Hold Q to halve the ramp rate for fine-aim micro-corrections.
       const upRate = input.keys.has('KeyQ') ? ARROW_RAMP_UP_RATE_FINE : ARROW_RAMP_UP_RATE;
@@ -1405,8 +1405,8 @@ export async function startGame(opts = {}) {
       if (input.keys.has('KeyA')) roll -= ROLL_RATE * pitchMult * dt;
 
       if (pitch) ship.quaternion.multiply(tmpQ.setFromAxisAngle(xAxis, pitch));
-      if (yaw)   ship.quaternion.multiply(tmpQ.setFromAxisAngle(yAxis, yaw));
-      if (roll)  ship.quaternion.multiply(tmpQ.setFromAxisAngle(zAxis, roll));
+      if (yaw) ship.quaternion.multiply(tmpQ.setFromAxisAngle(yAxis, yaw));
+      if (roll) ship.quaternion.multiply(tmpQ.setFromAxisAngle(zAxis, roll));
       ship.quaternion.normalize();
 
       if (aimAssistEnabled) {
@@ -1548,7 +1548,7 @@ export async function startGame(opts = {}) {
     const nowKeyC = input.keys.has('KeyC');
     if (nowKeyC && !prevKeyC) {
       aimAssistEnabled = !aimAssistEnabled;
-      try { localStorage.setItem('spaceships:aimAssist', aimAssistEnabled ? '1' : '0'); } catch {}
+      try { localStorage.setItem('spaceships:aimAssist', aimAssistEnabled ? '1' : '0'); } catch { }
       showAimAssistToast(aimAssistEnabled);
     }
     prevKeyC = nowKeyC;
@@ -1647,7 +1647,7 @@ export async function startGame(opts = {}) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           type: 'flare',
-          pos:  [ship.position.x, ship.position.y, ship.position.z],
+          pos: [ship.position.x, ship.position.y, ship.position.z],
           quat: [ship.quaternion.x, ship.quaternion.y, ship.quaternion.z, ship.quaternion.w],
         }));
       }
@@ -1665,8 +1665,8 @@ export async function startGame(opts = {}) {
         const origin = off.clone().applyQuaternion(ship.quaternion).add(ship.position);
         if (gunMode === 'beam') {
           const cast = castWorldRay(origin, dir, BEAM_RANGE, { skipTeam: myTeam });
-          let beamDist     = cast.dist;
-          let hitTargetId  = cast.hitShipId;
+          let beamDist = cast.dist;
+          let hitTargetId = cast.hitShipId;
           const hitAsteroidId = cast.hitAsteroidId;
           let hitBoss = false;
           if (isCampaign && bossActive) {
@@ -1730,7 +1730,7 @@ export async function startGame(opts = {}) {
     // Health regen: tick idle timers; regenerate 1 HP per 0.1s after 2s out of combat.
     if (myAlive) {
       healthIdleDamage += dt;
-      healthIdleShot   += dt;
+      healthIdleShot += dt;
       if (healthIdleDamage >= HEALTH_REGEN_DELAY && healthIdleShot >= HEALTH_REGEN_DELAY && myHp < SHIP_MAX_HP) {
         healthRegenTick += dt;
         if (healthRegenTick >= HEALTH_REGEN_INTERVAL) {
@@ -2412,8 +2412,8 @@ export async function startGame(opts = {}) {
       const py = halfSize.y - Math.abs(dy);
       const pz = halfSize.z - Math.abs(dz);
       if (px < py && px < pz) { nx = Math.sign(dx) || 1; ny = 0; nz = 0; push = px + radius; }
-      else if (py < pz)        { nx = 0; ny = Math.sign(dy) || 1; nz = 0; push = py + radius; }
-      else                     { nx = 0; ny = 0; nz = Math.sign(dz) || 1; push = pz + radius; }
+      else if (py < pz) { nx = 0; ny = Math.sign(dy) || 1; nz = 0; push = py + radius; }
+      else { nx = 0; ny = 0; nz = Math.sign(dz) || 1; push = pz + radius; }
     } else {
       const cx = Math.max(-halfSize.x, Math.min(halfSize.x, dx));
       const cy = Math.max(-halfSize.y, Math.min(halfSize.y, dy));
@@ -2530,7 +2530,7 @@ export async function startGame(opts = {}) {
     // Terrain map: ground surface is an instant-kill floor.
     if (isTerrainMap) {
       const groundY = getTerrainHeight(ship.position.x, ship.position.z);
-      const killY   = groundY + TERRAIN_KILL_CLEARANCE;
+      const killY = groundY + TERRAIN_KILL_CLEARANCE;
       if (ship.position.y < killY) {
         ship.position.y = killY;
         if (shipVelocity.y < 0) shipVelocity.y *= -0.5;
@@ -2568,17 +2568,17 @@ export async function startGame(opts = {}) {
   const BOSS_MAX_HP = 2500;
   const CAMPAIGN_WAVES = CAMPAIGN_MISSION === 3
     ? [
-        { count: 5, label: 'WAVE 1 / 3', objective: 'Destroy the assault wing', spawnZ: -280 },
-        { count: 7, label: 'WAVE 2 / 3', objective: 'Eliminate the heavy fighters', spawnZ: 20 },
-        { count: 6, label: 'WAVE 3 / 3', objective: 'Crush the elite vanguard', spawnZ: 330 },
-      ]
+      { count: 5, label: 'WAVE 1 / 3', objective: 'Destroy the assault wing', spawnZ: -280 },
+      { count: 7, label: 'WAVE 2 / 3', objective: 'Eliminate the heavy fighters', spawnZ: 20 },
+      { count: 6, label: 'WAVE 3 / 3', objective: 'Crush the elite vanguard', spawnZ: 330 },
+    ]
     : CAMPAIGN_MISSION === 2
-    ? [
+      ? [
         { count: 4, label: 'WAVE 1 / 3', objective: 'Destroy the patrol fleet', spawnZ: -280 },
         { count: 6, label: 'WAVE 2 / 3', objective: 'Eliminate the fighter escort', spawnZ: 20 },
         { count: 5, label: 'WAVE 3 / 3', objective: 'Break through the elite guard', spawnZ: 330 },
       ]
-    : [
+      : [
         { count: 3, label: 'WAVE 1 / 3', objective: 'Destroy the enemy scout drones', spawnZ: -280 },
         { count: 5, label: 'WAVE 2 / 3', objective: 'Destroy the enemy fighter squadron', spawnZ: 20 },
         { count: 4, label: 'WAVE 3 / 3', objective: 'Eliminate the elite guard', spawnZ: 330 },
@@ -2593,31 +2593,31 @@ export async function startGame(opts = {}) {
   // X: ±85, ±28  |  Z: ±150, ±75, 0  (+bridge row at top)
   const BOSS_HB_OFFSETS_WORLD = [
     // stern row  (z = -150)
-    new THREE.Vector3(-85,  0, -150),
-    new THREE.Vector3(-28,  0, -150),
-    new THREE.Vector3( 28,  0, -150),
-    new THREE.Vector3( 85,  0, -150),
+    new THREE.Vector3(-85, 0, -150),
+    new THREE.Vector3(-28, 0, -150),
+    new THREE.Vector3(28, 0, -150),
+    new THREE.Vector3(85, 0, -150),
     // mid-stern  (z = -75)
-    new THREE.Vector3(-85,  0,  -75),
-    new THREE.Vector3(-28,  0,  -75),
-    new THREE.Vector3( 28,  0,  -75),
-    new THREE.Vector3( 85,  0,  -75),
+    new THREE.Vector3(-85, 0, -75),
+    new THREE.Vector3(-28, 0, -75),
+    new THREE.Vector3(28, 0, -75),
+    new THREE.Vector3(85, 0, -75),
     // centre     (z = 0)
-    new THREE.Vector3(-85,  0,    0),
-    new THREE.Vector3(  0,  0,    0),
-    new THREE.Vector3( 85,  0,    0),
+    new THREE.Vector3(-85, 0, 0),
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(85, 0, 0),
     // mid-bow    (z = +75)
-    new THREE.Vector3(-85,  0,   75),
-    new THREE.Vector3(-28,  0,   75),
-    new THREE.Vector3( 28,  0,   75),
-    new THREE.Vector3( 85,  0,   75),
+    new THREE.Vector3(-85, 0, 75),
+    new THREE.Vector3(-28, 0, 75),
+    new THREE.Vector3(28, 0, 75),
+    new THREE.Vector3(85, 0, 75),
     // bow row    (z = +150)
-    new THREE.Vector3(-85,  0,  150),
-    new THREE.Vector3(-28,  0,  150),
-    new THREE.Vector3( 28,  0,  150),
-    new THREE.Vector3( 85,  0,  150),
+    new THREE.Vector3(-85, 0, 150),
+    new THREE.Vector3(-28, 0, 150),
+    new THREE.Vector3(28, 0, 150),
+    new THREE.Vector3(85, 0, 150),
     // bridge     (top superstructure)
-    new THREE.Vector3(  0, 30,   50),
+    new THREE.Vector3(0, 30, 50),
   ];
   let campaignPhase = 0;
   let campaignWaveBotIds = new Set();
@@ -2657,9 +2657,9 @@ export async function startGame(opts = {}) {
       toast.innerHTML =
         `<span class="ach-toast-icon">${icon}</span>` +
         `<div class="ach-toast-body">` +
-          `<span class="ach-toast-title">ACHIEVEMENT UNLOCKED</span>` +
-          `<span class="ach-toast-label">${label}</span>` +
-          crLine +
+        `<span class="ach-toast-title">ACHIEVEMENT UNLOCKED</span>` +
+        `<span class="ach-toast-label">${label}</span>` +
+        crLine +
         `</div>`;
       _achToastContainer.appendChild(toast);
       setTimeout(() => toast.remove(), 3700);
@@ -2678,7 +2678,7 @@ export async function startGame(opts = {}) {
     try {
       const existing = JSON.parse(localStorage.getItem('spaceships:pendingAchs') || '[]');
       localStorage.setItem('spaceships:pendingAchs', JSON.stringify([...existing, ...earned]));
-    } catch {}
+    } catch { }
   }
 
   function updateCachedCredits(total) {
@@ -2689,7 +2689,7 @@ export async function startGame(opts = {}) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
     try {
-      const res  = await fetch('/spaceships/api/solo-result', {
+      const res = await fetch('/spaceships/api/solo-result', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
         body: JSON.stringify({ kills, deaths, won, botsKilled }),
@@ -2711,7 +2711,7 @@ export async function startGame(opts = {}) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
     try {
-      const res  = await fetch('/spaceships/api/campaign-result', {
+      const res = await fetch('/spaceships/api/campaign-result', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
         body: JSON.stringify({ missionNum, livesRemaining }),
@@ -2733,7 +2733,7 @@ export async function startGame(opts = {}) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
     try {
-      const res  = await fetch('/spaceships/api/trial-result', {
+      const res = await fetch('/spaceships/api/trial-result', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
         body: JSON.stringify({ trialNum, time }),
@@ -2830,33 +2830,33 @@ export async function startGame(opts = {}) {
 
   function updateCampaignHud() {
     if (!isCampaign) return;
-    const waveEl  = document.getElementById('campaign-wave');
-    const objEl   = document.getElementById('campaign-objective');
+    const waveEl = document.getElementById('campaign-wave');
+    const objEl = document.getElementById('campaign-objective');
     const enemyEl = document.getElementById('campaign-enemies');
-    const fillEl  = document.getElementById('boss-bar-fill');
-    const hpEl    = document.getElementById('boss-hp-text');
+    const fillEl = document.getElementById('boss-bar-fill');
+    const hpEl = document.getElementById('boss-hp-text');
     if (campaignPhase < 3) {
       const wave = CAMPAIGN_WAVES[campaignPhase];
-      if (waveEl)  waveEl.textContent  = wave.label;
-      if (objEl)   objEl.textContent   = wave.objective;
+      if (waveEl) waveEl.textContent = wave.label;
+      if (objEl) objEl.textContent = wave.objective;
       if (enemyEl) enemyEl.textContent = campaignBotsAlive > 0
         ? `Enemies remaining: ${campaignBotsAlive}`
         : (campaignBetween ? 'Sector clear' : '');
     } else if (campaignPhase === 3) {
-      if (waveEl)  waveEl.textContent  = '— BOSS PHASE —';
-      if (objEl)   objEl.textContent   = 'Destroy the Capital Ship';
+      if (waveEl) waveEl.textContent = '— BOSS PHASE —';
+      if (objEl) objEl.textContent = 'Destroy the Capital Ship';
       if (enemyEl) enemyEl.textContent = '';
-      if (fillEl)  fillEl.style.width  = `${(bossHp / BOSS_MAX_HP * 100).toFixed(1)}%`;
-      if (hpEl)    hpEl.textContent    = `${Math.max(0, bossHp).toLocaleString()} / ${BOSS_MAX_HP.toLocaleString()}`;
+      if (fillEl) fillEl.style.width = `${(bossHp / BOSS_MAX_HP * 100).toFixed(1)}%`;
+      if (hpEl) hpEl.textContent = `${Math.max(0, bossHp).toLocaleString()} / ${BOSS_MAX_HP.toLocaleString()}`;
     } else {
-      if (waveEl)  waveEl.textContent  = 'VICTORY';
-      if (objEl)   objEl.textContent   = 'Mission accomplished';
+      if (waveEl) waveEl.textContent = 'VICTORY';
+      if (objEl) objEl.textContent = 'Mission accomplished';
       if (enemyEl) enemyEl.textContent = '';
     }
   }
 
   function showCampaignMsg(text, duration) {
-    const el     = document.getElementById('campaign-msg');
+    const el = document.getElementById('campaign-msg');
     const textEl = document.getElementById('campaign-msg-text');
     if (textEl) textEl.textContent = text;
     if (el) el.style.display = 'flex';
@@ -2871,9 +2871,9 @@ export async function startGame(opts = {}) {
 
   function buildCapitalShip() {
     const group = new THREE.Group();
-    const hullMat   = new THREE.MeshStandardMaterial({ color: 0x16192a, metalness: 0.75, roughness: 0.38 });
-    const accentMat = new THREE.MeshStandardMaterial({ color: 0x3d0909, metalness: 0.5,  roughness: 0.6 });
-    const glowMat   = new THREE.MeshBasicMaterial({ color: 0xff3300 });
+    const hullMat = new THREE.MeshStandardMaterial({ color: 0x16192a, metalness: 0.75, roughness: 0.38 });
+    const accentMat = new THREE.MeshStandardMaterial({ color: 0x3d0909, metalness: 0.5, roughness: 0.6 });
+    const glowMat = new THREE.MeshBasicMaterial({ color: 0xff3300 });
     const turretMat = new THREE.MeshStandardMaterial({ color: 0x20283a, metalness: 0.85, roughness: 0.28 });
     const barrelMat = new THREE.MeshStandardMaterial({ color: 0x343d50, metalness: 0.92, roughness: 0.18 });
 
@@ -2954,10 +2954,10 @@ export async function startGame(opts = {}) {
 
     // ── 4 turrets: outer-front ×2 and outer-aft ×2 ───────────────────
     const turretLocalPositions = [
-      new THREE.Vector3(-80, 18,  110),
-      new THREE.Vector3( 80, 18,  110),
+      new THREE.Vector3(-80, 18, 110),
+      new THREE.Vector3(80, 18, 110),
       new THREE.Vector3(-80, 18, -110),
-      new THREE.Vector3( 80, 18, -110),
+      new THREE.Vector3(80, 18, -110),
     ];
     capitalShipTurrets = [];
     for (let i = 0; i < turretLocalPositions.length; i++) {
@@ -3033,8 +3033,8 @@ export async function startGame(opts = {}) {
           setTimeout(() => { if (t.muzzleLight) t.muzzleLight.intensity = 0; }, 65);
           const hpFrac = bossHp / BOSS_MAX_HP;
           t.fireTimer = hpFrac > 0.65 ? 2.8 + Math.random() * 0.7
-                      : hpFrac > 0.35 ? 1.6 + Math.random() * 0.5
-                      : 0.9 + Math.random() * 0.3;
+            : hpFrac > 0.35 ? 1.6 + Math.random() * 0.5
+              : 0.9 + Math.random() * 0.3;
           audio.play('shoot');
         }
       }
@@ -3047,7 +3047,7 @@ export async function startGame(opts = {}) {
     campaignBotsAlive = 0;
     const ENEMY_ANCHOR = new THREE.Vector3(0, 20, wave.spawnZ ?? 380);
     for (let i = 0; i < wave.count; i++) {
-      const id  = campaignNextBotId++;
+      const id = campaignNextBotId++;
       const pos = ENEMY_ANCHOR.clone().add(new THREE.Vector3(
         (Math.random() - 0.5) * 160,
         (Math.random() - 0.5) * 60,
@@ -3071,8 +3071,8 @@ export async function startGame(opts = {}) {
   }
 
   function activateBossPhase() {
-    bossActive    = true;
-    bossHp        = BOSS_MAX_HP;
+    bossActive = true;
+    bossHp = BOSS_MAX_HP;
     bossFireTimer = 2.0;
     // Sync hitbox world positions with capital ship current position
     for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
@@ -3098,7 +3098,7 @@ export async function startGame(opts = {}) {
   function fireFromBoss() {
     if (!myAlive || !bossActive) return;
     const hpFrac = bossHp / BOSS_MAX_HP;
-    const count  = hpFrac > 0.6 ? 2 : hpFrac > 0.3 ? 4 : 6;
+    const count = hpFrac > 0.6 ? 2 : hpFrac > 0.3 ? 4 : 6;
     const spread = hpFrac > 0.6 ? 0.06 : hpFrac > 0.3 ? 0.10 : 0.15;
     const origin = platformB.position.clone().add(new THREE.Vector3(0, 5, -32));
     const toPlayer = ship.position.clone().sub(origin).normalize();
@@ -3117,7 +3117,7 @@ export async function startGame(opts = {}) {
   function updateBoss(dt) {
     if (!bossActive || campaignOver) return;
     // Turrets handle firing; updateBoss only sweeps boss bullets for player hits
-    const PLAYER_HIT_R    = 7.0;
+    const PLAYER_HIT_R = 7.0;
     const BOSS_BULLET_DMG = 14;
     for (let i = bossBullets.length - 1; i >= 0; i--) {
       const b = bossBullets[i];
@@ -3174,7 +3174,7 @@ export async function startGame(opts = {}) {
           if (overlay && skipBtn) {
             skipBtn.onclick = () => location.reload();
             overlay.style.display = 'flex';
-            try { (window.adsbygoogle = window.adsbygoogle || []).push({}); } catch {}
+            try { (window.adsbygoogle = window.adsbygoogle || []).push({}); } catch { }
           } else {
             location.reload();
           }
@@ -3226,13 +3226,13 @@ export async function startGame(opts = {}) {
           campaignCheckpointPos = [0, 20, (nextWave?.spawnZ ?? 20) - 80];
           campaignPhase++;
           showCampaignMsg('WAVE COMPLETE\nPrepare for incoming hostiles...', 3.2);
-          campaignBetween      = true;
+          campaignBetween = true;
           campaignBetweenTimer = 3.5;
         } else {
           campaignCheckpointPos = [0, 10, 450]; // near boss entrance
           campaignPhase = 3;
           showCampaignMsg('CAPITAL SHIP SHIELDS OFFLINE\nPrepare to engage', 4.5);
-          campaignBetween      = true;
+          campaignBetween = true;
           campaignBetweenTimer = 4.8;
         }
         updateCampaignHud();
@@ -3260,7 +3260,7 @@ export async function startGame(opts = {}) {
       spawnBot(1, 1, pos, 'Bot');
     } else if (SOLO_MODE === 'skirmish') {
       const FRIENDLY_ANCHOR = isTerrainMap ? new THREE.Vector3(0, 40, -1400) : new THREE.Vector3(0, 0, -540);
-      const ENEMY_ANCHOR    = isTerrainMap ? new THREE.Vector3(0, 40,  1400) : new THREE.Vector3(0, 0,  540);
+      const ENEMY_ANCHOR = isTerrainMap ? new THREE.Vector3(0, 40, 1400) : new THREE.Vector3(0, 0, 540);
       const jitter = (range) => (Math.random() - 0.5) * range;
       for (let i = 0; i < 4; i++) {
         const pos = FRIENDLY_ANCHOR.clone().add(new THREE.Vector3(jitter(80), jitter(30), jitter(80)));
@@ -3296,21 +3296,21 @@ export async function startGame(opts = {}) {
       remotePlayers.set(BOSS_ID_BASE + i, {
         id: BOSS_ID_BASE + i,
         ship: hbGroup,
-        targetPos:  hbGroup.position.clone(),
+        targetPos: hbGroup.position.clone(),
         targetQuat: new THREE.Quaternion(),
-        alive:     false,
-        team:      1,
+        alive: false,
+        team: 1,
         hasTarget: false,
-        isBot:     true,   // prevents network-lerp pass touching it
+        isBot: true,   // prevents network-lerp pass touching it
         isBossHitbox: true,
-        hp:        BOSS_MAX_HP,
-        hitFlash:  0,
+        hp: BOSS_MAX_HP,
+        hitFlash: 0,
         hitRadius: 28,
-        marker:    null,
-        box:       hbBox,
-        lead:      hbLead,
-        label:     hbLabel,
-        vel:       new THREE.Vector3(0, 0, 0),
+        marker: null,
+        box: hbBox,
+        lead: hbLead,
+        label: hbLabel,
+        vel: new THREE.Vector3(0, 0, 0),
       });
     }
   }
@@ -3610,8 +3610,8 @@ export async function startGame(opts = {}) {
         } else {
           // Warp back to last checkpoint
           campaignWarpActive = true;
-          campaignWarpTimer  = 1.5;
-          myRespawnTimer     = 1.5;
+          campaignWarpTimer = 1.5;
+          myRespawnTimer = 1.5;
           const flashEl = document.getElementById('campaign-warp-flash');
           if (flashEl) { flashEl.classList.remove('active'); void flashEl.offsetWidth; flashEl.classList.add('active'); }
         }
@@ -3645,7 +3645,7 @@ export async function startGame(opts = {}) {
     if (SOLO_MODE === 'skirmish') {
       anchor = r.team === 0
         ? (isTerrainMap ? new THREE.Vector3(0, 40, -1400) : new THREE.Vector3(0, 0, -540))
-        : (isTerrainMap ? new THREE.Vector3(0, 40,  1400) : new THREE.Vector3(0, 0,  540));
+        : (isTerrainMap ? new THREE.Vector3(0, 40, 1400) : new THREE.Vector3(0, 0, 540));
     } else {
       anchor = ship.position.clone().add(new THREE.Vector3(
         (Math.random() * 2 - 1), 0, (Math.random() * 2 - 1),
@@ -3685,11 +3685,11 @@ export async function startGame(opts = {}) {
         for (const d of tracerDots) d.visible = false;
         updateTrialsHud();
       } else if (isCampaign) {
-        pos  = campaignCheckpointPos.slice();
+        pos = campaignCheckpointPos.slice();
         quat = [0, 0, 0, 1];
       } else {
         const spawnZ = isTerrainMap ? -1400 : -540;
-        const spawnY = isTerrainMap ? 40     : 0;
+        const spawnY = isTerrainMap ? 40 : 0;
         pos = [
           (Math.random() - 0.5) * 60,
           spawnY + (Math.random() - 0.5) * 20,
@@ -3731,12 +3731,12 @@ export async function startGame(opts = {}) {
   }
 
   // --- Trials HUD ----------------------------------------------------------
-  const trialsHudEl          = document.getElementById('trials-hud');
-  const trialsTimerEl        = document.getElementById('trials-timer');
-  const trialsCpEl           = document.getElementById('trials-checkpoint');
-  const trialsBestEl         = document.getElementById('trials-best');
-  const trialsLastEl         = document.getElementById('trials-last');
-  const trialsLapEl          = document.getElementById('trials-lap');
+  const trialsHudEl = document.getElementById('trials-hud');
+  const trialsTimerEl = document.getElementById('trials-timer');
+  const trialsCpEl = document.getElementById('trials-checkpoint');
+  const trialsBestEl = document.getElementById('trials-best');
+  const trialsLastEl = document.getElementById('trials-last');
+  const trialsLapEl = document.getElementById('trials-lap');
   function fmtLapTime(t) {
     const total = Math.max(0, t);
     const m = Math.floor(total / 60);
@@ -3790,7 +3790,7 @@ export async function startGame(opts = {}) {
         if (overlay && skipBtn) {
           skipBtn.onclick = () => location.reload();
           overlay.style.display = 'flex';
-          try { (window.adsbygoogle = window.adsbygoogle || []).push({}); } catch {}
+          try { (window.adsbygoogle = window.adsbygoogle || []).push({}); } catch { }
         } else {
           location.reload();
         }
