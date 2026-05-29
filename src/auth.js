@@ -2,7 +2,7 @@
 // The overlay resolves a promise once the pilot is authenticated or chooses
 // to play as a guest.
 
-const TOKEN_KEY    = 'spaceships:token';
+const TOKEN_KEY = 'spaceships:token';
 const USERNAME_KEY = 'spaceships:pilotName';
 
 // ── Token helpers ─────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ function saveToken(token, username, colors = {}) {
   // Authenticated pilots are not guests.
   localStorage.removeItem('spaceships:isGuest');
   // Sync account ship colors so customization.js picks up the saved values.
-  if (colors.shipColor)   localStorage.setItem('spaceships:shipColor',       colors.shipColor);
+  if (colors.shipColor) localStorage.setItem('spaceships:shipColor', colors.shipColor);
   if (colors.accentColor) localStorage.setItem('spaceships:shipAccentColor', colors.accentColor);
 }
 
@@ -60,11 +60,13 @@ export function requireAuth() {
 function showAuthOverlay() {
   return new Promise((resolve) => {
     const overlay = document.getElementById('auth-overlay');
-    const loginPane  = document.getElementById('auth-login');
-    const regPane    = document.getElementById('auth-register');
-    const errorEl    = document.getElementById('auth-error');
+    const loginPane = document.getElementById('auth-login');
+    const regPane = document.getElementById('auth-register');
+    const errorEl = document.getElementById('auth-error');
 
-    overlay.classList.remove('hidden');
+    setTimeout(() => {
+      overlay.classList.remove('hidden');
+    }, 4500);
 
     function clearError() { errorEl.textContent = ''; }
     function showError(msg) { errorEl.textContent = msg; }
@@ -100,7 +102,7 @@ function showAuthOverlay() {
       btn.disabled = true;
       btn.textContent = 'Authenticating…';
       try {
-        const res  = await fetch('/spaceships/api/login', {
+        const res = await fetch('/spaceships/api/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username, password }),
@@ -123,16 +125,16 @@ function showAuthOverlay() {
     document.getElementById('auth-register-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       clearError();
-      const username  = document.getElementById('reg-username').value.trim();
-      const password  = document.getElementById('reg-password').value;
-      const confirm   = document.getElementById('reg-confirm').value;
+      const username = document.getElementById('reg-username').value.trim();
+      const password = document.getElementById('reg-password').value;
+      const confirm = document.getElementById('reg-confirm').value;
       if (password !== confirm) { showError('Passwords do not match'); return; }
       const btn = document.getElementById('register-submit');
       btn.disabled = true;
       btn.textContent = 'Registering…';
       try {
         // Register first, then auto-login so the player gets a token.
-        const regRes  = await fetch('/spaceships/api/register', {
+        const regRes = await fetch('/spaceships/api/register', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username, password }),
@@ -140,7 +142,7 @@ function showAuthOverlay() {
         const regData = await regRes.json();
         if (!regData.ok) { showError(regData.error); return; }
 
-        const loginRes  = await fetch('/spaceships/api/login', {
+        const loginRes = await fetch('/spaceships/api/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username, password }),

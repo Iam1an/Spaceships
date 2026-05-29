@@ -873,6 +873,7 @@ document.getElementById('btnCustomize').addEventListener('click', () => {
   }
   lobbyEl.classList.add('slide-left');
   custPanel.classList.add('open');
+    document.body.classList.add('customization-open');
   if (!custScene) {
     custScene = initCustomizationScene(document.getElementById('custCanvas'));
   } else {
@@ -984,6 +985,7 @@ document.getElementById('btnResetColors').addEventListener('click', () => {
 
 function closeCustomization() {
   custPanel.classList.remove('open');
+    document.body.classList.remove('customization-open');
   lobbyEl.classList.remove('slide-left');
   if (custScene) custScene.pause();
 }
@@ -1161,7 +1163,7 @@ const profilePaneMy  = document.getElementById('profile-pane-my');
 const profilePaneLb  = document.getElementById('profile-pane-lb');
 let lbLoaded = false;
 
-document.getElementById('btnProfile').addEventListener('click', openProfilePanel);
+document.getElementById('nameInput').addEventListener('click', openProfilePanel);
 document.getElementById('btnCloseProfile').addEventListener('click', () => {
   profileOverlay.classList.add('hidden');
   lbLoaded = false;
@@ -1372,3 +1374,6 @@ showStatsInput.addEventListener('change', () => {
   const hudStats = document.getElementById('hud-stats');
   if (hudStats) hudStats.style.display = show ? '' : 'none';
 });
+
+// Remove intro animation class so menus don't re-animate when navigating back
+setTimeout(() => document.body.classList.remove('intro-active'), 3500);
