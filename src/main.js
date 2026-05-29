@@ -2693,6 +2693,28 @@ export async function startGame(opts = {}) {
     }
   }
 
+  async function reportCampaignResult(missionNum, livesRemaining) {
+    const token = localStorage.getItem('spaceships:token');
+    if (!token) return;
+    try {
+      const res  = await fetch('/spaceships/api/campaign-result', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+        body: JSON.stringify({ missionNum, livesRemaining }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        if (data.newAchievements?.length) {
+          queueAchievementToasts(data.newAchievements);
+          stashAchievementsForHangar(data.newAchievements);
+        }
+        updateCachedCredits(data.totalCredits);
+      }
+    } catch (e) {
+      console.warn('[campaign-result] could not report:', e);
+    }
+  }
+
   async function reportTrialTime(trialNum, time) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
@@ -3109,6 +3131,7 @@ export async function startGame(opts = {}) {
       if (r) { r.alive = false; r.hasTarget = false; }
     }
     localStorage.setItem(`spaceships:campaign${CAMPAIGN_MISSION}Beat`, '1');
+    reportCampaignResult(CAMPAIGN_MISSION, campaignLives);
     const bossPos = (capitalShipMesh ? capitalShipMesh.position : platformB.position).clone();
     let k = 0;
     const explodeInterval = setInterval(() => {

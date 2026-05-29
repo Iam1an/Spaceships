@@ -1180,6 +1180,12 @@ function switchProfileTab(tab) {
   profilePaneLb.classList.toggle('hidden', tab !== 'lb');
 }
 
+function fmtCampaignBest(lives) {
+  if (lives === null || lives === undefined) return '—';
+  if (lives >= 3) return '✓ Flawless';
+  return `✓ (${lives} ${lives === 1 ? 'life' : 'lives'} left)`;
+}
+
 function fmtTrialTime(t) {
   if (t === null || t === undefined) return '—';
   const total = Math.max(0, parseFloat(t));
@@ -1284,6 +1290,14 @@ function renderMyProfile(p) {
       <div class="trial-row"><span>Trial 2</span><span>${fmtTrialTime(p.trial2Best)}</span></div>
       <div class="trial-row"><span>Trial 3</span><span>${fmtTrialTime(p.trial3Best)}</span></div>
       <div class="trial-row"><span>Trial 4</span><span>${fmtTrialTime(p.trial4Best)}</span></div>
+    </div>
+    <div class="profile-section-title">CAMPAIGN</div>
+    <div class="profile-trials">
+      <div class="trial-row"><span>Mission 1: Operation Ironclad</span><span>${fmtCampaignBest(p.campaign1BestLives)}</span></div>
+      <div class="trial-row"><span>Mission 2: Operation Stormfront</span><span>${fmtCampaignBest(p.campaign2BestLives)}</span></div>
+      <div class="trial-row"><span>Mission 3: Final Siege</span><span>${fmtCampaignBest(p.campaign3BestLives)}</span></div>
+      <div class="trial-row"><span>Capital Ship Kills</span><span>${p.campaignBossKills ?? 0}</span></div>
+      <div class="trial-row"><span>Total Completions</span><span>${p.campaignTotalCompletions ?? 0}</span></div>
     </div>
     <button class="ach-toggle-btn" id="achToggleBtn">
       ACHIEVEMENTS — ${earned.length} / ${p.achievements.length}

@@ -42,6 +42,11 @@ const migrations = [
   "ALTER TABLE pilots ADD COLUMN unlock_hull INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE pilots ADD COLUMN unlock_accent INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE pilots ADD COLUMN unlock_trail_shape INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE pilots ADD COLUMN campaign1_best_lives INTEGER",
+  "ALTER TABLE pilots ADD COLUMN campaign2_best_lives INTEGER",
+  "ALTER TABLE pilots ADD COLUMN campaign3_best_lives INTEGER",
+  "ALTER TABLE pilots ADD COLUMN campaign_boss_kills INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE pilots ADD COLUMN campaign_total_completions INTEGER NOT NULL DEFAULT 0",
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch {}
@@ -165,6 +170,31 @@ const ACHIEVEMENT_DEFS = [
   { type: 'the_grind',         label: 'The Grind',          icon: '⛏', desc: '1000 matches, 1000 kills, 1000 bots destroyed', reward: 20000, check: p => p.games_played >= 1000 && p.total_kills >= 1000 && p.bots_killed >= 1000, progress: p => ({ current: (p.games_played >= 1000 ? 1 : 0) + (p.total_kills >= 1000 ? 1 : 0) + (p.bots_killed >= 1000 ? 1 : 0), target: 3 }) },
   // ── Customization ─────────────────────────────────────────────────────────────
   { type: 'high_roller',       label: 'High Roller',        icon: '💎', desc: 'Unlock all customization features',            reward:  1000, check: p => !!p.unlock_hull && !!p.unlock_accent && !!p.unlock_trail && !!p.unlock_trail_shape, progress: p => ({ current: [p.unlock_hull, p.unlock_accent, p.unlock_trail, p.unlock_trail_shape].filter(Boolean).length, target: 4 }) },
+  // ── Campaign — mission completions ───────────────────────────────────────────
+  { type: 'campaign_m1_complete',  label: 'Ironclad',           icon: '🎖', desc: 'Complete Mission 1: Operation Ironclad',                     reward:  1500, check: p => p.campaign1_best_lives !== null, progress: null },
+  { type: 'campaign_m2_complete',  label: 'Stormbreaker',       icon: '⛈', desc: 'Complete Mission 2: Operation Stormfront',                   reward:  3000, check: p => p.campaign2_best_lives !== null, progress: null },
+  { type: 'campaign_m3_complete',  label: 'Final Victor',       icon: '🔱', desc: 'Complete Mission 3: Final Siege',                            reward:  6000, check: p => p.campaign3_best_lives !== null, progress: null },
+  { type: 'campaign_all_complete', label: 'Grand Commander',    icon: '👑', desc: 'Complete all 3 campaign missions',                           reward: 15000, check: p => p.campaign1_best_lives !== null && p.campaign2_best_lives !== null && p.campaign3_best_lives !== null, progress: p => ({ current: [p.campaign1_best_lives, p.campaign2_best_lives, p.campaign3_best_lives].filter(v => v !== null).length, target: 3 }) },
+  // ── Campaign — flawless runs (no deaths = 3 lives remaining) ─────────────────
+  { type: 'campaign_m1_flawless',  label: 'Ghost Pilot I',      icon: '👻', desc: 'Complete Mission 1 without dying',                          reward:  3000, check: p => p.campaign1_best_lives >= 3, progress: null },
+  { type: 'campaign_m2_flawless',  label: 'Ghost Pilot II',     icon: '🕶', desc: 'Complete Mission 2 without dying',                          reward:  6000, check: p => p.campaign2_best_lives >= 3, progress: null },
+  { type: 'campaign_m3_flawless',  label: 'Untouchable',        icon: '⚡', desc: 'Complete Mission 3 without dying',                          reward: 12000, check: p => p.campaign3_best_lives >= 3, progress: null },
+  { type: 'campaign_all_flawless', label: 'Immaculate',         icon: '💎', desc: 'Complete all 3 campaign missions without dying',             reward: 30000, check: p => p.campaign1_best_lives >= 3 && p.campaign2_best_lives >= 3 && p.campaign3_best_lives >= 3, progress: p => ({ current: [p.campaign1_best_lives, p.campaign2_best_lives, p.campaign3_best_lives].filter(v => v >= 3).length, target: 3 }) },
+  // ── Campaign — boss kills ─────────────────────────────────────────────────────
+  { type: 'campaign_boss_first',   label: 'Capital Punishment', icon: '💥', desc: 'Destroy the Capital Ship for the first time',               reward:  2000, check: p => p.campaign_boss_kills >= 1,   progress: p => ({ current: Math.min(p.campaign_boss_kills, 1),   target: 1 }) },
+  { type: 'campaign_boss_5',       label: 'Fleet Slayer',       icon: '🚀', desc: 'Destroy the Capital Ship 5 times',                          reward:  5000, check: p => p.campaign_boss_kills >= 5,   progress: p => ({ current: Math.min(p.campaign_boss_kills, 5),   target: 5 }) },
+  { type: 'campaign_boss_10',      label: 'Dreadnought Hunter', icon: '🎯', desc: 'Destroy the Capital Ship 10 times',                         reward: 10000, check: p => p.campaign_boss_kills >= 10,  progress: p => ({ current: Math.min(p.campaign_boss_kills, 10),  target: 10 }) },
+  { type: 'campaign_boss_25',      label: 'Capital Executioner',icon: '☠',  desc: 'Destroy the Capital Ship 25 times',                         reward: 20000, check: p => p.campaign_boss_kills >= 25,  progress: p => ({ current: Math.min(p.campaign_boss_kills, 25),  target: 25 }) },
+  { type: 'campaign_boss_50',      label: 'Fleet Annihilator',  icon: '🔥', desc: 'Destroy the Capital Ship 50 times',                         reward: 40000, check: p => p.campaign_boss_kills >= 50,  progress: p => ({ current: Math.min(p.campaign_boss_kills, 50),  target: 50 }) },
+  // ── Campaign — total completions ──────────────────────────────────────────────
+  { type: 'campaign_runs_5',       label: 'Seasoned Operative', icon: '✈',  desc: 'Complete any campaign mission 5 times total',               reward:  2500, check: p => p.campaign_total_completions >= 5,   progress: p => ({ current: Math.min(p.campaign_total_completions, 5),   target: 5 }) },
+  { type: 'campaign_runs_10',      label: 'Iron Will',          icon: '🛡', desc: 'Complete any campaign mission 10 times total',              reward:  5000, check: p => p.campaign_total_completions >= 10,  progress: p => ({ current: Math.min(p.campaign_total_completions, 10),  target: 10 }) },
+  { type: 'campaign_runs_25',      label: 'Veteran Commander',  icon: '⭐', desc: 'Complete any campaign mission 25 times total',              reward: 12000, check: p => p.campaign_total_completions >= 25,  progress: p => ({ current: Math.min(p.campaign_total_completions, 25),  target: 25 }) },
+  { type: 'campaign_runs_50',      label: 'Elite Ace',          icon: '🌟', desc: 'Complete any campaign mission 50 times total',              reward: 25000, check: p => p.campaign_total_completions >= 50,  progress: p => ({ current: Math.min(p.campaign_total_completions, 50),  target: 50 }) },
+  { type: 'campaign_runs_100',     label: 'Campaign Legend',    icon: '🏆', desc: 'Complete any campaign mission 100 times total',             reward: 60000, check: p => p.campaign_total_completions >= 100, progress: p => ({ current: Math.min(p.campaign_total_completions, 100), target: 100 }) },
+  // ── Campaign — cross-mode combos ──────────────────────────────────────────────
+  { type: 'campaign_and_trials',   label: 'All-Rounder',        icon: '🌐', desc: 'Complete all 3 campaign missions and all 4 time trials',    reward: 10000, check: p => p.campaign1_best_lives !== null && p.campaign2_best_lives !== null && p.campaign3_best_lives !== null && p.trial1_best !== null && p.trial2_best !== null && p.trial3_best !== null && p.trial4_best !== null, progress: p => ({ current: [p.campaign1_best_lives, p.campaign2_best_lives, p.campaign3_best_lives].filter(v => v !== null).length + [p.trial1_best, p.trial2_best, p.trial3_best, p.trial4_best].filter(v => v !== null).length, target: 7 }) },
+  { type: 'campaign_and_kills',    label: 'Warmonger',          icon: '🌋', desc: 'Complete all 3 campaign missions with 500+ total kills',    reward: 15000, check: p => p.campaign1_best_lives !== null && p.campaign2_best_lives !== null && p.campaign3_best_lives !== null && p.total_kills >= 500, progress: p => ({ current: (p.campaign1_best_lives !== null ? 1 : 0) + (p.campaign2_best_lives !== null ? 1 : 0) + (p.campaign3_best_lives !== null ? 1 : 0) + (p.total_kills >= 500 ? 1 : 0), target: 4 }) },
 ];
 
 const ACHIEVEMENT_MAP = Object.fromEntries(ACHIEVEMENT_DEFS.map(a => [a.type, a]));
@@ -208,6 +238,17 @@ const stmtGetCredits    = db.prepare('SELECT credits FROM pilots WHERE id = ?');
 const stmtLogTx         = db.prepare('INSERT INTO credit_transactions (pilot_id, amount, reason) VALUES (?, ?, ?)');
 const stmtGetTxHistory  = db.prepare('SELECT amount, reason, created_at FROM credit_transactions WHERE pilot_id = ? ORDER BY created_at DESC LIMIT ?');
 const stmtUncredited    = db.prepare("SELECT pilot_id, type FROM achievements WHERE credited = 0");
+const stmtCampaignComplete = db.prepare(`
+  UPDATE pilots SET
+    campaign_boss_kills        = campaign_boss_kills + 1,
+    campaign_total_completions = campaign_total_completions + 1
+  WHERE id = ?
+`);
+const stmtCampaignBestLives = [
+  db.prepare('UPDATE pilots SET campaign1_best_lives = ? WHERE id = ? AND (campaign1_best_lives IS NULL OR campaign1_best_lives < ?)'),
+  db.prepare('UPDATE pilots SET campaign2_best_lives = ? WHERE id = ? AND (campaign2_best_lives IS NULL OR campaign2_best_lives < ?)'),
+  db.prepare('UPDATE pilots SET campaign3_best_lives = ? WHERE id = ? AND (campaign3_best_lives IS NULL OR campaign3_best_lives < ?)'),
+];
 const stmtLeaderboard = db.prepare(`
   SELECT username, rank, total_kills, total_deaths, matches_won, matches_lost, games_played, high_score
   FROM pilots
@@ -297,6 +338,11 @@ export async function loginPilot(username, password) {
     unlockAccent:     !!pilot.unlock_accent,
     unlockTrail:      !!pilot.unlock_trail,
     unlockTrailShape: !!pilot.unlock_trail_shape,
+    campaign1BestLives:       pilot.campaign1_best_lives ?? null,
+    campaign2BestLives:       pilot.campaign2_best_lives ?? null,
+    campaign3BestLives:       pilot.campaign3_best_lives ?? null,
+    campaignBossKills:        pilot.campaign_boss_kills  ?? 0,
+    campaignTotalCompletions: pilot.campaign_total_completions ?? 0,
   };
 }
 
@@ -355,6 +401,23 @@ export function recordTrialTime(pilotId, trialNum, time) {
   return { newAchievements: newAchs, creditsEarned: achCr };
 }
 
+// ── Campaign result ───────────────────────────────────────────────────────────
+
+export function recordCampaignResult(pilotId, missionNum, livesRemaining) {
+  const idx = Number(missionNum) - 1;
+  if (idx < 0 || idx > 2) return { newAchievements: [], creditsEarned: 0 };
+  const lives = Math.max(0, Math.min(3, Math.round(Number(livesRemaining) || 0)));
+  stmtCampaignComplete.run(pilotId);
+  stmtCampaignBestLives[idx].run(lives, pilotId, lives);
+  const missionCr = [500, 1000, 2000][idx];
+  _addCredits(pilotId, missionCr, `campaign:mission${missionNum}`);
+  const pilot = stmtById.get(pilotId);
+  if (!pilot) return { newAchievements: [], creditsEarned: missionCr };
+  const newAchs = checkAndAwardAchievements(pilotId, pilot);
+  const achCr = newAchs.reduce((s, a) => s + (a.reward || 0), 0);
+  return { newAchievements: newAchs, creditsEarned: missionCr + achCr };
+}
+
 // ── Profile ───────────────────────────────────────────────────────────────────
 
 export function getPilotProfile(username) {
@@ -395,6 +458,11 @@ export function getPilotProfile(username) {
     unlockAccent:     !!pilot.unlock_accent,
     unlockTrail:      !!pilot.unlock_trail,
     unlockTrailShape: !!pilot.unlock_trail_shape,
+    campaign1BestLives:       pilot.campaign1_best_lives ?? null,
+    campaign2BestLives:       pilot.campaign2_best_lives ?? null,
+    campaign3BestLives:       pilot.campaign3_best_lives ?? null,
+    campaignBossKills:        pilot.campaign_boss_kills  ?? 0,
+    campaignTotalCompletions: pilot.campaign_total_completions ?? 0,
     createdAt:        pilot.created_at,
   };
 }

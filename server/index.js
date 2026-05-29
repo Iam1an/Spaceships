@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   registerPilot, loginPilot, verifyToken,
   recordGamePlayed, recordHighScore, savePilotColors,
-  recordMatchResult, recordTrialTime, getPilotProfile, getLeaderboard,
+  recordMatchResult, recordTrialTime, recordCampaignResult, getPilotProfile, getLeaderboard,
   getCredits, awardCredits, spendCredits, getCreditHistory,
   getCustomizationUnlocks, purchaseUnlock, UNLOCK_COSTS,
 } from './db.js';
@@ -157,6 +157,22 @@ app.post('/api/trial-result', (req, res) => {
       return res.status(400).json({ ok: false, error: 'Invalid trial data' });
     }
     const result = recordTrialTime(pilotId, num, t);
+    res.json({ ok: true, newAchievements: result.newAchievements, creditsEarned: result.creditsEarned, totalCredits: getCredits(pilotId) });
+  } catch (e) {
+    res.status(e.status ?? 500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/campaign-result', (req, res) => {
+  try {
+    const pilotId = extractPilotId(req);
+    const { missionNum, livesRemaining } = req.body ?? {};
+    const num   = Number(missionNum);
+    const lives = Number(livesRemaining);
+    if (![1, 2, 3].includes(num) || !Number.isFinite(lives) || lives < 0 || lives > 3) {
+      return res.status(400).json({ ok: false, error: 'Invalid campaign data' });
+    }
+    const result = recordCampaignResult(pilotId, num, lives);
     res.json({ ok: true, newAchievements: result.newAchievements, creditsEarned: result.creditsEarned, totalCredits: getCredits(pilotId) });
   } catch (e) {
     res.status(e.status ?? 500).json({ ok: false, error: e.message });
