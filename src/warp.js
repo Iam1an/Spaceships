@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 
 export function createWarpEffect(scene, camera) {
-  const WARP_DURATION = 3.0; // slightly longer for more impact
+  const WARP_DURATION = 4.5; // longer animation
   let warpTimer = WARP_DURATION;
 
   const starCount = 3000; // More lines
@@ -47,7 +47,7 @@ export function createWarpEffect(scene, camera) {
 
   const baseFov = camera.fov;
   // Extreme FOV to naturally cause a fish-eye / screen warp effect
-  const maxFov = 160; 
+  const maxFov = 175; 
   camera.fov = maxFov;
   camera.updateProjectionMatrix();
 
@@ -74,7 +74,7 @@ export function createWarpEffect(scene, camera) {
 
       // Extreme screen warp effect using FOV
       // We keep it extremely high for the first half, then snap it back
-      const fovProgress = 1.0 - Math.pow(1.0 - progress, 4); // sharp ease out
+      const fovProgress = 1.0 - Math.pow(1.0 - progress, 6); // Sharper ease-out holds the warp longer
       camera.fov = THREE.MathUtils.lerp(maxFov, baseFov, fovProgress);
       camera.updateProjectionMatrix();
 
