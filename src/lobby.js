@@ -740,7 +740,7 @@ zoomEl.addEventListener('input', () => {
 });
 
 // ── Customization unlock system ───────────────────────────────────────────────
-const UNLOCK_COSTS = { hull: 250, accent: 400, trail: 500, trail_shape: 200 };
+const UNLOCK_COSTS = { hull: 250, accent: 400, trail: 500, trail_shape: 200, admin_ship: 125000 };
 const COST_SAVE_COLORS = 50;
 
 const custCrStatusEl = document.getElementById('custCrStatus');
@@ -777,6 +777,23 @@ function updateCustUnlockUI() {
       el.style.color = '';
     }
   }
+
+  // Admin ship button
+  const adminBtn  = document.getElementById('btnBuyAdminShip');
+  const adminCost = document.getElementById('adminShipCost');
+  if (adminBtn) {
+    if (isUnlocked('admin_ship')) {
+      adminBtn.textContent = '⚡ ADMIN SHIP · OWNED';
+      adminBtn.style.opacity = '0.6';
+      adminBtn.style.cursor = 'default';
+      if (adminCost) { adminCost.textContent = '· ✓'; adminCost.style.color = '#66ff88'; }
+    } else {
+      adminBtn.textContent = '⚡ ADMIN SHIP · 125,000 ⬡';
+      adminBtn.style.opacity = '';
+      adminBtn.style.cursor = '';
+      if (adminCost) { adminCost.textContent = '· 125,000 ⬡'; adminCost.style.color = ''; }
+    }
+  }
 }
 
 async function refreshUnlocks() {
@@ -790,6 +807,7 @@ async function refreshUnlocks() {
     if (data.unlockAccent)     saveUnlockLocal('accent');
     if (data.unlockTrail)      saveUnlockLocal('trail');
     if (data.unlockTrailShape) saveUnlockLocal('trail_shape');
+    if (data.unlockAdminShip)  saveUnlockLocal('admin_ship');
     updateCustUnlockUI();
   } catch {}
 }
@@ -838,6 +856,36 @@ function makeTabHandler(id, feature) {
 makeTabHandler('tabHull',   'hull');
 makeTabHandler('tabAccent', 'accent');
 makeTabHandler('tabTrail',  'trail');
+
+// Admin ship purchase button
+const adminShipStatusEl = document.getElementById('adminShipStatus');
+let adminShipStatusTimer = null;
+function showAdminShipStatus(msg, color = '#ff8a8a') {
+  if (!adminShipStatusEl) return;
+  adminShipStatusEl.textContent = msg;
+  adminShipStatusEl.style.color = color;
+  if (adminShipStatusTimer) clearTimeout(adminShipStatusTimer);
+  adminShipStatusTimer = setTimeout(() => { adminShipStatusEl.textContent = ''; }, 4000);
+}
+
+document.getElementById('btnBuyAdminShip')?.addEventListener('click', async () => {
+  if (isUnlocked('admin_ship')) return;
+  const token = getToken();
+  if (!token) { showAdminShipStatus('Log in to purchase the Admin Ship'); return; }
+  const cached = parseInt(localStorage.getItem('spaceships:credits') || '0', 10);
+  if (cached < UNLOCK_COSTS.admin_ship) {
+    showAdminShipStatus(`Need ${(UNLOCK_COSTS.admin_ship - cached).toLocaleString()} more ⬡ (you have ${cached.toLocaleString()} ⬡)`);
+    return;
+  }
+  showAdminShipStatus('Processing…', '#c8e0ff');
+  const r = await tryPurchaseUnlock('admin_ship');
+  if (r.ok) {
+    showAdminShipStatus(r.alreadyOwned ? 'Already owned!' : 'Admin Ship unlocked! Active next match.', '#66ff88');
+    updateCustUnlockUI();
+  } else {
+    showAdminShipStatus(r.msg || 'Purchase failed');
+  }
+});
 
 // Trail shape picker
 const TRAIL_SHAPE_KEY = 'spaceships:trailShape';

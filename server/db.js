@@ -47,6 +47,7 @@ const migrations = [
   "ALTER TABLE pilots ADD COLUMN campaign3_best_lives INTEGER",
   "ALTER TABLE pilots ADD COLUMN campaign_boss_kills INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE pilots ADD COLUMN campaign_total_completions INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE pilots ADD COLUMN unlock_admin_ship INTEGER NOT NULL DEFAULT 0",
 ];
 for (const sql of migrations) {
   try { db.exec(sql); } catch {}
@@ -338,6 +339,7 @@ export async function loginPilot(username, password) {
     unlockAccent:     !!pilot.unlock_accent,
     unlockTrail:      !!pilot.unlock_trail,
     unlockTrailShape: !!pilot.unlock_trail_shape,
+    unlockAdminShip:  !!pilot.unlock_admin_ship,
     campaign1BestLives:       pilot.campaign1_best_lives ?? null,
     campaign2BestLives:       pilot.campaign2_best_lives ?? null,
     campaign3BestLives:       pilot.campaign3_best_lives ?? null,
@@ -458,6 +460,7 @@ export function getPilotProfile(username) {
     unlockAccent:     !!pilot.unlock_accent,
     unlockTrail:      !!pilot.unlock_trail,
     unlockTrailShape: !!pilot.unlock_trail_shape,
+    unlockAdminShip:  !!pilot.unlock_admin_ship,
     campaign1BestLives:       pilot.campaign1_best_lives ?? null,
     campaign2BestLives:       pilot.campaign2_best_lives ?? null,
     campaign3BestLives:       pilot.campaign3_best_lives ?? null,
@@ -486,16 +489,17 @@ export function getLeaderboard() {
 
 // ── Customization unlocks ─────────────────────────────────────────────────────
 
-export const UNLOCK_COSTS = { hull: 250, accent: 400, trail: 500, trail_shape: 200 };
+export const UNLOCK_COSTS = { hull: 250, accent: 400, trail: 500, trail_shape: 200, admin_ship: 125000 };
 
 const stmtGetUnlocks = db.prepare(
-  'SELECT unlock_hull, unlock_accent, unlock_trail, unlock_trail_shape FROM pilots WHERE id = ?'
+  'SELECT unlock_hull, unlock_accent, unlock_trail, unlock_trail_shape, unlock_admin_ship FROM pilots WHERE id = ?'
 );
 const stmtSetUnlock = {
   hull:        db.prepare('UPDATE pilots SET unlock_hull        = 1 WHERE id = ?'),
   accent:      db.prepare('UPDATE pilots SET unlock_accent      = 1 WHERE id = ?'),
   trail:       db.prepare('UPDATE pilots SET unlock_trail       = 1 WHERE id = ?'),
   trail_shape: db.prepare('UPDATE pilots SET unlock_trail_shape = 1 WHERE id = ?'),
+  admin_ship:  db.prepare('UPDATE pilots SET unlock_admin_ship  = 1 WHERE id = ?'),
 };
 
 export function getCustomizationUnlocks(pilotId) {
@@ -505,6 +509,7 @@ export function getCustomizationUnlocks(pilotId) {
     unlockAccent:     !!r?.unlock_accent,
     unlockTrail:      !!r?.unlock_trail,
     unlockTrailShape: !!r?.unlock_trail_shape,
+    unlockAdminShip:  !!r?.unlock_admin_ship,
   };
 }
 
@@ -513,7 +518,8 @@ export function purchaseUnlock(pilotId, feature) {
   if (!cost) return { ok: false, error: 'Unknown feature' };
   const u = getCustomizationUnlocks(pilotId);
   const already = (feature === 'hull' && u.unlockHull) || (feature === 'accent' && u.unlockAccent)
-    || (feature === 'trail' && u.unlockTrail) || (feature === 'trail_shape' && u.unlockTrailShape);
+    || (feature === 'trail' && u.unlockTrail) || (feature === 'trail_shape' && u.unlockTrailShape)
+    || (feature === 'admin_ship' && u.unlockAdminShip);
   if (already) return { ok: true, alreadyOwned: true, balance: getCredits(pilotId) };
   const result = spendCredits(pilotId, cost, `unlock:${feature}`);
   if (!result.ok) return { ok: false, error: 'Insufficient credits', balance: result.balance };

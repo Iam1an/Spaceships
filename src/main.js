@@ -214,7 +214,7 @@ export async function startGame(opts = {}) {
   // Names that get the admin ship model. Add more here as needed.
   const ADMIN_SHIP_NAMES = new Set(['Admin', 'ariairspeed']);
   const localPlayerName = (opts.pilotName || '').trim();
-  const isLocalAdmin = ADMIN_SHIP_NAMES.has(localPlayerName);
+  const isLocalAdmin = ADMIN_SHIP_NAMES.has(localPlayerName) || localStorage.getItem('spaceships:unlock_admin_ship') === '1';
   const ship = createShip({
     hullColor: savedHull,
     accentColor: savedAccent,
