@@ -56,6 +56,23 @@ export class Input {
     this._stickId = null;
     this._stickRadius = 80;   // px → full deflection
 
+    // Gamepad (Web Gamepad API). Polled each frame via pollGamepad().
+    // gp.fire/drift/boost are hold-type flags; missile/flare/gunToggle
+    // inject into this.keys for a single frame (edge-detected by main.js).
+    this.gpConnected = false;
+    this.gp = {
+      steerX: 0,       // right stick X → yaw
+      steerY: 0,       // right stick Y → pitch
+      rollAxis: 0,     // left stick X → roll (-1 left, +1 right)
+      throttleAxis: 0, // left stick Y, negated (+1 forward, -1 back)
+      fire: false,     // RT or A
+      drift: false,    // LT
+      boost: false,    // LB
+    };
+    this._gpPrevMissile = false;
+    this._gpPrevFlare = false;
+    this._gpPrevGunToggle = false;
+
     window.addEventListener('keydown', (e) => {
       this.keys.add(e.code);
       // Suppress browser default for keys we use as gameplay input.
@@ -193,5 +210,70 @@ export class Input {
     const w = this.wheel;
     this.wheel = 0;
     return w;
+  }
+
+  // Called once per frame from the game loop. Reads the first connected
+  // gamepad and maps it onto the same input state the keyboard/mouse use.
+  //
+  // Layout (Standard Gamepad — Xbox/PlayStation compatible):
+  //   Axes:    0=LS-X  1=LS-Y  2=RS-X  3=RS-Y
+  //   Buttons: 0=A/Cross  1=B/Circle  2=X/Square  3=Y/Triangle
+  //            4=LB/L1    5=RB/R1     6=LT/L2     7=RT/R2
+  //            8=Select   9=Start    10=L3        11=R3
+  //           12=D↑      13=D↓      14=D←        15=D→
+  pollGamepad() {
+    const DEAD = 0.12;
+    const dead = (v) => {
+      const a = Math.abs(v);
+      return a < DEAD ? 0 : Math.sign(v) * (a - DEAD) / (1 - DEAD);
+    };
+
+    const gamepad = [...(navigator.getGamepads?.() ?? [])].find(g => g?.connected);
+    this.gpConnected = !!gamepad;
+
+    if (!gamepad) {
+      this.gp.steerX = 0;
+      this.gp.steerY = 0;
+      this.gp.rollAxis = 0;
+      this.gp.throttleAxis = 0;
+      this.gp.fire = false;
+      this.gp.drift = false;
+      this.gp.boost = false;
+      return;
+    }
+
+    const ax = gamepad.axes;
+    const bt = gamepad.buttons;
+    const btn = (i) => bt[i]?.pressed ?? false;
+    const val = (i) => bt[i]?.value ?? (btn(i) ? 1 : 0);
+
+    // Right stick → steer (yaw/pitch). Only overrides mouse when stick moves.
+    this.gp.steerX = dead(ax[2] ?? 0);
+    this.gp.steerY = dead(ax[3] ?? 0);
+
+    // Left stick X → roll; left stick Y (negated) → throttle
+    this.gp.rollAxis = dead(ax[0] ?? 0);
+    this.gp.throttleAxis = -dead(ax[1] ?? 0);  // stick up (−) = throttle up
+
+    // Hold-type actions
+    this.gp.fire  = val(7) > 0.5 || btn(0);   // RT or A
+    this.gp.drift = val(6) > 0.5;             // LT
+    this.gp.boost = btn(4);                   // LB
+
+    // Edge-detected actions: inject into this.keys like a keydown/keyup pair
+    const gpMissile   = btn(5) || btn(2);     // RB or X
+    const gpFlare     = btn(1);               // B
+    const gpGunToggle = btn(3);               // Y
+
+    if (gpMissile   && !this._gpPrevMissile)   this.keys.add('KeyE');
+    if (!gpMissile  &&  this._gpPrevMissile)   this.keys.delete('KeyE');
+    if (gpFlare     && !this._gpPrevFlare)     this.keys.add('KeyQ');
+    if (!gpFlare    &&  this._gpPrevFlare)     this.keys.delete('KeyQ');
+    if (gpGunToggle && !this._gpPrevGunToggle) this.keys.add('KeyP');
+    if (!gpGunToggle && this._gpPrevGunToggle) this.keys.delete('KeyP');
+
+    this._gpPrevMissile   = gpMissile;
+    this._gpPrevFlare     = gpFlare;
+    this._gpPrevGunToggle = gpGunToggle;
   }
 }

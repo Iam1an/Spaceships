@@ -1326,6 +1326,7 @@ export async function startGame(opts = {}) {
   const zAxis = new THREE.Vector3(0, 0, 1);
 
   function update(dt) {
+    input.pollGamepad();
     warpEffect.update(dt);
     // Trials 3-2-1-GO countdown: freeze the ship, update the overlay, then release.
     if (isTrialsMode && trialsCountdownActive) {
@@ -1350,7 +1351,7 @@ export async function startGame(opts = {}) {
       return;
     }
 
-    const braking = myAlive && input.keys.has('Space');
+    const braking = myAlive && (input.keys.has('Space') || input.gp.drift);
 
     if (myAlive) {
       // Mobile slider sets throttle absolutely; W/S/wheel are ignored
@@ -1362,8 +1363,10 @@ export async function startGame(opts = {}) {
       } else {
         const wheel = input.consumeWheel();
         if (wheel !== 0) targetThrottle += wheel * THROTTLE_STEP;
-        if (input.keys.has('KeyW')) targetThrottle += KEY_THROTTLE_RATE * dt;
-        if (input.keys.has('KeyS')) targetThrottle -= KEY_THROTTLE_RATE * dt;
+        if (input.keys.has('KeyW') || input.gp.throttleAxis > 0.01)
+          targetThrottle += KEY_THROTTLE_RATE * dt * (input.gp.throttleAxis > 0.01 ? input.gp.throttleAxis : 1);
+        if (input.keys.has('KeyS') || input.gp.throttleAxis < -0.01)
+          targetThrottle -= KEY_THROTTLE_RATE * dt * (input.gp.throttleAxis < -0.01 ? -input.gp.throttleAxis : 1);
       }
       // Drifting preserves throttle so the ship resumes thrusting at the
       // same setting (along the new facing) the moment Space is released.
@@ -1372,6 +1375,11 @@ export async function startGame(opts = {}) {
 
       let sx = input.rmb ? 0 : input.steerX;
       let sy = input.rmb ? 0 : input.steerY;
+      // Gamepad right stick overrides mouse when the stick is pushed.
+      if (Math.abs(input.gp.steerX) > 0.01 || Math.abs(input.gp.steerY) > 0.01) {
+        sx = input.gp.steerX;
+        sy = input.gp.steerY;
+      }
       if (Math.abs(sx) < STEER_DEADZONE) sx = 0;
       if (Math.abs(sy) < STEER_DEADZONE) sy = 0;
       sx = Math.sign(sx) * Math.pow(Math.abs(sx), 1.6);
@@ -1403,6 +1411,8 @@ export async function startGame(opts = {}) {
       let roll = 0;
       if (input.keys.has('KeyD')) roll += ROLL_RATE * pitchMult * dt;
       if (input.keys.has('KeyA')) roll -= ROLL_RATE * pitchMult * dt;
+      // Gamepad left stick X: analog roll (overrides A/D when stick is pushed).
+      if (input.gp.rollAxis !== 0) roll = input.gp.rollAxis * ROLL_RATE * pitchMult * dt;
 
       if (pitch) ship.quaternion.multiply(tmpQ.setFromAxisAngle(xAxis, pitch));
       if (yaw) ship.quaternion.multiply(tmpQ.setFromAxisAngle(yAxis, yaw));
@@ -1416,7 +1426,7 @@ export async function startGame(opts = {}) {
     }
 
     if (brakeBoostTimer > 0) brakeBoostTimer = Math.max(0, brakeBoostTimer - dt);
-    const wantShift = input.keys.has('ShiftLeft') || input.keys.has('ShiftRight');
+    const wantShift = input.keys.has('ShiftLeft') || input.keys.has('ShiftRight') || input.gp.boost;
     const shiftBoost = myAlive && !braking && wantShift && boostMeter > 0;
     const brakeReleaseBoost = myAlive && brakeBoostTimer > 0;
     const boosting = myAlive && (shiftBoost || brakeReleaseBoost);
@@ -1658,7 +1668,7 @@ export async function startGame(opts = {}) {
     ammoIdle += dt;
     const ammoCost = gunMode === 'beam' ? 3 : 1;
     const canFire = ammo >= ammoCost;
-    if ((input.lmb || input.keys.has('KeyF')) && fireTimer <= 0 && myAlive && canFire) {
+    if ((input.lmb || input.keys.has('KeyF') || input.gp.fire) && fireTimer <= 0 && myAlive && canFire) {
       const dir = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
       const shots = [];
       for (const off of MUZZLE_OFFSETS) {
