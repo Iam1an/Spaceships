@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 
 export function createWarpEffect(scene, camera) {
-  const WARP_DURATION = 4.5; // longer animation
+  const WARP_DURATION = 1.5; // Quick mask during loading
   let warpTimer = WARP_DURATION;
 
   const starCount = 3000; // More lines

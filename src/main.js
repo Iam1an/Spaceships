@@ -28,17 +28,6 @@ export async function startGame(opts = {}) {
   if (started) return;
   started = true;
 
-  // Preload the regular ship GLB before spawning any ships (same as before).
-  try { await loadShipModel(); } catch (e) { console.warn('[ship] GLB load failed, using primitives', e); }
-
-  // Kick off the admin model load in the background — NOT awaited here so
-  // the game message handler (which receives friends' color updates) gets
-  // registered without delay. We save the promise so getOrCreateRemote can
-  // swap the model in-place if it finishes after a remote admin ship was
-  // already created with the regular-model fallback.
-  const ADMIN_MODEL_URL = 'public/spaceshipADMIN.glb';
-  const adminModelReady = loadShipModel(ADMIN_MODEL_URL).catch(() => null);
-
   const scene = new THREE.Scene();
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   // Cap pixel ratio so a 3× retina display doesn't render 9× the pixels of
@@ -52,8 +41,8 @@ export async function startGame(opts = {}) {
 
   // Far plane sized to fit the gameplay world (motherships at z=±600 +
   // hangar offset, 400-unit asteroid field, ship visibility cap at
-  // 1500). Lower than the original 5000 so the GPU isn't drawing scene
-  // objects that are way past anything you'd see during a match.
+  // 1500). Lower than the original 5000 so the GPU isnt drawing scene
+  // objects that are way past anything youd see during a match.
   const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2500);
 
   // ---- PSX-style pixelated render pipeline ----------------------------
@@ -61,7 +50,7 @@ export async function startGame(opts = {}) {
   // each axis) with NearestFilter, then blit it to the canvas via a
   // fullscreen quad. Less fragment work = perf win on iGPUs, and the
   // nearest-neighbor upscale gives the chunky retro look. DOM HUD stays
-  // crisp because it isn't part of the WebGL pipeline.
+  // crisp because it isnt part of the WebGL pipeline.
   const pixelEnabled = localStorage.getItem('spaceships:pixelFilter') !== '0';
   const PIXEL_SCALE = 3;
   const pixelRT = pixelEnabled ? new THREE.WebGLRenderTarget(
@@ -94,6 +83,31 @@ export async function startGame(opts = {}) {
       renderer.render(scene, camera);
     }
   }
+
+  const clock = new THREE.Clock();
+  const warpEffect = createWarpEffect(scene, camera);
+  
+  let isLoading = true;
+  function loadingLoop() {
+    if (!isLoading) return;
+    const dt = Math.min(0.05, clock.getDelta());
+    warpEffect.update(dt);
+    renderFrame();
+    requestAnimationFrame(loadingLoop);
+  }
+  loadingLoop();
+
+  // Preload the regular ship GLB before spawning any ships (same as before).
+  try { await loadShipModel(); } catch (e) { console.warn('[ship] GLB load failed, using primitives', e); }
+  isLoading = false;
+
+  // Kick off the admin model load in the background — NOT awaited here so
+  // the game message handler (which receives friends' color updates) gets
+  // registered without delay. We save the promise so getOrCreateRemote can
+  // swap the model in-place if it finishes after a remote admin ship was
+  // already created with the regular-model fallback.
+  const ADMIN_MODEL_URL = 'public/spaceshipADMIN.glb';
+  const adminModelReady = loadShipModel(ADMIN_MODEL_URL).catch(() => null);
 
   const MAP_TYPE = opts.map || 'space';
   const isTerrainMap = MAP_TYPE === 'terrain';
@@ -1310,9 +1324,6 @@ export async function startGame(opts = {}) {
   const xAxis = new THREE.Vector3(1, 0, 0);
   const yAxis = new THREE.Vector3(0, 1, 0);
   const zAxis = new THREE.Vector3(0, 0, 1);
-
-  const clock = new THREE.Clock();
-  const warpEffect = createWarpEffect(scene, camera);
 
   function update(dt) {
     warpEffect.update(dt);
