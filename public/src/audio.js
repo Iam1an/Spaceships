@@ -3,16 +3,16 @@
 // once with `loop = true` and a GainNode for volume — looping happens at the
 // sample level so there's no gap or restart glitch like HTMLAudioElement has.
 const SOUNDS = {
-  shoot:       './public/sounds/shoot.mp3',
-  shipdeath:   './public/sounds/shipdeath.mp3',
-  move:        './public/sounds/move.mp3',
-  boost:       './public/sounds/boost.mp3',
-  impact:      './public/sounds/impact.mp3',
-  rockbreak:   './public/sounds/rockbreak.mp3',
-  hitmarker_2: './public/sounds/hitmarker_2.mp3',
+  shoot:       'sounds/shoot.mp3',
+  shipdeath:   'sounds/shipdeath.mp3',
+  move:        'sounds/move.mp3',
+  boost:       'sounds/boost.mp3',
+  impact:      'sounds/impact.mp3',
+  rockbreak:   'sounds/rockbreak.mp3',
+  hitmarker_2: 'sounds/hitmarker_2.mp3',
   // Background music. Auto-loops at MUSIC volume once decoded; if the
   // file is missing the loop simply never starts (silent fallback).
-  music:       './public/sounds/dumb_Eflatmin.mp3',
+  music:       'sounds/dumb_Eflatmin.mp3',
 };
 
 const VOLUMES = {

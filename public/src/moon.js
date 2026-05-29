@@ -10,7 +10,7 @@ import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 // with subtle surface variation rather than a chunky asteroid. Surface
 // look comes from a dedicated moon photo (already light gray, so we
 // can use it as an albedo map without tinting the moon toward dark).
-const MOON_TEX = new THREE.TextureLoader().load('./public/sounds/Moon2.jpeg');
+const MOON_TEX = new THREE.TextureLoader().load('sounds/Moon2.jpeg');
 MOON_TEX.wrapS = THREE.RepeatWrapping;
 MOON_TEX.wrapT = THREE.RepeatWrapping;
 MOON_TEX.colorSpace = THREE.SRGBColorSpace;

@@ -5,7 +5,7 @@ import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 // icosahedron's default-but-quirky UVs still read as continuous rock.
 // Loaded once at module scope (TextureLoader caches automatically) and
 // applied to every cloned material.
-const ASTEROID_TEX = new THREE.TextureLoader().load('./public/sounds/asteroid.jpg');
+const ASTEROID_TEX = new THREE.TextureLoader().load('sounds/asteroid.jpg');
 ASTEROID_TEX.wrapS = THREE.RepeatWrapping;
 ASTEROID_TEX.wrapT = THREE.RepeatWrapping;
 ASTEROID_TEX.repeat.set(1.5, 1.5);
