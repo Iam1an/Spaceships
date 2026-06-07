@@ -25,3 +25,6 @@ build/
 pilots.db
 pilots.db-shm
 pilots.db-wal
+
+# Claude
+.claude
