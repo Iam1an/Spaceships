@@ -156,6 +156,22 @@ export function createTouchHud({ input, scheme }) {
     position: { right: '168px', bottom: '192px' },
     onHold: holdKey('KeyD'),
   });
+  // MSL/FLARE map to the E/Q key-down edges main.js already listens for,
+  // so a tap fires exactly one missile / one flare burst.
+  makeButton('MSL', {
+    size: 64,
+    bg: 'linear-gradient(180deg, #ffaa66 0%, #cc4411 100%)',
+    border: '#ffcc99', glow: 'rgba(255,140,60,0.55)',
+    position: { right: '264px', bottom: '24px' },
+    onHold: holdKey('KeyE'),
+  });
+  makeButton('FLARE', {
+    size: 64, fontSize: 10,
+    bg: 'linear-gradient(180deg, #fff0a0 0%, #d09020 100%)',
+    border: '#ffe680', glow: 'rgba(255,220,100,0.55)',
+    position: { right: '264px', bottom: '108px' },
+    onHold: holdKey('KeyQ'),
+  });
 
   // ---- Throttle slider ------------------------------------------------
   // Vertical track on the right edge above the FIRE button. Drag the

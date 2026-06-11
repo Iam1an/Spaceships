@@ -363,7 +363,9 @@ export function createMissiles() {
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
-  function fire(origin, direction, targetRecord, ownerId) {
+  // ownerTeam lets bot-fired missiles carry their own team for friendly-fire
+  // checks instead of inheriting the local player's team in update().
+  function fire(origin, direction, targetRecord, ownerId, ownerTeam) {
     const normDir = direction.clone().normalize();
     const { root, nozzle, glowMat } = makeMissileMesh();
     root.position.copy(origin);
@@ -379,12 +381,17 @@ export function createMissiles() {
       age:        0,
       trailTimer: 0,
       ownerId:    ownerId ?? null,
+      ownerTeam:  ownerTeam ?? null,
     });
   }
 
-  // asteroids  – the asteroids object from main.js ({ list: [...] })
-  // obstacles  – static obstacle array from main.js ([{ pos, radius }])
-  function update(dt, remoteShips, onHitRemote, shooterTeam, asteroids, obstacles) {
+  // asteroids   – the asteroids object from main.js ({ list: [...] })
+  // obstacles   – static obstacle array from main.js ([{ pos, radius }])
+  // localTarget – optional { id, team, record, onHit(ownerId, ownerTeam) }:
+  //               lets missiles fired by OTHER pilots (bots, remote players)
+  //               detonate against the local player's ship. Damage routing is
+  //               the caller's job inside onHit; here it's just hit detection.
+  function update(dt, remoteShips, onHitRemote, shooterTeam, asteroids, obstacles, localTarget) {
 
     // ── Missile physics ───────────────────────────────────────────────────────
     for (let i = missiles.length - 1; i >= 0; i--) {
@@ -502,20 +509,40 @@ export function createMissiles() {
           }
         }
 
-        // Ship hit detection.
+        // Ship hit detection. Friendly fire is filtered per missile: bot
+        // missiles use their own ownerTeam, player missiles fall back to the
+        // caller-supplied shooterTeam (the local player's team).
+        const mTeam = m.ownerTeam !== null ? m.ownerTeam : shooterTeam;
         if (remoteShips && !consumed) {
           for (const [id, r] of remoteShips) {
             if (!r.alive) continue;
-            if (shooterTeam !== undefined && shooterTeam !== null && r.team === shooterTeam) continue;
+            if (id === m.ownerId) continue; // never hit the ship that fired it
+            if (mTeam !== undefined && mTeam !== null && r.team === mTeam) continue;
             const dx = m.mesh.position.x - r.ship.position.x;
             const dy = m.mesh.position.y - r.ship.position.y;
             const dz = m.mesh.position.z - r.ship.position.z;
             if (dx * dx + dy * dy + dz * dz < HIT_RADIUS * HIT_RADIUS) {
               spawnExplosion(m.mesh.position.clone());
-              if (onHitRemote) onHitRemote(id);
+              if (onHitRemote) onHitRemote(id, m.ownerId, m.ownerTeam);
               consumed = true;
               break;
             }
+          }
+        }
+
+        // Local-player hit detection — covers missiles fired by bots and
+        // remote players. The local player's own missiles are skipped.
+        if (localTarget && !consumed
+            && m.ownerId !== localTarget.id
+            && localTarget.record.alive
+            && !(mTeam !== undefined && mTeam !== null && mTeam === localTarget.team)) {
+          const dx = m.mesh.position.x - localTarget.record.ship.position.x;
+          const dy = m.mesh.position.y - localTarget.record.ship.position.y;
+          const dz = m.mesh.position.z - localTarget.record.ship.position.z;
+          if (dx * dx + dy * dy + dz * dz < HIT_RADIUS * HIT_RADIUS) {
+            spawnExplosion(m.mesh.position.clone());
+            if (localTarget.onHit) localTarget.onHit(m.ownerId, m.ownerTeam);
+            consumed = true;
           }
         }
       }

@@ -17,6 +17,11 @@ export function createBotAI(record, deps) {
     onFire,
     hardMode = false,
     terrainHeightFn = null,
+    // Missile support: fireMissile(targetEntity) is provided by main.js and
+    // handles spawn + network relay; returns false if no shot was possible.
+    // missileMax is the per-life stock (0 = this bot carries none).
+    fireMissile = null,
+    missileMax = 0,
   } = deps;
   const ZERO_VEC = new THREE.Vector3();
 
@@ -31,6 +36,15 @@ export function createBotAI(record, deps) {
   // is the original 6.7/sec so bots stay beatable for casual play.
   const FIRE_COOLDOWN = hardMode ? 0.05 : 0.15;
   const DAMAGE = 10;            // matches player bullet damage (buffed)
+  // Missiles: limited stock per life, restocked on respawn. Fired from
+  // attack state at medium range once roughly nose-on — the homing does the
+  // rest, so the aim gate is much looser than the bullet gate. The cooldown
+  // spaces shots out for bots carrying more than one (hard mode has 3).
+  const MISSILE_MIN_RANGE = 130;   // don't waste the stock point-blank
+  const MISSILE_MAX_RANGE = 560;
+  const MISSILE_FIRE_DOT = 0.90;   // ~26° cone
+  const MISSILE_COOLDOWN = 8.0;
+  const missileDelay = () => 2.5 + Math.random() * 4.0; // grace after (re)spawn
   const BULLET_SPEED = 780;
   const BULLET_LIFE = 2.0;
   const SEEK_DIST = 250;
@@ -62,6 +76,8 @@ export function createBotAI(record, deps) {
   let state = 'seek';
   let stateTimer = 0;
   let fireTimer = 0;
+  let missilesLeft = missileMax;
+  let missileTimer = missileDelay();
   let stuckTime = 0;
   let evadeAxis = new THREE.Vector3();
   const aimOffset = new THREE.Vector3();
@@ -78,6 +94,7 @@ export function createBotAI(record, deps) {
   const tmpFwd = new THREE.Vector3();
   const tmpAxis = new THREE.Vector3();
   const tmpQuat = new THREE.Quaternion();
+  const tmpToTarget = new THREE.Vector3();
 
   function chooseEvadeDir() {
     return new THREE.Vector3(
@@ -174,6 +191,7 @@ export function createBotAI(record, deps) {
 
     stateTimer += dt;
     fireTimer -= dt;
+    missileTimer -= dt;
 
     const target = pickTarget();
     if (!target) {
@@ -366,6 +384,19 @@ export function createBotAI(record, deps) {
         fireTimer = FIRE_COOLDOWN;
       }
     }
+
+    // Missile launch: attack state, medium range, roughly nose-on. The
+    // missile homes after launch, so this gate is loose by design.
+    if (missilesLeft > 0 && fireMissile && state === 'attack'
+        && missileTimer <= 0 && dist > MISSILE_MIN_RANGE && dist < MISSILE_MAX_RANGE) {
+      tmpToTarget.copy(targetPos).sub(botPos).normalize();
+      if (tmpFwd.dot(tmpToTarget) > MISSILE_FIRE_DOT) {
+        if (fireMissile(target) !== false) {
+          missilesLeft--;
+          missileTimer = MISSILE_COOLDOWN;
+        }
+      }
+    }
   }
 
   function fireBullet() {
@@ -450,6 +481,8 @@ export function createBotAI(record, deps) {
     state = 'seek';
     stateTimer = 0;
     fireTimer = 0;
+    missilesLeft = missileMax;
+    missileTimer = missileDelay();
     record.vel.set(0, 0, 0);
   }
 

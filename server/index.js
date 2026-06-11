@@ -794,7 +794,11 @@ function handleConnection(ws) {
       if (ws.id !== room.botHostId) return;
       const bot = room.players.get(msg.botId);
       if (!bot || !bot.isBot || !bot.alive) return;
-      const out = JSON.stringify({ type: 'fire', id: msg.botId, kind: 'bullet', shots: msg.shots });
+      // Bots fire bullets and homing missiles; anything else is rejected by
+      // normalizing to 'bullet'. Missile shots carry a targetId the clients
+      // resolve to a homing record.
+      const kind = msg.kind === 'missile' ? 'missile' : 'bullet';
+      const out = JSON.stringify({ type: 'fire', id: msg.botId, kind, shots: msg.shots });
       for (const c of room.sockets) {
         if (c !== ws && c.open) c.send(out);
       }

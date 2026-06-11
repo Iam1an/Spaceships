@@ -992,7 +992,7 @@ export async function startGame(opts = {}) {
             const targetRecord = (shot.targetId === myId)
               ? localShipRecord
               : (remotePlayers.get(shot.targetId) ?? null);
-            missileSystem.fire(origin, dir, targetRecord, msg.id);
+            missileSystem.fire(origin, dir, targetRecord, msg.id, shooterTeam);
           }
         } else {
           for (const shot of msg.shots) {
@@ -1656,7 +1656,7 @@ export async function startGame(opts = {}) {
       if (closestRecord !== null) {
         const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
         const mslOrigin = ship.position.clone().addScaledVector(fwd, 6);
-        missileSystem.fire(mslOrigin, fwd, closestRecord, myId);
+        missileSystem.fire(mslOrigin, fwd, closestRecord, myId, myTeam);
         missilesLeft--;
         audio.play('shoot');
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1896,19 +1896,46 @@ export async function startGame(opts = {}) {
     missileSystem.update(
       dt,
       remotePlayers,
-      (targetId) => {
-        audio.play('hitmarker_2');
+      (targetId, ownerId, ownerTeam) => {
+        // ownerId null/myId → the local player's own missile. Bot missiles
+        // carry the bot's id/team so kills get credited to the right pilot.
+        const mine = ownerId == null || ownerId === myId;
+        if (mine) audio.play('hitmarker_2');
         if (isCampaign && targetId >= BOSS_ID_BASE && targetId < BOSS_ID_BASE + BOSS_HITBOX_COUNT) {
-          applyBossHit(50);
-        } else if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'hit', targetId, kind: 'missile' }));
+          if (mine) applyBossHit(50);
         } else if (isSolo) {
-          applyHitToBot(targetId, 50, opts.you, myTeam);
+          applyHitToBot(targetId, 50, ownerId ?? opts.you, ownerTeam ?? myTeam);
+        } else if (ws && ws.readyState === WebSocket.OPEN) {
+          if (mine) {
+            ws.send(JSON.stringify({ type: 'hit', targetId, kind: 'missile' }));
+          } else if (mpBots.some((b) => b.id === ownerId)) {
+            // Host-driven bot missile — report with fromBotId for credit.
+            ws.send(JSON.stringify({ type: 'hit', targetId, fromBotId: ownerId, kind: 'missile' }));
+          }
+          // Missiles owned by other remote players are visual-only here;
+          // their own client reports the hit.
         }
       },
       myTeam,
       asteroids,
       obstacles,
+      {
+        id: myId,
+        team: myTeam,
+        record: localShipRecord,
+        onHit: (ownerId, ownerTeam) => {
+          if (isSolo) {
+            applyPlayerDamageLocal(50, ownerId, ownerTeam);
+          } else if (mpBots.some((b) => b.id === ownerId)
+              && ws && ws.readyState === WebSocket.OPEN) {
+            // A bot this client hosts hit this client's own ship — the
+            // server explicitly allows fromBotId hits on the bot host.
+            ws.send(JSON.stringify({ type: 'hit', targetId: myId, fromBotId: ownerId, kind: 'missile' }));
+          }
+          // Remote players' missiles: damage arrives via the server, this
+          // just detonates the visual on contact.
+        },
+      },
     );
     trails.update(dt, camera);
     if (clouds) clouds.update(dt);
@@ -2847,6 +2874,22 @@ export async function startGame(opts = {}) {
       distanceVol,
       hardMode: !!opts.hardMode,
       terrainHeightFn: isTerrainMap ? getTerrainHeight : null,
+      // Regular bots carry a single missile per life; secret hard mode bots
+      // get a full rack of 3 like players. Restocked by notifyRespawn().
+      missileMax: opts.hardMode ? 3 : 1,
+      fireMissile: (targetEntity) => {
+        // Resolve the homing record: localShipRecord for the player (keeps
+        // the HUD missile-lock warning working), remote record for bots.
+        const targetRecord = targetEntity.id === myId
+          ? localShipRecord
+          : (remotePlayers.get(targetEntity.id) ?? null);
+        if (!targetRecord) return false;
+        const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(r.ship.quaternion);
+        const mslOrigin = r.ship.position.clone().addScaledVector(fwd, 6);
+        missileSystem.fire(mslOrigin, fwd, targetRecord, id, team);
+        audio.play('shoot', distanceVol(r.ship.position));
+        return true;
+      },
       getOpponents: () => {
         const out = [];
         if (playerEntity.team !== team) out.push(playerEntity);
@@ -3402,6 +3445,32 @@ export async function startGame(opts = {}) {
       solveIntercept, raySphereDist, audio, distanceVol,
       hardMode: true,
       terrainHeightFn: isTerrainMap ? getTerrainHeight : null,
+      // Hard mode bots fly with a player-sized rack of 3 missiles per life.
+      missileMax: 3,
+      fireMissile: (targetEntity) => {
+        const targetRecord = targetEntity.id === myId
+          ? localShipRecord
+          : (remotePlayers.get(targetEntity.id) ?? null);
+        if (!targetRecord) return false;
+        const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(r.ship.quaternion);
+        const mslOrigin = r.ship.position.clone().addScaledVector(fwd, 6);
+        missileSystem.fire(mslOrigin, fwd, targetRecord, id, team);
+        audio.play('shoot', distanceVol(r.ship.position));
+        // Relay so every other client spawns the same homing missile.
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'bot-fire',
+            botId: id,
+            kind: 'missile',
+            shots: [{
+              pos: [mslOrigin.x, mslOrigin.y, mslOrigin.z],
+              dir: [fwd.x, fwd.y, fwd.z],
+              targetId: targetEntity.id,
+            }],
+          }));
+        }
+        return true;
+      },
       onFire: (start, dir) => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
