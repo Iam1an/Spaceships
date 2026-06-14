@@ -19,38 +19,18 @@ import { createBotAI } from './bot.js';
 import { createTouchHud } from './touchhud.js';
 import { getSavedShipColor, getSavedAccentColor, getSavedTrailColor, getSavedTrailShape } from './customization.js';
 import { createWarpEffect } from './warp.js';
-
-// Game entry point. Called by the lobby once the host clicks Start (or a
-// non-host receives the `start` broadcast). The `opts.ws` socket is kept
-// open for the multiplayer state-sync layer that lands next iteration.
 let started = false;
 export async function startGame(opts = {}) {
   if (started) return;
   started = true;
-
   const scene = new THREE.Scene();
   const renderer = new THREE.WebGLRenderer({ antialias: true });
-  // Cap pixel ratio so a 3× retina display doesn't render 9× the pixels of
-  // a 1× display — the visual difference past 1.5 is marginal but the
-  // fragment cost scales quadratically. Big win on integrated GPUs.
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.BasicShadowMap;
   document.body.appendChild(renderer.domElement);
-
-  // Far plane sized to fit the gameplay world (motherships at z=±600 +
-  // hangar offset, 400-unit asteroid field, ship visibility cap at
-  // 1500). Lower than the original 5000 so the GPU isnt drawing scene
-  // objects that are way past anything youd see during a match.
   const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2500);
-
-  // ---- PSX-style pixelated render pipeline ----------------------------
-  // Render the 3D scene to a low-res WebGLRenderTarget (1/PIXEL_SCALE on
-  // each axis) with NearestFilter, then blit it to the canvas via a
-  // fullscreen quad. Less fragment work = perf win on iGPUs, and the
-  // nearest-neighbor upscale gives the chunky retro look. DOM HUD stays
-  // crisp because it isnt part of the WebGL pipeline.
   const pixelEnabled = localStorage.getItem('spaceships:pixelFilter') !== '0';
   const PIXEL_SCALE = 3;
   const pixelRT = pixelEnabled ? new THREE.WebGLRenderTarget(
@@ -83,10 +63,8 @@ export async function startGame(opts = {}) {
       renderer.render(scene, camera);
     }
   }
-
   const clock = new THREE.Clock();
   const warpEffect = createWarpEffect(scene, camera);
-
   let isLoading = true;
   function loadingLoop() {
     if (!isLoading) return;
@@ -96,26 +74,14 @@ export async function startGame(opts = {}) {
     requestAnimationFrame(loadingLoop);
   }
   loadingLoop();
-
-  // Preload the regular ship GLB before spawning any ships (same as before).
   try { await loadShipModel(); } catch (e) { console.warn('[ship] GLB load failed, using primitives', e); }
   isLoading = false;
-
-  // Kick off the admin model load in the background — NOT awaited here so
-  // the game message handler (which receives friends' color updates) gets
-  // registered without delay. We save the promise so getOrCreateRemote can
-  // swap the model in-place if it finishes after a remote admin ship was
-  // already created with the regular-model fallback.
   const ADMIN_MODEL_URL = 'spaceshipADMIN.glb';
   const adminModelReady = loadShipModel(ADMIN_MODEL_URL).catch(() => null);
-
   const MAP_TYPE = opts.map || 'space';
   const isTerrainMap = MAP_TYPE === 'terrain';
-
-  // Bump far plane for terrain map (3× larger world).
   if (isTerrainMap) camera.far = 5000;
   camera.updateProjectionMatrix();
-
   let terrainSun = null;
   if (isTerrainMap) {
     scene.add(new THREE.AmbientLight(0xfff8e8, 0.60));
@@ -140,16 +106,10 @@ export async function startGame(opts = {}) {
     scene.add(sun);
     scene.background = createSkybox();
   }
-
   const isTrialsMode = !!(opts.solo && opts.mode && opts.mode.startsWith('trials'));
-  // Hoisted early so platform/asteroid setup can branch on campaign mode
   const isCampaign = !!(opts.solo && opts.mode === 'campaign');
   const CAMPAIGN_MISSION = isCampaign ? (opts.missionId ?? 1) : 1;
-
-  // Base platforms: motherships for space, airfields for terrain. AABBs kept
-  // separately for collision — same world-aligned box approach either way.
   const MOTHERSHIP_HALF = new THREE.Vector3(45, 18, 35);
-
   let platformA, platformB, platformHalf;
   if (isTerrainMap) {
     platformHalf = AIRFIELD_HALF;
@@ -170,25 +130,19 @@ export async function startGame(opts = {}) {
     platformB.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
     scene.add(platformB);
   }
-
-  // Keep legacy name alias so all downstream collision code is unchanged.
   const mothershipA = platformA;
   const mothershipB = platformB;
-
   const motherships = [
     { pos: platformA.position, halfSize: platformHalf },
     { pos: platformB.position, halfSize: platformHalf },
   ];
-
   if (isTrialsMode) {
     platformA.visible = false;
     platformB.visible = false;
   }
   if (isCampaign) {
-    platformB.visible = false; // replaced by custom capital ship
+    platformB.visible = false;
   }
-
-  // Terrain map: heightmap ground, trees, clouds.
   const terrainMesh = isTerrainMap ? createTerrain() : null;
   if (terrainMesh) {
     terrainMesh.receiveShadow = true;
@@ -196,10 +150,6 @@ export async function startGame(opts = {}) {
   }
   if (isTerrainMap) createTrees(scene);
   const clouds = isTerrainMap ? createClouds(scene) : null;
-
-
-
-  // Indestructible obstacle at the origin (space only).
   const MOON_RADIUS = 80;
   const moon = isTerrainMap ? null : createMoon({ radius: MOON_RADIUS, position: [0, 0, 0] });
   if (moon) scene.add(moon.mesh);
@@ -207,11 +157,9 @@ export async function startGame(opts = {}) {
   const moonAvoid = moon
     ? { pos: moon.pos, halfSize: new THREE.Vector3(MOON_RADIUS, MOON_RADIUS, MOON_RADIUS) }
     : null;
-
   const SHIP_SCALE = 1.5;
   const savedHull = parseInt(getSavedShipColor().replace('#', ''), 16);
   const savedAccent = parseInt(getSavedAccentColor().replace('#', ''), 16);
-  // Names that get the admin ship model. Add more here as needed.
   const ADMIN_SHIP_NAMES = new Set(['Admin', 'ariairspeed']);
   const localPlayerName = (opts.pilotName || '').trim();
   const isLocalAdmin = ADMIN_SHIP_NAMES.has(localPlayerName) || localStorage.getItem('spaceships:unlock_admin_ship') === '1';
@@ -221,8 +169,6 @@ export async function startGame(opts = {}) {
     modelUrl: isLocalAdmin ? ADMIN_MODEL_URL : 'spaceship.glb',
     doubleSided: isLocalAdmin,
   });
-  // If we're admin but the model wasn't cached yet (still downloading),
-  // swap the geometry in-place once it finishes — same pattern as remotes.
   if (isLocalAdmin && !isModelCached(ADMIN_MODEL_URL)) {
     adminModelReady.then((adminScene) => {
       if (!adminScene) return;
@@ -240,7 +186,6 @@ export async function startGame(opts = {}) {
     });
   }
   ship.scale.setScalar(SHIP_SCALE);
-  // Apply server-provided spawn (team-specific) or fall back to mothership A.
   if (opts.spawn) {
     ship.position.fromArray(opts.spawn.pos);
     ship.quaternion.fromArray(opts.spawn.quat);
@@ -253,9 +198,6 @@ export async function startGame(opts = {}) {
   }
   scene.add(ship);
   if (isTerrainMap) ship.traverse((o) => { if (o.isMesh) o.castShadow = true; });
-
-  // Prefer the server-authoritative field if it was sent in the start
-  // message; fall back to local random generation for offline runs.
   const _trialRockCount = opts.mode === 'trials4' ? 210
     : opts.mode === 'trials3' ? 180
       : opts.mode === 'trials2' ? 150
@@ -304,81 +246,73 @@ export async function startGame(opts = {}) {
         ? createAsteroidFieldFromData(genCampaignAsteroids())
         : createAsteroidField({ count: _trialRockCount, radius: 400, avoid: _avoidList }));
   scene.add(asteroids.group);
-
-  // ── Time Trials checkpoint data ─────────────────────────────────────────
-  // Each trial has its own set of checkpoint positions. Rings are torus
-  // meshes oriented perpendicular to the path. Timer begins on the first
-  // crossing of CP0 (start/finish); each full circuit records a lap time.
   const TRIAL1_CPS = [
-    new THREE.Vector3(0, 20, -380),  // CP0  start / finish
-    new THREE.Vector3(180, 60, -260),  // CP1  climb right
-    new THREE.Vector3(340, 0, -80),  // CP2  east entry
-    new THREE.Vector3(360, -50, 120),  // CP3  east exit
-    new THREE.Vector3(220, 80, 280),  // CP4  back-right high
-    new THREE.Vector3(60, -60, 370),  // CP5  back centre low
-    new THREE.Vector3(-150, 40, 360),  // CP6  back left
-    new THREE.Vector3(-320, -40, 180),  // CP7  west entry
-    new THREE.Vector3(-370, 60, -60),  // CP8  west exit
-    new THREE.Vector3(-260, -80, -240),  // CP9  south-west deep
-    new THREE.Vector3(-100, 30, -360),  // CP10 approach left
-    new THREE.Vector3(100, -40, -350),  // CP11 final approach
+    new THREE.Vector3(0, 20, -380),
+    new THREE.Vector3(180, 60, -260),
+    new THREE.Vector3(340, 0, -80),
+    new THREE.Vector3(360, -50, 120),
+    new THREE.Vector3(220, 80, 280),
+    new THREE.Vector3(60, -60, 370),
+    new THREE.Vector3(-150, 40, 360),
+    new THREE.Vector3(-320, -40, 180),
+    new THREE.Vector3(-370, 60, -60),
+    new THREE.Vector3(-260, -80, -240),
+    new THREE.Vector3(-100, 30, -360),
+    new THREE.Vector3(100, -40, -350),
   ];
-  // Trial 2 — 14 CPs, tighter turns, closes in on the moon
   const TRIAL2_CPS = [
-    new THREE.Vector3(0, 20, -360),  // CP0  start
-    new THREE.Vector3(160, 80, -220),  // CP1
-    new THREE.Vector3(290, -40, -80),  // CP2  tighter east entry
-    new THREE.Vector3(310, -80, 100),  // CP3
-    new THREE.Vector3(190, 100, 270),  // CP4
-    new THREE.Vector3(40, -90, 330),  // CP5  low back
-    new THREE.Vector3(-120, 70, 310),  // CP6
-    new THREE.Vector3(-270, -60, 190),  // CP7
-    new THREE.Vector3(-300, 90, 20),  // CP8  close west pass
-    new THREE.Vector3(-270, -100, -170),  // CP9
-    new THREE.Vector3(-120, 60, -310),  // CP10
-    new THREE.Vector3(20, -80, -310),  // CP11
-    new THREE.Vector3(140, 90, -240),  // CP12
-    new THREE.Vector3(260, -60, -120),  // CP13 final
+    new THREE.Vector3(0, 20, -360),
+    new THREE.Vector3(160, 80, -220),
+    new THREE.Vector3(290, -40, -80),
+    new THREE.Vector3(310, -80, 100),
+    new THREE.Vector3(190, 100, 270),
+    new THREE.Vector3(40, -90, 330),
+    new THREE.Vector3(-120, 70, 310),
+    new THREE.Vector3(-270, -60, 190),
+    new THREE.Vector3(-300, 90, 20),
+    new THREE.Vector3(-270, -100, -170),
+    new THREE.Vector3(-120, 60, -310),
+    new THREE.Vector3(20, -80, -310),
+    new THREE.Vector3(140, 90, -240),
+    new THREE.Vector3(260, -60, -120),
   ];
-  // Trial 3 — 16 CPs, extreme height variation, very tight
   const TRIAL3_CPS = [
-    new THREE.Vector3(0, -30, -370),  // CP0  start
-    new THREE.Vector3(150, 100, -240),  // CP1  climb
-    new THREE.Vector3(300, -80, -60),  // CP2  dive
-    new THREE.Vector3(350, 100, 120),  // CP3  climb
-    new THREE.Vector3(220, -110, 280),  // CP4  deep dive
-    new THREE.Vector3(60, 100, 350),  // CP5  high climb
-    new THREE.Vector3(-80, -110, 300),  // CP6  deep dive
-    new THREE.Vector3(-240, 100, 160),  // CP7  climb
-    new THREE.Vector3(-330, -90, 0),  // CP8  close left of moon
-    new THREE.Vector3(-260, 110, -180),  // CP9  climb
-    new THREE.Vector3(-120, -100, -290),  // CP10 dive
-    new THREE.Vector3(20, 110, -350),  // CP11 climb
-    new THREE.Vector3(170, -100, -250),  // CP12 dive
-    new THREE.Vector3(310, 100, -70),  // CP13 climb
-    new THREE.Vector3(220, -110, 120),  // CP14 dive
-    new THREE.Vector3(80, 80, -200),  // CP15 final approach
+    new THREE.Vector3(0, -30, -370),
+    new THREE.Vector3(150, 100, -240),
+    new THREE.Vector3(300, -80, -60),
+    new THREE.Vector3(350, 100, 120),
+    new THREE.Vector3(220, -110, 280),
+    new THREE.Vector3(60, 100, 350),
+    new THREE.Vector3(-80, -110, 300),
+    new THREE.Vector3(-240, 100, 160),
+    new THREE.Vector3(-330, -90, 0),
+    new THREE.Vector3(-260, 110, -180),
+    new THREE.Vector3(-120, -100, -290),
+    new THREE.Vector3(20, 110, -350),
+    new THREE.Vector3(170, -100, -250),
+    new THREE.Vector3(310, 100, -70),
+    new THREE.Vector3(220, -110, 120),
+    new THREE.Vector3(80, 80, -200),
   ];
-  // Trial 4 — 18 CPs, closest moon passes, maximum difficulty
   const TRIAL4_CPS = [
-    new THREE.Vector3(0, 50, -370),  // CP0  start
-    new THREE.Vector3(180, -100, -210),  // CP1
-    new THREE.Vector3(340, 110, -40),  // CP2
-    new THREE.Vector3(210, -110, 240),  // CP3
-    new THREE.Vector3(40, 110, 340),  // CP4
-    new THREE.Vector3(-180, -110, 210),  // CP5
-    new THREE.Vector3(-160, 80, 0),  // CP6  close left of moon
-    new THREE.Vector3(-200, -100, -210),  // CP7
-    new THREE.Vector3(0, 110, -180),  // CP8  above front of moon
-    new THREE.Vector3(200, -100, -40),  // CP9
-    new THREE.Vector3(300, 100, 180),  // CP10
-    new THREE.Vector3(80, -110, 320),  // CP11
-    new THREE.Vector3(-200, 100, 180),  // CP12
-    new THREE.Vector3(-320, -100, -40),  // CP13
-    new THREE.Vector3(-200, 100, -220),  // CP14
-    new THREE.Vector3(0, -110, -340),  // CP15 south close
-    new THREE.Vector3(200, 100, -220),  // CP16
-    new THREE.Vector3(100, -80, -330),  // CP17 final
+    new THREE.Vector3(0, 50, -370),
+    new THREE.Vector3(180, -100, -210),
+    new THREE.Vector3(340, 110, -40),
+    new THREE.Vector3(210, -110, 240),
+    new THREE.Vector3(40, 110, 340),
+    new THREE.Vector3(-180, -110, 210),
+    new THREE.Vector3(-160, 80, 0),
+    new THREE.Vector3(-200, -100, -210),
+    new THREE.Vector3(0, 110, -180),
+    new THREE.Vector3(200, -100, -40),
+    new THREE.Vector3(300, 100, 180),
+    new THREE.Vector3(80, -110, 320),
+    new THREE.Vector3(-200, 100, 180),
+    new THREE.Vector3(-320, -100, -40),
+    new THREE.Vector3(-200, 100, -220),
+    new THREE.Vector3(0, -110, -340),
+    new THREE.Vector3(200, 100, -220),
+    new THREE.Vector3(100, -80, -330),
   ];
   const TRIAL_CPS = opts.mode === 'trials4' ? TRIAL4_CPS
     : opts.mode === 'trials3' ? TRIAL3_CPS
@@ -401,13 +335,10 @@ export async function startGame(opts = {}) {
   let cpCooldown = 0;
   let trialsCountdown = 0;
   let trialsCountdownActive = false;
-
   if (isTrialsMode) {
     const savedBest = parseFloat(localStorage.getItem(TRIAL_BEST_KEY));
     if (!isNaN(savedBest)) trialsBestLap = savedBest;
-
-    cpCooldown = 1.5; // prevent CP0 triggering the instant the countdown ends
-
+    cpCooldown = 1.5;
     const cpGeo = new THREE.TorusGeometry(48, 3.5, 8, 36);
     for (let i = 0; i < TRIAL_CPS.length; i++) {
       const isNext = i === 0;
@@ -425,9 +356,6 @@ export async function startGame(opts = {}) {
       scene.add(mesh);
       cpMeshes.push(mesh);
     }
-
-    // Tracer dots: small glowing spheres that flow from the ship toward the
-    // next checkpoint so the player always knows where to go.
     const dotGeo = new THREE.SphereGeometry(2.5, 5, 5);
     for (let i = 0; i < 10; i++) {
       const dotMat = new THREE.MeshBasicMaterial({ color: 0x66ffcc, transparent: true, opacity: 0.7 });
@@ -436,7 +364,6 @@ export async function startGame(opts = {}) {
       scene.add(dot);
       tracerDots.push(dot);
     }
-
     trialsCountdown = 3.0;
     trialsCountdownActive = true;
     const _cdWrap = document.getElementById('trials-countdown');
@@ -444,65 +371,38 @@ export async function startGame(opts = {}) {
     if (_cdWrap) _cdWrap.style.display = 'flex';
     if (_cdNum) { _cdNum.textContent = '3'; _cdNum.style.color = '#ff5566'; }
   }
-
-  // Bullet hit-sphere is generous in both modes — mouse 6.0 (slight
-  // forgiveness, lead correction still has to be roughly right), keys /
-  // mobile 7.0 (more forgiveness, since digital + thumb input can't
-  // pixel-aim). Decided up-front so we can size the sphere once.
   const coarseAim = !!opts.noMouse || opts.controlScheme === 'keyboard' || opts.controlScheme === 'mobile';
   const bullets = createBullets({ shipHitRadius: coarseAim ? 7.0 : 6.0 });
   scene.add(bullets.group);
-
   const beams = createBeams();
   scene.add(beams.group);
-
   const missileSystem = createMissiles();
   scene.add(missileSystem.group);
-
   const trails = createTrails();
   scene.add(trails.group);
-
   const tpCam = new ThirdPersonCamera(camera, ship);
   tpCam.snap();
   const input = new Input(renderer.domElement);
-  // Control scheme (set in the lobby): 'mouse_keys' (default), 'keyboard'
-  // (arrow steering, no mouse), or 'mobile' (touch joystick + on-screen
-  // buttons).
   const controlScheme = opts.controlScheme
     || (opts.noMouse ? 'keyboard' : 'mouse_keys');
   const noMouseMode = controlScheme === 'keyboard';
   const isMobileScheme = controlScheme === 'mobile';
-  // Mobile also disables real mouse handling — browsers synthesize
-  // mousedown/mousemove from touches, and we don't want those bleeding
-  // into the steering layer when the joystick is already driving it.
   input.mouseDisabled = noMouseMode || isMobileScheme;
   input.touchEnabled = isMobileScheme;
-  // Arrow-keys mode: hide the cursor on game start, let Escape toggle it
-  // back on (so the player can reach the settings gear without leaving
-  // the match). Setting hides at the document level via a body class.
   if (noMouseMode) {
     document.body.classList.add('mouse-hidden');
     window.addEventListener('keydown', (e) => {
       if (e.code === 'Escape') document.body.classList.toggle('mouse-hidden');
     });
   }
-  // On-screen control overlay (joystick + buttons) for mobile. Returns
-  // no-op stubs for the other schemes so callers don't need to branch.
   const touchHud = createTouchHud({ input, scheme: controlScheme });
   const audio = createAudio();
-  // Live volume from the settings panel: read the saved values (defaults
-  // music=0.6, sfx=1.0) and apply, then expose `audio` globally so the
-  // lobby's slider change handlers can adjust mid-game.
   const savedMusic = parseFloat(localStorage.getItem('spaceships:musicVolume'));
   const savedSfx = parseFloat(localStorage.getItem('spaceships:sfxVolume'));
   audio.setMusicVolume(Number.isFinite(savedMusic) ? savedMusic : 0.6);
   audio.setSfxVolume(Number.isFinite(savedSfx) ? savedSfx : 1.0);
   window.__shipAudio = audio;
-
   const ZERO_VEC = new THREE.Vector3();
-
-  // Quadratic distance falloff for environmental SFX (rockbreak, shipdeath).
-  // Within NEAR_DIST: full volume. Beyond FAR_DIST: silent. Smooth in between.
   const SFX_NEAR_DIST = 80;
   const SFX_FAR_DIST = 900;
   function distanceVol(pos) {
@@ -512,39 +412,30 @@ export async function startGame(opts = {}) {
     const u = 1 - (d - SFX_NEAR_DIST) / (SFX_FAR_DIST - SFX_NEAR_DIST);
     return u * u;
   }
-
-  // Engine audio mixer state. Move and boost loops crossfade based on speed
-  // and boost/brake state. Volumes are smoothed toward a target each frame.
   const MOVE_MAX_VOL = 0.25;
   const BOOST_MAX_VOL = 0.4;
-  const SPEED_FOR_FULL_VOL = 80; // u/s — at full throttle move loop hits peak
-  const MOVE_DUCK_BOOST = 0.25;  // multiplier on move volume while boosting
-  const MOVE_DUCK_BRAKE = 0.4;   // multiplier on move volume while airbraking
+  const SPEED_FOR_FULL_VOL = 80;
+  const MOVE_DUCK_BOOST = 0.25;
+  const MOVE_DUCK_BRAKE = 0.4;
   let moveVol = 0;
   let boostVol = 0;
-
-  // --- Multiplayer ---
   const ws = opts.ws;
   const myId = opts.you;
   const isSolo = !!opts.solo;
   const remotePlayers = new Map();
-  const remoteColors = new Map(); // id -> { hullColor, accentColor } as hex integers
-  const remoteModels = new Map(); // id -> modelUrl (set by 'ship-model' broadcast)
+  const remoteColors = new Map();
+  const remoteModels = new Map();
   const PALETTE = [0xff5577, 0x55ff88, 0xffcc55, 0xaa66ff, 0x55ddff, 0xff99cc, 0xff8833, 0x99ff55];
-
-  // Marker diamond textures: red for enemies, green for teammates. Shared
-  // across all remote ships; a per-record material is picked from r.team
-  // vs myTeam. Diamond shape reads as more "HUD marker" than a plain dot.
   function makeDotTexture(fill) {
     const c = document.createElement('canvas');
     c.width = c.height = 32;
     const ctx = c.getContext('2d');
     ctx.fillStyle = fill;
     ctx.beginPath();
-    ctx.moveTo(16, 2);   // top
-    ctx.lineTo(30, 16);  // right
-    ctx.lineTo(16, 30);  // bottom
-    ctx.lineTo(2, 16);   // left
+    ctx.moveTo(16, 2);
+    ctx.lineTo(30, 16);
+    ctx.lineTo(16, 30);
+    ctx.lineTo(2, 16);
     ctx.closePath();
     ctx.fill();
     const t = new THREE.CanvasTexture(c);
@@ -566,18 +457,13 @@ export async function startGame(opts = {}) {
   function refreshMarker(r) {
     if (r && r.marker) r.marker.material = pickMarkerMat(r.team);
   }
-
   const SHIP_MAX_HP = 100;
   const RESPAWN_DELAY = 2.5;
   const SPAWN_INVULN_DURATION = 2.0;
   let myHp = SHIP_MAX_HP;
   let myAlive = true;
   let myRespawnTimer = 0;
-  let myInvulnTimer = SPAWN_INVULN_DURATION; // protected at game start too
-
-  // Scoreboard: id → { name, kills, deaths }. Multiplayer fills from server
-  // 'players' messages; solo seeds with the local pilot + a stub Bot entry
-  // and updates locally on hits.
+  let myInvulnTimer = SPAWN_INVULN_DURATION;
   const scores = new Map();
   if (Array.isArray(opts.players)) {
     for (const p of opts.players) {
@@ -589,10 +475,6 @@ export async function startGame(opts = {}) {
       });
     }
   }
-  // Always ensure the local player has the correct display name in scores.
-  // In solo mode this is the only population; in multiplayer it may already
-  // exist from opts.players but we want to prefer opts.pilotName (the
-  // client-side callsign) and preserve any team/kill/death data already set.
   {
     const existing = scores.get(opts.you);
     scores.set(opts.you, {
@@ -603,7 +485,6 @@ export async function startGame(opts = {}) {
     });
   }
   if (isSolo) {
-    // Bot entries are seeded by spawnBot() when the solo mode is wired below.
   }
   const scoreboardEl = document.getElementById('scoreboard');
   const scoreboardBody = document.getElementById('scoreboard-body');
@@ -612,18 +493,14 @@ export async function startGame(opts = {}) {
     const rows = [...scores.entries()]
       .map(([id, s]) => ({ id, ...s }))
       .sort((a, b) => {
-        // Group by team first (0 before 1 before null), then kills desc, deaths asc
         const ta = a.team ?? 99, tb = b.team ?? 99;
         if (ta !== tb) return ta - tb;
         return b.kills - a.kills || a.deaths - b.deaths;
       });
-
     const hasTeams = rows.some(r => r.team !== null && r.team !== undefined);
     scoreboardBody.innerHTML = '';
     let lastTeam = undefined;
-
     for (const r of rows) {
-      // Insert a team-header divider row when the team changes
       if (hasTeams && r.team !== lastTeam) {
         const header = document.createElement('tr');
         header.className = `sb-team-header t${r.team ?? 'x'}`;
@@ -632,25 +509,18 @@ export async function startGame(opts = {}) {
         scoreboardBody.appendChild(header);
         lastTeam = r.team;
       }
-
       const tr = document.createElement('tr');
       const classes = [];
       if (r.id === myId) classes.push('you');
       if (r.team === 0) classes.push('team0');
       if (r.team === 1) classes.push('team1');
       if (classes.length) tr.className = classes.join(' ');
-
       tr.innerHTML = `<td></td><td class="num">${r.kills}</td><td class="num">${r.deaths}</td>`;
       tr.children[0].textContent = r.name + (r.id === myId ? ' (you)' : '');
       scoreboardBody.appendChild(tr);
     }
   }
   renderScoreboard();
-
-  // Returns smallest positive intercept time, or null if no real solution.
-  // Working in the shooter's rest frame: bullet flies at speed `s` along
-  // some forward direction; target sits at relative position R, drifting at
-  // relative velocity U. We need t such that |R + U·t| = s·t.
   function solveIntercept(enemyPos, enemyVel, selfPos, selfVel, s) {
     const Rx = enemyPos.x - selfPos.x, Ry = enemyPos.y - selfPos.y, Rz = enemyPos.z - selfPos.z;
     const Ux = enemyVel.x - selfVel.x, Uy = enemyVel.y - selfVel.y, Uz = enemyVel.z - selfVel.z;
@@ -675,7 +545,6 @@ export async function startGame(opts = {}) {
     if (t2 > 0) t = Math.min(t, t2);
     return Number.isFinite(t) ? t : null;
   }
-
   function getOrCreateRemote(id) {
     let r = remotePlayers.get(id);
     if (r) return r;
@@ -687,17 +556,12 @@ export async function startGame(opts = {}) {
       ? createShip({ hullColor: colors.hullColor, accentColor: colors.accentColor, modelUrl: remoteModelUrl, doubleSided: isRemoteAdmin })
       : createShip({ tint: PALETTE[id % PALETTE.length], modelUrl: remoteModelUrl, doubleSided: isRemoteAdmin });
     remoteShip.scale.setScalar(SHIP_SCALE);
-
-    // Constant-size dot above the ship. Red for enemies, green for allies.
-    // sizeAttenuation: false keeps it a fixed fraction of the viewport.
     const teamHint = scores.get(id)?.team ?? null;
     const marker = new THREE.Sprite(pickMarkerMat(teamHint));
     marker.scale.set(0.011, 0.011, 1);
     marker.position.y = 1.6;
     marker.renderOrder = 999;
     remoteShip.add(marker);
-
-    // Targeting overlays: bracket box + lead indicator + label.
     const box = document.createElement('div');
     box.className = 'target-box';
     box.style.display = 'none';
@@ -705,12 +569,10 @@ export async function startGame(opts = {}) {
     label.className = 'target-label';
     box.appendChild(label);
     document.body.appendChild(box);
-
     const lead = document.createElement('div');
     lead.className = 'lead-marker';
     lead.style.display = 'none';
     document.body.appendChild(lead);
-
     scene.add(remoteShip);
     if (isTerrainMap) remoteShip.traverse((o) => { if (o.isMesh) o.castShadow = true; });
     r = {
@@ -722,8 +584,6 @@ export async function startGame(opts = {}) {
       hasTarget: false,
       alive: true,
       hp: SHIP_MAX_HP,
-      // Hit flash intensity. Set to 1 whenever HP drops, decays each
-      // frame to 0 — drives emissive on every mesh under r.ship.
       hitFlash: 0,
       marker,
       box, label, lead,
@@ -733,14 +593,10 @@ export async function startGame(opts = {}) {
       team: scores.get(id)?.team ?? null,
     };
     remotePlayers.set(id, r);
-
-    // If this is an admin player but the admin model wasn't cached yet,
-    // swap the ship's 3D model in-place once the download finishes.
     if (isRemoteAdmin && !isModelCached(ADMIN_MODEL_URL)) {
       adminModelReady.then((adminScene) => {
         const rec = remotePlayers.get(id);
         if (!rec || !adminScene) return;
-        // Remove non-marker children (the old placeholder model).
         rec.ship.children.slice().forEach((c) => {
           if (c !== rec.marker) rec.ship.remove(c);
         });
@@ -758,14 +614,11 @@ export async function startGame(opts = {}) {
         if (col) applyColorsToShip(rec.ship, col.hullColor, col.accentColor);
       });
     }
-
     return r;
   }
-
   function explodeAt(pos, scale) {
     bullets.spawnExplosion(pos, scale);
   }
-
   function killRemote(id) {
     const r = remotePlayers.get(id);
     if (!r) return;
@@ -773,7 +626,6 @@ export async function startGame(opts = {}) {
     explodeAt(r.ship.position, 6);
     r.ship.visible = false;
   }
-
   function reviveRemote(id, pos, quat) {
     const r = getOrCreateRemote(id);
     r.alive = true;
@@ -784,7 +636,6 @@ export async function startGame(opts = {}) {
     r.ship.quaternion.copy(r.targetQuat);
     r.ship.visible = true;
   }
-
   function killSelf() {
     if (!myAlive) return;
     myAlive = false;
@@ -792,7 +643,6 @@ export async function startGame(opts = {}) {
     ship.visible = false;
     shipVelocity.set(0, 0, 0);
   }
-
   function reviveSelf(pos, quat) {
     myAlive = true;
     myHp = SHIP_MAX_HP;
@@ -806,7 +656,6 @@ export async function startGame(opts = {}) {
     ship.visible = true;
     tpCam.snap();
   }
-
   function removeRemote(id) {
     const r = remotePlayers.get(id);
     if (!r) return;
@@ -816,7 +665,6 @@ export async function startGame(opts = {}) {
     if (r.lead) r.lead.remove();
     remotePlayers.delete(id);
   }
-
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
       type: 'colors',
@@ -827,7 +675,6 @@ export async function startGame(opts = {}) {
       ws.send(JSON.stringify({ type: 'ship-model', modelUrl: ADMIN_MODEL_URL }));
     }
   }
-
   if (ws) {
     ws.addEventListener('message', (e) => {
       let msg;
@@ -845,7 +692,6 @@ export async function startGame(opts = {}) {
         const isAdminModel = msg.modelUrl === ADMIN_MODEL_URL;
         const r = remotePlayers.get(msg.id);
         if (r && isAdminModel) {
-          // Ship already exists with wrong model — swap to admin model now.
           adminModelReady.then((adminScene) => {
             const rec = remotePlayers.get(msg.id);
             if (!rec || !adminScene) return;
@@ -873,9 +719,6 @@ export async function startGame(opts = {}) {
         if (!r.alive) return;
         const newPos = new THREE.Vector3().fromArray(msg.pos);
         const now = performance.now() / 1000;
-        // Differentiate successive state messages to estimate velocity, with
-        // exponential smoothing (alpha=0.45) so the lead reticle doesn't
-        // twitch on each network update.
         if (r.lastStateTime > 0) {
           const dtState = now - r.lastStateTime;
           if (dtState > 0.005 && dtState < 0.5) {
@@ -937,10 +780,8 @@ export async function startGame(opts = {}) {
         else {
           const r = remotePlayers.get(msg.id);
           if (r) {
-            // HP drop = trigger hit flash before overwriting.
             if (msg.hp < r.hp) {
               r.hitFlash = 1;
-              // Tell mpBot AI it was hit so it can switch to evasion.
               const mpb = mpBots.find(b => b.id === msg.id);
               if (mpb) mpb.ai.notifyHit();
             }
@@ -969,7 +810,6 @@ export async function startGame(opts = {}) {
           reviveSelf(msg.pos, msg.quat);
         } else {
           reviveRemote(msg.id, msg.pos, msg.quat);
-          // Reset mpBot AI state so it starts fresh from the new spawn point.
           const mpb = mpBots.find(b => b.id === msg.id);
           if (mpb) mpb.ai.notifyRespawn();
         }
@@ -986,9 +826,6 @@ export async function startGame(opts = {}) {
           for (const shot of (msg.shots || [])) {
             const origin = new THREE.Vector3().fromArray(shot.pos);
             const dir = new THREE.Vector3().fromArray(shot.dir);
-            // Resolve the homing target on this client:
-            //   - shot.targetId === myId  → missile is chasing the local player
-            //   - otherwise               → look up the remote player record
             const targetRecord = (shot.targetId === myId)
               ? localShipRecord
               : (remotePlayers.get(shot.targetId) ?? null);
@@ -1001,14 +838,11 @@ export async function startGame(opts = {}) {
             bullets.fire(origin, dir, faction);
           }
         }
-        // Play one shoot sound per volley, attenuated by shooter distance.
         if (msg.shots.length > 0) {
           const o = msg.shots[0].pos;
           audio.play('shoot', distanceVol(new THREE.Vector3(o[0], o[1], o[2])));
         }
       } else if (msg.type === 'flare' && msg.id !== myId) {
-        // Remote player deployed flares — create them locally so they can divert
-        // missiles running on this client (e.g. missiles we fired at that player).
         const fPos = new THREE.Vector3().fromArray(msg.pos);
         const fQuat = new THREE.Quaternion().fromArray(msg.quat);
         missileSystem.deployFlare(fPos, fQuat, msg.id);
@@ -1031,13 +865,10 @@ export async function startGame(opts = {}) {
       }
     });
   }
-
   const STATE_INTERVAL = 1 / 20;
   let stateTimer = 0;
-
   const shipRadius = 2.2 * SHIP_SCALE;
   const shipVelocity = new THREE.Vector3();
-
   const MAX_THROTTLE = 80;
   const BOOST_FACTOR = 1.7;
   const THROTTLE_STEP = 6;
@@ -1048,98 +879,35 @@ export async function startGame(opts = {}) {
   const ROLL_RATE = 1.4;
   const VELOCITY_BLEND = 4;
   const STEER_DEADZONE = 0.05;
-  // Arrow-key ramp: asymmetric so quick taps give micro-corrections.
-  //   Press → slow ramp up (~0.5s to full deflection): a brief tap only
-  //           pushes a small fraction of input.
-  //   Press + hold Q → fine-aim mode, much slower ramp so 50ms taps
-  //           barely deflect at all (good for crosshair micro-adjusts).
-  //   Release → fast decay (~0.1s back to neutral): no input lingers
-  //           after key-up, so repeated taps stay tappy.
   let arrowKx = 0, arrowKy = 0;
   const ARROW_RAMP_UP_RATE = 3;
   const ARROW_RAMP_UP_RATE_FINE = 1.5;
   const ARROW_RAMP_DOWN_RATE = 12;
-
-  // Aim assist: when an enemy is in the forward cone, rotate the ship
-  // gently toward them. Press C to toggle in-game (persisted to
-  // localStorage). In no-mouse mode it's forced on at the stronger
-  // profile since arrow-key aiming is coarser.
-  // Coarse-aim schemes (keyboard arrows + mobile thumbstick) get the
-  // assist forced on and run with the wider/stronger profile below.
   let aimAssistEnabled = coarseAim
     ? true
     : localStorage.getItem('spaceships:aimAssist') === '1';
   let prevKeyC = false;
-  const ASSIST_CONE_DOT = coarseAim ? 0.5 : 0.60;          // 60° vs 53° cone
-  // Engagement caps. Autoaim turns off past this distance, matching
-  // the targeting computer's pickup range so you can only get help on
-  // enemies you can actually see the box on.
+  const ASSIST_CONE_DOT = coarseAim ? 0.5 : 0.60;
   const ASSIST_MIN_RANGE = 0;
   const ASSIST_RANGE = 1000;
-  // The overhead team-color diamond shows from further out — it's the
-  // low-detail "there's someone over there" indicator before the full
-  // target box appears at closer range.
   const MARKER_VISIBLE_DIST = 1500;
-  // Pull profile: strong while swinging onto target (helps newcomers and
-  // arrow-key pilots track), zero once the crosshair is on. Strong far,
-  // weak near = "guide, don't lock."
-  const ASSIST_STRENGTH = coarseAim ? 2.2 : 2.6;           // max rad/sec
-  const ASSIST_FALLOFF_START = coarseAim ? 0.30 : 0.28;    // ~17° vs ~16°
-  // Both modes pull all the way to the lead point now — mouse used to
-  // keep a small dead-zone to leave cursor freedom, but the intent
-  // damper (ASSIST_INTENT_BREAK) handles "I want to aim manually" via
-  // cursor velocity, so the dead-zone just hurt the lock accuracy.
+  const ASSIST_STRENGTH = coarseAim ? 2.2 : 2.6;
+  const ASSIST_FALLOFF_START = coarseAim ? 0.30 : 0.28;
   const ASSIST_DEAD_ANGLE = coarseAim ? 0.0 : 0.005;
-  // Once a target is acquired, give it a small dot-bonus on subsequent
-  // frames so the assist doesn't flicker between two equidistant enemies
-  // and stays committed to the one you're already swinging onto.
   const ASSIST_STICKY_DOT_BONUS = 0.05;
-  // Stick-intent break: pull strength scales down with steering magnitude
-  // so deliberate input slips the lock. Tuned per input device:
-  //   - Keys: low threshold (0.25) — any sustained press releases easily,
-  //     so you aren't auto-locked when you're trying to evade or rotate.
-  //   - Mouse: high threshold (1.8) — fine cursor jitter from aiming
-  //     doesn't kill the assist; only a deliberate full-deflection swing
-  //     does. Lets the mouse magnetism actually help during tracking.
   const ASSIST_INTENT_BREAK = coarseAim ? 0.25 : 1.8;
-
-  // Hold-Space drift: decouples orientation from velocity. The ship keeps
-  // its current momentum vector unchanged while you rotate freely, then
-  // on release re-engages thrust along the new facing — a kart-style
-  // power-slide that lets you spin to fire on a chaser without losing
-  // speed. Sharpened turning rates apply during the drift, and a release
-  // boost rewards longer holds.
   const BRAKE_PITCH_MULT = 1.3;
   const BRAKE_YAW_MULT = 1.7;
-  const BRAKE_FULL_TIME = 1.4;            // seconds of holding to fully charge
-  const BRAKE_BOOST_MIN = 0.18;           // minimum charge to launch any boost
-  const BRAKE_BOOST_DURATION_MAX = 1.0;   // seconds of post-release boost at full charge
-  const BRAKE_BOOST_BONUS_MAX = 50;       // flat extra u/s added to forward speed at full charge
-  // Drift drag: per-second velocity multiplier while Space is held. 0.9
-  // ≈ −10%/s, so speed has to drop ~7s to halve. Light enough that drift
-  // still preserves momentum, heavy enough that you can't spin forever.
+  const BRAKE_FULL_TIME = 1.4;
+  const BRAKE_BOOST_MIN = 0.18;
+  const BRAKE_BOOST_DURATION_MAX = 1.0;
+  const BRAKE_BOOST_BONUS_MAX = 50;
   const DRIFT_DRAG = 0.9;
-  // Drift grip: how strongly the velocity vector is rotated toward the
-  // current facing while drifting (magnitude preserved). Mimics a real
-  // drift where the wheels still pull you in the new direction over
-  // time. Set to 0 to fully decouple orientation from velocity.
-  // [REVERT: drop this constant + the grip block in the drift branch.]
   const DRIFT_GRIP = 0.3;
-  // Hold S during a drift to brake hard. Replaces the gentle DRIFT_DRAG
-  // with a much stronger decay (~90%/s) for the frames S is held — gives
-  // the player an explicit "I want to slow down now" tool without
-  // breaking the drift's orientation freedom.
   const DRIFT_BRAKE = 0.1;
-  // Velocity blend used while the brake-release boost is firing. Lower
-  // than the normal VELOCITY_BLEND so the slingshot redirects floatily
-  // — old momentum lingers a beat before the new heading takes over.
   const VELOCITY_BLEND_RELEASE = 1.5;
-  // Drift overload: a two-stage warning before damage. Once charge is
-  // full the bar stays yellow for the WARN delay (still safe — release
-  // here for a clean boost). After WARN it flips red as a "let go now"
-  // signal and waits another DAMAGE delay before HP starts ticking.
-  const BRAKE_OVERCHARGE_WARN = 1.0;     // yellow → red after this long at full
-  const BRAKE_OVERCHARGE_DAMAGE = 2.0;   // total seconds at full before damage
+  const BRAKE_OVERCHARGE_WARN = 1.0;
+  const BRAKE_OVERCHARGE_DAMAGE = 2.0;
   const BRAKE_OVERCHARGE_DPS = 10;
   let brakeOverchargeTime = 0;
   let selfDamageAccum = 0;
@@ -1149,35 +917,17 @@ export async function startGame(opts = {}) {
   let brakeBoostCharge = 0;
   const chargeBar = document.getElementById('chargebar');
   const chargeFill = document.getElementById('chargebar-fill');
-
-  // Bullets fire faster than beams — projectiles need lead, so giving them
-  // higher DPS keeps them competitive with the always-on-target beam.
-  const BULLET_COOLDOWN = 0.05;       // 20 shots/sec
-  const BEAM_COOLDOWN = 0.25;         // 4 shots/sec
-  // Single nose-mounted gun — fires straight along ship-forward from the
-  // tip of the cone (cone half-length is 1.6).
+  const BULLET_COOLDOWN = 0.05;
+  const BEAM_COOLDOWN = 0.25;
   const MUZZLE_OFFSETS = [new THREE.Vector3(0, 0, 0.6)];
   let fireTimer = 0;
-
-  // Gun mode toggle: 'bullet' (projectile) or 'beam' (instant hitscan).
-  // Beam costs 2 ammo per shot, range BEAM_RANGE units.
   let gunMode = 'bullet';
   let prevKeyP = false;
   let prevKeyO = false;
   let prevKeyL = false;
   const BEAM_RANGE = 1000;
-  // Generous targeting sphere — covers wing silhouette comfortably for both
-  // reticle anchoring and beam hit detection. Slightly bigger than the
-  // bullet hit radius so beams feel reliably "locked" when reticle is on.
   const BEAM_SHIP_RADIUS = 5.5;
   const BEAM_FORWARD_OFFSET = 4;
-
-  // Casts a ray from origin along unit dir up to maxDist against the world
-  // (remote ships + asteroids). Returns the closest hit metadata. Used by:
-  //   - Targeting reticle anchoring
-  //   - Beam fire hit detection
-  // opts.skipShipId ignores a specific ship; opts.skipTeam ignores all
-  // ships on a given team (no friendly fire / friendly target lock).
   function castWorldRay(origin, dir, maxDist, opts = {}) {
     const skipShipId = opts.skipShipId ?? null;
     const skipTeam = opts.skipTeam ?? null;
@@ -1201,9 +951,6 @@ export async function startGame(opts = {}) {
       );
       if (t !== null && t < bestT) { bestT = t; hitAsteroidId = a.id; hitShipId = null; }
     }
-    // Static obstacles (moon). No hitId — they can't be damaged, they
-    // just truncate the ray so beams stop at the surface and reticle
-    // anchors don't reach through.
     for (const o of obstacles) {
       const t = raySphereDist(
         origin.x, origin.y, origin.z, dir.x, dir.y, dir.z,
@@ -1213,8 +960,6 @@ export async function startGame(opts = {}) {
     }
     return { dist: bestT, hitShipId, hitAsteroidId };
   }
-
-  // Ray-vs-sphere. Returns hit distance along `dir` (unit), or null.
   function raySphereDist(ox, oy, oz, dx, dy, dz, cx, cy, cz, r) {
     const mx = ox - cx, my = oy - cy, mz = oz - cz;
     const b = mx * dx + my * dy + mz * dz;
@@ -1227,17 +972,11 @@ export async function startGame(opts = {}) {
     if (t < 0) t = -b + sd;
     return t > 0 ? t : null;
   }
-
-  // Gun: 20 trigger pulls before lockout. Both gun and boost share the
-  // same lazy regen rule — passive recharge only kicks in REGEN_DELAY
-  // seconds after the last use, so trigger-spamming or shift-tapping
-  // doesn't get free top-ups.
-  const REGEN_DELAY = 1.0;          // matches BOOST_REGEN_DELAY
+  const REGEN_DELAY = 1.0;
   const MAX_AMMO = 90;
-  const AMMO_REGEN = 36;            // 90 / 2.5s, same refill time as boost
+  const AMMO_REGEN = 36;
   let ammo = MAX_AMMO;
-  let ammoIdle = REGEN_DELAY; // start full, eligible to regen immediately
-
+  let ammoIdle = REGEN_DELAY;
   const MISSILE_MAX = 4;
   let missilesLeft = MISSILE_MAX;
   let prevKeyE = false;
@@ -1247,7 +986,6 @@ export async function startGame(opts = {}) {
     document.getElementById('msl-pip-3'),
     document.getElementById('msl-pip-4'),
   ];
-
   const FLARE_MAX = 3;
   let flaresLeft = FLARE_MAX;
   let prevKeyQ = false;
@@ -1256,88 +994,63 @@ export async function startGame(opts = {}) {
     document.getElementById('fla-pip-2'),
     document.getElementById('fla-pip-3'),
   ];
-
-  // Shift-boost fuel: 10 seconds at full, drains while held.
   const MAX_BOOST = 10;
   const BOOST_DRAIN = 2;
   const BOOST_RECHARGE = 4;
   const BOOST_REGEN_DELAY = 1.0;
   let boostMeter = MAX_BOOST;
   let boostIdle = REGEN_DELAY;
-
-  // Health regeneration: after 2s out of combat (no damage taken, no shots
-  // fired) regen ticks +1 HP every 0.1s until full.
   const HEALTH_REGEN_DELAY = 2.0;
   const HEALTH_REGEN_INTERVAL = 0.1;
-  let healthIdleDamage = HEALTH_REGEN_DELAY; // time since last damage received
-  let healthIdleShot = HEALTH_REGEN_DELAY; // time since last shot fired
-  let healthRegenTick = 0;                  // accumulator for 0.1s ticks
-
+  let healthIdleDamage = HEALTH_REGEN_DELAY;
+  let healthIdleShot = HEALTH_REGEN_DELAY;
+  let healthRegenTick = 0;
   const boostBar = document.getElementById('boostbar');
   const boostFill = document.getElementById('boostbar-fill');
   const heatBar = document.getElementById('heatbar');
   const heatFill = document.getElementById('heatbar-fill');
   const hitVignette = document.getElementById('hit-vignette');
-  // Vignette intensity is driven each frame: spike to 1 on damage, decay
-  // toward 0. prevHpForFlash tracks the last HP so we only flash on a
-  // drop (not on respawn-back-to-full or during clamps).
   let prevHpForFlash = SHIP_MAX_HP;
   let vignetteAlpha = 0;
-  const VIGNETTE_DECAY = 2.4; // 1 → 0 in ~0.4s
-
+  const VIGNETTE_DECAY = 2.4;
   const TRAIL_OFFSETS = [
     new THREE.Vector3(-2.2, -0.05, -1.8),
     new THREE.Vector3(2.2, -0.05, -1.8),
   ];
-  // Admin model has jets closer together and further back.
   const ADMIN_TRAIL_OFFSETS = [
     new THREE.Vector3(-0.9, -0.05, -2.4),
     new THREE.Vector3(0.9, -0.05, -2.4),
   ];
   const localTrailOffsets = isLocalAdmin ? ADMIN_TRAIL_OFFSETS : TRAIL_OFFSETS;
-  // Enemy/remote-ship trails. Default on; users on low-end devices can
-  // turn this off in the settings panel. Captured at startGame time —
-  // mid-match changes apply on next game.
   const enemyTrailsEnabled = localStorage.getItem('spaceships:enemyTrails') !== '0';
-  // Per-state emission profile: rate (puffs/sec/engine), particle scale
-  // range, color palette, position jitter, and lifetime range.
   const EMIT_CONFIG = {
     move: { rate: 18, scale: [0.16, 0.28], colors: [0xffffff], jitter: 0.05, life: [0.18, 0.30] },
     boost: { rate: 45, scale: [0.50, 0.85], colors: [0x66ddff, 0xffffff], jitter: 0.13, life: [0.45, 0.65] },
     brake: { rate: 35, scale: [0.36, 0.60], colors: [0xffd933, 0xffaa33], jitter: 0.10, life: [0.28, 0.45] },
   };
   let trailTimer = 0;
-  // Read trail customization once at game start; captured so mid-match changes
-  // apply on the next match (consistent with how pixel filter / enemy trails work).
   const savedTrailColorHex = parseInt(getSavedTrailColor().replace('#', ''), 16);
   const savedTrailShape = getSavedTrailShape();
-
   let targetThrottle = 0;
   let throttle = 0;
-
   const hud = document.getElementById('hud-stats');
   const hpFill = document.getElementById('healthbar-fill');
   const hpText = document.getElementById('healthbar-text');
   const deathBanner = document.getElementById('deathbanner');
-
   const tmpQ = new THREE.Quaternion();
   const xAxis = new THREE.Vector3(1, 0, 0);
   const yAxis = new THREE.Vector3(0, 1, 0);
   const zAxis = new THREE.Vector3(0, 0, 1);
-
   function update(dt) {
     input.pollGamepad();
-
-    // ── Gamepad pause overlay handling ──────────────────────────────────────
     if (input.gp.menuBtn) {
       if (pauseOpen) closePause(); else openPause();
     }
     if (pauseOpen) {
-      // Navigate the two pause buttons with D-pad / left stick
       pauseNavCooldown = Math.max(0, pauseNavCooldown - dt);
       const rawGp = [...(navigator.getGamepads?.() ?? [])].find(g => g?.connected);
       if (rawGp) {
-        const navUp   = rawGp.buttons[12]?.pressed || rawGp.axes[1] < -0.5;
+        const navUp = rawGp.buttons[12]?.pressed || rawGp.axes[1] < -0.5;
         const navDown = rawGp.buttons[13]?.pressed || rawGp.axes[1] > 0.5;
         const confirm = rawGp.buttons[0]?.pressed;
         if (pauseNavCooldown === 0 && (navUp || navDown)) {
@@ -1346,15 +1059,12 @@ export async function startGame(opts = {}) {
           pauseNavCooldown = (pausePrevNavUp || pausePrevNavDown) ? 0.12 : 0.25;
         }
         if (confirm && !pausePrevConfirm) pauseBtns[pauseFocusIdx].click();
-        pausePrevNavUp   = navUp;
+        pausePrevNavUp = navUp;
         pausePrevNavDown = navDown;
         pausePrevConfirm = confirm;
       }
     }
-    // ────────────────────────────────────────────────────────────────────────
-
     warpEffect.update(dt);
-    // Trials 3-2-1-GO countdown: freeze the ship, update the overlay, then release.
     if (isTrialsMode && trialsCountdownActive) {
       trialsCountdown -= dt;
       const cdWrap = document.getElementById('trials-countdown');
@@ -1376,13 +1086,8 @@ export async function startGame(opts = {}) {
       tpCam.update(dt, input);
       return;
     }
-
     const braking = myAlive && (input.keys.has('Space') || input.gp.drift);
-
     if (myAlive) {
-      // Mobile slider sets throttle absolutely; W/S/wheel are ignored
-      // while it has a value (touch never sets the others anyway, but
-      // be explicit so a stale wheel delta can't bump the slider).
       if (input.throttleOverride !== null) {
         targetThrottle = input.throttleOverride * MAX_THROTTLE;
         input.consumeWheel();
@@ -1394,14 +1099,10 @@ export async function startGame(opts = {}) {
         if (input.keys.has('KeyS') || input.gp.throttleAxis < -0.01)
           targetThrottle -= KEY_THROTTLE_RATE * dt * (input.gp.throttleAxis < -0.01 ? -input.gp.throttleAxis : 1);
       }
-      // Drifting preserves throttle so the ship resumes thrusting at the
-      // same setting (along the new facing) the moment Space is released.
       targetThrottle = Math.max(0, Math.min(MAX_THROTTLE, targetThrottle));
       throttle = THREE.MathUtils.damp(throttle, targetThrottle, 3, dt);
-
       let sx = input.rmb ? 0 : input.steerX;
       let sy = input.rmb ? 0 : input.steerY;
-      // Gamepad right stick overrides mouse when the stick is pushed.
       if (Math.abs(input.gp.steerX) > 0.01 || Math.abs(input.gp.steerY) > 0.01) {
         sx = input.gp.steerX;
         sy = input.gp.steerY;
@@ -1410,16 +1111,11 @@ export async function startGame(opts = {}) {
       if (Math.abs(sy) < STEER_DEADZONE) sy = 0;
       sx = Math.sign(sx) * Math.pow(Math.abs(sx), 1.6);
       sy = Math.sign(sy) * Math.pow(Math.abs(sy), 1.6);
-      // Arrow-key steering for trackpad-averse pilots. Targets ramp from 0
-      // toward ±1 via damp so deflection is smooth, not a snap. Held key
-      // = analog-feeling input; release returns toward 0.
       let kxTarget = 0, kyTarget = 0;
       if (input.keys.has('ArrowLeft')) kxTarget -= 1;
       if (input.keys.has('ArrowRight')) kxTarget += 1;
       if (input.keys.has('ArrowUp')) kyTarget -= 1;
       if (input.keys.has('ArrowDown')) kyTarget += 1;
-      // Slow ramp on press, fast decay on release — taps stay micro.
-      // Hold Q to halve the ramp rate for fine-aim micro-corrections.
       const upRate = input.keys.has('KeyQ') ? ARROW_RAMP_UP_RATE_FINE : ARROW_RAMP_UP_RATE;
       const rateX = kxTarget !== 0 ? upRate : ARROW_RAMP_DOWN_RATE;
       const rateY = kyTarget !== 0 ? upRate : ARROW_RAMP_DOWN_RATE;
@@ -1427,30 +1123,24 @@ export async function startGame(opts = {}) {
       arrowKy = THREE.MathUtils.damp(arrowKy, kyTarget, rateY, dt);
       if (kxTarget !== 0 || Math.abs(arrowKx) > 0.01) sx = arrowKx;
       if (kyTarget !== 0 || Math.abs(arrowKy) > 0.01) sy = arrowKy;
-
       const pitchMult = braking ? BRAKE_PITCH_MULT : 1;
       const yawMult = braking ? BRAKE_YAW_MULT : 1;
       const pitchRate = (sy < 0 ? PITCH_RATE * PITCH_UP_BOOST : PITCH_RATE) * pitchMult;
       const pitch = sy * pitchRate * dt;
       const yaw = -sx * YAW_RATE * yawMult * dt;
-
       let roll = 0;
       if (input.keys.has('KeyD')) roll += ROLL_RATE * pitchMult * dt;
       if (input.keys.has('KeyA')) roll -= ROLL_RATE * pitchMult * dt;
-      // Gamepad left stick X: analog roll (overrides A/D when stick is pushed).
       if (input.gp.rollAxis !== 0) roll = input.gp.rollAxis * ROLL_RATE * pitchMult * dt;
-
       if (pitch) ship.quaternion.multiply(tmpQ.setFromAxisAngle(xAxis, pitch));
       if (yaw) ship.quaternion.multiply(tmpQ.setFromAxisAngle(yAxis, yaw));
       if (roll) ship.quaternion.multiply(tmpQ.setFromAxisAngle(zAxis, roll));
       ship.quaternion.normalize();
-
       if (aimAssistEnabled) {
         const steerMag = Math.max(Math.abs(sx), Math.abs(sy));
         applyAimAssist(dt, steerMag);
       }
     }
-
     if (brakeBoostTimer > 0) brakeBoostTimer = Math.max(0, brakeBoostTimer - dt);
     const wantShift = input.keys.has('ShiftLeft') || input.keys.has('ShiftRight') || input.gp.boost;
     const shiftBoost = myAlive && !braking && wantShift && boostMeter > 0;
@@ -1461,51 +1151,33 @@ export async function startGame(opts = {}) {
       boostMeter = Math.max(0, boostMeter - BOOST_DRAIN * dt);
       boostIdle = 0;
     } else if (wantShift) {
-      // Holding shift with empty meter still counts as "in use" — hold the
-      // regen back until they release the key.
       boostIdle = 0;
     }
     if (boostMeter < MAX_BOOST && boostIdle >= BOOST_REGEN_DELAY) {
       boostMeter = Math.min(MAX_BOOST, boostMeter + BOOST_RECHARGE * dt);
     }
     if (myAlive) {
-      // Drift mode: orientation is decoupled from velocity. We freeze the
-      // thrust integration while Space is held, so the player can swing
-      // the nose around without losing trajectory. A gentle drag still
-      // bleeds speed so a held drift isn't free perpetual motion.
       if (braking) {
-        // [REVERT-DRIFT-GRIP start] Rotate velocity toward facing while
-        // preserving magnitude — gives the drift a "wheel grip" feel.
         const speed = shipVelocity.length();
         if (speed > 0.001 && DRIFT_GRIP > 0) {
           const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
           const desired = fwd.multiplyScalar(speed);
           shipVelocity.lerp(desired, 1 - Math.pow(0.001, dt * DRIFT_GRIP / 6));
         }
-        // [REVERT-DRIFT-GRIP end]
-        // S during a drift overrides the gentle drag with a hard brake.
         const drag = input.keys.has('KeyS') ? DRIFT_BRAKE : DRIFT_DRAG;
         shipVelocity.multiplyScalar(Math.pow(drag, dt));
       } else {
         const speedMult = shiftBoost ? BOOST_FACTOR : 1;
         const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
         const target = forward.clone().multiplyScalar(throttle * speedMult);
-        // Brake-release adds a flat forward bonus instead of a multiplier so
-        // the effect is the same regardless of current throttle.
         if (brakeReleaseBoost) {
           target.addScaledVector(forward, BRAKE_BOOST_BONUS_MAX * brakeBoostCharge);
         }
-        // While the release-boost is firing, fall to a slower blend so
-        // the redirect floats — old momentum eases out instead of snapping.
         const blend = brakeReleaseBoost ? VELOCITY_BLEND_RELEASE : VELOCITY_BLEND;
         shipVelocity.lerp(target, 1 - Math.pow(0.001, dt * blend / 6));
       }
       ship.position.addScaledVector(shipVelocity, dt);
     }
-
-    // Charge while braking; on release convert charge into a timed boost
-    // (same speed multiplier as Shift, but it auto-runs for a duration
-    // proportional to how long you held).
     if (braking) {
       brakeCharge = Math.min(1, brakeCharge + dt / BRAKE_FULL_TIME);
     } else if (prevBraking && myAlive) {
@@ -1520,14 +1192,8 @@ export async function startGame(opts = {}) {
       brakeBoostCharge = 0;
     }
     prevBraking = braking;
-
-    // Drift overload: once charge is full, tick a grace timer. The bar
-    // stays yellow up to BRAKE_OVERCHARGE_WARN, flips red between WARN
-    // and BRAKE_OVERCHARGE_DAMAGE, and only starts costing HP past that.
     if (braking && brakeCharge >= 1 && myAlive) {
       brakeOverchargeTime += dt;
-      // Tutorial: damage suppressed so a new pilot exploring drift can't
-      // accidentally die while reading the prompt.
       if (brakeOverchargeTime > BRAKE_OVERCHARGE_DAMAGE && SOLO_MODE !== 'tutorial') {
         selfDamageAccum += BRAKE_OVERCHARGE_DPS * dt;
         while (selfDamageAccum >= 1) {
@@ -1543,7 +1209,6 @@ export async function startGame(opts = {}) {
       brakeOverchargeTime = 0;
       selfDamageAccum = 0;
     }
-
     if (chargeBar && chargeFill) {
       chargeBar.classList.toggle('active', braking || brakeCharge > 0);
       chargeBar.classList.toggle('full', brakeCharge >= 1);
@@ -1558,8 +1223,6 @@ export async function startGame(opts = {}) {
     }
     if (heatFill && heatBar) {
       heatFill.style.width = (ammo / MAX_AMMO * 100).toFixed(1) + '%';
-      // Red bar when there isn't enough for the current weapon's next
-      // shot — visual cue that you have to wait for regen.
       heatBar.classList.toggle('overheated', ammo < (gunMode === 'beam' ? 3 : 1));
     }
     for (let _pi = 0; _pi < mslPips.length; _pi++) {
@@ -1568,19 +1231,14 @@ export async function startGame(opts = {}) {
     for (let _pi = 0; _pi < flarePips.length; _pi++) {
       if (flarePips[_pi]) flarePips[_pi].classList.toggle('empty', _pi >= flaresLeft);
     }
-    // Missile lock-on warning: flashes when any hostile missile is homing on you.
     const _missileLocked = missileSystem.isTargetingLocal(localShipRecord) && myAlive;
     const _lockWarnEl = document.getElementById('missile-lock-warning');
     if (_lockWarnEl) _lockWarnEl.style.display = _missileLocked ? '' : 'none';
-
-    // P: toggle gun mode (bullet ↔ beam) on key-down edge.
     const nowKeyP = input.keys.has('KeyP');
     if (nowKeyP && !prevKeyP) {
       gunMode = gunMode === 'beam' ? 'bullet' : 'beam';
     }
     prevKeyP = nowKeyP;
-
-    // C: toggle aim assist. Persisted to localStorage so it sticks.
     const nowKeyC = input.keys.has('KeyC');
     if (nowKeyC && !prevKeyC) {
       aimAssistEnabled = !aimAssistEnabled;
@@ -1588,9 +1246,6 @@ export async function startGame(opts = {}) {
       showAimAssistToast(aimAssistEnabled);
     }
     prevKeyC = nowKeyC;
-
-    // O: grab/release mouse via pointer lock. No-op in no-mouse mode since
-    // the mouse is intentionally inert.
     const nowKeyO = input.keys.has('KeyO');
     if (nowKeyO && !prevKeyO && !noMouseMode) {
       if (document.pointerLockElement) {
@@ -1600,8 +1255,6 @@ export async function startGame(opts = {}) {
       }
     }
     prevKeyO = nowKeyO;
-
-    // L: toggle fullscreen on the page root.
     const nowKeyL = input.keys.has('KeyL');
     if (nowKeyL && !prevKeyL) {
       if (document.fullscreenElement) {
@@ -1611,11 +1264,6 @@ export async function startGame(opts = {}) {
       }
     }
     prevKeyL = nowKeyL;
-
-    // E: fire a homing missile at the closest VISIBLE enemy.
-    // LOS is checked at the moment of firing using the same asteroid + obstacle
-    // raycast the targeting computer uses. Once airborne the missile tracks
-    // freely — the target can duck behind cover after launch.
     const nowKeyE = input.keys.has('KeyE');
     if (nowKeyE && !prevKeyE && myAlive && missilesLeft > 0) {
       let closestRecord = null;
@@ -1624,8 +1272,7 @@ export async function startGame(opts = {}) {
         if (!r.alive || !r.hasTarget) continue;
         if (myTeam !== undefined && myTeam !== null && r.team === myTeam) continue;
         const d = ship.position.distanceTo(r.ship.position);
-        if (d >= closestDist) continue; // already have a closer candidate
-        // Line-of-sight check — same logic as the targeting computer.
+        if (d >= closestDist) continue;
         const lx = (r.ship.position.x - ship.position.x) / d;
         const ly = (r.ship.position.y - ship.position.y) / d;
         const lz = (r.ship.position.z - ship.position.z) / d;
@@ -1673,8 +1320,6 @@ export async function startGame(opts = {}) {
       }
     }
     prevKeyE = nowKeyE;
-
-    // Q: deploy flares (key-down edge). Hold still activates arrow-key fine-aim.
     const nowKeyQ = input.keys.has('KeyQ');
     if (nowKeyQ && !prevKeyQ && myAlive && flaresLeft > 0) {
       missileSystem.deployFlare(ship.position.clone(), ship.quaternion, myId);
@@ -1689,7 +1334,6 @@ export async function startGame(opts = {}) {
       }
     }
     prevKeyQ = nowKeyQ;
-
     fireTimer -= dt;
     ammoIdle += dt;
     const ammoCost = gunMode === 'beam' ? 3 : 1;
@@ -1716,9 +1360,6 @@ export async function startGame(opts = {}) {
             }
           }
           const end = origin.clone().addScaledVector(dir, beamDist);
-          // Visual: spawn the beam farther forward so it doesn't appear to
-          // emerge from inside the ship. If the hit is closer than the
-          // offset, fall back to the muzzle origin.
           const visualStart = beamDist > BEAM_FORWARD_OFFSET
             ? origin.clone().addScaledVector(dir, BEAM_FORWARD_OFFSET)
             : origin;
@@ -1762,8 +1403,6 @@ export async function startGame(opts = {}) {
     if (ammo < MAX_AMMO && ammoIdle >= REGEN_DELAY) {
       ammo = Math.min(MAX_AMMO, ammo + AMMO_REGEN * dt);
     }
-
-    // Health regen: tick idle timers; regenerate 1 HP per 0.1s after 2s out of combat.
     if (myAlive) {
       healthIdleDamage += dt;
       healthIdleShot += dt;
@@ -1777,18 +1416,12 @@ export async function startGame(opts = {}) {
         healthRegenTick = 0;
       }
     }
-
-    // Pick which engine emission profile applies this frame. Brake takes
-    // priority over boost; boost over plain movement.
     let emitMode = null;
     if (myAlive) {
       if (braking) emitMode = 'brake';
       else if (boosting) emitMode = 'boost';
       else if (shipVelocity.length() > 5) emitMode = 'move';
     }
-    // Engine mixer: move volume scales with speed, boost ramps in via damp.
-    // Boosting and braking each duck the move loop so the layered sound
-    // doesn't muddy. Damp smooths transitions for ease-in/ease-out.
     const speed = shipVelocity.length();
     const speedFrac = Math.max(0, Math.min(1, speed / SPEED_FOR_FULL_VOL));
     let moveTarget = myAlive ? MOVE_MAX_VOL * speedFrac : 0;
@@ -1817,8 +1450,6 @@ export async function startGame(opts = {}) {
           p.y += (Math.random() - 0.5) * cfg.jitter;
           p.z += (Math.random() - 0.5) * cfg.jitter;
           const scale = cfg.scale[0] + Math.random() * (cfg.scale[1] - cfg.scale[0]);
-          // Use player's chosen color for move/boost; keep brake orange as a
-          // distinct deceleration signal.
           const baseColor = cfg.colors[Math.floor(Math.random() * cfg.colors.length)];
           const color = (emitMode !== 'brake') ? savedTrailColorHex : baseColor;
           const life = cfg.life[0] + Math.random() * (cfg.life[1] - cfg.life[0]);
@@ -1828,17 +1459,9 @@ export async function startGame(opts = {}) {
     } else {
       trailTimer = 0;
     }
-
-    // Remote ship trails. Same emission machinery as the local player,
-    // but driven from each remote's tracked velocity (and r.boost flag
-    // from their 'state' broadcast). Skipped entirely when the user has
-    // disabled enemy trails for perf.
     if (enemyTrailsEnabled) {
       for (const r of remotePlayers.values()) {
         if (!r.alive || !r.hasTarget) { r.trailTimer = 0; continue; }
-        // Distance-gate so distant pilots don't reveal themselves via
-        // bright additive plumes. Tied to the marker-visibility cap so
-        // the diamond and the engine trail appear/disappear together.
         if (ship.position.distanceTo(r.ship.position) > MARKER_VISIBLE_DIST) {
           r.trailTimer = 0;
           continue;
@@ -1866,7 +1489,6 @@ export async function startGame(opts = {}) {
         }
       }
     }
-
     asteroids.update(dt);
     if (moon) moon.update(dt);
     beams.update(dt);
@@ -1897,8 +1519,6 @@ export async function startGame(opts = {}) {
       dt,
       remotePlayers,
       (targetId, ownerId, ownerTeam) => {
-        // ownerId null/myId → the local player's own missile. Bot missiles
-        // carry the bot's id/team so kills get credited to the right pilot.
         const mine = ownerId == null || ownerId === myId;
         if (mine) audio.play('hitmarker_2');
         if (isCampaign && targetId >= BOSS_ID_BASE && targetId < BOSS_ID_BASE + BOSS_HITBOX_COUNT) {
@@ -1909,11 +1529,8 @@ export async function startGame(opts = {}) {
           if (mine) {
             ws.send(JSON.stringify({ type: 'hit', targetId, kind: 'missile' }));
           } else if (mpBots.some((b) => b.id === ownerId)) {
-            // Host-driven bot missile — report with fromBotId for credit.
             ws.send(JSON.stringify({ type: 'hit', targetId, fromBotId: ownerId, kind: 'missile' }));
           }
-          // Missiles owned by other remote players are visual-only here;
-          // their own client reports the hit.
         }
       },
       myTeam,
@@ -1927,21 +1544,14 @@ export async function startGame(opts = {}) {
           if (isSolo) {
             applyPlayerDamageLocal(50, ownerId, ownerTeam);
           } else if (mpBots.some((b) => b.id === ownerId)
-              && ws && ws.readyState === WebSocket.OPEN) {
-            // A bot this client hosts hit this client's own ship — the
-            // server explicitly allows fromBotId hits on the bot host.
+            && ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'hit', targetId: myId, fromBotId: ownerId, kind: 'missile' }));
           }
-          // Remote players' missiles: damage arrives via the server, this
-          // just detonates the visual on contact.
         },
       },
     );
     trails.update(dt, camera);
     if (clouds) clouds.update(dt);
-
-    // Keep shadow light directly above the player so the frustum stays tight
-    // and the shadow falls straight down regardless of world position.
     if (terrainSun) {
       terrainSun.target.position.copy(ship.position);
       terrainSun.target.updateMatrixWorld();
@@ -1952,8 +1562,6 @@ export async function startGame(opts = {}) {
       resolveMothershipCollisions();
     }
     tpCam.update(dt, input);
-
-    // --- Network sync ---
     if (ws && ws.readyState === WebSocket.OPEN && myAlive) {
       stateTimer += dt;
       if (stateTimer >= STATE_INTERVAL) {
@@ -1966,7 +1574,6 @@ export async function startGame(opts = {}) {
         }));
       }
     }
-    // Tick host-driven multiplayer bots and broadcast their positions.
     if (!isSolo && mpBots.length > 0 && !matchOver) {
       mpBotStateTimer += dt;
       const sendBotState = mpBotStateTimer >= STATE_INTERVAL;
@@ -1983,18 +1590,12 @@ export async function startGame(opts = {}) {
         }
       }
     }
-
-    // Smooth remote players toward their last reported pose.
     const remoteLerp = 1 - Math.pow(0.001, dt * 8);
     for (const r of remotePlayers.values()) {
-      // Solo bots and host-driven mp bots write position directly; lerp is for network players only.
       if (r.isBot && (isSolo || r.isMpBot)) continue;
       r.ship.position.lerp(r.targetPos, remoteLerp);
       r.ship.quaternion.slerp(r.targetQuat, remoteLerp);
     }
-
-    // Solo: tick all bots' AI, run respawn timers for bots + player, and
-    // count down the match timer.
     if (isSolo) {
       for (const b of bots) {
         if (b.record.alive) {
@@ -2013,7 +1614,6 @@ export async function startGame(opts = {}) {
         renderMatchHud();
         if (matchTimer <= 0) endMatch();
       }
-
       if (isTrialsMode && cpMeshes.length > 0) {
         if (cpCooldown > 0) {
           cpCooldown -= dt;
@@ -2025,7 +1625,6 @@ export async function startGame(opts = {}) {
           const wasAtStart = trialsNextCp === 0;
           trialsNextCp = (trialsNextCp + 1) % TRIAL_CPS.length;
           cpCooldown = 1.5;
-
           if (wasAtStart) {
             if (!trialsRunning) {
               trialsRunning = true;
@@ -2042,18 +1641,14 @@ export async function startGame(opts = {}) {
               trialsLap++;
             }
           }
-
           cpMeshes[trialsNextCp].material.color.setHex(0x66ffcc);
           cpMeshes[trialsNextCp].material.opacity = 0.9;
           updateTrialsHud();
         }
-
         if (trialsRunning && myAlive) {
           trialsTimer += dt;
           updateTrialsHud();
         }
-
-        // Animate tracer dots flowing from ship toward the next checkpoint.
         if (tracerDots.length > 0) {
           if (myAlive) {
             const target = TRIAL_CPS[trialsNextCp];
@@ -2070,20 +1665,11 @@ export async function startGame(opts = {}) {
           }
         }
       }
-
       if (isCampaign && !campaignOver) {
         updateCampaign(dt);
       }
     }
-
-
     if (tutorial) tutorial.update(dt);
-
-    // --- Targeting computer ---
-    // Player crosshair: raycast from muzzle along ship-forward, anchor the
-    // reticle to whatever it hits (or BEAM_RANGE if empty space). This
-    // sidesteps camera parallax — the reticle sits on the actual hit point
-    // of an instant shot, so it always lines up with the beam visually.
     const W = window.innerWidth, H = window.innerHeight;
     const projTmp = new THREE.Vector3();
     const aimFwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
@@ -2093,18 +1679,13 @@ export async function startGame(opts = {}) {
     projTmp.copy(reticleAimWorld).project(camera);
     const reticleX = (projTmp.x * 0.5 + 0.5) * W;
     const reticleY = (-projTmp.y * 0.5 + 0.5) * H;
-
     const reticleEl = document.getElementById('reticle');
     if (reticleEl) {
       reticleEl.style.left = reticleX + 'px';
       reticleEl.style.top = reticleY + 'px';
     }
-
     let bestAlignment = Infinity;
     let anyVisible = false;
-    // Show target box whenever the diamond marker is visible so there is no
-    // confusing gap where you see the blip but not the stats. Aim-assist
-    // still only engages within ASSIST_RANGE (1000u).
     const TARGETING_MAX_DIST = MARKER_VISIBLE_DIST;
     for (const r of remotePlayers.values()) {
       if (!r.alive || !r.hasTarget) {
@@ -2114,14 +1695,7 @@ export async function startGame(opts = {}) {
         continue;
       }
       const dist = ship.position.distanceTo(r.ship.position);
-      // Fog-of-war: hide the ship mesh, marker, and (via separate caps
-      // above) trails / box past MARKER_VISIBLE_DIST. Three.js was
-      // rendering the silhouette out to the camera's 5000u far plane,
-      // which leaked enemy positions long before the diamond appeared.
       r.ship.visible = dist <= MARKER_VISIBLE_DIST;
-      // Hit flash: spike on HP drop, ramp down over ~0.25s. Drives the
-      // emissive of every Mesh in the ship Group toward white so the
-      // whole hull pulses on damage.
       if (r.hitFlash > 0) {
         r.hitFlash = Math.max(0, r.hitFlash - dt * 4);
         const f = r.hitFlash;
@@ -2131,10 +1705,6 @@ export async function startGame(opts = {}) {
           }
         });
       }
-      // Overhead diamond marker: shows from MARKER_VISIBLE_DIST so distant
-      // pilots register as a colored blip before the full target box
-      // appears at closer range. Doesn't care about team — friendlies and
-      // enemies both blip, you just read their color.
       if (r.marker) r.marker.visible = dist <= MARKER_VISIBLE_DIST;
       const isTeammate = r.team !== null && r.team !== undefined && r.team === myTeam;
       if (isTeammate) {
@@ -2147,10 +1717,6 @@ export async function startGame(opts = {}) {
         r.lead.style.display = 'none';
         continue;
       }
-      // Line-of-sight: if any asteroid intersects the ray from us to the
-      // target closer than the target itself, the target is occluded.
-      // Same check the aim assist uses, so visual and lock-on stay in
-      // sync — hide behind a rock and the HUD goes blind too.
       const losDx = (r.ship.position.x - ship.position.x) / dist;
       const losDy = (r.ship.position.y - ship.position.y) / dist;
       const losDz = (r.ship.position.z - ship.position.z) / dist;
@@ -2165,9 +1731,6 @@ export async function startGame(opts = {}) {
         if (hit !== null && hit < dist) { occluded = true; break; }
       }
       if (!occluded) {
-        // Static obstacles (moon) hide the target box too — without this,
-        // the lead marker shows through the moon and the reticle locks
-        // on a target the bullets can't actually reach.
         for (const o of obstacles) {
           const hit = raySphereDist(
             ship.position.x, ship.position.y, ship.position.z,
@@ -2198,14 +1761,10 @@ export async function startGame(opts = {}) {
       r.box.style.top = sy + 'px';
       const targetName = scores.get(r.id)?.name || `P${r.id}`;
       r.label.textContent = `${targetName}  HP ${r.hp}`;
-
-      // Lead marker stays on the enemy ship itself — no motion prediction.
-      // sx/sy were already projected just above for the target box.
       r.lead.style.display = '';
       r.lead.style.left = sx + 'px';
       r.lead.style.top = sy + 'px';
       const lx = sx, ly = sy;
-
       const dx = lx - reticleX, dy = ly - reticleY;
       const screenDist = Math.sqrt(dx * dx + dy * dy);
       r.lead.classList.toggle('aligned', screenDist < 22);
@@ -2214,7 +1773,6 @@ export async function startGame(opts = {}) {
     if (reticleEl) {
       reticleEl.classList.toggle('locked', anyVisible && bestAlignment < 22);
     }
-
     if (hud) {
       const tPct = Math.round((throttle / MAX_THROTTLE) * 100);
       const gunLabel = gunMode === 'beam' ? 'BEAM (3 ammo)' : 'BULLET';
@@ -2227,24 +1785,19 @@ export async function startGame(opts = {}) {
       hud.textContent =
         `${status}   Speed: ${shipVelocity.length().toFixed(1)} u/s   X:${x} Y:${y} Z:${z}   Asteroids: ${asteroids.list.length}   Players: ${remotePlayers.size + 1}`;
     }
-
     if (hpFill && hpText) {
       const pct = Math.max(0, myHp / SHIP_MAX_HP);
       hpFill.style.width = (pct * 100).toFixed(1) + '%';
-      // Hue shifts green → yellow → red as HP drops.
       const hue = Math.round(pct * 120);
       hpFill.style.background = `linear-gradient(180deg, hsl(${hue}, 80%, 60%) 0%, hsl(${hue}, 70%, 38%) 100%)`;
       hpText.textContent = `${myHp} / ${SHIP_MAX_HP}`;
     }
-    // Hit vignette: spike on any HP drop while alive, decay otherwise.
     if (myAlive && myHp < prevHpForFlash) {
       vignetteAlpha = 1;
     }
     prevHpForFlash = myHp;
     vignetteAlpha = Math.max(0, vignetteAlpha - VIGNETTE_DECAY * dt);
     if (hitVignette) hitVignette.style.opacity = vignetteAlpha.toFixed(3);
-    // Spawn protection: tick down + flicker the ship at 6Hz so the player
-    // can see they're invulnerable. When timer hits 0 the ship goes solid.
     if (myInvulnTimer > 0) {
       myInvulnTimer = Math.max(0, myInvulnTimer - dt);
       if (myAlive) {
@@ -2256,9 +1809,6 @@ export async function startGame(opts = {}) {
       deathBanner.style.display = myAlive ? 'none' : 'block';
     }
   }
-
-  // Brief on-screen toast when aim assist is toggled. Reuses (or creates)
-  // a single floating div so repeated toggles just refresh the text.
   let aimAssistToastEl = null;
   let aimAssistToastTimer = null;
   function showAimAssistToast(on) {
@@ -2279,45 +1829,30 @@ export async function startGame(opts = {}) {
       if (aimAssistToastEl) aimAssistToastEl.style.display = 'none';
     }, 1500);
   }
-
   const killfeedEl = document.getElementById('killfeed');
   function pushKillFeed(killerName, victimName, isYouKiller, isYouVictim) {
     if (!killfeedEl) return;
     const entry = document.createElement('div');
     entry.className = 'kf-entry';
-
     const kEl = document.createElement('span');
     kEl.className = 'kf-killer' + (isYouKiller ? ' kf-you' : '');
     kEl.textContent = killerName;
-
     const iEl = document.createElement('span');
     iEl.className = 'kf-icon';
     iEl.textContent = '→';
-
     const vEl = document.createElement('span');
     vEl.className = 'kf-victim' + (isYouVictim ? ' kf-you' : '');
     vEl.textContent = victimName;
-
     entry.appendChild(kEl);
     entry.appendChild(iEl);
     entry.appendChild(vEl);
     killfeedEl.insertBefore(entry, killfeedEl.firstChild);
     while (killfeedEl.children.length > 5) killfeedEl.removeChild(killfeedEl.lastChild);
-
     setTimeout(() => {
       entry.classList.add('kf-fading');
       setTimeout(() => { if (entry.parentNode) entry.parentNode.removeChild(entry); }, 420);
     }, 3600);
   }
-
-  // Aim assist: damped magnetic pull toward closest enemy in the forward
-  // cone. Two layers of smoothing prevent jank:
-  //   1. assistStrengthSmoothed ramps up/down as targets enter/exit cone.
-  //   2. assistTargetDir lerps toward the current target's lead point, so
-  //      switching targets doesn't snap — the pull arcs across smoothly.
-  // Lead correction: the pull aims at where the bullet will arrive, not
-  // where the enemy currently is. That's the difference between "the
-  // crosshair tracks them" and "your shots actually hit."
   const _assistFwd = new THREE.Vector3();
   const _assistTo = new THREE.Vector3();
   const _assistLead = new THREE.Vector3();
@@ -2333,10 +1868,6 @@ export async function startGame(opts = {}) {
       assistHasTarget = false;
       return;
     }
-    // Player-intent damper: any deliberate steering scales pull down so
-    // the lock yields when you try to switch targets or evade. Quadratic
-    // so light corrections leave most of the help intact, but moderate
-    // input slips it fast.
     const intentDamp = Math.max(0, 1 - steerMag / ASSIST_INTENT_BREAK);
     const intentFactor = intentDamp * intentDamp;
     if (intentFactor <= 0) {
@@ -2345,21 +1876,12 @@ export async function startGame(opts = {}) {
       return;
     }
     _assistFwd.set(0, 0, 1).applyQuaternion(ship.quaternion);
-
-    // Find the best target this frame. Aim/score against each enemy's
-    // lead point (where a bullet would actually intercept them) so the
-    // assist commits to the same point that bullets will hit. Sticky
-    // bonus on whoever was the previous target keeps the lock from
-    // hopping between equidistant enemies.
     let bestDot = ASSIST_CONE_DOT;
     let bestTarget = null;
     let bestLead = null;
     for (const r of remotePlayers.values()) {
       if (!r.alive || !r.hasTarget) continue;
       if (r.team !== null && r.team !== undefined && r.team === myTeam) continue;
-      // Lead-corrected aim point. solveIntercept can return null for
-      // unreachable targets (e.g. fleeing faster than bullets) — fall
-      // back to the raw position in that case.
       const t = solveIntercept(r.ship.position, r.vel, ship.position, shipVelocity, BULLET_SPEED);
       if (t !== null && t > 0 && Number.isFinite(t)) {
         _assistLead.copy(r.vel).multiplyScalar(t).add(r.ship.position);
@@ -2370,11 +1892,6 @@ export async function startGame(opts = {}) {
       const dist = _assistTo.length();
       if (dist > ASSIST_RANGE || dist < ASSIST_MIN_RANGE) continue;
       _assistTo.divideScalar(dist);
-      // Line-of-sight: if any asteroid OR static obstacle intersects the
-      // ray to the lead point inside that distance, the target is blocked
-      // — skip. This mirrors what the player's actual bullets would do
-      // (rocks + moon block shots) so the lock can't drag your nose
-      // through cover.
       let blocked = false;
       for (const a of asteroids.list) {
         const hit = raySphereDist(
@@ -2404,22 +1921,13 @@ export async function startGame(opts = {}) {
         bestLead = _assistLead.clone();
       }
     }
-
-    // Smooth on/off as a target enters/leaves the cone — the actual pull
-    // strength comes from the angle profile below.
     const targetPresence = bestTarget ? 1 : 0;
     assistStrengthSmoothed = THREE.MathUtils.damp(assistStrengthSmoothed, targetPresence, 6, dt);
-
     if (bestTarget) {
       _assistTo.subVectors(bestLead, ship.position).normalize();
       if (!assistHasTarget || lastAssistTargetId !== bestTarget.id) {
-        // First frame seeing this target — seed instead of lerping from a
-        // stale direction so the pull starts in the right place.
         assistTargetDir.copy(_assistTo);
       } else {
-        // Tighter lerp than before (12 vs 8) — with sticky targeting the
-        // direction doesn't need slack for cross-target arcs, and faster
-        // tracking means the lead point stays accurate as the enemy moves.
         assistTargetDir.lerp(_assistTo, 1 - Math.exp(-12 * dt));
         assistTargetDir.normalize();
       }
@@ -2429,17 +1937,9 @@ export async function startGame(opts = {}) {
       assistHasTarget = false;
       lastAssistTargetId = null;
     }
-
     if (assistStrengthSmoothed < 0.01 || !assistHasTarget) return;
-
     const angle = _assistFwd.angleTo(assistTargetDir);
-    // Dead zone: don't pull at all when crosshair is on/near target so
-    // arrow-key fine-aim stays free.
     if (angle <= ASSIST_DEAD_ANGLE) return;
-    // Falloff zone: pull strength ramps from 0 (at the dead-angle edge)
-    // up to full (at FALLOFF_START and beyond). So the pull is strongest
-    // while you're swinging onto the target — exactly when help is most
-    // useful — and fades smoothly to nothing as the crosshair approaches.
     let strengthMult;
     if (angle >= ASSIST_FALLOFF_START) {
       strengthMult = 1.0;
@@ -2458,9 +1958,6 @@ export async function startGame(opts = {}) {
     _assistQ.setFromAxisAngle(_assistAxis, step);
     ship.quaternion.premultiply(_assistQ).normalize();
   }
-
-  // Sphere-vs-AABB. Pushes the sphere out of the box along the shortest
-  // separation axis and reflects velocity along the contact normal.
   function collideSphereWithBox(pos, vel, radius, boxCenter, halfSize) {
     const dx = pos.x - boxCenter.x;
     const dy = pos.y - boxCenter.y;
@@ -2498,25 +1995,15 @@ export async function startGame(opts = {}) {
       vel.z -= 1.4 * vDotN * nz;
     }
   }
-
   function resolveMothershipCollisions() {
     for (const m of motherships) {
       collideSphereWithBox(ship.position, shipVelocity, shipRadius, m.pos, m.halfSize);
     }
   }
-
-  // Per-frame "currently touching" sets. Damage is applied on the rising
-  // edge — the frame contact begins — so a ship wedged against a rock
-  // doesn't take a hit every tick. Carried across frames; resets on
-  // death (the ship is teleported out of contact anyway).
   const touchingAsteroids = new Set();
   let touchingMoon = false;
   let touchingWater = false;
   function dealSelfDamage(dmg) {
-    // Respect spawn protection here as well as in applyPlayerDamageLocal
-    // (the server doesn't know about invuln for self-damage messages, so
-    // the guard has to live client-side to avoid being one-shot mid-
-    // respawn flicker by a rock you spawned next to).
     if (myInvulnTimer > 0) return;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'self-damage', dmg }));
@@ -2524,7 +2011,6 @@ export async function startGame(opts = {}) {
       applyPlayerDamageLocal(dmg);
     }
   }
-
   function resolveCollisions() {
     const nextAsteroids = new Set();
     for (const a of asteroids.list) {
@@ -2547,9 +2033,6 @@ export async function startGame(opts = {}) {
           shipVelocity.z -= 1.3 * vDotN * nz;
         }
         nextAsteroids.add(a);
-        // Rising-edge damage: 15–29 HP per fresh contact. Tutorial is
-        // exempt so a first-time pilot bumping a rock doesn't die mid-
-        // lesson — same exemption the drift-overload damage uses.
         if (!touchingAsteroids.has(a) && SOLO_MODE !== 'tutorial') {
           const dmg = 15 + Math.floor(Math.random() * 15); // [15, 29]
           dealSelfDamage(dmg);
@@ -2558,10 +2041,6 @@ export async function startGame(opts = {}) {
     }
     touchingAsteroids.clear();
     for (const a of nextAsteroids) touchingAsteroids.add(a);
-
-    // Static obstacles (moon): same sphere bounce, but a fresh contact
-    // is instantly fatal. Send a max-HP self-damage so the server kills
-    // us authoritatively; solo applies locally.
     let moonContactThisFrame = false;
     for (const o of obstacles) {
       const dx = ship.position.x - o.pos.x;
@@ -2589,8 +2068,6 @@ export async function startGame(opts = {}) {
       }
     }
     touchingMoon = moonContactThisFrame;
-
-    // Terrain map: ground surface is an instant-kill floor.
     if (isTerrainMap) {
       const groundY = getTerrainHeight(ship.position.x, ship.position.z);
       const killY = groundY + TERRAIN_KILL_CLEARANCE;
@@ -2600,32 +2077,20 @@ export async function startGame(opts = {}) {
         if (!touchingWater && SOLO_MODE !== 'tutorial') {
           dealSelfDamage(SHIP_MAX_HP);
         }
-        touchingWater = true; // reuse rising-edge flag
+        touchingWater = true;
       } else {
         touchingWater = false;
       }
     }
   }
-
-  // --- Solo mode wiring -------------------------------------------------
-  // 'train' = 1v1 vs one bot, shorter timer so practice sessions wrap naturally.
-  // Bots reuse the remote-player render pipeline; damage and respawns are
-  // applied locally. Each bot is fed an `entity` for the player and other
-  // bots so its targeting can pick the closest opponent.
   const SOLO_MODE = isSolo ? (opts.mode || 'train') : null;
-  // isCampaign and CAMPAIGN_MISSION are hoisted near the top of startGame
   const myTeam = isSolo ? 0 : (opts.spawn?.team ?? 0);
   const MATCH_DURATION = SOLO_MODE === 'train' ? 180 : 300;
   const teamKills = [0, 0];
   let matchTimer = MATCH_DURATION;
   let matchOver = false;
-  // Train and any networked match show the team HUD + win banner. Solo ticks
-  // the timer locally; MP receives match-state from the server. Tutorial is
-  // excluded — it's a guided lesson, not a match.
   const matchActive = SOLO_MODE === 'skirmish' || SOLO_MODE === 'train' || !isSolo;
   let soloBotsKilled = 0;
-
-  // ── Campaign mode state ───────────────────────────────────────────────────
   const BOSS_ID_BASE = 9000;
   const BOSS_HITBOX_COUNT = 20;
   const BOSS_MAX_HP = 2500;
@@ -2652,34 +2117,26 @@ export async function startGame(opts = {}) {
     'OPERATION: STORMFRONT\nHeavier defenses stand between you and the dreadnought',
     'OPERATION: FINAL SIEGE\nEverything or nothing — destroy the flagship and end it',
   ];
-  // 20 hitboxes in a 4×5 grid covering the full 200W × 360L ship footprint.
-  // X: ±85, ±28  |  Z: ±150, ±75, 0  (+bridge row at top)
   const BOSS_HB_OFFSETS_WORLD = [
-    // stern row  (z = -150)
     new THREE.Vector3(-85, 0, -150),
     new THREE.Vector3(-28, 0, -150),
     new THREE.Vector3(28, 0, -150),
     new THREE.Vector3(85, 0, -150),
-    // mid-stern  (z = -75)
     new THREE.Vector3(-85, 0, -75),
     new THREE.Vector3(-28, 0, -75),
     new THREE.Vector3(28, 0, -75),
     new THREE.Vector3(85, 0, -75),
-    // centre     (z = 0)
     new THREE.Vector3(-85, 0, 0),
     new THREE.Vector3(0, 0, 0),
     new THREE.Vector3(85, 0, 0),
-    // mid-bow    (z = +75)
     new THREE.Vector3(-85, 0, 75),
     new THREE.Vector3(-28, 0, 75),
     new THREE.Vector3(28, 0, 75),
     new THREE.Vector3(85, 0, 75),
-    // bow row    (z = +150)
     new THREE.Vector3(-85, 0, 150),
     new THREE.Vector3(-28, 0, 150),
     new THREE.Vector3(28, 0, 150),
     new THREE.Vector3(85, 0, 150),
-    // bridge     (top superstructure)
     new THREE.Vector3(0, 30, 50),
   ];
   let campaignPhase = 0;
@@ -2702,12 +2159,9 @@ export async function startGame(opts = {}) {
   let capitalShipTurrets = [];
   let capitalShipTime = 0;
   const CAPITAL_SHIP_BASE_POS = new THREE.Vector3(0, 0, 600);
-
-  // ── Achievement toast queue ───────────────────────────────────────────────
   const _achToastContainer = document.getElementById('achievement-toasts');
   let _achQueue = [];
   let _achTimer = null;
-
   function _flushAchQueue() {
     if (!_achQueue.length) { _achTimer = null; return; }
     const { icon, label, reward } = _achQueue.shift();
@@ -2729,13 +2183,11 @@ export async function startGame(opts = {}) {
     }
     _achTimer = setTimeout(_flushAchQueue, 900);
   }
-
   function queueAchievementToasts(earned) {
     if (!Array.isArray(earned) || !earned.length) return;
     _achQueue.push(...earned);
     if (!_achTimer) _flushAchQueue();
   }
-
   function stashAchievementsForHangar(earned) {
     if (!Array.isArray(earned) || !earned.length) return;
     try {
@@ -2743,11 +2195,9 @@ export async function startGame(opts = {}) {
       localStorage.setItem('spaceships:pendingAchs', JSON.stringify([...existing, ...earned]));
     } catch { }
   }
-
   function updateCachedCredits(total) {
     if (Number.isFinite(total)) localStorage.setItem('spaceships:credits', String(total));
   }
-
   async function reportSoloResult(kills, deaths, won, botsKilled) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
@@ -2769,7 +2219,6 @@ export async function startGame(opts = {}) {
       console.warn('[solo-result] could not report:', e);
     }
   }
-
   async function reportCampaignResult(missionNum, livesRemaining) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
@@ -2791,7 +2240,6 @@ export async function startGame(opts = {}) {
       console.warn('[campaign-result] could not report:', e);
     }
   }
-
   async function reportTrialTime(trialNum, time) {
     const token = localStorage.getItem('spaceships:token');
     if (!token) return;
@@ -2813,7 +2261,6 @@ export async function startGame(opts = {}) {
       console.warn('[trial-result] could not report:', e);
     }
   }
-
   function makeBotEntity(r) {
     return {
       id: r.id,
@@ -2836,17 +2283,12 @@ export async function startGame(opts = {}) {
       applyPlayerDamageLocal(dmg, killerId, killerTeam);
     },
   };
-
-  // Minimal record used by remote missiles that are targeting the local player.
-  // The missile system reads .alive and .ship.position each frame, so getters
-  // ensure it always reflects current state without any per-frame updates.
   const localShipRecord = {
     get alive() { return myAlive; },
-    ship,  // ship.position is the live Three.js position
+    ship,
   };
-
-  const bots = []; // { id, team, record, ai, entity }
-  const mpBots = []; // host-driven hard-mode bots for multiplayer team balance
+  const bots = [];
+  const mpBots = [];
   let mpBotStateTimer = 0;
   function spawnBot(id, team, position, name) {
     const r = getOrCreateRemote(id);
@@ -2874,12 +2316,8 @@ export async function startGame(opts = {}) {
       distanceVol,
       hardMode: !!opts.hardMode,
       terrainHeightFn: isTerrainMap ? getTerrainHeight : null,
-      // Regular bots carry a single missile per life; secret hard mode bots
-      // get a full rack of 3 like players. Restocked by notifyRespawn().
       missileMax: opts.hardMode ? 3 : 1,
       fireMissile: (targetEntity) => {
-        // Resolve the homing record: localShipRecord for the player (keeps
-        // the HUD missile-lock warning working), remote record for bots.
         const targetRecord = targetEntity.id === myId
           ? localShipRecord
           : (remotePlayers.get(targetEntity.id) ?? null);
@@ -2904,9 +2342,6 @@ export async function startGame(opts = {}) {
     }
     return bot;
   }
-
-  // ── Campaign helpers ──────────────────────────────────────────────────────
-
   function updateCampaignHud() {
     if (!isCampaign) return;
     const waveEl = document.getElementById('campaign-wave');
@@ -2933,7 +2368,6 @@ export async function startGame(opts = {}) {
       if (enemyEl) enemyEl.textContent = '';
     }
   }
-
   function showCampaignMsg(text, duration) {
     const el = document.getElementById('campaign-msg');
     const textEl = document.getElementById('campaign-msg-text');
@@ -2941,13 +2375,11 @@ export async function startGame(opts = {}) {
     if (el) el.style.display = 'flex';
     campaignMsgTimer = duration;
   }
-
   function updateCampaignLivesDisplay() {
     const el = document.getElementById('campaign-lives');
     if (!el) return;
     el.textContent = '❤'.repeat(Math.max(0, campaignLives));
   }
-
   function buildCapitalShip() {
     const group = new THREE.Group();
     const hullMat = new THREE.MeshStandardMaterial({ color: 0x16192a, metalness: 0.75, roughness: 0.38 });
@@ -2955,33 +2387,23 @@ export async function startGame(opts = {}) {
     const glowMat = new THREE.MeshBasicMaterial({ color: 0xff3300 });
     const turretMat = new THREE.MeshStandardMaterial({ color: 0x20283a, metalness: 0.85, roughness: 0.28 });
     const barrelMat = new THREE.MeshStandardMaterial({ color: 0x343d50, metalness: 0.92, roughness: 0.18 });
-
-    // ── Main hull (200 W × 30 H × 360 L) ──────────────────────────────
     const hull = new THREE.Mesh(new THREE.BoxGeometry(200, 30, 360), hullMat);
     group.add(hull);
-
-    // Raised spine along the top
     const spine = new THREE.Mesh(new THREE.BoxGeometry(40, 10, 340), hullMat);
     spine.position.set(0, 20, 0);
     group.add(spine);
-
-    // Side wing pods (extend hull width to ~280 at mid-ship)
     for (const sx of [-115, 115]) {
       const wing = new THREE.Mesh(new THREE.BoxGeometry(36, 16, 260), hullMat);
       wing.position.set(sx, -5, 0);
       group.add(wing);
-      // Red accent stripe on each wing
       const stripe = new THREE.Mesh(new THREE.BoxGeometry(38, 3, 260), accentMat);
       stripe.position.set(sx, 7, 0);
       group.add(stripe);
-      // Wingtip lights
       const tipMat = new THREE.MeshBasicMaterial({ color: 0xff2200 });
       const tipLight = new THREE.Mesh(new THREE.SphereGeometry(2.5, 6, 4), tipMat);
       tipLight.position.set(sx, 0, 0);
       group.add(tipLight);
     }
-
-    // ── Superstructure / bridge tower ─────────────────────────────────
     const bridge = new THREE.Mesh(new THREE.BoxGeometry(60, 30, 110), hullMat);
     bridge.position.set(0, 30, 55);
     group.add(bridge);
@@ -2990,20 +2412,15 @@ export async function startGame(opts = {}) {
     );
     dome.position.set(0, 46, 65);
     group.add(dome);
-    // Bridge windows (emissive cyan strips)
     const winMat = new THREE.MeshBasicMaterial({ color: 0x44aaff, transparent: true, opacity: 0.8 });
     const winRow = new THREE.Mesh(new THREE.BoxGeometry(52, 4, 2), winMat);
     winRow.position.set(0, 32, 112);
     group.add(winRow);
-
-    // ── Red accent stripes across hull ────────────────────────────────
     for (const z of [-120, -40, 40, 120]) {
       const acc = new THREE.Mesh(new THREE.BoxGeometry(202, 3, 4), accentMat);
       acc.position.set(0, 10, z);
       group.add(acc);
     }
-
-    // ── Rear engine bank (8 engines spread across width) ──────────────
     const enginePositions = [
       [-80, -4], [-48, -4], [-16, -4], [16, -4], [48, -4], [80, -4],
       [-38, 10], [38, 10],
@@ -3021,8 +2438,6 @@ export async function startGame(opts = {}) {
     const engLight = new THREE.PointLight(0xff3300, 4.5, 240);
     engLight.position.set(0, 0, -195);
     group.add(engLight);
-
-    // ── Running lights ────────────────────────────────────────────────
     const runMat = new THREE.MeshBasicMaterial({ color: 0xffaa22 });
     for (let i = -6; i <= 6; i++) {
       if (i === 0) continue;
@@ -3030,8 +2445,6 @@ export async function startGame(opts = {}) {
       dot.position.set((i / 6) * 95, 16, 170);
       group.add(dot);
     }
-
-    // ── 4 turrets: outer-front ×2 and outer-aft ×2 ───────────────────
     const turretLocalPositions = [
       new THREE.Vector3(-80, 18, 110),
       new THREE.Vector3(80, 18, 110),
@@ -3057,21 +2470,16 @@ export async function startGame(opts = {}) {
       pivot.add(muzzleLight);
       capitalShipTurrets.push({ pivot, muzzleLight, localPos: tPos.clone(), fireTimer: i * 0.85 + 0.4 });
     }
-
     group.position.copy(CAPITAL_SHIP_BASE_POS);
     group.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
     scene.add(group);
     return group;
   }
-
   function updateCapitalShip(dt) {
     if (!capitalShipMesh || !bossActive || campaignOver) return;
     capitalShipTime += dt;
-    // Slow patrol drift
     capitalShipMesh.position.x = CAPITAL_SHIP_BASE_POS.x + 88 * Math.sin(capitalShipTime * 0.09);
     capitalShipMesh.position.y = CAPITAL_SHIP_BASE_POS.y + 9 * Math.sin(capitalShipTime * 0.055);
-
-    // Sync hitbox world positions to follow the ship
     for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
       const r = remotePlayers.get(BOSS_ID_BASE + i);
       if (r) {
@@ -3079,26 +2487,18 @@ export async function startGame(opts = {}) {
         r.targetPos.copy(r.ship.position);
       }
     }
-
-    // Turrets: aim and fire
     const invQ = capitalShipMesh.quaternion.clone().invert();
     for (const t of capitalShipTurrets) {
-      // World position of turret muzzle
       const muzzleWorld = new THREE.Vector3(0, 1.8, 22).applyQuaternion(t.pivot.quaternion);
       muzzleWorld.add(t.pivot.position).applyQuaternion(capitalShipMesh.quaternion).add(capitalShipMesh.position);
-
-      // Direction from turret pivot to player (in world space)
       const pivotWorld = t.pivot.position.clone().applyQuaternion(capitalShipMesh.quaternion).add(capitalShipMesh.position);
       const toPlayer = ship.position.clone().sub(pivotWorld);
-      // Convert to ship local space for pivot rotation
       const localDir = toPlayer.clone().applyQuaternion(invQ);
       const yaw = Math.atan2(localDir.x, localDir.z);
       const horizDist = Math.sqrt(localDir.x * localDir.x + localDir.z * localDir.z);
       const pitch = -Math.atan2(localDir.y, horizDist);
       t.pivot.rotation.y = yaw;
       t.pivot.rotation.x = Math.max(-0.7, Math.min(0.7, pitch));
-
-      // Fire
       if (myAlive) {
         t.fireTimer -= dt;
         if (t.fireTimer <= 0) {
@@ -3119,7 +2519,6 @@ export async function startGame(opts = {}) {
       }
     }
   }
-
   function spawnCampaignWave(waveIdx) {
     const wave = CAMPAIGN_WAVES[waveIdx];
     campaignWaveBotIds.clear();
@@ -3139,7 +2538,6 @@ export async function startGame(opts = {}) {
     }
     updateCampaignHud();
   }
-
   function applyBossHit(dmg) {
     if (!bossActive || campaignOver) return;
     bossHp = Math.max(0, bossHp - dmg);
@@ -3148,12 +2546,10 @@ export async function startGame(opts = {}) {
     updateCampaignHud();
     if (bossHp <= 0) endCampaignVictory();
   }
-
   function activateBossPhase() {
     bossActive = true;
     bossHp = BOSS_MAX_HP;
     bossFireTimer = 2.0;
-    // Sync hitbox world positions with capital ship current position
     for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
       const r = remotePlayers.get(BOSS_ID_BASE + i);
       if (r) {
@@ -3167,13 +2563,11 @@ export async function startGame(opts = {}) {
     scores.set(BOSS_ID_BASE, { name: 'Capital Ship', kills: 0, deaths: 0, team: 1 });
     const barEl = document.getElementById('campaign-boss-bar');
     if (barEl) barEl.style.display = 'flex';
-    // Red ambient glow — attach as child of capital ship so it follows
     const bossGlow = new THREE.PointLight(0xff2200, 3.5, 320);
     bossGlow.position.set(0, 30, -20);
     if (capitalShipMesh) capitalShipMesh.add(bossGlow); else scene.add(bossGlow);
     updateCampaignHud();
   }
-
   function fireFromBoss() {
     if (!myAlive || !bossActive) return;
     const hpFrac = bossHp / BOSS_MAX_HP;
@@ -3192,10 +2586,8 @@ export async function startGame(opts = {}) {
     }
     audio.play('shoot');
   }
-
   function updateBoss(dt) {
     if (!bossActive || campaignOver) return;
-    // Turrets handle firing; updateBoss only sweeps boss bullets for player hits
     const PLAYER_HIT_R = 7.0;
     const BOSS_BULLET_DMG = 14;
     for (let i = bossBullets.length - 1; i >= 0; i--) {
@@ -3214,7 +2606,6 @@ export async function startGame(opts = {}) {
       }
     }
   }
-
   function endCampaignVictory() {
     campaignOver = true;
     campaignPhase = 4;
@@ -3262,10 +2653,8 @@ export async function startGame(opts = {}) {
     }, 4500);
     updateCampaignHud();
   }
-
   function updateCampaign(dt) {
     if (campaignOver) return;
-
     if (campaignMsgTimer > 0) {
       campaignMsgTimer -= dt;
       if (campaignMsgTimer <= 0) {
@@ -3273,7 +2662,6 @@ export async function startGame(opts = {}) {
         if (el) el.style.display = 'none';
       }
     }
-
     if (campaignBetween) {
       campaignBetweenTimer -= dt;
       if (campaignBetweenTimer <= 0) {
@@ -3286,7 +2674,6 @@ export async function startGame(opts = {}) {
       }
       return;
     }
-
     if (campaignPhase < 3) {
       let alive = 0;
       for (const id of campaignWaveBotIds) {
@@ -3300,7 +2687,6 @@ export async function startGame(opts = {}) {
       if (alive === 0 && campaignWaveBotIds.size > 0) {
         campaignWaveBotIds.clear();
         if (campaignPhase < 2) {
-          // Save checkpoint ahead of the next wave zone
           const nextWave = CAMPAIGN_WAVES[campaignPhase + 1];
           campaignCheckpointPos = [0, 20, (nextWave?.spawnZ ?? 20) - 80];
           campaignPhase++;
@@ -3308,7 +2694,7 @@ export async function startGame(opts = {}) {
           campaignBetween = true;
           campaignBetweenTimer = 3.5;
         } else {
-          campaignCheckpointPos = [0, 10, 450]; // near boss entrance
+          campaignCheckpointPos = [0, 10, 450];
           campaignPhase = 3;
           showCampaignMsg('CAPITAL SHIP SHIELDS OFFLINE\nPrepare to engage', 4.5);
           campaignBetween = true;
@@ -3320,8 +2706,6 @@ export async function startGame(opts = {}) {
       updateBoss(dt);
       updateCapitalShip(dt);
     }
-
-    // Warp-flash fade timer
     if (campaignWarpActive) {
       campaignWarpTimer -= dt;
       if (campaignWarpTimer <= 0) {
@@ -3331,7 +2715,6 @@ export async function startGame(opts = {}) {
       }
     }
   }
-
   function spawnSoloEntities() {
     if (SOLO_MODE === 'train') {
       const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
@@ -3354,12 +2737,9 @@ export async function startGame(opts = {}) {
     }
   }
   if (isSolo) spawnSoloEntities();
-
-  // Campaign: build the custom capital ship mesh and register boss hitboxes.
-  // Hitboxes start inactive (alive=false) and are enabled in activateBossPhase().
   if (isCampaign) {
     capitalShipMesh = buildCapitalShip();
-    const bossCenter = CAPITAL_SHIP_BASE_POS; // use constant start pos for initial hitbox placement
+    const bossCenter = CAPITAL_SHIP_BASE_POS;
     for (let i = 0; i < BOSS_HITBOX_COUNT; i++) {
       const hbGroup = new THREE.Group();
       hbGroup.position.copy(bossCenter).add(BOSS_HB_OFFSETS_WORLD[i]);
@@ -3380,7 +2760,7 @@ export async function startGame(opts = {}) {
         alive: false,
         team: 1,
         hasTarget: false,
-        isBot: true,   // prevents network-lerp pass touching it
+        isBot: true,
         isBossHitbox: true,
         hp: BOSS_MAX_HP,
         hitFlash: 0,
@@ -3393,8 +2773,6 @@ export async function startGame(opts = {}) {
       });
     }
   }
-
-  // Spawn host-driven bots for multiplayer team balancing.
   function spawnMultiplayerBot(id, team, spawnPos, spawnQuat) {
     scores.set(id, { name: 'Bot [Hard]', team, kills: 0, deaths: 0 });
     const r = getOrCreateRemote(id);
@@ -3409,8 +2787,6 @@ export async function startGame(opts = {}) {
     r.targetPos.copy(spawnPos);
     r.targetQuat.copy(spawnQuat);
     r.hasTarget = true;
-
-    // Entities for opponent lookup — takeHit routes damage through the server.
     const localOpponent = {
       id: myId,
       get team() { return myTeam; },
@@ -3437,7 +2813,6 @@ export async function startGame(opts = {}) {
         },
       };
     }
-
     const ai = createBotAI(r, {
       team,
       faction: team === myTeam ? 'ally' : 'enemy',
@@ -3445,7 +2820,6 @@ export async function startGame(opts = {}) {
       solveIntercept, raySphereDist, audio, distanceVol,
       hardMode: true,
       terrainHeightFn: isTerrainMap ? getTerrainHeight : null,
-      // Hard mode bots fly with a player-sized rack of 3 missiles per life.
       missileMax: 3,
       fireMissile: (targetEntity) => {
         const targetRecord = targetEntity.id === myId
@@ -3456,7 +2830,6 @@ export async function startGame(opts = {}) {
         const mslOrigin = r.ship.position.clone().addScaledVector(fwd, 6);
         missileSystem.fire(mslOrigin, fwd, targetRecord, id, team);
         audio.play('shoot', distanceVol(r.ship.position));
-        // Relay so every other client spawns the same homing missile.
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
             type: 'bot-fire',
@@ -3493,7 +2866,6 @@ export async function startGame(opts = {}) {
 
     mpBots.push({ id, team, record: r, ai });
   }
-
   if (!isSolo && opts.host && Array.isArray(opts.botAssignments)) {
     for (const ba of opts.botAssignments) {
       const pos = new THREE.Vector3().fromArray(ba.pos || [0, 0, 0]);
@@ -3501,12 +2873,6 @@ export async function startGame(opts = {}) {
       spawnMultiplayerBot(ba.id, ba.team, pos, quat);
     }
   }
-
-  // ---- Tutorial mode ---------------------------------------------------
-  // Step machine that gates progression on real input/state changes, with
-  // an on-screen prompt. After all steps complete the player gets 20s of
-  // free flight, then the page reloads back to the lobby. Player is
-  // damage-immune throughout (no enemies, drift-overload disabled).
   const isTutorial = SOLO_MODE === 'tutorial';
   const tutorial = isTutorial ? createTutorial() : null;
   function createTutorial() {
@@ -3516,14 +2882,11 @@ export async function startGame(opts = {}) {
     const hintEl = document.getElementById('tutorial-hint');
     const fillEl = document.getElementById('tutorial-progress-fill');
     if (panel) panel.style.display = 'block';
-
     const steerHintMouse = 'Move the mouse to aim — yaw the ship 30° to either side.';
     const steerHintKeys = 'Hold Left or Right arrow to yaw the ship 30°.';
     let initialFwd = null;
     let initialUp = null;
     const tmpVec = new THREE.Vector3();
-
-    // Helpers each step reads via closure.
     const steps = [
       {
         prompt: 'Throttle Up',
@@ -3624,7 +2987,6 @@ export async function startGame(opts = {}) {
       hintEl.textContent = step.hint;
       fillEl.style.width = '0%';
     }
-
     function advance() {
       idx += 1;
       if (idx >= steps.length) {
@@ -3635,19 +2997,16 @@ export async function startGame(opts = {}) {
       if (typeof step.onEnter === 'function') step.onEnter();
       show(step);
     }
-
     function finish() {
       promptEl.textContent = 'Complete!';
       hintEl.textContent = 'Returning to menu…';
       fillEl.style.width = '100%';
       setTimeout(() => { window.location.reload(); }, 1200);
     }
-
     function update(dt) {
       if (idx < 0) { advance(); return; }
       if (idx >= steps.length) return;
       const step = steps[idx];
-      // Pass dt to per-step check (held-key timers, free-flight countdown).
       const done = step.check(dt);
       if (step.showCountdown) {
         const left = Math.max(0, 20 - (step.state.t || 0));
@@ -3659,7 +3018,6 @@ export async function startGame(opts = {}) {
 
     return { update, isActive: () => idx >= 0 && idx < steps.length };
   }
-
   function applyHitToBot(id, dmg, killerId, killerTeam) {
     const r = remotePlayers.get(id);
     if (!r || !r.alive) return;
@@ -3691,10 +3049,9 @@ export async function startGame(opts = {}) {
       if (b && b.ai) b.ai.notifyHit();
     }
   }
-
   function applyPlayerDamageLocal(dmg, killerId, killerTeam) {
     if (!myAlive) return;
-    if (myInvulnTimer > 0) return; // spawn protection
+    if (myInvulnTimer > 0) return;
     healthIdleDamage = 0;
     myHp = Math.max(0, myHp - dmg);
     if (myHp <= 0) {
@@ -3713,7 +3070,6 @@ export async function startGame(opts = {}) {
           const returnBtn = document.getElementById('btnFailedReturn');
           if (returnBtn) returnBtn.onclick = () => location.reload();
         } else {
-          // Warp back to last checkpoint
           campaignWarpActive = true;
           campaignWarpTimer = 1.5;
           myRespawnTimer = 1.5;
@@ -3741,7 +3097,6 @@ export async function startGame(opts = {}) {
       renderMatchHud();
     }
   }
-
   function reviveBotLocal(id) {
     const r = remotePlayers.get(id);
     if (!r) return;
@@ -3771,7 +3126,6 @@ export async function startGame(opts = {}) {
     const b = bots.find((b) => b.id === id);
     if (b && b.ai) b.ai.notifyRespawn();
   }
-
   function revivePlayerLocal() {
     myInvulnTimer = SPAWN_INVULN_DURATION;
     let pos, quat;
@@ -3811,8 +3165,6 @@ export async function startGame(opts = {}) {
       myHp = Math.floor(SHIP_MAX_HP * 0.55); // respawn at 55% HP
     }
   }
-
-  // --- Match HUD (timer + team score) ---
   const matchHudEl = document.getElementById('matchhud');
   const matchTimerEl = document.getElementById('matchtimer');
   const team0ScoreEl = document.getElementById('team0score');
@@ -3834,8 +3186,6 @@ export async function startGame(opts = {}) {
     matchHudEl.style.display = 'flex';
     renderMatchHud();
   }
-
-  // --- Trials HUD ----------------------------------------------------------
   const trialsHudEl = document.getElementById('trials-hud');
   const trialsTimerEl = document.getElementById('trials-timer');
   const trialsCpEl = document.getElementById('trials-checkpoint');
@@ -3867,16 +3217,13 @@ export async function startGame(opts = {}) {
     updateCampaignLivesDisplay();
     showCampaignMsg(MISSION_BRIEFINGS[CAMPAIGN_MISSION] || MISSION_BRIEFINGS[1], 4.5);
   }
-
   function endMatch() {
     matchOver = true;
-
     if (isSolo && matchActive) {
       const myScore = scores.get(opts.you) || { kills: 0, deaths: 0 };
       const won = teamKills[0] > teamKills[1] ? true : teamKills[1] > teamKills[0] ? false : null;
       reportSoloResult(myScore.kills, myScore.deaths, won, soloBotsKilled);
     }
-
     let title;
     if (teamKills[0] > teamKills[1]) title = 'BLUE WINS';
     else if (teamKills[1] > teamKills[0]) title = 'RED WINS';
@@ -3886,8 +3233,6 @@ export async function startGame(opts = {}) {
         `${title}<span class="sub">${teamKills[0]} – ${teamKills[1]}</span>` +
         `<button class="lobby-btn" id="btnBackToLobby">Back to Lobby</button>`;
       matchResultEl.style.display = 'block';
-      // Reload restores the pristine lobby — simpler than tearing down the
-      // running scene + WebSocket + bots one piece at a time.
       const btn = matchResultEl.querySelector('#btnBackToLobby');
       if (btn) btn.addEventListener('click', () => {
         const overlay = document.getElementById('ad-overlay');
@@ -3902,15 +3247,10 @@ export async function startGame(opts = {}) {
       });
     }
   }
-
-  // ── Gamepad pause overlay ────────────────────────────────────────────────
-  // The Start / Menu button (button 9) toggles this overlay during gameplay.
-  // D-pad or left stick up/down moves focus; A confirms; Start again closes.
   let pauseOpen = false;
-  let pauseFocusIdx = 0;   // 0 = Resume, 1 = Back to Lobby
+  let pauseFocusIdx = 0;
   let pauseNavCooldown = 0;
   let pausePrevNavUp = false, pausePrevNavDown = false, pausePrevConfirm = false;
-
   const pauseOverlay = document.createElement('div');
   Object.assign(pauseOverlay.style, {
     position: 'fixed', inset: '0', display: 'none',
@@ -3929,11 +3269,9 @@ export async function startGame(opts = {}) {
       A / Click — confirm &nbsp;·&nbsp; Start — close
     </div>`;
   document.body.appendChild(pauseOverlay);
-
-  const pauseResumeBtn    = document.getElementById('pauseResume');
+  const pauseResumeBtn = document.getElementById('pauseResume');
   const pauseBackLobbyBtn = document.getElementById('pauseBackLobby');
   const pauseBtns = [pauseResumeBtn, pauseBackLobbyBtn];
-
   function openPause() {
     pauseOpen = true;
     pauseOverlay.style.display = 'flex';
@@ -3948,16 +3286,11 @@ export async function startGame(opts = {}) {
   pauseBackLobbyBtn.addEventListener('click', () => {
     if (window.confirm('Leave match and return to menu?')) window.location.reload();
   });
-
-  // TAB toggles the scoreboard. One press shows; press again hides. Key
-  // repeat is ignored so holding doesn't ping-pong. Listener is in capture
-  // phase so it pre-empts any focusable element that might steal Tab.
   window.addEventListener('keydown', (e) => {
     if (e.code !== 'Tab' || e.repeat) return;
     e.preventDefault();
     if (scoreboardEl) scoreboardEl.classList.toggle('visible');
   }, true);
-
   function loop() {
     try {
       const dt = Math.min(0.05, clock.getDelta());
@@ -3969,7 +3302,6 @@ export async function startGame(opts = {}) {
     }
     requestAnimationFrame(loop);
   }
-
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
@@ -3981,6 +3313,5 @@ export async function startGame(opts = {}) {
       );
     }
   });
-
   loop();
 }
