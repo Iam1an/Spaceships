@@ -1,23 +1,16 @@
 import * as THREE from 'three';
-
-// Hitscan beam manager. Each beam is a thin cylinder oriented along the
-// shot direction, fading out over LIFE seconds. Cylinders are used instead
-// of THREE.Line so the beam has actual width — WebGL ignores LineBasicMaterial.linewidth.
 export function createBeams() {
   const group = new THREE.Group();
   group.name = 'Beams';
-
   const LIFE = 0.18;
   const FACTION_COLOR = {
-    self:  0x88ffd6,
-    ally:  0x4aa3ff,
+    self: 0x88ffd6,
+    ally: 0x4aa3ff,
     enemy: 0xff5566,
   };
   const RADIUS = 0.5;
   const upAxis = new THREE.Vector3(0, 1, 0);
-
   const beams = [];
-
   function fire(origin, end, faction = 'self') {
     const length = origin.distanceTo(end);
     if (length <= 0.001) return;
@@ -37,7 +30,6 @@ export function createBeams() {
     group.add(mesh);
     beams.push({ mesh, mat, geo, age: 0 });
   }
-
   function update(dt) {
     for (let i = beams.length - 1; i >= 0; i--) {
       const b = beams[i];
@@ -53,6 +45,5 @@ export function createBeams() {
       }
     }
   }
-
   return { group, fire, update };
 }
