@@ -1,14 +1,4 @@
 import * as THREE from 'three';
-
-// Bot AI driving a player-shaped `record`. Steering + reactive state machine:
-// SEEK chases at distance, ATTACK lines up an intercept and fires beams,
-// EVADE breaks off after damage or when too close. Aims with the same
-// intercept solver the player's targeting computer uses, so it leads.
-//
-// Generic over targets: `deps.getOpponents()` returns entity-like objects
-// with { position, velocity, alive, takeHit(dmg, killerTeam) }. Bot picks
-// the closest live opponent, aims at it, and fires beams that can hit any
-// opponent in the line of sight (or asteroids that block the shot).
 export function createBotAI(record, deps) {
   const {
     getOpponents, team, beams, bullets, asteroids, obstacles = [],
@@ -17,62 +7,37 @@ export function createBotAI(record, deps) {
     onFire,
     hardMode = false,
     terrainHeightFn = null,
-    // Missile support: fireMissile(targetEntity) is provided by main.js and
-    // handles spawn + network relay; returns false if no shot was possible.
-    // missileMax is the per-life stock (0 = this bot carries none).
     fireMissile = null,
     missileMax = 0,
   } = deps;
   const ZERO_VEC = new THREE.Vector3();
-
   const SPEED = 60;
   const TURN_RATE = 1.3;
   const ACCEL = 3;
   const FIRE_RANGE = 600;
-  // Projectile aim — bot fires bullets that travel at finite speed, leads
-  // its targets via the same intercept solver the player uses.
-  const FIRE_DOT = 0.97;        // ~14° cone
-  // Hard mode matches the player's 20 shots/sec (0.05s cooldown). Default
-  // is the original 6.7/sec so bots stay beatable for casual play.
+  const FIRE_DOT = 0.97;
   const FIRE_COOLDOWN = hardMode ? 0.05 : 0.15;
-  const DAMAGE = 10;            // matches player bullet damage (buffed)
-  // Missiles: limited stock per life, restocked on respawn. Fired from
-  // attack state at medium range once roughly nose-on — the homing does the
-  // rest, so the aim gate is much looser than the bullet gate. The cooldown
-  // spaces shots out for bots carrying more than one (hard mode has 3).
-  const MISSILE_MIN_RANGE = 130;   // don't waste the stock point-blank
+  const DAMAGE = 10;
+  const MISSILE_MIN_RANGE = 130;
   const MISSILE_MAX_RANGE = 560;
-  const MISSILE_FIRE_DOT = 0.90;   // ~26° cone
+  const MISSILE_FIRE_DOT = 0.90;
   const MISSILE_COOLDOWN = 8.0;
-  const missileDelay = () => 2.5 + Math.random() * 4.0; // grace after (re)spawn
+  const missileDelay = () => 2.5 + Math.random() * 4.0;
   const BULLET_SPEED = 780;
   const BULLET_LIFE = 2.0;
   const SEEK_DIST = 250;
   const ATTACK_TOO_CLOSE = 35;
-  const EVADE_DURATION = 0.6;   // was 1.2 — bots come back for the kill faster
+  const EVADE_DURATION = 0.6;
   const SHIP_RADIUS = 3.5;
-  // Aim wobble: bot's intended aim is offset from target by a slowly-drifting
-  // vector. Scaled by distance so the angular error is the same at any range
-  // (~2-3° max at the current values), giving a "shaky human pilot" feel.
   const AIM_OFFSET_MAX = 14;
   const AIM_OFFSET_DRIFT = 12;
   const AIM_REF_DIST = 200;
-  // Tracking lag: the bot aims at a damped follower of the true lead
-  // point, not the lead point directly. Makes the aim slide onto target
-  // over ~0.10s instead of snapping, which keeps a tiny human-feel
-  // hesitation without being a free dodge window.
   const AIM_TRACK_RATE = 10;
-
-  // Steering avoidance: lookahead along current forward, perpendicular push
-  // away from any asteroid the ray would clip. Blends into desiredDir.
   const AVOID_LOOKAHEAD = 80;
   const AVOID_MARGIN = 4;
   const AVOID_WEIGHT = 2.0;
-  // Stuck detector: if velocity stays low for too long, kick into a random
-  // evade axis to break wedged-against-an-asteroid situations.
   const STUCK_SPEED_THRESH = 6;
   const STUCK_TIME = 1.5;
-
   let state = 'seek';
   let stateTimer = 0;
   let fireTimer = 0;
@@ -81,21 +46,14 @@ export function createBotAI(record, deps) {
   let stuckTime = 0;
   let evadeAxis = new THREE.Vector3();
   const aimOffset = new THREE.Vector3();
-  // Where the bot currently *thinks* the lead point is. Lerps toward
-  // the freshly-computed lead each frame so aim slides, not snaps.
   const trackedLead = new THREE.Vector3();
   let trackedLeadSeeded = false;
-  // Per-bot projectile ledger. bullets.js renders the visual; this list is
-  // for hit detection, since bullets.js only resolves hits for the local
-  // player's own bullets.
   const myProjectiles = [];
   const BULLET_HIT_R = SHIP_RADIUS + 0.5;
-
   const tmpFwd = new THREE.Vector3();
   const tmpAxis = new THREE.Vector3();
   const tmpQuat = new THREE.Quaternion();
   const tmpToTarget = new THREE.Vector3();
-
   function chooseEvadeDir() {
     return new THREE.Vector3(
       Math.random() * 2 - 1,
@@ -103,7 +61,6 @@ export function createBotAI(record, deps) {
       Math.random() * 2 - 1,
     ).normalize();
   }
-
   function rotateToward(quaternion, fromDir, toDir, maxAngle) {
     const angle = fromDir.angleTo(toDir);
     if (angle < 1e-3) return;
@@ -119,25 +76,15 @@ export function createBotAI(record, deps) {
     quaternion.premultiply(tmpQuat);
     quaternion.normalize();
   }
-
-  // Steering-style obstacle avoidance: cast forward along `dir` from `origin`,
-  // sum perpendicular pushes away from any asteroid that would clip the
-  // path. Returns a unit vector to blend with the desired direction, or
-  // null if nothing's in the way.
   const tmpAvoid = new THREE.Vector3();
   function computeAvoidance(origin, dir) {
     tmpAvoid.set(0, 0, 0);
     let any = false;
-    // Single sphere-avoidance pass over asteroids + static obstacles
-    // (moon). Same shape handling for both — only the source list and
-    // radius differ.
     function consider(cx, cy, cz, radius) {
       const px = cx - origin.x;
       const py = cy - origin.y;
       const pz = cz - origin.z;
       const t = px * dir.x + py * dir.y + pz * dir.z;
-      // Scale lookahead by obstacle size so large obstacles (moon, radius=80)
-      // are seen ~2.5× further out than small asteroids.
       const lookAhead = Math.max(AVOID_LOOKAHEAD, radius * 2.5);
       if (t < 0 || t > lookAhead) return;
       const ax = origin.x + dir.x * t;
@@ -152,7 +99,6 @@ export function createBotAI(record, deps) {
       const urgency = 1 - t / lookAhead;
       const dist = Math.sqrt(distSq);
       if (dist < 1e-3) {
-        // Head-on: pick a deterministic perpendicular (right-hand turn).
         tmpAvoid.x += -dir.z * urgency;
         tmpAvoid.z += dir.x * urgency;
       } else {
@@ -170,7 +116,6 @@ export function createBotAI(record, deps) {
     }
     return any ? tmpAvoid.normalize() : null;
   }
-
   function pickTarget() {
     let best = null;
     let bestDist = Infinity;
@@ -182,20 +127,14 @@ export function createBotAI(record, deps) {
     }
     return best;
   }
-
   function update(dt) {
-    // Bullets keep ticking even while the bot is dead — gives in-flight
-    // shots a chance to land instead of vanishing on death.
     updateProjectiles(dt);
     if (!record.alive) return;
-
     stateTimer += dt;
     fireTimer -= dt;
     missileTimer -= dt;
-
     const target = pickTarget();
     if (!target) {
-      // No opponents — drift on current heading.
       tmpFwd.set(0, 0, 1).applyQuaternion(record.ship.quaternion);
       const targetVel = tmpFwd.clone().multiplyScalar(SPEED * 0.3);
       record.vel.lerp(targetVel, 1 - Math.exp(-ACCEL * dt));
@@ -205,13 +144,10 @@ export function createBotAI(record, deps) {
       record.hasTarget = true;
       return;
     }
-
     const targetPos = target.position;
     const targetVel = target.velocity;
     const botPos = record.ship.position;
     const dist = targetPos.distanceTo(botPos);
-
-    // State transitions
     if (state === 'seek' && dist < SEEK_DIST) {
       state = 'attack';
       stateTimer = 0;
@@ -228,22 +164,15 @@ export function createBotAI(record, deps) {
       state = 'seek';
       stateTimer = 0;
     }
-
-    // Drift the aim wobble each frame and clamp to a sphere.
     aimOffset.x += (Math.random() - 0.5) * AIM_OFFSET_DRIFT * dt;
     aimOffset.y += (Math.random() - 0.5) * AIM_OFFSET_DRIFT * dt;
     aimOffset.z += (Math.random() - 0.5) * AIM_OFFSET_DRIFT * dt;
     const aimMaxSq = AIM_OFFSET_MAX * AIM_OFFSET_MAX;
     if (aimOffset.lengthSq() > aimMaxSq) aimOffset.setLength(AIM_OFFSET_MAX);
-
-    // Compute the bullet-lead intercept point — bullets travel at finite
-    // speed in world frame (no shipVel inheritance), so selfVel = 0.
     const leadT = solveIntercept(targetPos, targetVel, botPos, ZERO_VEC, BULLET_SPEED);
     const leadPoint = leadT !== null && Number.isFinite(leadT)
       ? targetPos.clone().addScaledVector(targetVel, leadT)
       : targetPos.clone();
-    // Track the lead point with a lag so a darting target slips out of
-    // the bot's reticle for a moment before it catches up.
     if (!trackedLeadSeeded) {
       trackedLead.copy(leadPoint);
       trackedLeadSeeded = true;
@@ -252,31 +181,21 @@ export function createBotAI(record, deps) {
     }
     const errorScale = dist / AIM_REF_DIST;
     const aimWorld = trackedLead.clone().addScaledVector(aimOffset, errorScale);
-
-    // Desired direction = lead point + wobble.
     let desiredDir;
     if (state === 'evade') {
       desiredDir = evadeAxis.clone();
     } else {
       desiredDir = aimWorld.clone().sub(botPos).normalize();
     }
-
-    // Blend in obstacle avoidance: lookahead along current heading, push
-    // perpendicular off any asteroid in the way.
     tmpFwd.set(0, 0, 1).applyQuaternion(record.ship.quaternion);
     const avoid = computeAvoidance(botPos, tmpFwd);
     if (avoid) {
       desiredDir.addScaledVector(avoid, AVOID_WEIGHT).normalize();
     }
-
-    // Terrain map: pull up when close to the ground, and also sample ahead
-    // so bots don't fly nose-first into rising slopes.
     if (terrainHeightFn !== null) {
       const margin = 180;
-      // Sample directly below
       const groundBelow = terrainHeightFn(botPos.x, botPos.z);
       const clearanceBelow = botPos.y - groundBelow;
-      // Sample 1.5 s ahead along current heading
       const ahead = botPos.clone().addScaledVector(tmpFwd, SPEED * 1.5);
       const groundAhead = terrainHeightFn(ahead.x, ahead.z);
       const clearanceAhead = botPos.y - groundAhead;
@@ -287,18 +206,11 @@ export function createBotAI(record, deps) {
         if (desiredDir.length() > 0.001) desiredDir.normalize();
       }
     }
-
-    // Rotate toward desired
     rotateToward(record.ship.quaternion, tmpFwd, desiredDir, TURN_RATE * dt);
-
-    // Move along forward
     tmpFwd.set(0, 0, 1).applyQuaternion(record.ship.quaternion);
     const tv = tmpFwd.clone().multiplyScalar(SPEED);
     record.vel.lerp(tv, 1 - Math.exp(-ACCEL * dt));
     botPos.addScaledVector(record.vel, dt);
-
-    // Hard collision resolution: push bot out of obstacles (moon) and asteroids
-    // so they can't physically pass through them, regardless of steering.
     for (const o of obstacles) {
       const dx = botPos.x - o.pos.x;
       const dy = botPos.y - o.pos.y;
@@ -347,8 +259,6 @@ export function createBotAI(record, deps) {
         }
       }
     }
-
-    // Hard floor on terrain map — don't let bots clip into the ground.
     if (terrainHeightFn !== null) {
       const groundY = terrainHeightFn(botPos.x, botPos.z);
       if (botPos.y < groundY + 5) {
@@ -356,13 +266,9 @@ export function createBotAI(record, deps) {
         if (record.vel.y < 0) record.vel.y *= -0.5;
       }
     }
-
     record.targetPos.copy(botPos);
     record.targetQuat.copy(record.ship.quaternion);
     record.hasTarget = true;
-
-    // Stuck detector: if velocity stays low while we want to be moving,
-    // jolt into evade with a random axis to break free.
     if (record.vel.lengthSq() < STUCK_SPEED_THRESH * STUCK_SPEED_THRESH && state !== 'evade') {
       stuckTime += dt;
       if (stuckTime >= STUCK_TIME) {
@@ -374,9 +280,6 @@ export function createBotAI(record, deps) {
     } else {
       stuckTime = 0;
     }
-
-    // Fire — projectile leaves along forward at BULLET_SPEED. Check whether
-    // forward is pointed close enough to the wobble-adjusted lead point.
     if (state === 'attack' && fireTimer <= 0 && dist < FIRE_RANGE) {
       const ideal = aimWorld.clone().sub(botPos).normalize();
       if (tmpFwd.dot(ideal) > FIRE_DOT) {
@@ -384,11 +287,8 @@ export function createBotAI(record, deps) {
         fireTimer = FIRE_COOLDOWN;
       }
     }
-
-    // Missile launch: attack state, medium range, roughly nose-on. The
-    // missile homes after launch, so this gate is loose by design.
     if (missilesLeft > 0 && fireMissile && state === 'attack'
-        && missileTimer <= 0 && dist > MISSILE_MIN_RANGE && dist < MISSILE_MAX_RANGE) {
+      && missileTimer <= 0 && dist > MISSILE_MIN_RANGE && dist < MISSILE_MAX_RANGE) {
       tmpToTarget.copy(targetPos).sub(botPos).normalize();
       if (tmpFwd.dot(tmpToTarget) > MISSILE_FIRE_DOT) {
         if (fireMissile(target) !== false) {
@@ -398,18 +298,12 @@ export function createBotAI(record, deps) {
       }
     }
   }
-
   function fireBullet() {
     const botPos = record.ship.position;
     tmpFwd.set(0, 0, 1).applyQuaternion(record.ship.quaternion);
     const start = botPos.clone().addScaledVector(tmpFwd, 2.5);
-    // Visual via shared bullet pool (renders + dies on asteroid contact).
     if (bullets) bullets.fire(start, tmpFwd, faction);
     if (onFire) onFire(start, tmpFwd);
-    // Authoritative tracking: each bot owns its in-flight bullets and runs
-    // its own collision against opponents/asteroids. bullets.js only
-    // resolves hits for the local player's own bullets, so without this
-    // ledger bot bullets would be visual-only.
     myProjectiles.push({
       pos: start.clone(),
       vel: tmpFwd.clone().multiplyScalar(BULLET_SPEED),
@@ -417,15 +311,12 @@ export function createBotAI(record, deps) {
     });
     if (audio && distanceVol) audio.play('shoot', distanceVol(botPos));
   }
-
   function updateProjectiles(dt) {
     for (let i = myProjectiles.length - 1; i >= 0; i--) {
       const p = myProjectiles[i];
       p.life -= dt;
       if (p.life <= 0) { myProjectiles.splice(i, 1); continue; }
       p.pos.addScaledVector(p.vel, dt);
-
-      // Hit any opponent? Sphere-overlap check.
       let consumed = false;
       for (const e of getOpponents()) {
         if (!e.alive) continue;
@@ -440,8 +331,6 @@ export function createBotAI(record, deps) {
         }
       }
       if (consumed) { myProjectiles.splice(i, 1); continue; }
-
-      // Hit asteroid? Bullet dies (no damage to the rock).
       for (const a of asteroids.list) {
         const dx = p.pos.x - a.mesh.position.x;
         const dy = p.pos.y - a.mesh.position.y;
@@ -454,7 +343,6 @@ export function createBotAI(record, deps) {
         }
       }
       if (consumed) continue;
-      // Hit a static obstacle (moon)? Same outcome — bullet dies silently.
       for (const o of obstacles) {
         const dx = p.pos.x - o.pos.x;
         const dy = p.pos.y - o.pos.y;
@@ -467,7 +355,6 @@ export function createBotAI(record, deps) {
       }
     }
   }
-
   function notifyHit() {
     if (!record.alive) return;
     if (state !== 'evade') {
@@ -476,7 +363,6 @@ export function createBotAI(record, deps) {
       evadeAxis = chooseEvadeDir();
     }
   }
-
   function notifyRespawn() {
     state = 'seek';
     stateTimer = 0;
@@ -485,6 +371,5 @@ export function createBotAI(record, deps) {
     missileTimer = missileDelay();
     record.vel.set(0, 0, 0);
   }
-
   return { update, notifyHit, notifyRespawn };
 }
