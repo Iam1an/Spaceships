@@ -1,8 +1,4 @@
 import * as THREE from 'three';
-
-// Procedural starfield skybox. Generates a 6-face cube texture in canvases
-// so we don't depend on external image assets. Swap to CubeTextureLoader
-// once you have real space textures.
 export function createSkybox() {
   const size = 1024;
   const faces = [];
@@ -14,14 +10,10 @@ export function createSkybox() {
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
 }
-
 function makeStarFace(size, faceIndex) {
   const c = document.createElement('canvas');
   c.width = c.height = size;
   const ctx = c.getContext('2d');
-
-  // Deep-space gradient with a faint nebula tint that varies per face
-  // so the cube doesn't look uniformly flat.
   const tints = [
     [10, 12, 30],
     [8, 6, 24],
@@ -36,8 +28,6 @@ function makeStarFace(size, faceIndex) {
   grad.addColorStop(1, `rgb(${r},${g},${b})`);
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, size, size);
-
-  // Soft nebula blobs.
   for (let i = 0; i < 4; i++) {
     const x = Math.random() * size;
     const y = Math.random() * size;
@@ -49,8 +39,6 @@ function makeStarFace(size, faceIndex) {
     ctx.fillStyle = ng;
     ctx.fillRect(0, 0, size, size);
   }
-
-  // Stars.
   const starCount = 500;
   for (let i = 0; i < starCount; i++) {
     const x = Math.random() * size;
@@ -62,7 +50,6 @@ function makeStarFace(size, faceIndex) {
     ctx.arc(x, y, sz, 0, Math.PI * 2);
     ctx.fill();
   }
-  // A few brighter colored stars.
   for (let i = 0; i < 12; i++) {
     const x = Math.random() * size;
     const y = Math.random() * size;
