@@ -2,12 +2,6 @@ import { startGame } from './main.js';
 import { requireAuth, getToken, clearToken } from './auth.js';
 import { getSavedShipColor, getSavedAccentColor, getSavedTrailColor, getSavedTrailShape, hslToHex, hexToHsl, initCustomizationScene } from './customization.js';
 import { containsProfanity } from './filter.js';
-
-// Lobby state machine: main → find → room. Talks to the server over a single
-// long-lived WebSocket. Once the host hits Start (or a non-host receives the
-// `start` broadcast), we hide the overlay and hand the socket to startGame()
-// — gameplay sync messages will reuse it next iteration.
-
 const lobbyEl = document.getElementById('lobby');
 const screens = {
   main: document.getElementById('lobby-main'),
@@ -20,14 +14,12 @@ const screens = {
   trials: document.getElementById('lobby-trials'),
   campaign: document.getElementById('lobby-campaign'),
 };
-
 const roomCodeEl = document.getElementById('roomCode');
 const playersEl = document.getElementById('players');
 const startBtn = document.getElementById('btnStart');
 const waitingEl = document.getElementById('waitingForHost');
 const errorEl = document.getElementById('lobby-error');
 const codeInput = document.getElementById('codeInput');
-
 let ws = null;
 let myId = null;
 let isHost = false;
@@ -36,7 +28,6 @@ let myAsteroids = null;
 let myMap = 'space';
 let myBotAssignments = [];
 let lastPlayers = [];
-
 const nameInput = document.getElementById('nameInput');
 const SAVED_NAME_KEY = 'spaceships:pilotName';
 nameInput.value = localStorage.getItem(SAVED_NAME_KEY) || '';
@@ -52,23 +43,16 @@ nameInput.addEventListener('input', () => {
   nameInput.title = '';
   localStorage.setItem(SAVED_NAME_KEY, cleaned);
 });
-
-// Control scheme: one of 'mouse_keys' | 'keyboard' | 'mobile'.
-// Replaces the older spaceships:noMouse boolean. We migrate any legacy value
-// on first read so saved preferences carry over. Default for fresh installs
-// is mobile-aware: touchscreens get 'mobile', everything else 'mouse_keys'.
 const SCHEMES = ['mouse_keys', 'keyboard', 'mobile'];
 const SAVED_SCHEME_KEY = 'spaceships:controlScheme';
 const SAVED_NO_MOUSE_KEY = 'spaceships:noMouse';
 function detectDefaultScheme() {
   const touch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-  // Heuristic: real phones/tablets are both touch and lack hover.
   const coarse = window.matchMedia?.('(pointer: coarse)')?.matches;
   return touch && coarse ? 'mobile' : 'mouse_keys';
 }
 let selectedScheme = localStorage.getItem(SAVED_SCHEME_KEY);
 if (!SCHEMES.includes(selectedScheme)) {
-  // Migrate from the old checkbox: noMouse=1 → keyboard, else default.
   selectedScheme = localStorage.getItem(SAVED_NO_MOUSE_KEY) === '1'
     ? 'keyboard'
     : detectDefaultScheme();
@@ -91,11 +75,6 @@ for (const picker of document.querySelectorAll('[data-scheme-picker]')) {
   });
 }
 setScheme(selectedScheme);
-
-// Settings gear (top-right): opens a panel with the Secret Hard Mode
-// toggle. Persisted in localStorage so it survives reloads. Closes on
-// outside click. The gear is hidden once the HUD shows so it doesn't
-// float over gameplay.
 const settingsBtn = document.getElementById('settingsBtn');
 const settingsPanel = document.getElementById('settingsPanel');
 const hardModeInput = document.getElementById('hardModeInput');
@@ -104,28 +83,18 @@ hardModeInput.checked = localStorage.getItem(SAVED_HARD_MODE_KEY) === '1';
 hardModeInput.addEventListener('change', () => {
   localStorage.setItem(SAVED_HARD_MODE_KEY, hardModeInput.checked ? '1' : '0');
 });
-
-// Retro pixel filter: default on (the user opted into the look). Stored
-// as the inverse — '0' for off — so a fresh install gets the filter.
 const pixelFilterInput = document.getElementById('pixelFilterInput');
 const SAVED_PIXEL_KEY = 'spaceships:pixelFilter';
 pixelFilterInput.checked = localStorage.getItem(SAVED_PIXEL_KEY) !== '0';
 pixelFilterInput.addEventListener('change', () => {
   localStorage.setItem(SAVED_PIXEL_KEY, pixelFilterInput.checked ? '1' : '0');
 });
-
-// Enemy trails: default on. Stored inverted so '0' means off and fresh
-// installs render trails for all ships.
 const enemyTrailsInput = document.getElementById('enemyTrailsInput');
 const SAVED_ENEMY_TRAILS = 'spaceships:enemyTrails';
 enemyTrailsInput.checked = localStorage.getItem(SAVED_ENEMY_TRAILS) !== '0';
 enemyTrailsInput.addEventListener('change', () => {
   localStorage.setItem(SAVED_ENEMY_TRAILS, enemyTrailsInput.checked ? '1' : '0');
 });
-
-// Volume sliders. Values stored as 0–1 in localStorage; UI is 0–100.
-// Changes apply live to the running game via `window.__shipAudio` (set
-// by main.js on startGame) so the gear panel works mid-match.
 const musicSlider = document.getElementById('musicVolumeInput');
 const sfxSlider = document.getElementById('sfxVolumeInput');
 const musicVal = document.getElementById('musicVolumeVal');
@@ -165,7 +134,6 @@ document.addEventListener('click', (e) => {
   if (settingsPanel.contains(e.target) || settingsBtn.contains(e.target)) return;
   settingsPanel.classList.add('hidden');
 });
-
 function pilotName() {
   const n = (nameInput.value || '').trim();
   if (!n || containsProfanity(n)) return localStorage.getItem(SAVED_NAME_KEY) || 'Pilot';
@@ -174,38 +142,28 @@ function pilotName() {
 function controlScheme() {
   return selectedScheme;
 }
-// Back-compat shim for the existing main.js branch — keyboard is the only
-// scheme that fully suppresses the mouse.
 function noMouse() {
   return selectedScheme === 'keyboard';
 }
-
 function showScreen(name) {
   for (const k of Object.keys(screens)) {
     screens[k].classList.toggle('hidden', k !== name);
   }
 }
-
 function setError(text) {
   errorEl.textContent = text || '';
 }
-
 function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
   }
 }
-
 function connect() {
   if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve();
   if (ws) ws.close();
-
-  // Loading the file directly via file:// produces an empty location.host —
-  // catch that early with a useful message instead of a generic disconnect.
   if (!location.host || location.protocol === 'file:') {
     return Promise.reject(new Error('Open via http://localhost:4000 (run `npm start` first)'));
   }
-
   return new Promise((resolve, reject) => {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const token = getToken();
@@ -230,16 +188,12 @@ function connect() {
       handle(msg);
     });
     ws.addEventListener('close', () => {
-      // Only surface "Disconnected" if we were actually connected; during a
-      // failed initial handshake the explicit reject() already set a clearer
-      // error message and we don't want to clobber it.
       if (openedOnce && !lobbyEl.classList.contains('hidden')) {
         setError('Disconnected from server');
       }
     });
   });
 }
-
 function renderRoomList(rooms) {
   const list = document.getElementById('roomList');
   const empty = document.getElementById('roomListEmpty');
@@ -265,26 +219,21 @@ function renderRoomList(rooms) {
     }
   }
 }
-
 async function joinRoom(code) {
   setError('Connecting…');
   try { await connect(); } catch (e) { setError(e.message); return; }
   send({ type: 'name', name: pilotName() });
   send({ type: 'join', code });
 }
-
 function isPrivateRoom() {
   return document.getElementById('privacyPrivate')?.checked ?? false;
 }
-
 function selectedMap() {
   return document.getElementById('mapTerrain')?.checked ? 'terrain' : 'space';
 }
-
 function autoBotEnabled() {
   return document.getElementById('autoBotInput')?.checked ?? true;
 }
-
 function handle(msg) {
   switch (msg.type) {
     case 'room':
@@ -321,11 +270,8 @@ function handle(msg) {
       break;
   }
 }
-
 function showHud() {
   lobbyEl.classList.add('hidden');
-  // Drop the in-lobby flag so the settings panel's "Back to Menu" button
-  // becomes visible (it's hidden while the lobby is on screen).
   document.body.classList.remove('in-lobby');
   if (localStorage.getItem('spaceships:showStats') !== '0') {
     document.getElementById('hud-stats').style.display = '';
@@ -337,26 +283,15 @@ function showHud() {
   document.getElementById('heatbar').style.display = '';
   document.getElementById('missilehud').style.display = '';
   document.getElementById('flarehud').style.display = '';
-  // Settings gear stays visible in-game so the volume sliders work
-  // during a match. Panel collapses so it doesn't float over the HUD.
   settingsPanel.classList.add('hidden');
 }
-// Lobby is the initial state; flag it so the Back-to-Menu button stays
-// hidden until showHud() flips us into a running game.
 document.body.classList.add('in-lobby');
-
-// "Back to Menu" inside the settings panel. Simplest, safest impl is a
-// full page reload — tears down WebGL, audio nodes, WebSocket, all bot
-// AI timers, and re-enters the lobby in a clean state. We confirm first
-// since it discards an in-progress match.
 document.getElementById('btnBackToMenu').addEventListener('click', () => {
   if (window.confirm('Leave match and return to menu?')) {
     window.location.reload();
   }
 });
-
 function hardMode() { return hardModeInput.checked; }
-
 function enterGame() {
   closeCustomization();
   showHud();
@@ -371,16 +306,12 @@ function enterGame() {
     botAssignments: myBotAssignments,
   });
 }
-
 function soloSelectedMap() {
   return document.getElementById('soloMapTerrain')?.checked ? 'terrain' : 'space';
 }
-
 function enterSoloGame(mode, opts = {}) {
   closeCustomization();
   showHud();
-  // Tutorial buttons can force a scheme (keyboard-only vs mouse+keys) for
-  // their lesson; everything else takes the lobby's saved choice.
   const scheme = opts.controlScheme ?? controlScheme();
   startGame({
     solo: true, you: 0, pilotName: pilotName(), mode,
@@ -391,64 +322,51 @@ function enterSoloGame(mode, opts = {}) {
     missionId: opts.missionId,
   });
 }
-
 document.getElementById('btnMulti').addEventListener('click', () => {
   setError('');
   showScreen('multi');
 });
-
 document.getElementById('btnBackMulti').addEventListener('click', () => {
   setError('');
   showScreen('main');
 });
-
 document.getElementById('btnCreateMenu').addEventListener('click', () => {
   setError('');
   showScreen('create');
 });
-
 document.getElementById('btnBackCreate').addEventListener('click', () => {
   setError('');
   showScreen('multi');
 });
-
 document.getElementById('btnPlay').addEventListener('click', async () => {
   setError('Connecting…');
   try { await connect(); } catch (e) { setError(e.message); return; }
   send({ type: 'name', name: pilotName() });
   send({ type: 'create', private: isPrivateRoom(), map: selectedMap(), allowBot: autoBotEnabled() });
 });
-
-
 document.getElementById('btnSingle').addEventListener('click', () => {
   setError('');
   showScreen('single');
 });
-
 document.getElementById('btnBackSingle').addEventListener('click', () => {
   setError('');
   showScreen('main');
 });
-
 document.getElementById('btnTrain').addEventListener('click', () => {
   enterSoloGame('train');
 });
-
 document.getElementById('btnSkirmish').addEventListener('click', () => {
   enterSoloGame('skirmish');
 });
-
 document.getElementById('btnCampaign').addEventListener('click', () => {
   setError('');
   refreshCampaignButtons();
   showScreen('campaign');
 });
-
 document.getElementById('btnBackCampaign').addEventListener('click', () => {
   setError('');
   showScreen('main');
 });
-
 function refreshCampaignButtons() {
   const locks = [
     { id: 'btnMission2', reqKey: 'spaceships:campaign1Beat', statusId: 'mission2Status' },
@@ -466,7 +384,6 @@ function refreshCampaignButtons() {
     if (el) el.textContent = localStorage.getItem(statusKeys[i - 1]) ? '✓ COMPLETED' : '';
   }
 }
-
 document.getElementById('btnMission1').addEventListener('click', () => {
   enterSoloGame('campaign', { map: 'space', missionId: 1 });
 });
@@ -478,36 +395,29 @@ document.getElementById('btnMission3').addEventListener('click', () => {
   if (document.getElementById('btnMission3').classList.contains('locked')) return;
   enterSoloGame('campaign', { map: 'space', missionId: 3 });
 });
-
 document.getElementById('btnTutorial').addEventListener('click', () => {
   setError('');
   showScreen('tutorial');
 });
-
 document.getElementById('btnBackTutorial').addEventListener('click', () => {
   setError('');
   showScreen('single');
 });
-
 document.getElementById('btnTutorialKeys').addEventListener('click', () => {
   enterSoloGame('tutorial', { noMouse: true, controlScheme: 'keyboard' });
 });
-
 document.getElementById('btnTutorialMouse').addEventListener('click', () => {
   enterSoloGame('tutorial', { noMouse: false, controlScheme: 'mouse_keys' });
 });
-
 document.getElementById('btnTrials').addEventListener('click', () => {
   setError('');
   refreshTrialButtons();
   showScreen('trials');
 });
-
 document.getElementById('btnBackTrials').addEventListener('click', () => {
   setError('');
   showScreen('single');
 });
-
 function refreshTrialButtons() {
   const defs = [
     { id: 'btnTrial2', label: 'Trial 2', mode: 'trials2', reqKey: 'spaceships:trial1Best' },
@@ -522,26 +432,21 @@ function refreshTrialButtons() {
     el.textContent = unlocked ? def.label : `[LOCKED]  ${def.label}`;
   }
 }
-
 document.getElementById('btnTrial1').addEventListener('click', () => {
   enterSoloGame('trials');
 });
-
 document.getElementById('btnTrial2').addEventListener('click', () => {
   if (document.getElementById('btnTrial2').classList.contains('locked')) return;
   enterSoloGame('trials2');
 });
-
 document.getElementById('btnTrial3').addEventListener('click', () => {
   if (document.getElementById('btnTrial3').classList.contains('locked')) return;
   enterSoloGame('trials3');
 });
-
 document.getElementById('btnTrial4').addEventListener('click', () => {
   if (document.getElementById('btnTrial4').classList.contains('locked')) return;
   enterSoloGame('trials4');
 });
-
 document.getElementById('btnFind').addEventListener('click', async () => {
   setError('');
   showScreen('find');
@@ -555,7 +460,6 @@ document.getElementById('btnFind').addEventListener('click', async () => {
     setError(e.message);
   }
 });
-
 document.getElementById('btnRefreshRooms').addEventListener('click', async () => {
   try {
     await connect();
@@ -564,12 +468,10 @@ document.getElementById('btnRefreshRooms').addEventListener('click', async () =>
     setError(e.message);
   }
 });
-
 document.getElementById('btnBackFind').addEventListener('click', () => {
   showScreen('multi');
   setError('');
 });
-
 document.getElementById('btnJoin').addEventListener('click', async () => {
   const code = codeInput.value.trim().toUpperCase();
   if (code.length !== 4) {
@@ -578,57 +480,40 @@ document.getElementById('btnJoin').addEventListener('click', async () => {
   }
   await joinRoom(code);
 });
-
 startBtn.addEventListener('click', () => send({ type: 'start' }));
-
 document.getElementById('btnLeave').addEventListener('click', () => {
   send({ type: 'leave' });
   if (ws) ws.close();
   ws = null;
   showScreen('main');
 });
-
-// Sanitize the code input to uppercase A–Z only.
 codeInput.addEventListener('input', (e) => {
   e.target.value = e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4);
 });
 codeInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') document.getElementById('btnJoin').click();
 });
-
-// ── Ship Customization ────────────────────────────────────────────────────────
-
-const custPanel       = document.getElementById('customization');
-const colorWheelEl    = document.getElementById('colorWheel');
-const brightnessEl    = document.getElementById('brightnessSlider');
-const zoomEl          = document.getElementById('zoomSlider');
-const colorPreviewEl  = document.getElementById('colorPreview');
-const wheelCtx        = colorWheelEl.getContext('2d');
-const WHEEL_SIZE      = colorWheelEl.width; // 200
-const WHEEL_R         = WHEEL_SIZE / 2;
-
+const custPanel = document.getElementById('customization');
+const colorWheelEl = document.getElementById('colorWheel');
+const brightnessEl = document.getElementById('brightnessSlider');
+const zoomEl = document.getElementById('zoomSlider');
+const colorPreviewEl = document.getElementById('colorPreview');
+const wheelCtx = colorWheelEl.getContext('2d');
+const WHEEL_SIZE = colorWheelEl.width;
+const WHEEL_R = WHEEL_SIZE / 2;
 let custScene = null;
-
-// Hull color state
 const _initHull = hexToHsl(getSavedShipColor());
 let hullH = _initHull.h, hullS = _initHull.s;
 let hullL = Math.max(0.05, Math.min(0.88, _initHull.l));
-
-// Accent color state
 const _initAccent = hexToHsl(getSavedAccentColor());
 let accentH = _initAccent.h, accentS = _initAccent.s;
 let accentL = Math.max(0.05, Math.min(0.88, _initAccent.l));
-
-// Trail color state
 const _initTrail = hexToHsl(getSavedTrailColor());
 let trailH = _initTrail.h, trailS = _initTrail.s;
 let trailL = Math.max(0.05, Math.min(0.88, _initTrail.l));
-
-// Active picker mirrors whichever target is selected
 let colorTarget = 'hull';
 let pickH = hullH, pickS = hullS, pickL = hullL;
 brightnessEl.value = Math.round(hullL * 100);
-
 function hslToRgbInt(h, s, l) {
   const a = s * Math.min(l, 1 - l);
   const f = n => {
@@ -637,7 +522,6 @@ function hslToRgbInt(h, s, l) {
   };
   return [f(0), f(8), f(4)];
 }
-
 function drawWheel() {
   const img = wheelCtx.createImageData(WHEEL_SIZE, WHEEL_SIZE);
   const d = img.data;
@@ -654,7 +538,6 @@ function drawWheel() {
     }
   }
   wheelCtx.putImageData(img, 0, 0);
-
   const sx = WHEEL_R + Math.cos(pickH * Math.PI / 180) * pickS * (WHEEL_R - 2);
   const sy = WHEEL_R + Math.sin(pickH * Math.PI / 180) * pickS * (WHEEL_R - 2);
   wheelCtx.beginPath();
@@ -668,7 +551,6 @@ function drawWheel() {
   wheelCtx.lineWidth = 1.5;
   wheelCtx.stroke();
 }
-
 function applyColor() {
   const hex = hslToHex(pickH, pickS, pickL);
   if (colorTarget === 'hull') {
@@ -680,7 +562,6 @@ function applyColor() {
     localStorage.setItem('spaceships:shipAccentColor', hex);
     if (custScene) custScene.setAccentColor(hex);
   } else {
-    // trail — show via the trail swatch
     const trailSwatch = document.getElementById('trailColorSwatch');
     if (trailSwatch) trailSwatch.style.background = hex;
     localStorage.setItem('spaceships:trailColor', hex);
@@ -688,63 +569,51 @@ function applyColor() {
   const hullHex = hslToHex(hullH, hullS, hullL);
   colorPreviewEl.style.boxShadow = `0 0 18px ${hullHex}88`;
 }
-
 function setColorTarget(target) {
-  if (colorTarget === 'hull')   { hullH   = pickH; hullS   = pickS; hullL   = pickL; }
+  if (colorTarget === 'hull') { hullH = pickH; hullS = pickS; hullL = pickL; }
   else if (colorTarget === 'accent') { accentH = pickH; accentS = pickS; accentL = pickL; }
-  else                          { trailH  = pickH; trailS  = pickS; trailL  = pickL; }
-
+  else { trailH = pickH; trailS = pickS; trailL = pickL; }
   colorTarget = target;
-
-  if (target === 'hull')   { pickH = hullH;   pickS = hullS;   pickL = hullL;   }
+  if (target === 'hull') { pickH = hullH; pickS = hullS; pickL = hullL; }
   else if (target === 'accent') { pickH = accentH; pickS = accentS; pickL = accentL; }
-  else                     { pickH = trailH;  pickS = trailS;  pickL = trailL;  }
-
+  else { pickH = trailH; pickS = trailS; pickL = trailL; }
   brightnessEl.value = Math.round(pickL * 100);
   document.getElementById('tabHull').classList.toggle('active', target === 'hull');
   document.getElementById('tabAccent').classList.toggle('active', target === 'accent');
   document.getElementById('tabTrail').classList.toggle('active', target === 'trail');
-  // Show trail swatch when editing trail color, hide ship color preview and vice-versa.
   const trailSwatch = document.getElementById('trailColorSwatch');
   if (trailSwatch) trailSwatch.style.display = target === 'trail' ? '' : 'none';
   colorPreviewEl.style.display = target === 'trail' ? 'none' : '';
   drawWheel();
 }
-
 function pickFromWheel(clientX, clientY) {
   const rect = colorWheelEl.getBoundingClientRect();
   const scaleX = WHEEL_SIZE / rect.width;
   const scaleY = WHEEL_SIZE / rect.height;
   const dx = (clientX - rect.left) * scaleX - WHEEL_R;
-  const dy = (clientY - rect.top)  * scaleY - WHEEL_R;
+  const dy = (clientY - rect.top) * scaleY - WHEEL_R;
   const dist = Math.sqrt(dx * dx + dy * dy);
   pickH = ((Math.atan2(dy, dx) * 180 / Math.PI) + 360) % 360;
   pickS = Math.min(1, dist / WHEEL_R);
   drawWheel();
   applyColor();
 }
-
 let wheelDragging = false;
 colorWheelEl.addEventListener('mousedown', e => { wheelDragging = true; pickFromWheel(e.clientX, e.clientY); });
 window.addEventListener('mousemove', e => { if (wheelDragging) pickFromWheel(e.clientX, e.clientY); });
 window.addEventListener('mouseup', () => { wheelDragging = false; });
 colorWheelEl.addEventListener('touchstart', e => { e.preventDefault(); pickFromWheel(e.touches[0].clientX, e.touches[0].clientY); }, { passive: false });
-colorWheelEl.addEventListener('touchmove',  e => { e.preventDefault(); pickFromWheel(e.touches[0].clientX, e.touches[0].clientY); }, { passive: false });
-
+colorWheelEl.addEventListener('touchmove', e => { e.preventDefault(); pickFromWheel(e.touches[0].clientX, e.touches[0].clientY); }, { passive: false });
 brightnessEl.addEventListener('input', () => {
   pickL = brightnessEl.value / 100;
   drawWheel();
   applyColor();
 });
-
 zoomEl.addEventListener('input', () => {
   if (custScene) custScene.setZoom(parseFloat(zoomEl.value));
 });
-
-// ── Customization unlock system ───────────────────────────────────────────────
 const UNLOCK_COSTS = { hull: 250, accent: 400, trail: 500, trail_shape: 200, admin_ship: 125000 };
 const COST_SAVE_COLORS = 50;
-
 const custCrStatusEl = document.getElementById('custCrStatus');
 let custCrTimer = null;
 function showCustCrStatus(msg, color = '#ff8a8a') {
@@ -754,19 +623,17 @@ function showCustCrStatus(msg, color = '#ff8a8a') {
   if (custCrTimer) clearTimeout(custCrTimer);
   custCrTimer = setTimeout(() => { custCrStatusEl.textContent = ''; }, 3000);
 }
-
 function isUnlocked(feature) {
   return localStorage.getItem(`spaceships:unlock_${feature}`) === '1';
 }
 function saveUnlockLocal(feature) {
   localStorage.setItem(`spaceships:unlock_${feature}`, '1');
 }
-
 function updateCustUnlockUI() {
   const badges = {
-    hull:        document.getElementById('hullTabCost'),
-    accent:      document.getElementById('accentTabCost'),
-    trail:       document.getElementById('trailTabCost'),
+    hull: document.getElementById('hullTabCost'),
+    accent: document.getElementById('accentTabCost'),
+    trail: document.getElementById('trailTabCost'),
     trail_shape: document.getElementById('trailShapeCost'),
   };
   for (const [feature, el] of Object.entries(badges)) {
@@ -779,9 +646,7 @@ function updateCustUnlockUI() {
       el.style.color = '';
     }
   }
-
-  // Admin ship button
-  const adminBtn  = document.getElementById('btnBuyAdminShip');
+  const adminBtn = document.getElementById('btnBuyAdminShip');
   const adminCost = document.getElementById('adminShipCost');
   if (adminBtn) {
     if (isUnlocked('admin_ship')) {
@@ -797,23 +662,21 @@ function updateCustUnlockUI() {
     }
   }
 }
-
 async function refreshUnlocks() {
   const token = getToken();
   if (!token) return;
   try {
-    const res  = await fetch('/spaceships/api/unlocks', { headers: { 'Authorization': 'Bearer ' + token } });
+    const res = await fetch('/spaceships/api/unlocks', { headers: { 'Authorization': 'Bearer ' + token } });
     const data = await res.json();
     if (!data.ok) return;
-    if (data.unlockHull)       saveUnlockLocal('hull');
-    if (data.unlockAccent)     saveUnlockLocal('accent');
-    if (data.unlockTrail)      saveUnlockLocal('trail');
+    if (data.unlockHull) saveUnlockLocal('hull');
+    if (data.unlockAccent) saveUnlockLocal('accent');
+    if (data.unlockTrail) saveUnlockLocal('trail');
     if (data.unlockTrailShape) saveUnlockLocal('trail_shape');
-    if (data.unlockAdminShip)  saveUnlockLocal('admin_ship');
+    if (data.unlockAdminShip) saveUnlockLocal('admin_ship');
     updateCustUnlockUI();
-  } catch {}
+  } catch { }
 }
-
 async function tryPurchaseUnlock(feature) {
   const cost = UNLOCK_COSTS[feature];
   if (!cost) return { ok: false, msg: 'Unknown feature' };
@@ -823,7 +686,7 @@ async function tryPurchaseUnlock(feature) {
   const cached = parseInt(localStorage.getItem('spaceships:credits') || '0', 10);
   if (cached < cost) return { ok: false, msg: `Need ${cost - cached} more ⬡ (you have ${cached} ⬡)` };
   try {
-    const res  = await fetch(`/spaceships/api/unlock/${feature}`, {
+    const res = await fetch(`/spaceships/api/unlock/${feature}`, {
       method: 'POST', headers: { 'Authorization': 'Bearer ' + token },
     });
     const data = await res.json();
@@ -835,7 +698,7 @@ async function tryPurchaseUnlock(feature) {
         try {
           const prev = JSON.parse(localStorage.getItem('spaceships:pendingAchs') || '[]');
           localStorage.setItem('spaceships:pendingAchs', JSON.stringify([...prev, ...data.newAchievements]));
-        } catch {}
+        } catch { }
         checkPendingAchievements();
       }
       return { ok: true, alreadyOwned: data.alreadyOwned };
@@ -845,7 +708,6 @@ async function tryPurchaseUnlock(feature) {
     return { ok: false, msg: 'Could not reach server' };
   }
 }
-
 function makeTabHandler(id, feature) {
   document.getElementById(id).addEventListener('click', async () => {
     if (isUnlocked(feature)) { setColorTarget(feature === 'trail' ? 'trail' : feature); return; }
@@ -855,11 +717,9 @@ function makeTabHandler(id, feature) {
     setColorTarget(feature === 'trail' ? 'trail' : feature);
   });
 }
-makeTabHandler('tabHull',   'hull');
+makeTabHandler('tabHull', 'hull');
 makeTabHandler('tabAccent', 'accent');
-makeTabHandler('tabTrail',  'trail');
-
-// Admin ship purchase button
+makeTabHandler('tabTrail', 'trail');
 const adminShipStatusEl = document.getElementById('adminShipStatus');
 let adminShipStatusTimer = null;
 function showAdminShipStatus(msg, color = '#ff8a8a') {
@@ -869,7 +729,6 @@ function showAdminShipStatus(msg, color = '#ff8a8a') {
   if (adminShipStatusTimer) clearTimeout(adminShipStatusTimer);
   adminShipStatusTimer = setTimeout(() => { adminShipStatusEl.textContent = ''; }, 4000);
 }
-
 document.getElementById('btnBuyAdminShip')?.addEventListener('click', async () => {
   if (isUnlocked('admin_ship')) return;
   const token = getToken();
@@ -888,8 +747,6 @@ document.getElementById('btnBuyAdminShip')?.addEventListener('click', async () =
     showAdminShipStatus(r.msg || 'Purchase failed');
   }
 });
-
-// Trail shape picker
 const TRAIL_SHAPE_KEY = 'spaceships:trailShape';
 function setTrailShape(shape) {
   localStorage.setItem(TRAIL_SHAPE_KEY, shape);
@@ -907,15 +764,11 @@ document.getElementById('trail-shape-picker').addEventListener('click', async (e
   setTrailShape(btn.dataset.shape);
 });
 setTrailShape(getSavedTrailShape());
-
-// Trail color swatch initial state
 const trailSwatchEl = document.getElementById('trailColorSwatch');
 if (trailSwatchEl) trailSwatchEl.style.background = getSavedTrailColor();
-
 drawWheel();
 applyColor();
 colorPreviewEl.style.borderColor = hslToHex(accentH, accentS, accentL);
-
 document.getElementById('btnCustomize').addEventListener('click', () => {
   if (custPanel.classList.contains('open')) {
     closeCustomization();
@@ -923,7 +776,7 @@ document.getElementById('btnCustomize').addEventListener('click', () => {
   }
   lobbyEl.classList.add('slide-left');
   custPanel.classList.add('open');
-    document.body.classList.add('customization-open');
+  document.body.classList.add('customization-open');
   if (!custScene) {
     custScene = initCustomizationScene(document.getElementById('custCanvas'));
   } else {
@@ -932,10 +785,8 @@ document.getElementById('btnCustomize').addEventListener('click', () => {
   custScene.setColor(getSavedShipColor());
   custScene.setAccentColor(getSavedAccentColor());
 });
-
 const saveColorsStatus = document.getElementById('saveColorsStatus');
 let saveStatusTimer = null;
-
 async function saveColorsToServer() {
   const token = getToken();
   if (!token) {
@@ -992,69 +843,52 @@ async function saveColorsToServer() {
   if (saveStatusTimer) clearTimeout(saveStatusTimer);
   saveStatusTimer = setTimeout(() => { saveColorsStatus.textContent = ''; }, 3000);
 }
-
 document.getElementById('btnSaveColors').addEventListener('click', saveColorsToServer);
-
 document.getElementById('btnResetColors').addEventListener('click', () => {
-  const DEFAULT_HULL   = '#9fb6cc';
+  const DEFAULT_HULL = '#9fb6cc';
   const DEFAULT_ACCENT = '#2a3340';
-  const DEFAULT_TRAIL  = '#66ddff';
-
-  // Reset stored values
-  localStorage.setItem('spaceships:shipColor',       DEFAULT_HULL);
+  const DEFAULT_TRAIL = '#66ddff';
+  localStorage.setItem('spaceships:shipColor', DEFAULT_HULL);
   localStorage.setItem('spaceships:shipAccentColor', DEFAULT_ACCENT);
-  localStorage.setItem('spaceships:trailColor',      DEFAULT_TRAIL);
-
-  // Rebuild internal HSL state for all three targets
+  localStorage.setItem('spaceships:trailColor', DEFAULT_TRAIL);
   const h = hexToHsl(DEFAULT_HULL);
   hullH = h.h; hullS = h.s; hullL = Math.max(0.05, Math.min(0.88, h.l));
   const a = hexToHsl(DEFAULT_ACCENT);
   accentH = a.h; accentS = a.s; accentL = Math.max(0.05, Math.min(0.88, a.l));
   const t = hexToHsl(DEFAULT_TRAIL);
   trailH = t.h; trailS = t.s; trailL = Math.max(0.05, Math.min(0.88, t.l));
-
-  // Re-sync the active picker to whatever tab is currently selected
-  if (colorTarget === 'hull')        { pickH = hullH;   pickS = hullS;   pickL = hullL;   }
+  if (colorTarget === 'hull') { pickH = hullH; pickS = hullS; pickL = hullL; }
   else if (colorTarget === 'accent') { pickH = accentH; pickS = accentS; pickL = accentL; }
-  else                               { pickH = trailH;  pickS = trailS;  pickL = trailL;  }
+  else { pickH = trailH; pickS = trailS; pickL = trailL; }
   brightnessEl.value = Math.round(pickL * 100);
-
-  // Apply to scene and UI
   if (custScene) {
     custScene.setColor(DEFAULT_HULL);
     custScene.setAccentColor(DEFAULT_ACCENT);
   }
-  colorPreviewEl.style.background   = DEFAULT_HULL;
-  colorPreviewEl.style.borderColor  = DEFAULT_ACCENT;
-  colorPreviewEl.style.boxShadow    = `0 0 18px ${DEFAULT_HULL}88`;
+  colorPreviewEl.style.background = DEFAULT_HULL;
+  colorPreviewEl.style.borderColor = DEFAULT_ACCENT;
+  colorPreviewEl.style.boxShadow = `0 0 18px ${DEFAULT_HULL}88`;
   const trailSwatch = document.getElementById('trailColorSwatch');
   if (trailSwatch) trailSwatch.style.background = DEFAULT_TRAIL;
-
   drawWheel();
 });
-
 function closeCustomization() {
   custPanel.classList.remove('open');
-    document.body.classList.remove('customization-open');
+  document.body.classList.remove('customization-open');
   lobbyEl.classList.remove('slide-left');
   if (custScene) custScene.pause();
 }
-
 document.getElementById('btnSaveCustom').addEventListener('click', closeCustomization);
-
-// ── Logout ────────────────────────────────────────────────────────────────────
-
 function parseJwtUsername(token) {
   try {
     return JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).username || null;
   } catch { return null; }
 }
-
 function refreshLogoutRow() {
-  const token    = getToken();
+  const token = getToken();
   const username = token ? parseJwtUsername(token) : null;
-  const row      = document.getElementById('settingsLogoutRow');
-  const label    = document.getElementById('pilotLabelName');
+  const row = document.getElementById('settingsLogoutRow');
+  const label = document.getElementById('pilotLabelName');
   if (username) {
     label.textContent = username;
     row.classList.remove('hidden');
@@ -1062,16 +896,11 @@ function refreshLogoutRow() {
     row.classList.add('hidden');
   }
 }
-
 document.getElementById('btnLogout').addEventListener('click', () => {
   clearToken();
-  // Close the settings panel, reload so the auth overlay re-appears.
   document.getElementById('settingsPanel').classList.add('hidden');
   location.reload();
 });
-
-// ── Hangar achievements summary ───────────────────────────────────────────────
-
 function checkPendingAchievements() {
   try {
     const raw = localStorage.getItem('spaceships:pendingAchs');
@@ -1079,11 +908,9 @@ function checkPendingAchievements() {
     const earned = JSON.parse(raw);
     if (!Array.isArray(earned) || !earned.length) return;
     localStorage.removeItem('spaceships:pendingAchs');
-
     const list = document.getElementById('hangar-ach-list');
     const overlay = document.getElementById('hangar-ach-overlay');
     if (!list || !overlay) return;
-
     list.innerHTML = earned.map(a =>
       `<div class="hangar-ach-row">
         <span class="ach-toast-icon">${esc(a.icon)}</span>
@@ -1094,19 +921,14 @@ function checkPendingAchievements() {
         </div>
       </div>`
     ).join('');
-
     overlay.classList.remove('hidden');
     document.getElementById('btnDismissHangarAch').onclick = () => {
       overlay.classList.add('hidden');
     };
-  } catch {}
+  } catch { }
 }
-
-// Gate the lobby behind auth. If the player already has a valid JWT this
-// resolves instantly (no overlay shown). Guests click through without a token.
 requireAuth().then(() => {
   refreshLogoutRow();
-  // Guests get a randomly-generated name they cannot change.
   if (localStorage.getItem('spaceships:isGuest') === '1') {
     const guestName = localStorage.getItem(SAVED_NAME_KEY) || 'Pilot';
     nameInput.value = guestName;
@@ -1114,23 +936,17 @@ requireAuth().then(() => {
     nameInput.style.opacity = '0.55';
     nameInput.title = 'Guests cannot change their callsign — log in to choose a name';
   } else if (getToken()) {
-    // Logged-in players always use their account username.
     const accountName = localStorage.getItem(SAVED_NAME_KEY) || 'Pilot';
     nameInput.value = accountName;
     nameInput.readOnly = true;
     nameInput.style.opacity = '0.55';
     nameInput.title = 'Your callsign is your account username and cannot be changed here';
   }
-  // Refresh credits, unlocks, and show any achievements earned in the last match.
   refreshCredits();
   refreshUnlocks();
   checkPendingAchievements();
 });
-
-// ── Credits display ───────────────────────────────────────────────────────────
-
 const creditsAmountEl = document.getElementById('creditsAmount');
-
 function setCreditsDisplay(amount) {
   if (creditsAmountEl) {
     creditsAmountEl.textContent = Number.isFinite(amount)
@@ -1139,25 +955,19 @@ function setCreditsDisplay(amount) {
   }
   localStorage.setItem('spaceships:credits', String(amount));
 }
-
 async function refreshCredits() {
   const token = getToken();
   if (!token) return;
   try {
-    const res  = await fetch('/spaceships/api/credits', {
+    const res = await fetch('/spaceships/api/credits', {
       headers: { 'Authorization': 'Bearer ' + token },
     });
     const data = await res.json();
     if (data.ok) setCreditsDisplay(data.credits);
-  } catch {}
+  } catch { }
 }
-
-// Seed from localStorage immediately so there's no blank flash on load.
 const _cachedCr = parseInt(localStorage.getItem('spaceships:credits'), 10);
 if (!isNaN(_cachedCr)) setCreditsDisplay(_cachedCr);
-
-// ── Controls popup ────────────────────────────────────────────────────────────
-
 const CONTROL_GUIDES = {
   mouse_keys: [
     ['Mouse / Arrows', 'Steer'],
@@ -1190,10 +1000,8 @@ const CONTROL_GUIDES = {
     ['Slider', 'Throttle'],
   ],
 };
-
 const btnControlsPopup = document.getElementById('btnControlsPopup');
 const controlsPopup = document.getElementById('controls-popup');
-
 btnControlsPopup.addEventListener('click', () => {
   const isHidden = controlsPopup.classList.toggle('hidden');
   btnControlsPopup.textContent = isHidden ? 'CONTROLS ▾' : 'CONTROLS ▴';
@@ -1205,39 +1013,31 @@ btnControlsPopup.addEventListener('click', () => {
       .join('');
   }
 });
-
-// ── Profile panel ────────────────────────────────────────────────────────────
-
 const profileOverlay = document.getElementById('profile-overlay');
-const profilePaneMy  = document.getElementById('profile-pane-my');
-const profilePaneLb  = document.getElementById('profile-pane-lb');
+const profilePaneMy = document.getElementById('profile-pane-my');
+const profilePaneLb = document.getElementById('profile-pane-lb');
 let lbLoaded = false;
-
 document.getElementById('nameInput').addEventListener('click', openProfilePanel);
 document.getElementById('btnCloseProfile').addEventListener('click', () => {
   profileOverlay.classList.add('hidden');
   lbLoaded = false;
 });
-
 document.getElementById('profile-tab-my').addEventListener('click', () => switchProfileTab('my'));
 document.getElementById('profile-tab-lb').addEventListener('click', async () => {
   switchProfileTab('lb');
   if (!lbLoaded) { lbLoaded = true; await loadLeaderboard(); }
 });
-
 function switchProfileTab(tab) {
   document.getElementById('profile-tab-my').classList.toggle('active', tab === 'my');
   document.getElementById('profile-tab-lb').classList.toggle('active', tab === 'lb');
   profilePaneMy.classList.toggle('hidden', tab !== 'my');
   profilePaneLb.classList.toggle('hidden', tab !== 'lb');
 }
-
 function fmtCampaignBest(lives) {
   if (lives === null || lives === undefined) return '—';
   if (lives >= 3) return '✓ Flawless';
   return `✓ (${lives} ${lives === 1 ? 'life' : 'lives'} left)`;
 }
-
 function fmtTrialTime(t) {
   if (t === null || t === undefined) return '—';
   const total = Math.max(0, parseFloat(t));
@@ -1245,31 +1045,26 @@ function fmtTrialTime(t) {
   const s = (total % 60).toFixed(3).padStart(6, '0');
   return `${m}:${s}`;
 }
-
 function esc(str) {
-  return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
-
 async function openProfilePanel() {
   profileOverlay.classList.remove('hidden');
   lbLoaded = false;
   switchProfileTab('my');
-
   const token = getToken();
   if (!token) {
     profilePaneMy.innerHTML = '<div class="profile-no-account">Log in to view your profile and stats.</div>';
     return;
   }
-
   const username = localStorage.getItem('spaceships:pilotName');
   if (!username) {
     profilePaneMy.innerHTML = '<div class="profile-no-account">No pilot name found.</div>';
     return;
   }
-
   profilePaneMy.innerHTML = '<div class="profile-loading">Loading…</div>';
   try {
-    const res  = await fetch(`/spaceships/api/profile/${encodeURIComponent(username)}`);
+    const res = await fetch(`/spaceships/api/profile/${encodeURIComponent(username)}`);
     const data = await res.json();
     if (!data.ok) {
       profilePaneMy.innerHTML = `<div class="profile-error">${esc(data.error || 'Failed to load profile')}</div>`;
@@ -1280,17 +1075,13 @@ async function openProfilePanel() {
     profilePaneMy.innerHTML = '<div class="profile-error">Could not reach server.</div>';
   }
 }
-
 function renderMyProfile(p) {
   const winRate = p.gamesPlayed > 0 ? Math.round(p.matchesWon / p.gamesPlayed * 100) : 0;
-
   const earned = p.achievements.filter(a => a.earned);
   const locked = p.achievements.filter(a => !a.earned);
-
   function badgeHtml(a) {
-    const cls  = a.earned ? 'achievement-badge' : 'achievement-badge locked';
+    const cls = a.earned ? 'achievement-badge' : 'achievement-badge locked';
     const icon = a.earned ? esc(a.icon) : '🔒';
-
     let progressHtml = '';
     if (!a.earned && a.progress) {
       const { current, target, isTime } = a.progress;
@@ -1306,7 +1097,6 @@ function renderMyProfile(p) {
           </div>`;
       }
     }
-
     return `<div class="${cls}" title="${esc(a.desc)}">
       <span class="ach-icon">${icon}</span>
       <div class="ach-badge-body">
@@ -1315,11 +1105,9 @@ function renderMyProfile(p) {
       </div>
     </div>`;
   }
-
   const earnedHtml = earned.length > 0
     ? earned.map(badgeHtml).join('')
     : '<div class="profile-no-ach">No achievements yet — get out there!</div>';
-
   profilePaneMy.innerHTML = `
     <div class="profile-header">
       <div class="profile-callsign">${esc(p.username)}</div>
@@ -1361,7 +1149,6 @@ function renderMyProfile(p) {
       ${locked.length > 0 ? `<div class="ach-section-label locked-label">LOCKED</div>${locked.map(badgeHtml).join('')}` : ''}
     </div>
   `;
-
   const toggleBtn = profilePaneMy.querySelector('#achToggleBtn');
   const achContent = profilePaneMy.querySelector('#achContent');
   if (toggleBtn && achContent) {
@@ -1371,11 +1158,10 @@ function renderMyProfile(p) {
     });
   }
 }
-
 async function loadLeaderboard() {
   profilePaneLb.innerHTML = '<div class="profile-loading">Loading…</div>';
   try {
-    const res  = await fetch('/spaceships/api/leaderboard');
+    const res = await fetch('/spaceships/api/leaderboard');
     const data = await res.json();
     if (!data.ok) {
       profilePaneLb.innerHTML = '<div class="profile-error">Failed to load leaderboard.</div>';
@@ -1386,7 +1172,6 @@ async function loadLeaderboard() {
     profilePaneLb.innerHTML = '<div class="profile-error">Could not reach server.</div>';
   }
 }
-
 function renderLeaderboard(entries) {
   if (!entries || entries.length === 0) {
     profilePaneLb.innerHTML = '<div class="profile-no-account">No pilots on record yet.</div>';
@@ -1413,9 +1198,6 @@ function renderLeaderboard(entries) {
       <tbody>${rows}</tbody>
     </table>`;
 }
-
-// ── Stats toggle ──────────────────────────────────────────────────────────────
-
 const showStatsInput = document.getElementById('showStatsInput');
 showStatsInput.checked = localStorage.getItem('spaceships:showStats') !== '0';
 showStatsInput.addEventListener('change', () => {
@@ -1424,24 +1206,8 @@ showStatsInput.addEventListener('change', () => {
   const hudStats = document.getElementById('hud-stats');
   if (hudStats) hudStats.style.display = show ? '' : 'none';
 });
-
-// Remove intro animation class so menus don't re-animate when navigating back
 setTimeout(() => document.body.classList.remove('intro-active'), 3500);
-
-// ── Gamepad menu navigation ───────────────────────────────────────────────────
-// Polls the first connected gamepad in a rAF loop while the lobby is active.
-//
-// Controls:
-//   D-pad up / Left-stick up   → move focus up
-//   D-pad down / Left-stick down → move focus down
-//   A (button 0)               → confirm / click focused element
-//   B (button 1)               → back (clicks the current screen's ← back btn)
-//   Start (button 9)           → back to main screen from any sub-screen
-//
-// A small CSS block is injected once to give focused buttons a visible
-// controller-style highlight ring that matches the game's blue theme.
 (function startGamepadMenuNav() {
-  // Inject focus style once
   const focusStyle = document.createElement('style');
   focusStyle.textContent = `
     .big:focus-visible, .link:focus-visible,
@@ -1451,92 +1217,66 @@ setTimeout(() => document.body.classList.remove('intro-active'), 3500);
       box-shadow: 0 0 0 5px rgba(74,163,255,0.28), 0 0 18px rgba(74,163,255,0.35);
     }`;
   document.head.appendChild(focusStyle);
-
-  // Maps screen element IDs → the ID of the "go back" button for that screen.
   const BACK_BTNS = {
-    'lobby-multi':    'btnBackMulti',
-    'lobby-create':   'btnBackCreate',
-    'lobby-find':     'btnBackFind',
-    'lobby-room':     'btnLeave',
-    'lobby-single':   'btnBackSingle',
+    'lobby-multi': 'btnBackMulti',
+    'lobby-create': 'btnBackCreate',
+    'lobby-find': 'btnBackFind',
+    'lobby-room': 'btnLeave',
+    'lobby-single': 'btnBackSingle',
     'lobby-tutorial': 'btnBackTutorial',
-    'lobby-trials':   'btnBackTrials',
+    'lobby-trials': 'btnBackTrials',
     'lobby-campaign': 'btnBackCampaign',
   };
-
   function getActiveScreen() {
     return document.querySelector('.screen:not(.hidden)');
   }
-
   function getMenuFocusables() {
     const screen = getActiveScreen();
     if (!screen) return [];
-    // Buttons (excluding locked/disabled), radios, checkboxes — not text inputs
-    // since those require a keyboard; players can still click them with mouse.
     return [...screen.querySelectorAll(
       'button:not(.locked):not([disabled]), input[type="radio"], input[type="checkbox"]'
     )].filter(el => el.offsetParent !== null);
   }
-
-  let navCooldown  = 0;
-  let prevNavUp    = false, prevNavDown  = false;
-  let prevA        = false, prevB        = false, prevStart = false;
-  let lastTs       = null;
-
+  let navCooldown = 0;
+  let prevNavUp = false, prevNavDown = false;
+  let prevA = false, prevB = false, prevStart = false;
+  let lastTs = null;
   function loop(ts) {
-    // Stop the loop once the game has started (lobby hidden)
     if (!document.body.classList.contains('in-lobby')) return;
-
     const dt = lastTs == null ? 0 : Math.min((ts - lastTs) / 1000, 0.1);
     lastTs = ts;
     navCooldown = Math.max(0, navCooldown - dt);
-
     const rawGp = [...(navigator.getGamepads?.() ?? [])].find(g => g?.connected);
     if (!rawGp) { requestAnimationFrame(loop); return; }
-
-    const bt  = rawGp.buttons;
-    const ax  = rawGp.axes;
+    const bt = rawGp.buttons;
+    const ax = rawGp.axes;
     const btn = (i) => bt[i]?.pressed ?? false;
-
-    const DEAD    = 0.5;
-    const navUp   = btn(12) || (ax[1] ?? 0) < -DEAD;
+    const DEAD = 0.5;
+    const navUp = btn(12) || (ax[1] ?? 0) < -DEAD;
     const navDown = btn(13) || (ax[1] ?? 0) > DEAD;
-    const pressA  = btn(0);
-    const pressB  = btn(1);
+    const pressA = btn(0);
+    const pressB = btn(1);
     const pressStart = btn(9);
-
     const focusables = getMenuFocusables();
-
-    // If nothing on the current screen is focused (e.g. just navigated here),
-    // auto-focus the first focusable element so the player has a starting point.
     if (focusables.length > 0 && !focusables.includes(document.activeElement)) {
       focusables[0].focus();
     }
-
-    // Up / down navigation with initial delay + held-repeat
     if (navCooldown === 0 && (navUp || navDown)) {
-      const dir  = navUp ? -1 : 1;
-      const cur  = focusables.indexOf(document.activeElement);
+      const dir = navUp ? -1 : 1;
+      const cur = focusables.indexOf(document.activeElement);
       const next = ((cur < 0 ? 0 : cur) + dir + focusables.length) % focusables.length;
       focusables[next].focus();
-      // First press: 280 ms delay before repeat; while held: 120 ms repeat
       navCooldown = (prevNavUp || prevNavDown) ? 0.12 : 0.28;
     }
-
-    // A → confirm (click)
     if (pressA && !prevA) {
       const el = document.activeElement;
       if (el && focusables.includes(el)) el.click();
     }
-
-    // B → back
     if (pressB && !prevB) {
       const screen = getActiveScreen();
       const backId = screen && BACK_BTNS[screen.id];
       if (backId) document.getElementById(backId)?.click();
     }
-
-    // Start → back to main from any sub-screen
     if (pressStart && !prevStart) {
       const screen = getActiveScreen();
       if (screen && screen.id !== 'lobby-main') {
@@ -1544,12 +1284,9 @@ setTimeout(() => document.body.classList.remove('intro-active'), 3500);
         if (backId) document.getElementById(backId)?.click();
       }
     }
-
     prevNavUp = navUp; prevNavDown = navDown;
     prevA = pressA; prevB = pressB; prevStart = pressStart;
-
     requestAnimationFrame(loop);
   }
-
   requestAnimationFrame(loop);
 }());
