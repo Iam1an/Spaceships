@@ -1,12 +1,9 @@
 import * as THREE from 'three';
-
-export const WATER_Y = -60;      // kill threshold (ship center below this = death)
-export const WATER_MESH_Y = -65; // visual mesh sits slightly below kill plane
-
+export const WATER_Y = -60;
+export const WATER_MESH_Y = -65;
 export function createWater(scene) {
   const geo = new THREE.PlaneGeometry(8000, 8000, 1, 1);
   geo.rotateX(-Math.PI / 2);
-
   const mat = new THREE.MeshStandardMaterial({
     color: 0x1a6ea8,
     roughness: 0.15,
@@ -14,19 +11,14 @@ export function createWater(scene) {
     transparent: true,
     opacity: 0.88,
   });
-
   const mesh = new THREE.Mesh(geo, mat);
   mesh.position.y = WATER_MESH_Y;
   scene.add(mesh);
-
-  // Scrolling UV offset gives a slow wave shimmer without a shader.
   let uvOffset = 0;
   function update(dt) {
     uvOffset += dt * 0.012;
     mat.map && (mat.map.offset.set(uvOffset % 1, uvOffset % 1));
   }
-
-  // Subtle foam/specular layer on top.
   const foamGeo = new THREE.PlaneGeometry(8000, 8000, 1, 1);
   foamGeo.rotateX(-Math.PI / 2);
   const foamMat = new THREE.MeshBasicMaterial({
@@ -39,6 +31,5 @@ export function createWater(scene) {
   const foam = new THREE.Mesh(foamGeo, foamMat);
   foam.position.y = WATER_MESH_Y + 0.5;
   scene.add(foam);
-
   return { mesh, foam, update };
 }
