@@ -245,7 +245,7 @@ This game and all its code, assets, and design are the exclusive property of the
 
 | Role | Contributor |
 |:---|:---|
-| Game creator | **Ian** |
+| Game creator & Logic | **Ian** |
 | Online play & backend infrastructure | **Gheat** |
 
 ---
