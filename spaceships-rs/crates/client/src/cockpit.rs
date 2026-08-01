@@ -244,6 +244,13 @@ impl CockpitProfile {
     /// shifted 3.2 units nose-ward, and a cockpit that ignored that put the
     /// pilot's head out among the tailfins with the panel buried in the
     /// fuselage — the hull moves, the seat does not.
+    ///
+    /// Test-only now that [`interior_transform`] carries the fit. It is kept
+    /// rather than deleted because it is a *second, independent* statement of
+    /// the same arithmetic, written before the transform was: the test that
+    /// checks the two agree is only worth anything while they are written out
+    /// separately.
+    #[cfg(test)]
     const fn fitted(self, scale: f32, offset: Vec3) -> CockpitProfile {
         CockpitProfile {
             eye: Vec3::new(
@@ -309,15 +316,58 @@ fn admin_hull() -> bool {
     }
 }
 
-/// The profile for a hull, in the ship space the interior is built in.
+/// The profile for a hull, in the space the interior is **built** in.
+///
+/// Deliberately *unfitted*. The fit used to be applied here, and that was
+/// wrong: `build_interior` measures a great deal of the cockpit in literal
+/// constants rather than off the profile — the stick sits `eye.z + 0.30`
+/// forward, its shaft is 0.24 long, the pedals are 0.115 by 0.135 — and those
+/// literals do not go through `fitted`. Scaling the profile alone therefore
+/// pulled the tub away from the furniture inside it: at the jet's 2.43 the
+/// stick ended up a third of the distance from the seat it should have been,
+/// which is to say inside the pilot and out of frame, and the consoles no
+/// longer reached the side walls, which is the gap either side of the panel.
+///
+/// So the fit goes on the interior's **root transform** instead, and every
+/// number below it — profile and literal alike — lives in one unscaled space
+/// and scales together. That is also exactly what the JS does: the cockpit
+/// group is a child of the ship group, and `main.js:219` scales the group.
+///
+/// The one thing that still needs the fit explicitly is the seated camera,
+/// because it is not parented to the interior; see [`Rig::eye`].
 fn profile(hull: Hull) -> CockpitProfile {
-    let base = match hull {
+    match hull {
         Hull::Default => DEFAULT_PROFILE,
         Hull::Admin => ADMIN_PROFILE,
         Hull::Jet => JET_PROFILE,
-    };
+    }
+}
+
+/// How much to shrink the hand-authored furniture — stick, throttle — for the
+/// hull being flown.
+///
+/// The tub is described by a profile and so follows the aircraft; the furniture
+/// inside it is not. `build_interior` writes the stick as a 0.24 shaft under a
+/// 0.15 grip, and those numbers were authored against `spaceship.glb`, whose
+/// fit is the identity. A pilot's hand is the same size in every cockpit, so
+/// what has to hold constant is the furniture's size *after* the fit — which
+/// means dividing by the fit the interior root is about to multiply by.
+///
+/// [`crate::scene::SHIP_SCALE`] over the hull's own fit: 1 for the two original
+/// hulls, and about 0.62 for `jet.glb`, which is authored small and scaled up
+/// 1.62 to match. Without it the jet gets a stick two and a half times life
+/// size — a black column through the middle of the windscreen.
+fn furniture_scale() -> f32 {
+    crate::scene::SHIP_SCALE / crate::scene::ship_fit().0
+}
+
+/// The interior root's transform: `scene::ship_fit` as a `Transform`.
+///
+/// `ship_fit` describes `q' = scale * (q + offset)`, and a `Transform` applies
+/// `scale * q + translation`, so the translation is `scale * offset`.
+fn interior_transform() -> Transform {
     let (scale, offset) = crate::scene::ship_fit();
-    base.fitted(scale, offset)
+    Transform::from_translation(offset * scale).with_scale(Vec3::splat(scale))
 }
 
 // ---------------------------------------------------------------------------
@@ -746,7 +796,19 @@ impl Gauge {
 /// `Option<Res<Rig>>` and no field has to be an `Option`.
 #[derive(Resource)]
 struct Rig {
-    profile: CockpitProfile,
+    /// [`CockpitProfile::eye`] carried through `scene::ship_fit`, in **ship**
+    /// space.
+    ///
+    /// The interior root holds the fit for everything parented to it, but the
+    /// camera is not parented to the interior — `seat_camera` writes it from
+    /// the ship's world matrix — so the one anchor that leaves this hierarchy
+    /// has to be fitted by hand. Stored rather than recomputed so the fit is
+    /// read once, at spawn, from the same call the root transform used.
+    ///
+    /// This is the whole of the profile the `Rig` still needs: everything else
+    /// it described is now geometry hanging off [`Rig::root`], and the seated
+    /// FOV is read straight from `profile(hull())` at `toggle_view`.
+    eye: Vec3,
     /// The interior root, a child of the local ship. Hidden in third person.
     root: Entity,
     /// Centre stick and throttle lever, which follow the controls.
@@ -1093,7 +1155,9 @@ fn build_cockpit(
     let root = commands
         .spawn((
             Name::new("CockpitInterior"),
-            Transform::IDENTITY,
+            // Carries `scene::ship_fit` for the whole interior — see
+            // `profile`. Everything below this node is authored unscaled.
+            interior_transform(),
             // `syncShipVisibility`: shown only while seated.
             Visibility::Hidden,
             ChildOf(ship),
@@ -1112,7 +1176,7 @@ fn build_cockpit(
     };
 
     commands.insert_resource(Rig {
-        profile,
+        eye: interior_transform().transform_point(profile.eye),
         root,
         stick,
         throttle,
@@ -1137,6 +1201,7 @@ fn build_cockpit(
 fn build_interior(b: &mut Bld, root: Entity, p: &CockpitProfile) -> (Entity, Entity) {
     let (hw, floor_y, rail_y, back_z, dash_z) = (p.hw, p.floor_y, p.rail_y, p.back_z, p.dash_z);
     let eye = p.eye;
+    let furn = furniture_scale();
     let dash_top = p.dash_top;
     let dash_bot = dash_top - 0.36;
     let rail_z1 = dash_z - 0.10;
@@ -1324,7 +1389,14 @@ fn build_interior(b: &mut Bld, root: Entity, p: &CockpitProfile) -> (Entity, Ent
     }
 
     // -- centre stick, between the pilot's knees ----------------------------
-    let stick = b.node(root, Transform::from_xyz(0.0, floor_y + 0.02, eye.z + 0.30));
+    // `0.30` ahead of the eye is the JS's reach to the grip (`cockpit.js:184`)
+    // and it scales with the pilot, not with the tub — so it goes through
+    // `furn` like the stick's own dimensions do.
+    let stick = b.node(
+        root,
+        Transform::from_xyz(0.0, floor_y + 0.02 * furn, eye.z + 0.30 * furn)
+            .with_scale(Vec3::splat(furn)),
+    );
     let boot = b.pal.boot.clone();
     let shaft = b.pal.shaft.clone();
     b.mesh(stick, &boot, &rubber, Transform::from_xyz(0.0, 0.03, 0.0));
@@ -1358,9 +1430,13 @@ fn build_interior(b: &mut Bld, root: Entity, p: &CockpitProfile) -> (Entity, Ent
     );
 
     // -- throttle lever, left console ---------------------------------------
+    // Inboard of the left console wall by a hand's width, so this one offset is
+    // measured from `hw` and stays there; everything else about the lever is
+    // the pilot's scale.
     let throttle = b.node(
         root,
-        Transform::from_xyz(hw - 0.14, floor_y + 0.34, eye.z + 0.02),
+        Transform::from_xyz(hw - 0.14 * furn, floor_y + 0.34 * furn, eye.z + 0.02 * furn)
+            .with_scale(Vec3::splat(furn)),
     );
     b.boxm(
         throttle,
@@ -1382,19 +1458,21 @@ fn build_interior(b: &mut Bld, root: Entity, p: &CockpitProfile) -> (Entity, Ent
     );
 
     // -- rudder pedals, seen through the chin glazing -----------------------
+    // A footwell is the pilot's, not the airframe's, so these go through `furn`
+    // whole: sizes, spacing and reach alike.
     for s in [-1.0, 1.0] {
         b.box_rx(
             root,
-            Vec3::new(0.115, 0.135, 0.022),
+            Vec3::new(0.115, 0.135, 0.022) * furn,
             &stick_m,
-            Vec3::new(s * 0.20, floor_y + 0.065, eye.z + 0.72),
+            Vec3::new(s * 0.20 * furn, floor_y + 0.065 * furn, eye.z + 0.72 * furn),
             0.62,
         );
         b.boxm(
             root,
-            Vec3::new(0.05, 0.016, 0.24),
+            Vec3::new(0.05, 0.016, 0.24) * furn,
             &frame,
-            Vec3::new(s * 0.20, floor_y + 0.018, eye.z + 0.60),
+            Vec3::new(s * 0.20 * furn, floor_y + 0.018 * furn, eye.z + 0.60 * furn),
         );
     }
 
@@ -1845,7 +1923,7 @@ fn seat_camera(
     // The eye anchor is ship-local; the ship's world matrix carries it out.
     // Reading `GlobalTransform` here rather than `ShipView::pos` is what keeps
     // the view free of the 60 Hz staircase `scene.rs` exists to remove.
-    tf.translation = ship.transform_point(rig.profile.eye);
+    tf.translation = ship.transform_point(rig.eye);
 
     // A Bevy camera looks down its local -Z and this game's ship forward is
     // +Z, hence the PI yaw correction — the same one `fpcamera.js` bakes in.
@@ -2564,17 +2642,18 @@ fn glyph(ch: char) -> u16 {
 mod tests {
     use super::*;
 
-    /// Every profile as it is actually built: the jet's anchors are authored
-    /// against `jet.glb`'s own geometry and only mean anything once
-    /// `scene::model_fit`'s scale and nose-ward shift are on them.
+    /// `scene::ship_fit()` for `jet.glb`, which the tests cannot call: it reads
+    /// `SPACESHIPS_SHIP_MODEL`, and a test that set the environment would
+    /// change what every other test in the binary sees.
+    ///
+    /// `model_fit`'s 1.62 times `scene::SHIP_SCALE`, with its (1.98, 0.20, 0.0)
+    /// turned into ship axes by the -90 degree yaw.
+    const JET_FIT: (f32, Vec3) = (1.62 * crate::scene::SHIP_SCALE, Vec3::new(0.0, 0.20, 1.98));
+
+    /// Every profile as it is actually built — which is **unfitted**, because
+    /// the fit now lives on the interior's root transform. See `profile`.
     fn built_profiles() -> [CockpitProfile; 3] {
-        [
-            DEFAULT_PROFILE.fitted(1.0, Vec3::ZERO),
-            ADMIN_PROFILE.fitted(1.0, Vec3::ZERO),
-            // `scene::ship_fit()` for `jet.glb`: 1.62, with `model_fit`'s
-            // (1.98, 0.20, 0.0) turned into ship axes by the -90 degree yaw.
-            JET_PROFILE.fitted(1.62, Vec3::new(0.0, 0.20, 1.98)),
-        ]
+        [DEFAULT_PROFILE, ADMIN_PROFILE, JET_PROFILE]
     }
 
     #[test]
@@ -2588,6 +2667,47 @@ mod tests {
             // The usable panel is what sits between the side consoles.
             assert!(p.hw - 0.20 > 0.0, "the panel has room for a display");
         }
+    }
+
+    /// The interior is built in **one** space: the profile is unfitted, and the
+    /// fit is a transform on the root.
+    ///
+    /// This is the property that broke and it is worth stating outright, because
+    /// nothing about the types enforces it. `build_interior` measures much of
+    /// the cockpit in literal constants — the stick at `eye.z + 0.30`, a 0.24
+    /// shaft, 0.115 by 0.135 pedals — and a literal cannot be fitted. Scale the
+    /// profile without scaling those and the furniture separates from the tub:
+    /// at the jet's fit the stick sat at 40% of its intended distance from the
+    /// seat, which put it inside the pilot, and the consoles stopped short of
+    /// the walls, which is a gap either side of the panel.
+    #[test]
+    fn the_profile_is_unfitted_so_it_matches_the_literals_around_it() {
+        for hull in [Hull::Default, Hull::Admin, Hull::Jet] {
+            let p = profile(hull);
+            assert!(
+                [DEFAULT_PROFILE, ADMIN_PROFILE, JET_PROFILE].contains(&p),
+                "{hull:?} came back fitted; the fit belongs on the root",
+            );
+        }
+
+        // And the root carries it. An identity fit is an identity transform, so
+        // the hull that needs no fit pays nothing for the scheme.
+        let jet =
+            Transform::from_translation(JET_FIT.1 * JET_FIT.0).with_scale(Vec3::splat(JET_FIT.0));
+        assert!(jet.scale.x > 2.0, "the jet's interior really is scaled up");
+        // Approximate, and it has to be: the transform computes
+        // `scale * q + scale * offset` where `fitted` computes
+        // `scale * (q + offset)`, which differ in the last bit. A ten-thousandth
+        // of a unit is far below anything the eye can be wrong by and far above
+        // that.
+        let (a, b) = (
+            jet.transform_point(JET_PROFILE.eye),
+            JET_PROFILE.fitted(JET_FIT.0, JET_FIT.1).eye,
+        );
+        assert!(
+            a.abs_diff_eq(b, 1e-4),
+            "the root transform and `fitted` disagree about the eye: {a} vs {b}",
+        );
     }
 
     /// A hull whose fit is the identity — which is both of the originals — must
@@ -2609,10 +2729,17 @@ mod tests {
     /// unit above it, which is out among the tailfins.
     #[test]
     fn the_jet_pilot_sits_inside_the_jets_canopy() {
-        const CANOPY_Z: (f32, f32) = (4.471, 6.406);
-        const CANOPY_CROWN: f32 = 0.573;
+        // `jet.glb`'s canopy carried through the same fit as the hull, so both
+        // sides of every comparison below are in one space. The literals are
+        // the canopy at `model_fit`'s 1.62; `SHIP_SCALE` applies to the glass
+        // and the pilot alike, so it multiplies both.
+        const CANOPY_Z: (f32, f32) = (
+            4.471 * crate::scene::SHIP_SCALE,
+            6.406 * crate::scene::SHIP_SCALE,
+        );
+        const CANOPY_CROWN: f32 = 0.573 * crate::scene::SHIP_SCALE;
 
-        let p = JET_PROFILE.fitted(1.62, Vec3::new(0.0, 0.20, 1.98));
+        let p = JET_PROFILE.fitted(JET_FIT.0, JET_FIT.1);
         assert!(
             p.eye.z > CANOPY_Z.0 && p.eye.z < CANOPY_Z.1,
             "eye outside the canopy lengthwise: {}",
