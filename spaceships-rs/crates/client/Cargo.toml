@@ -1,0 +1,100 @@
+[package]
+name = "spaceships-client"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# NOT inherited from the workspace. `sim`, `protocol`, and `server` build on
+# 1.85; Bevy 0.19 declares rust-version = "1.95.0", and cargo's MSRV-aware
+# resolver will silently pick Bevy 0.16 for this package if it inherits the
+# workspace's 1.85. Overriding it here keeps that constraint local to the
+# renderer instead of dragging the dependency-free crates forward with it.
+rust-version = "1.95"
+
+[dependencies]
+# The whole point: the renderer reads the simulation, never the reverse.
+spaceships-sim.workspace = true
+
+# Pinned exactly. Bevy renames core types every release (this crate was written
+# against 0.19: `SceneRoot` is `WorldAssetRoot`, `EventReader` is
+# `MessageReader`, `shadows_enabled` is `shadow_maps_enabled`), so a caret
+# range would be a silent breakage waiting for the next minor bump.
+#
+# `default-features = false` with a hand-picked list rather than the "3d"
+# profile. The default set pulls in 2d, UI, audio, picking, gizmos, gilrs, and
+# BSN scenes, all of which cost wasm bytes we cannot spend. Feature names below
+# are from bevy 0.19's own docs/cargo_features.md — several changed in 0.18/0.19
+# (`zstd` split into `zstd_rust`/`zstd_c`, `bevy_gizmos` split from
+# `bevy_gizmos_render`, scene serialization renamed to
+# `bevy_world_serialization`).
+[dependencies.bevy]
+version = "=0.19.0"
+default-features = false
+features = [
+  # -- app / core ----------------------------------------------------------
+  "std",
+  "async_executor",
+  "bevy_asset",
+  "bevy_log",
+  "reflect_auto_register",
+
+  # -- windowing -----------------------------------------------------------
+  "bevy_window",
+  "bevy_winit",
+
+  # -- scene description ---------------------------------------------------
+  "bevy_camera",
+  "bevy_color",
+  "bevy_image",
+  "bevy_mesh",
+  "bevy_shader",
+  "bevy_material",
+  "bevy_light",
+
+  # -- renderer ------------------------------------------------------------
+  "bevy_render",
+  "bevy_core_pipeline",
+  "bevy_pbr",
+  "bevy_gltf",
+  # Bloom, chromatic aberration, and vignette — the Ultra Graphics pipeline
+  # (`public/src/graphics.js`) is the look being matched, and all three are in
+  # here. Not free: this is the feature that pulls in the post-process render
+  # graph and its shaders.
+  "bevy_post_process",
+  # `WorldAssetRoot` (ex-`SceneRoot`) lives here; spawning a glTF scene needs
+  # it. This is the old scene system, not the new BSN one.
+  "bevy_world_serialization",
+
+  # -- image formats -------------------------------------------------------
+  # png: the glTF's embedded textures. jpeg: "moon Texture.jpg", for when the
+  # moon lands. ktx2+zstd_rust: bevy's own tonemapping LUTs are ktx2/zstd.
+  "png",
+  "jpeg",
+  "ktx2",
+  "zstd_rust",
+  "tonemapping_luts",
+]
+
+# Native only. `multi_threaded` needs real threads; on wasm32 without
+# SharedArrayBuffer + COOP/COEP it is a build error, and turning it on would
+# also force the COOP/COEP header work described in vite.config.js.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.bevy]
+version = "=0.19.0"
+default-features = false
+features = ["multi_threaded"]
+
+# wasm-only. `webgl2` is in bevy's `default_platform` collection, which
+# `default-features = false` removed, so it has to be named explicitly or the
+# render backend has no browser target at all.
+[target.'cfg(target_arch = "wasm32")'.dependencies.bevy]
+version = "=0.19.0"
+default-features = false
+features = ["webgl2"]
+
+# getrandom has no default backend on wasm32-unknown-unknown; something in the
+# graph (wgpu -> uuid, and bevy's own asset ids) pulls it in. Needs both this
+# feature and `RUSTFLAGS=--cfg getrandom_backend="wasm_js"` at build time — see
+# build-wasm.sh. Missing either produces a link error about
+# `__getrandom_v03_custom` that reads like a Bevy problem and is not one.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "=0.3.4", default-features = false, features = ["wasm_js"] }

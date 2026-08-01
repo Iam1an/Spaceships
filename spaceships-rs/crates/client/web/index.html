@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>Spaceships (wasm)</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #05050c; overflow: hidden; }
+      /* Bevy's `fit_canvas_to_parent` sizes the canvas from its parent, so the
+         parent is what needs the dimensions. */
+      #wrap { width: 100vw; height: 100vh; }
+      canvas { display: block; outline: none; }
+      #status {
+        position: fixed; inset: 0; display: grid; place-items: center;
+        color: #8ea8c8; font: 14px ui-monospace, monospace; pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="wrap"><canvas id="game"></canvas></div>
+    <div id="status">loading…</div>
+
+    <script type="module">
+      // wasm-bindgen's `--target web` output. The .wasm is fetched by the shim
+      // relative to its own URL, which is why vite.config.js's WASM-readiness
+      // note calls out `optimizeDeps.exclude` — esbuild rewrites that URL and
+      // the fetch 404s. This page loads the shim directly, so it does not
+      // apply here; it will when this is wired into the Vite build.
+      import init from './spaceships-client.js';
+
+      const status = document.getElementById('status');
+      try {
+        await init();
+        status.remove();
+      } catch (e) {
+        // Bevy's winit loop reports its own shutdown by throwing. That is not
+        // an error worth showing the player.
+        if (!String(e).includes('Using exceptions for control flow')) {
+          status.textContent = 'failed to start: ' + e;
+          throw e;
+        }
+        status.remove();
+      }
+    </script>
+  </body>
+</html>
