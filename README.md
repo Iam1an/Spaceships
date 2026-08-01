@@ -143,6 +143,49 @@ flowchart LR
 
 ---
 
+## 🧪 Development & Testing
+
+```bash
+npm start        # builds with Vite, serves on :4000
+npm run dev      # Vite dev server with HMR, proxies API + WebSocket to :4000
+npm run build    # build to dist/
+```
+
+### Getting a quiet match to test in
+
+Most gameplay changes are impossible to observe in a normal match — you get
+killed before you can see anything. To get an **empty lobby**:
+
+> **Multiplayer → Create Game → uncheck "Auto-fill uneven teams with bot" →
+> Recruit Players**
+
+No bot is added and you have the map to yourself: free to fly around, line up
+specific shots, and watch what actually happens. Use it for weapon behavior,
+collision, hit registration, camera work, HUD state, and performance profiling.
+
+The toggle is `#autoBotInput`, read by `autoBotEnabled()` in
+`public/src/lobby/rooms.js` and sent as `allowBot` on the `create` message.
+
+### Other entry points
+
+| Route | Good for |
+|:---|:---|
+| **Solo → Train with Robot** | Combat *with* an opponent — bad if you need to stay alive |
+| **Solo → Trials** | Flight model and terrain; checkpoint courses, no combat |
+| **Solo → Campaign** | Mission 3 is the only way to reach the capital-ship boss |
+
+`playwright` is available for automated checks — guest login needs no
+credentials, so no fixture accounts are required. Run **headed** when measuring
+anything GPU-related; headless Chromium falls back to software GL and the
+numbers are meaningless.
+
+> **Known local-only breakage:** the client calls `/spaceships/api/*` but the
+> server registers `/api/*`. These 404 under `npm start`; production sits behind
+> a proxy that strips the prefix, and `npm run dev` works around it with a
+> rewrite.
+
+---
+
 ## 🏗️ Architecture
 
 ```mermaid
