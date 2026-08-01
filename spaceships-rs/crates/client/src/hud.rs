@@ -72,7 +72,7 @@
 //! state rather than the animation, and the deviations are noted at each site.
 
 use bevy::prelude::*;
-use bevy::text::{FontWeight, Justify, LetterSpacing};
+use bevy::text::{FontSource, FontWeight, Justify, LetterSpacing};
 
 use sim::rules::Rules;
 use sim::world::{Frame, GunMode, HudState, ShipFlags};
@@ -161,22 +161,30 @@ const FLA_PIP_EMPTY_BORDER: Color = rgba(241, 196, 15, 0.4);
 /// The label colour shared by `.meterbar-label`, `.msl-label` and `.fla-label`.
 const LABEL_WHITE: Color = rgba(255, 255, 255, 0.9);
 
+/// Orbitron, the face the JS HUD is set in.
+///
+/// The JS pulls it from Google Fonts with a `<link>` in `index.html`. The TTF is
+/// now vendored at `public/fonts/` (SIL OFL, so redistributable), which is what
+/// closed this gap — before that every string fell back to the `default_font`
+/// feature's embedded FiraMono subset, a monospace that reads acceptably for
+/// telemetry but is not the same face.
+///
+/// Held as a resource because a `TextFont` needs a live `Handle<Font>` and
+/// [`hud_font`] is called from seven places during layout.
+#[derive(Resource)]
+struct HudFont(Handle<Font>);
+
+/// Path under the asset root (`public/`). `build-wasm.sh` copies this into the
+/// web build's assets alongside the models and sounds.
+const FONT_PATH: &str = "fonts/Orbitron-VariableFont_wght.ttf";
+
 /// The font every HUD string is set in.
 ///
-/// The JS HUD is Orbitron, pulled from Google Fonts by a `<link>` in
-/// `index.html`. No TTF ships in `public/`, so there is nothing here to load
-/// and this falls back to the `default_font` feature's embedded FiraMono
-/// subset — a monospace, which reads acceptably for a telemetry HUD but is not
-/// the same face.
-///
-/// To close the gap: drop `Orbitron-VariableFont.ttf` into `public/`, then
-/// `asset_server.load("Orbitron-VariableFont.ttf").into()` here. It is a
-/// one-line change precisely because every text node already reads its font
-/// from this one place — but it means shipping the file, which is a licensing
-/// and asset-pipeline decision rather than a rendering one, so it is left to
-/// whoever owns `public/`.
-fn hud_font(size: f32, weight: u16) -> TextFont {
+/// Every text node reads from this one place, which is what made the Orbitron
+/// swap a single change rather than seven.
+fn hud_font(font: &HudFont, size: f32, weight: u16) -> TextFont {
     TextFont {
+        font: FontSource::Handle(font.0.clone()),
         font_size: FontSize::Px(size),
         weight: FontWeight(weight),
         ..default()
@@ -533,7 +541,8 @@ struct HudNodes {
               dozen single-use builders would hide the layout rather than \
               clarify it"
 )]
-fn spawn_hud(mut commands: Commands) {
+fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
+    let font = HudFont(assets.load(FONT_PATH));
     // No camera is spawned here. `bevy_ui` renders root nodes to the default UI
     // camera, which `DefaultUiCamera` resolves as the highest-order camera
     // targeting the primary window — `camera.rs`'s `Camera3d`. Adding a
@@ -607,7 +616,7 @@ fn spawn_hud(mut commands: Commands) {
                         health_text = slot
                             .spawn((
                                 Text::new(format!("{MAX_HP} / {MAX_HP}")),
-                                hud_font(14.0, 800),
+                                hud_font(&font, 14.0, 800),
                                 TextColor(Color::WHITE),
                                 LetterSpacing::Px(4.0),
                                 // `text-shadow: 0 2px 4px rgba(0,0,0,0.9)`.
@@ -637,7 +646,7 @@ fn spawn_hud(mut commands: Commands) {
                         ))
                         .id();
                     bar.spawn(meter_label_slot()).with_children(|slot| {
-                        slot.spawn(meter_label("BOOST"));
+                        slot.spawn(meter_label(&font, "BOOST"));
                     });
                 });
             });
@@ -660,7 +669,7 @@ fn spawn_hud(mut commands: Commands) {
                             ))
                             .id();
                         bar.spawn(meter_label_slot()).with_children(|slot| {
-                            slot.spawn(meter_label("GUN"));
+                            slot.spawn(meter_label(&font, "GUN"));
                         });
                     })
                     .id();
@@ -710,7 +719,7 @@ fn spawn_hud(mut commands: Commands) {
                 ..default()
             })
             .with_children(|row| {
-                row.spawn(pip_label("MSL"));
+                row.spawn(pip_label(&font, "MSL"));
                 for slot in &mut missile_pips {
                     *slot = row.spawn(pip(MSL_PIP)).id();
                 }
@@ -728,7 +737,7 @@ fn spawn_hud(mut commands: Commands) {
                 ..default()
             })
             .with_children(|row| {
-                row.spawn(pip_label("FLR"));
+                row.spawn(pip_label(&font, "FLR"));
                 for slot in &mut flare_pips {
                     *slot = row.spawn(pip(FLA_PIP)).id();
                 }
@@ -817,7 +826,7 @@ fn spawn_hud(mut commands: Commands) {
                         // `clamp(36px, 8vw, 72px)`; 8vw exceeds 72 at any
                         // window wider than 900px, so this is the clamped value
                         // for every realistic size. `FontSize` has no clamp.
-                        hud_font(72.0, 800),
+                        hud_font(&font, 72.0, 800),
                         TextColor(RED_BRIGHT),
                         LetterSpacing::Px(12.0),
                         Visibility::Hidden,
@@ -875,14 +884,18 @@ fn spawn_hud(mut commands: Commands) {
                         Visibility::Hidden,
                     ))
                     .with_children(|panel| {
-                        team0 = panel.spawn(score_text(BLUE, 32.0, Justify::Right)).id();
+                        team0 = panel
+                            .spawn(score_text(&font, BLUE, 32.0, Justify::Right))
+                            .id();
                         clock = panel
                             .spawn((
-                                score_text(GOLD, 72.0, Justify::Center),
+                                score_text(&font, GOLD, 72.0, Justify::Center),
                                 LetterSpacing::Px(2.0),
                             ))
                             .id();
-                        team1 = panel.spawn(score_text(RED, 32.0, Justify::Left)).id();
+                        team1 = panel
+                            .spawn(score_text(&font, RED, 32.0, Justify::Left))
+                            .id();
                     })
                     .id();
             });
@@ -909,7 +922,7 @@ fn spawn_hud(mut commands: Commands) {
                         },
                         BackgroundColor(rgba(255, 0, 0, 0.1)),
                         Text::new(LOCK_WARNING_TEXT),
-                        hud_font(20.0, 800),
+                        hud_font(&font, 20.0, 800),
                         TextColor(RED_BRIGHT),
                         LetterSpacing::Px(8.0),
                         Visibility::Hidden,
@@ -1037,10 +1050,10 @@ fn meter_label_slot() -> Node {
 }
 
 /// `.meterbar-label` — "BOOST", "GUN". Drawn over the fill.
-fn meter_label(text: &str) -> impl Bundle {
+fn meter_label(font: &HudFont, text: &str) -> impl Bundle {
     (
         Text::new(text.to_owned()),
-        hud_font(10.0, 800),
+        hud_font(font, 10.0, 800),
         TextColor(LABEL_WHITE),
         LetterSpacing::Px(2.0),
         TextShadow {
@@ -1051,10 +1064,10 @@ fn meter_label(text: &str) -> impl Bundle {
 }
 
 /// `.msl-label` / `.fla-label`.
-fn pip_label(text: &str) -> impl Bundle {
+fn pip_label(font: &HudFont, text: &str) -> impl Bundle {
     (
         Text::new(text.to_owned()),
-        hud_font(11.0, 800),
+        hud_font(font, 11.0, 800),
         TextColor(LABEL_WHITE),
         LetterSpacing::Px(2.0),
         TextShadow {
@@ -1089,7 +1102,7 @@ fn pip(colour: Color) -> impl Bundle {
 }
 
 /// A `#matchhud` cell: fixed minimum width, its own colour and alignment.
-fn score_text(colour: Color, min_width: f32, justify: Justify) -> impl Bundle {
+fn score_text(font: &HudFont, colour: Color, min_width: f32, justify: Justify) -> impl Bundle {
     (
         Node {
             min_width: px(min_width),
@@ -1098,7 +1111,7 @@ fn score_text(colour: Color, min_width: f32, justify: Justify) -> impl Bundle {
         Text::new("0"),
         // `font-size: clamp(16px, 2.5vw, 22px)`; 2.5vw passes 22px at 880px
         // wide, so this is the clamped value in practice.
-        hud_font(22.0, 800),
+        hud_font(font, 22.0, 800),
         TextColor(colour),
         TextLayout::new(justify, LineBreak::NoWrap),
     )

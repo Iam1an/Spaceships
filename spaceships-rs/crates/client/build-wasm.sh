@@ -95,12 +95,26 @@ fi
 after=$(wc -c <"$bg")
 
 # ── Assets ───────────────────────────────────────────────────────────────────
-# Only what the slice actually loads. `spaceshipADMIN.glb` is 4.9 MB and
-# `sounds/` is eight mp3s; neither belongs in a payload nobody plays yet.
-mkdir -p "$out/assets/sounds"
-cp "$repo/public/spaceship.glb"      "$out/assets/"
-cp "$repo/public/moon Texture.jpg"   "$out/assets/"
+# What the client actually loads. `spaceshipADMIN.glb` stays out: it is 4.9 MB
+# for a model most players never own, and the JS loads it unconditionally on
+# every session, which is a mistake worth not repeating here.
+mkdir -p "$out/assets/sounds/warnings" "$out/assets/fonts"
+
+# Models and textures.
+cp "$repo/public/spaceship.glb"       "$out/assets/"
+cp "$repo/public/jet.glb"             "$out/assets/"
+cp "$repo/public/moon Texture.jpg"    "$out/assets/"
 cp "$repo/public/sounds/asteroid.jpg" "$out/assets/sounds/"
+
+# Audio. `audio.rs` loads every effect plus the fourteen voice warnings, and a
+# missing file is silent rather than an error, so an incomplete copy here shows
+# up as a game that simply has no sound.
+cp "$repo/public/sounds/"*.mp3          "$out/assets/sounds/"
+cp "$repo/public/sounds/warnings/"*.mp3 "$out/assets/sounds/warnings/"
+
+# Orbitron, the HUD face. Without it `hud.rs` silently falls back to bevy's
+# embedded FiraMono subset — no error, just the wrong typeface.
+cp "$repo/public/fonts/"*.ttf "$out/assets/fonts/"
 
 # ── Report ───────────────────────────────────────────────────────────────────
 gz=$(gzip -9 -c "$bg" | wc -c)
