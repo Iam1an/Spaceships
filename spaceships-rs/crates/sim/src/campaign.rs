@@ -582,6 +582,40 @@ pub const CHECKPOINT_BOSS: Vec3 = Vec3::new(0.0, 10.0, 450.0);
 /// Waves per mission. All three missions run three waves and then the boss.
 pub const WAVES_PER_MISSION: usize = 3;
 
+/// How far outside the moon a respawn point has to sit to be usable.
+///
+/// A few ship radii — enough that the collision solver is not the thing placing
+/// you, and enough to see the surface rather than be inside it.
+const MOON_CHECKPOINT_CLEARANCE: f64 = 18.0;
+
+/// Pushes a checkpoint out of the moon if the wave table put it inside one.
+///
+/// Wave 2 spawns at `z = +20`, so its checkpoint lands at `(0, 20, -60)` —
+/// **63.2 units from the origin, inside a moon of radius 80.** `main.js:2869`
+/// computes the same point and has the same problem; it is inherited, not
+/// introduced. The symptom is not a death loop (spawn invulnerability plus the
+/// push-out solver save you) but a respawn *stuck on the moon's surface*,
+/// nowhere near the intended staging point.
+///
+/// Pushing radially outward keeps the checkpoint on the line from the moon to
+/// where the designer put it, so it stays on the right side of the corridor.
+fn clear_of_moon(p: Vec3, rules: &Rules) -> Vec3 {
+    let keep_out = rules.world.moon_radius + MOON_CHECKPOINT_CLEARANCE;
+    let from_moon = p - rules.world.moon_pos;
+    let d = from_moon.length();
+    if d >= keep_out {
+        return p;
+    }
+    // Dead centre has no outward direction; back along -z is where the player
+    // came from, so it stages them short of the moon rather than past it.
+    let dir = if d > 1e-9 {
+        from_moon * (1.0 / d)
+    } else {
+        Vec3::new(0.0, 0.0, -1.0)
+    };
+    rules.world.moon_pos + dir * keep_out
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -719,9 +753,13 @@ fn spawn_wave_with(world: &mut World, index: usize, hard: bool) {
 
         let mut s = Ship::spawn(id, ShipKind::Bot, pos, Quat::IDENTITY, &world.rules);
         s.team = Some(Team::One);
-        s.bot.is_campaign_bot = true;
-        s.bot.hard_mode = hard;
-        s.bot.missiles_left = world.rules.bot.missile_max_for(hard);
+        // Arm through `bot::init` rather than setting fields by hand. Doing it
+        // by hand left `missile_timer` at its `Default` zero, so a campaign bot
+        // launched its first missile the instant it had range and line of
+        // sight, where every other bot in the game waits out an initial delay.
+        // The draw it makes also has to happen here, or the spawn stream
+        // desyncs between a campaign world and any other.
+        crate::bot::init(&mut s, hard, true, &world.rules, &mut world.rng.bots);
         s.missiles_left = s.bot.missiles_left;
         world.ships.push(s);
 
@@ -818,10 +856,13 @@ fn step_wave(world: &World, camp: &mut CampaignState, events: &mut Vec<SimEvent>
     let waves = campaign_waves(camp.mission);
     if cleared + 1 < WAVES_PER_MISSION {
         let next = &waves[cleared + 1];
-        camp.checkpoint_pos = Vec3::new(
-            0.0,
-            CHECKPOINT_WAVE_Y,
-            f64::from(next.spawn_z) - CHECKPOINT_WAVE_LEAD,
+        camp.checkpoint_pos = clear_of_moon(
+            Vec3::new(
+                0.0,
+                CHECKPOINT_WAVE_Y,
+                f64::from(next.spawn_z) - CHECKPOINT_WAVE_LEAD,
+            ),
+            &world.rules,
         );
         camp.wave_index = cleared + 1;
         camp.between = true;
@@ -1793,14 +1834,50 @@ mod tests {
     }
 
     #[test]
+    fn the_wave_two_checkpoint_is_not_inside_the_moon() {
+        let rules = Rules::DEFAULT;
+        let waves = campaign_waves(1);
+        let raw = v(0.0, 20.0, f64::from(waves[1].spawn_z) - 80.0);
+
+        // The bug, stated: the wave table's own point is inside the moon.
+        let inside = (raw - rules.world.moon_pos).length();
+        assert!(
+            inside < rules.world.moon_radius,
+            "wave 2's raw checkpoint should be the inside-the-moon case ({inside} < {})",
+            rules.world.moon_radius
+        );
+
+        // And the fix: every checkpoint the campaign actually uses clears it.
+        for w in 1..WAVES_PER_MISSION {
+            for mission in 1..=3u8 {
+                let ws = campaign_waves(mission);
+                let p = clear_of_moon(v(0.0, 20.0, f64::from(ws[w].spawn_z) - 80.0), &rules);
+                let d = (p - rules.world.moon_pos).length();
+                assert!(
+                    d >= rules.world.moon_radius,
+                    "mission {mission} wave {w} checkpoint is {d} from the moon centre"
+                );
+            }
+        }
+        for p in [CHECKPOINT_START, CHECKPOINT_BOSS] {
+            assert!((p - rules.world.moon_pos).length() >= rules.world.moon_radius);
+        }
+    }
+
+    #[test]
     fn the_checkpoint_walks_forward_as_waves_clear() {
         let mut w = world_at(1);
         let mut ev = Vec::new();
         let waves = campaign_waves(1);
+        // Wave 2 spawns at z = +20, so its raw checkpoint is (0, 20, -60) --
+        // 63.2 units from the origin, inside a moon of radius 80. `clear_of_moon`
+        // pushes it back out, so the expectation is the cleared point, not the
+        // raw one. See `the_wave_two_checkpoint_is_not_inside_the_moon`.
+        let rules = Rules::DEFAULT;
         let expected = [
             CHECKPOINT_START,
-            v(0.0, 20.0, f64::from(waves[1].spawn_z) - 80.0),
-            v(0.0, 20.0, f64::from(waves[2].spawn_z) - 80.0),
+            clear_of_moon(v(0.0, 20.0, f64::from(waves[1].spawn_z) - 80.0), &rules),
+            clear_of_moon(v(0.0, 20.0, f64::from(waves[2].spawn_z) - 80.0), &rules),
             CHECKPOINT_BOSS,
         ];
         assert_eq!(w.campaign.as_ref().unwrap().checkpoint_pos, expected[0]);

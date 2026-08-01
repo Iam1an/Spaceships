@@ -1873,6 +1873,13 @@ pub struct HudState {
     pub assist_target: i32,
     /// Seconds left on the match clock.
     pub match_timer: f32,
+    /// Whether a timed match is actually running.
+    ///
+    /// [`MatchState::timer`] holds its full duration before the clock starts and
+    /// in modes that have no clock at all, so `match_timer > 0.0` is not the
+    /// test it looks like — it showed the multiplayer scoreline over the
+    /// campaign. This is [`MatchState::active`], flattened.
+    pub match_active: bool,
     /// Kills per team.
     pub team_kills: [u32; 2],
     /// Steering after deadzone and curve, for the camera lean.

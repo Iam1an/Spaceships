@@ -1161,6 +1161,7 @@ fn hud_state(world: &World, flights: &[(EntityId, FlightStep)]) -> HudState {
     let rules = &world.rules;
     let mut hud = HudState {
         match_timer: world.match_state.timer as f32,
+        match_active: world.match_state.active,
         team_kills: world.match_state.team_kills,
         assist_target: world.aim_assist.locked_target().unwrap_or(-1),
         trials: trials_hud(world),

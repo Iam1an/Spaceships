@@ -441,9 +441,10 @@ fn model(frame: &Frame, time: f32, seated: bool) -> HudModel {
         // HUD reads it off the local `ShipView` rather than needing its own.
         vignette: (me.hit_flash.clamp(0.0, 1.0) * VIGNETTE_STEPS).round() as u8,
 
-        // `HudState` has no `match_active`. See the gap noted at the bottom of
-        // this file; a running clock is the closest available stand-in.
-        match_on: hud.match_timer > 0.0,
+        // `match_timer` alone is not the test: it holds the match's full
+        // duration before the clock starts and in modes that have no clock,
+        // which drew the multiplayer scoreline over the campaign.
+        match_on: hud.match_active,
         team0: hud.team_kills[0],
         team1: hud.team_kills[1],
         clock: hud.match_timer.max(0.0).ceil() as u32,
@@ -1780,6 +1781,24 @@ mod tests {
         assert_eq!(model(&hot, PULSE_HALF_PERIOD * 2.0, false).pulse, 0);
     }
 
+    /// The match scoreline follows `MatchState::active`, not a non-zero clock.
+    ///
+    /// `match_timer` carries the full match duration before the clock starts and
+    /// in modes that have no clock at all, so testing it drew the multiplayer
+    /// scoreline over a campaign mission.
+    #[test]
+    fn the_match_scoreline_hides_outside_a_timed_match() {
+        let mut f = frame(healthy());
+        f.ships[0].flags = ShipFlags::LOCAL.with(ShipFlags::ALIVE);
+
+        f.hud.match_timer = 300.0;
+        f.hud.match_active = false;
+        assert!(!model(&f, 0.0, false).match_on, "campaign must not show it");
+
+        f.hud.match_active = true;
+        assert!(model(&f, 0.0, false).match_on, "a live match must");
+    }
+
     /// Seated in the cockpit, the flat overlay stands down entirely — the 3D
     /// instrument panel is the HUD. Without this the bottom bars draw on top of
     /// the panel, which is what `main.js`'s `cockpit-view` body class prevents.
@@ -1827,6 +1846,7 @@ mod tests {
         let m = model(
             &frame(HudState {
                 match_timer: 299.2,
+                match_active: true,
                 ..healthy()
             }),
             0.0,
