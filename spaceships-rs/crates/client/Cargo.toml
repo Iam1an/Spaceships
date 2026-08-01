@@ -65,6 +65,26 @@ features = [
   # it. This is the old scene system, not the new BSN one.
   "bevy_world_serialization",
 
+  # -- HUD -----------------------------------------------------------------
+  # `bevy_ui` is the layout engine; `bevy_ui_render` is what actually draws it,
+  # and they are separate features in 0.19 — enabling only the former gives you
+  # a laid-out tree that renders nothing, with no error. `bevy_ui` pulls
+  # `bevy_text` and `bevy_sprite`, `bevy_ui_render` pulls `bevy_sprite_render`;
+  # both are named anyway so the dependency is legible at the call site.
+  #
+  # Note that in 0.19 the `ui` feature is no longer implied by `2d`/`3d`
+  # (`_release-content/migration-guides/ui_feature.md`), so a hand-picked list
+  # like this one has to ask for it.
+  "bevy_ui",
+  "bevy_ui_render",
+  "bevy_text",
+  # The 20 kB embedded FiraMono subset. The JS HUD is Orbitron, fetched from
+  # Google Fonts; no TTF ships in `public/`, so there is nothing to load and
+  # without this feature `bevy_text` renders *nothing at all* — silently, since
+  # a missing font is a `TextError::NoSuchFont` that the text system retries
+  # forever rather than reporting. See `HUD_FONT` in `hud.rs` for the swap.
+  "default_font",
+
   # -- image formats -------------------------------------------------------
   # png: the glTF's embedded textures. jpeg: "moon Texture.jpg", for when the
   # moon lands. ktx2+zstd_rust: bevy's own tonemapping LUTs are ktx2/zstd.
