@@ -1214,6 +1214,7 @@ fn sync_hud(
     frame: Res<SimFrame>,
     time: Res<Time>,
     view: Res<crate::cockpit::ViewMode>,
+    lobby: Option<Res<crate::ui::LobbyOpen>>,
     nodes: Option<Res<HudNodes>>,
     mut applied: ResMut<AppliedHud>,
     mut q_node: Query<&mut Node>,
@@ -1228,7 +1229,11 @@ fn sync_hud(
 ) {
     let Some(nodes) = nodes else { return };
 
-    let next = model(&frame.0, time.elapsed_secs(), view.seated);
+    // The lobby covers the screen, so the flight overlay stands down behind it
+    // for the same reason it stands down in the cockpit: something else is
+    // already the interface.
+    let hidden = view.seated || lobby.is_some_and(|l| l.0);
+    let next = model(&frame.0, time.elapsed_secs(), hidden);
     let prev = applied.0;
 
     // The early-out. On a frame where nothing the player can see has changed —

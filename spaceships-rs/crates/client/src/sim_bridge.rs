@@ -571,7 +571,10 @@ impl Plugin for SimPlugin {
             .add_message::<StartMatch>()
             // Before `RunFixedMainLoop`, so a match built this frame is the one
             // this frame's fixed steps advance.
-            .add_systems(PreUpdate, apply_start_match)
+            .add_systems(
+                PreUpdate,
+                (forward_launch_requests, apply_start_match).chain(),
+            )
             // The simulation is fixed-step by contract: variable frame time
             // must never reach it (`sim::world::TickFn`). Bevy's `FixedUpdate`
             // accumulator is exactly the "accumulate real time and run a whole
@@ -605,6 +608,26 @@ fn latch_edges(input: Res<PlayerInput>, mut latch: ResMut<EdgeLatch>) {
 /// means two clicks, and building the loser first would be a wasted 280-rock
 /// field generation. The input latch is cleared with the world, so a missile
 /// key pressed on the menu does not fire on the new match's first tick.
+/// Turns the lobby's [`crate::ui::LaunchRequest`] into a [`StartMatch`].
+///
+/// `ui.rs` produces the selection but deliberately does not rebuild the world
+/// itself — `scene.rs` spawns its static geometry once in `Startup` and would be
+/// left holding stale entities. Routing through the message that already exists
+/// means the lobby reuses the rebuild path this module already tests.
+///
+/// `online` is ignored for now: `new_match` serves solo modes, and a networked
+/// match takes its spawns from the server's `start` message rather than a seed.
+/// The field is carried on the message so that path has what it needs when it
+/// lands.
+fn forward_launch_requests(
+    mut requests: MessageReader<crate::ui::LaunchRequest>,
+    mut start: MessageWriter<StartMatch>,
+) {
+    if let Some(req) = requests.read().last() {
+        start.write(StartMatch(req.setup.clone()));
+    }
+}
+
 fn apply_start_match(
     mut requests: MessageReader<StartMatch>,
     mut setup: ResMut<MatchSetup>,

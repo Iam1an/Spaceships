@@ -20,6 +20,7 @@
 //! payload on a build whose entire problem is payload.
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::RenderTarget;
 use bevy::image::Image;
 use bevy::light::{GeneratedEnvironmentMapLight, Skybox};
 use bevy::prelude::*;
@@ -97,13 +98,27 @@ impl Plugin for SkyboxPlugin {
     }
 }
 
+// Only the camera that draws the world gets a sky.
+//
+// `ui.rs` runs a second `Camera3d` on its own render layer to draw the spinning
+// ship into the CRT's off-screen image. An unfiltered `With<Camera3d>` query
+// attaches the nebula to that one too — which happens to look good behind the
+// preview, but is accidental and depends on system order. Filtering on a
+// window target makes the intent explicit and stops a third camera inheriting
+// it by surprise.
 fn attach_sky(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    cameras: Query<Entity, With<Camera3d>>,
+    cameras: Query<(Entity, Option<&RenderTarget>), With<Camera3d>>,
 ) {
     let handle = images.add(nebula_cubemap());
-    for cam in &cameras {
+    for (cam, target) in &cameras {
+        // `RenderTarget` is a separate component in 0.19, and absent means the
+        // default — the primary window. Only an explicit `Image` target is the
+        // off-screen preview camera.
+        if matches!(target, Some(RenderTarget::Image(_))) {
+            continue;
+        }
         commands.entity(cam).insert((
             Skybox {
                 // 0.19: this is `Option<Handle<Image>>`, not a bare handle —
