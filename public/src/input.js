@@ -30,6 +30,7 @@ export class Input {
       drift: false,
       boost: false,
       menuBtn: false,
+      freeLook: false,
     };
     this._gpPrevMissile = false;
     this._gpPrevFlare = false;
@@ -166,6 +167,7 @@ export class Input {
       this.gp.fire = false;
       this.gp.drift = false;
       this.gp.boost = false;
+      this.gp.freeLook = false;
       return;
     }
     const ax = gamepad.axes;
@@ -179,6 +181,9 @@ export class Input {
     this.gp.fire = val(7) > 0.5 || btn(0);
     this.gp.drift = val(6) > 0.5;
     this.gp.boost = btn(4);
+    // R3 (right-stick click) held = free-look with the right stick. The right stick already
+    // steers the ship on gamepad, so head-look needs this modifier rather than the bare stick.
+    this.gp.freeLook = btn(11);
     const gpMissile = btn(5) || btn(2);
     const gpFlare = btn(1);
     const gpGunToggle = btn(3);

@@ -83,6 +83,12 @@ hardModeInput.checked = localStorage.getItem(SAVED_HARD_MODE_KEY) === '1';
 hardModeInput.addEventListener('change', () => {
   localStorage.setItem(SAVED_HARD_MODE_KEY, hardModeInput.checked ? '1' : '0');
 });
+const cockpitViewInput = document.getElementById('cockpitViewInput');
+const SAVED_VIEW_KEY = 'spaceships:viewMode';
+cockpitViewInput.checked = localStorage.getItem(SAVED_VIEW_KEY) === 'first';
+cockpitViewInput.addEventListener('change', () => {
+  localStorage.setItem(SAVED_VIEW_KEY, cockpitViewInput.checked ? 'first' : 'third');
+});
 const pixelFilterInput = document.getElementById('pixelFilterInput');
 const SAVED_PIXEL_KEY = 'spaceships:pixelFilter';
 pixelFilterInput.checked = localStorage.getItem(SAVED_PIXEL_KEY) !== '0';
@@ -977,6 +983,8 @@ const CONTROL_GUIDES = {
     ['Space', 'Drift / Charge'],
     ['A / D', 'Roll'],
     ['RMB', 'Free-look'],
+    ['V', 'Cockpit view'],
+    ['Alt', 'Look back'],
     ['P', 'Toggle gun'],
     ['C', 'Aim assist'],
     ['O', 'Grab mouse'],
@@ -989,6 +997,8 @@ const CONTROL_GUIDES = {
     ['Shift', 'Boost'],
     ['Space', 'Drift / Charge'],
     ['A / D', 'Roll'],
+    ['V', 'Cockpit view'],
+    ['Alt', 'Look back'],
     ['P', 'Toggle gun'],
     ['C', 'Aim assist'],
     ['L', 'Fullscreen'],

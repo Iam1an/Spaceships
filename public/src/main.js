@@ -13,6 +13,8 @@ import { createTerrain, getTerrainHeight, TERRAIN_KILL_CLEARANCE } from './terra
 import { createTrees } from './trees.js';
 import { createClouds } from './clouds.js';
 import { ThirdPersonCamera } from './camera.js';
+import { FirstPersonCamera } from './fpcamera.js';
+import { getCockpitProfile, createCockpit } from './cockpit.js';
 import { Input } from './input.js';
 import { createAudio } from './audio.js';
 import { createBotAI } from './bot.js';
@@ -31,6 +33,7 @@ export async function startGame(opts = {}) {
   renderer.shadowMap.type = THREE.BasicShadowMap;
   document.body.appendChild(renderer.domElement);
   const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2500);
+  const BASE_FOV = camera.fov;
   const pixelEnabled = localStorage.getItem('spaceships:pixelFilter') !== '0';
   const PIXEL_SCALE = 3;
   const pixelRT = pixelEnabled ? new THREE.WebGLRenderTarget(
@@ -172,7 +175,9 @@ export async function startGame(opts = {}) {
   if (isLocalAdmin && !isModelCached(ADMIN_MODEL_URL)) {
     adminModelReady.then((adminScene) => {
       if (!adminScene) return;
-      ship.children.slice().forEach((c) => ship.remove(c));
+      // Only strip the exterior — the cockpit interior is a sibling child and must survive
+      // this swap, which lands after the 4.7 MB admin GLB finishes loading.
+      ship.children.slice().forEach((c) => { if (!c.userData?.isInterior) ship.remove(c); });
       const newModel = adminScene.clone(true);
       newModel.rotation.y = -Math.PI / 2;
       newModel.traverse((o) => {
@@ -183,6 +188,7 @@ export async function startGame(opts = {}) {
       });
       ship.add(newModel);
       applyColorsToShip(ship, savedHull, savedAccent);
+      syncShipVisibility();
     });
   }
   ship.scale.setScalar(SHIP_SCALE);
@@ -380,8 +386,91 @@ export async function startGame(opts = {}) {
   scene.add(missileSystem.group);
   const trails = createTrails();
   scene.add(trails.group);
+  // Declared here rather than with the other player state further down: inCockpit()
+  // reads it during camera setup below, and a `let` declared later sits in the temporal
+  // dead zone. With viewMode 'third' the && short-circuits and hides the problem, so this
+  // only threw for players who had already switched to the cockpit view.
+  let myAlive = true;
   const tpCam = new ThirdPersonCamera(camera, ship);
-  tpCam.snap();
+  const cockpitProfile = getCockpitProfile(isLocalAdmin);
+  const fpCam = new FirstPersonCamera(camera, ship, cockpitProfile);
+  const cockpit = createCockpit(cockpitProfile);
+  ship.add(cockpit.group);
+  const TP_FOV = BASE_FOV;
+  let viewMode = localStorage.getItem('spaceships:viewMode') === 'first' ? 'first' : 'third';
+  // Dead pilots always watch in third person — the cockpit is hidden with the wreck.
+  const inCockpit = () => viewMode === 'first' && myAlive;
+  const activeCam = () => (inCockpit() ? fpCam : tpCam);
+  // Telemetry channel shared with the cockpit dash; ThirdPersonCamera ignores it.
+  const camTel = {
+    steerX: 0, steerY: 0, throttle01: 0, speed: 0, hpFrac: 1, boosting: false,
+    missiles: 0, flares: 0, heat01: 1, gunMode: 'bullet', boost01: 1, charge01: 0,
+    targetLock: false, missileLock: false, hitFlash: 0, contacts: [],
+  };
+  // Arena scale: the two motherships sit at z -600 and +600, so a 500-unit scope showed
+  // an empty screen for most of a match.
+  const RADAR_RANGE = 1200;
+  const _radarQ = new THREE.Quaternion();
+  const _radarV = new THREE.Vector3();
+  // In first person the hull stays DRAWN, so you can see your own nose, wings and engines
+  // from the cockpit rather than floating in a detached box. It is forced to FrontSide, which
+  // back-face culls everything enclosing the eye — the admin hull is authored DoubleSide
+  // (ship.js:47) and would otherwise be a solid black wall from the inside. Only the canopy
+  // shell itself is hidden, since the cockpit interior provides its own.
+  const CANOPY_RE = /cockpit|canopy|glass|windshield|window/i;
+  const isCanopyMesh = (o) => CANOPY_RE.test(o.name || '') || CANOPY_RE.test(o.material?.name || '');
+  function applyExteriorMode(fp) {
+    for (const child of ship.children) {
+      if (child.userData?.isInterior) continue;
+      child.traverse((o) => {
+        if (!o.isMesh || !o.material) return;
+        if (o.userData._origSide === undefined) o.userData._origSide = o.material.side;
+        if (fp) {
+          o.material.side = THREE.FrontSide;
+          o.visible = !isCanopyMesh(o);
+        } else {
+          o.material.side = o.userData._origSide;
+          o.visible = true;
+        }
+      });
+      child.visible = true;
+    }
+  }
+  function syncShipVisibility() {
+    const fp = inCockpit();
+    applyExteriorMode(fp);
+    // Dev hook: hide the interior to inspect what the hull looks like from the eye point.
+    cockpit.group.visible = fp && !window.__fpHideInterior;
+    // The 3D dash replaces the DOM meters, which would otherwise sit right on top of it.
+    document.body.classList.toggle('cockpit-view', fp);
+  }
+  function setViewMode(mode) {
+    if (mode === viewMode) return;
+    viewMode = mode;
+    try { localStorage.setItem('spaceships:viewMode', mode); } catch { }
+    syncShipVisibility();
+    activeCam().snap();
+  }
+  function updateCamera(dt) {
+    const cam = activeCam();
+    // fpCam re-asserts its own FOV each frame; the third-person path must restore the base.
+    if (cam === tpCam && camera.fov !== TP_FOV) {
+      camera.fov = TP_FOV;
+      camera.updateProjectionMatrix();
+    }
+    cam.update(dt, input, camTel);
+    syncShipVisibility();
+  }
+  window.__fpDebug = () => ({
+    viewMode, inCockpit: inCockpit(), profile: cockpitProfile.id, fov: camera.fov,
+    contacts: camTel.contacts.length,
+    exterior: ship.children.filter((c) => !c.userData?.isInterior).flatMap((c) => {
+      const out = []; c.traverse((o) => { if (o.isMesh) out.push(`${o.name}:${o.visible ? 'v' : 'h'}`); });
+      return out;
+    }),
+  });
+  syncShipVisibility();
+  activeCam().snap();
   const input = new Input(renderer.domElement);
   const controlScheme = opts.controlScheme
     || (opts.noMouse ? 'keyboard' : 'mouse_keys');
@@ -461,7 +550,6 @@ export async function startGame(opts = {}) {
   const RESPAWN_DELAY = 2.5;
   const SPAWN_INVULN_DURATION = 2.0;
   let myHp = SHIP_MAX_HP;
-  let myAlive = true;
   let myRespawnTimer = 0;
   let myInvulnTimer = SPAWN_INVULN_DURATION;
   const scores = new Map();
@@ -654,7 +742,8 @@ export async function startGame(opts = {}) {
     targetThrottle = 0;
     throttle = 0;
     ship.visible = true;
-    tpCam.snap();
+    syncShipVisibility();
+    activeCam().snap();
   }
   function removeRemote(id) {
     const r = remotePlayers.get(id);
@@ -925,6 +1014,7 @@ export async function startGame(opts = {}) {
   let prevKeyP = false;
   let prevKeyO = false;
   let prevKeyL = false;
+  let prevKeyV = false;
   const BEAM_RANGE = 1000;
   const BEAM_SHIP_RADIUS = 5.5;
   const BEAM_FORWARD_OFFSET = 4;
@@ -1083,10 +1173,13 @@ export async function startGame(opts = {}) {
         trialsCountdownActive = false;
         if (cdWrap) cdWrap.style.display = 'none';
       }
-      tpCam.update(dt, input);
+      updateCamera(dt);
       return;
     }
     const braking = myAlive && (input.keys.has('Space') || input.gp.drift);
+    camTel.steerX = 0;
+    camTel.steerY = 0;
+    camTel.throttle01 = MAX_THROTTLE > 0 ? throttle / MAX_THROTTLE : 0;
     if (myAlive) {
       if (input.throttleOverride !== null) {
         targetThrottle = input.throttleOverride * MAX_THROTTLE;
@@ -1103,7 +1196,8 @@ export async function startGame(opts = {}) {
       throttle = THREE.MathUtils.damp(throttle, targetThrottle, 3, dt);
       let sx = input.rmb ? 0 : input.steerX;
       let sy = input.rmb ? 0 : input.steerY;
-      if (Math.abs(input.gp.steerX) > 0.01 || Math.abs(input.gp.steerY) > 0.01) {
+      if (!input.gp.freeLook
+        && (Math.abs(input.gp.steerX) > 0.01 || Math.abs(input.gp.steerY) > 0.01)) {
         sx = input.gp.steerX;
         sy = input.gp.steerY;
       }
@@ -1123,6 +1217,8 @@ export async function startGame(opts = {}) {
       arrowKy = THREE.MathUtils.damp(arrowKy, kyTarget, rateY, dt);
       if (kxTarget !== 0 || Math.abs(arrowKx) > 0.01) sx = arrowKx;
       if (kyTarget !== 0 || Math.abs(arrowKy) > 0.01) sy = arrowKy;
+      camTel.steerX = sx;
+      camTel.steerY = sy;
       const pitchMult = braking ? BRAKE_PITCH_MULT : 1;
       const yawMult = braking ? BRAKE_YAW_MULT : 1;
       const pitchRate = (sy < 0 ? PITCH_RATE * PITCH_UP_BOOST : PITCH_RATE) * pitchMult;
@@ -1264,6 +1360,11 @@ export async function startGame(opts = {}) {
       }
     }
     prevKeyL = nowKeyL;
+    const nowKeyV = input.keys.has('KeyV');
+    if (nowKeyV && !prevKeyV) {
+      setViewMode(viewMode === 'first' ? 'third' : 'first');
+    }
+    prevKeyV = nowKeyV;
     const nowKeyE = input.keys.has('KeyE');
     if (nowKeyE && !prevKeyE && myAlive && missilesLeft > 0) {
       let closestRecord = null;
@@ -1561,7 +1662,7 @@ export async function startGame(opts = {}) {
       resolveCollisions();
       resolveMothershipCollisions();
     }
-    tpCam.update(dt, input);
+    updateCamera(dt);
     if (ws && ws.readyState === WebSocket.OPEN && myAlive) {
       stateTimer += dt;
       if (stateTimer >= STATE_INTERVAL) {
@@ -1770,8 +1871,41 @@ export async function startGame(opts = {}) {
       r.lead.classList.toggle('aligned', screenDist < 22);
       if (screenDist < bestAlignment) bestAlignment = screenDist;
     }
+    const hasTargetLock = anyVisible && bestAlignment < 22;
     if (reticleEl) {
-      reticleEl.classList.toggle('locked', anyVisible && bestAlignment < 22);
+      reticleEl.classList.toggle('locked', hasTargetLock);
+    }
+    if (inCockpit()) {
+      camTel.speed = shipVelocity.length();
+      camTel.hpFrac = Math.max(0, myHp / SHIP_MAX_HP);
+      camTel.boosting = boosting;
+      camTel.missiles = missilesLeft;
+      camTel.flares = flaresLeft;
+      camTel.heat01 = ammo / MAX_AMMO;
+      camTel.gunMode = gunMode;
+      camTel.boost01 = boostMeter / MAX_BOOST;
+      camTel.charge01 = brakeCharge;
+      camTel.hitFlash = vignetteAlpha;
+      // Radar contacts, rotated into the ship's frame so the scope reads heading-up.
+      // Offsets stay in world units (no worldToLocal, which would divide by SHIP_SCALE).
+      camTel.contacts.length = 0;
+      _radarQ.copy(ship.quaternion).invert();
+      for (const r of remotePlayers.values()) {
+        if (!r.alive || !r.hasTarget) continue;
+        _radarV.subVectors(r.ship.position, ship.position);
+        if (_radarV.lengthSq() > RADAR_RANGE * RADAR_RANGE) continue;
+        _radarV.applyQuaternion(_radarQ);
+        camTel.contacts.push({
+          x: _radarV.x / RADAR_RANGE,
+          z: _radarV.z / RADAR_RANGE,
+          hostile: !(myTeam !== undefined && myTeam !== null && r.team === myTeam),
+        });
+      }
+      camTel.targetLock = hasTargetLock;
+      camTel.missileLock = _missileLocked;
+      // Dev hook: force instrument states from the console to check the panel without combat.
+      if (window.__fpForce) Object.assign(camTel, window.__fpForce);
+      cockpit.update(dt, camTel);
     }
     if (hud) {
       const tPct = Math.round((throttle / MAX_THROTTLE) * 100);
@@ -1801,7 +1935,8 @@ export async function startGame(opts = {}) {
     if (myInvulnTimer > 0) {
       myInvulnTimer = Math.max(0, myInvulnTimer - dt);
       if (myAlive) {
-        ship.visible = (Math.floor(performance.now() * 0.012) % 2 === 0);
+        // In the cockpit the exterior is already hidden, so only strobe in third person.
+        ship.visible = inCockpit() || (Math.floor(performance.now() * 0.012) % 2 === 0);
         if (myInvulnTimer === 0) ship.visible = true;
       }
     }
