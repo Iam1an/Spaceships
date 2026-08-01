@@ -94,7 +94,7 @@ const SHIP_MODEL: &str = "spaceship.glb";
 ///
 /// Native only. On the web there is no process environment, so the constant
 /// stands.
-fn ship_model() -> String {
+pub(crate) fn ship_model() -> String {
     #[cfg(not(target_arch = "wasm32"))]
     if let Ok(name) = std::env::var("SPACESHIPS_SHIP_MODEL") {
         if !name.is_empty() {
@@ -131,6 +131,26 @@ fn model_fit(model: &str) -> (f32, Vec3) {
     } else {
         (1.0, Vec3::ZERO)
     }
+}
+
+/// [`model_fit`] for the hull actually flying, expressed in **ship** space.
+///
+/// The model child carries `rotation_y(-PI/2)` *and* the fit, so a model point
+/// `p` lands at `scale * R * (p + offset)`. Rewriting that in ship space —
+/// where `q = R * p` is where the anchor would have sat unfitted — gives
+///
+/// ```text
+/// q' = scale * (q + R * offset)
+/// ```
+///
+/// a uniform scale about a shifted origin, and that is the whole fit. Anything
+/// anchored to the hull has to go through it: the engine nozzles
+/// (`weapons.rs`'s `TRAIL_OFFSETS_JET`, which bake it in) and the pilot's eye
+/// (`cockpit.rs`'s profiles, which apply it). An anchor that skips it stays
+/// where `spaceship.glb` put it while the hull moves out from under it.
+pub(crate) fn ship_fit() -> (f32, Vec3) {
+    let (scale, offset) = model_fit(&ship_model());
+    (scale, Quat::from_rotation_y(-FRAC_PI_2) * offset)
 }
 
 /// `upgradeMaterials`'s `anisotropy: 8`.

@@ -139,6 +139,7 @@ use spaceships_sim as sim;
 
 use sim::world::{MapKind, Mode};
 
+use crate::cockpit::ViewMode;
 use crate::net::{ConnState, NetStatus};
 use crate::sim_bridge::{MatchSetup, PlayerInput};
 
@@ -167,6 +168,7 @@ impl Plugin for UiPlugin {
             .add_systems(
                 Update,
                 (
+                    mirror_cockpit_flag,
                     read_input,
                     advance_boot,
                     publish_lobby_open,
@@ -1283,8 +1285,9 @@ enum Flag {
     Stats,
     /// "Enemy Trails".
     Trails,
-    /// `spaceships:viewMode`, which `cockpit.rs` currently reads from
-    /// `SPACESHIPS_COCKPIT` for want of a settings store.
+    /// `spaceships:viewMode`. Mirrored onto `cockpit.rs`'s [`ViewMode`] by
+    /// [`mirror_cockpit_flag`], which also carries a `V` pressed in flight back
+    /// here, so this row and the seat never disagree.
     Cockpit,
     /// "Secret Hard Mode". Mirrors [`Menu::hard`], so it can be set from either
     /// page exactly as the JS lets you.
@@ -1829,6 +1832,54 @@ fn publish_lobby_open(menu: Res<Menu>, mut out: ResMut<LobbyOpen>) {
     if out.0 != menu.open {
         out.0 = menu.open;
     }
+}
+
+/// Keeps [`Flag::Cockpit`] and [`ViewMode::first_person`] equal, both ways.
+///
+/// The two used to be unrelated: `cockpit.rs` read `SPACESHIPS_COCKPIT` once at
+/// startup and `V` moved it thereafter, while this row moved a bit in
+/// [`Menu::flags`] that nothing read — so a player who switched the display's
+/// `COCKPIT VIEW` on got no cockpit, and one who pressed `V` found the row
+/// still claiming they were in the chase camera.
+///
+/// [`ViewMode`] is the authority, because it is what every system in
+/// `cockpit.rs` reads and what the env var seeds. The rule is therefore:
+///
+/// - the row moved (it differs from what this system last left there) — the
+///   player just toggled it, so push it onto the view;
+/// - otherwise — pull the view onto the row, which is how `V` gets back here.
+///
+/// The first run seeds rather than pushes, so `SPACESHIPS_COCKPIT=1` is
+/// reflected on the row instead of being immediately overwritten by
+/// [`Flag::DEFAULTS`]. Writes are guarded on both sides: an unconditional one
+/// would mark [`Menu`] changed every frame and defeat [`MenuModel`]'s early
+/// out.
+fn mirror_cockpit_flag(
+    mut menu: ResMut<Menu>,
+    mut view: ResMut<ViewMode>,
+    mut last: Local<Option<bool>>,
+) {
+    let i = Flag::Cockpit as usize;
+    let row = menu.flags[i];
+
+    let Some(was) = *last else {
+        // Startup: the view mode already holds the env override or the default,
+        // and the row has never been touched.
+        if row != view.first_person {
+            menu.flags[i] = view.first_person;
+        }
+        *last = Some(view.first_person);
+        return;
+    };
+
+    if row != was {
+        if view.first_person != row {
+            view.first_person = row;
+        }
+    } else if row != view.first_person {
+        menu.flags[i] = view.first_person;
+    }
+    *last = Some(menu.flags[i]);
 }
 
 #[derive(Message, Debug, Clone)]
@@ -4797,6 +4848,68 @@ mod tests {
             ..Menu::default()
         };
         (menu, LobbyData::placeholder(), NetStatus::default())
+    }
+
+    /// An app with nothing in it but the two resources and the mirror. The
+    /// system touches no entity, no asset and no window, so this needs no
+    /// plugins — `App::default` brings the `Main` schedule and that is all
+    /// `Update` requires.
+    fn mirror_app(first_person: bool) -> App {
+        let mut app = App::new();
+        app.insert_resource(Menu::default())
+            .insert_resource(ViewMode {
+                first_person,
+                seated: false,
+            })
+            .add_systems(Update, mirror_cockpit_flag);
+        app
+    }
+
+    fn row(app: &App) -> bool {
+        app.world().resource::<Menu>().flags[Flag::Cockpit as usize]
+    }
+
+    fn seat(app: &App) -> bool {
+        app.world().resource::<ViewMode>().first_person
+    }
+
+    /// `COCKPIT VIEW` and the seat are one setting, and each direction was its
+    /// own defect: the row used to move a bit that nothing read, so switching
+    /// it on did nothing at all; and `V` used to move a view mode the row had
+    /// never heard of, so the display then lied about where the player was
+    /// sitting.
+    #[test]
+    fn the_cockpit_row_and_the_view_mode_track_each_other() {
+        let mut app = mirror_app(false);
+        app.update();
+        assert!(!row(&app) && !seat(&app), "third person to begin with");
+
+        // The display's switch seats the pilot.
+        app.world_mut().resource_mut::<Menu>().flags[Flag::Cockpit as usize] = true;
+        app.update();
+        assert!(seat(&app), "the row never reached the seat");
+
+        // ...and switching it back stands them up again.
+        app.world_mut().resource_mut::<Menu>().flags[Flag::Cockpit as usize] = false;
+        app.update();
+        assert!(!seat(&app));
+
+        // `V` in flight is what the row reads when it is next opened.
+        app.world_mut().resource_mut::<ViewMode>().first_person = true;
+        app.update();
+        assert!(row(&app), "`V` never reached the row");
+    }
+
+    /// `SPACESHIPS_COCKPIT` seeds [`ViewMode`], so the first frame has to adopt
+    /// it rather than stamp [`Flag::DEFAULTS`] over the top — which is what a
+    /// mirror without a seeding case would do, silently disabling the one hook
+    /// a visual check has for capturing this view.
+    #[test]
+    fn the_env_seed_survives_the_first_frame() {
+        let mut app = mirror_app(true);
+        app.update();
+        assert!(seat(&app), "the seed was overwritten by the row's default");
+        assert!(row(&app), "the row did not adopt the seed");
     }
 
     /// The property the whole module rests on: a page nobody is touching

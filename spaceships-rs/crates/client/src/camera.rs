@@ -51,6 +51,23 @@ const VIEW_BLEND: f32 = 0.25;
 /// reproducing: everything looked magnified and the field of view read wrong.
 pub const BASE_FOV: f32 = 75.0 * std::f32::consts::PI / 180.0;
 
+/// The one camera the player looks through.
+///
+/// `With<Camera3d>` stopped meaning that when `ui.rs` added the menu's ship
+/// preview, which is a second `Camera3d` rendering to an off-screen image. A
+/// `single()` over two of them does not pick one, it *fails* — which is how
+/// `cockpit.rs` silently stopped seating anyone the day the preview landed:
+/// pressing `V` hid the flat HUD and the canopy, and left the camera exactly
+/// where the chase camera had it.
+///
+/// So the question "which camera draws the match" gets an answer that cannot
+/// drift. `skybox.rs` and `hud.rs` each infer it — from the render target and
+/// from render layer 0 respectively — and both of those still hold; this is for
+/// callers that need it as a query *filter*, where neither test can be
+/// expressed.
+#[derive(Component)]
+pub struct FlightCamera;
+
 /// The camera's smoothed up vector. In Three.js this is `camera.up`, a mutable
 /// field on the camera object; Bevy's `Transform::look_at` takes up as an
 /// argument, so it has to be stored.
@@ -143,6 +160,7 @@ pub fn spawn_camera(mut commands: Commands) {
             ..default()
         }),
         ChaseCam { up: Vec3::Y },
+        FlightCamera,
         Transform::from_xyz(0.0, HEIGHT, -540.0 - DISTANCE),
     ));
 }

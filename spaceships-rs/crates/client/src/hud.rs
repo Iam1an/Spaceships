@@ -617,6 +617,17 @@ const BLINK_HALF_PERIOD: f32 = 0.125;
 /// a second, so 64 steps is a handful of writes per hit and none afterwards.
 const VIGNETTE_STEPS: f32 = 64.0;
 
+/// What a hit is worth at **full** health, as a fraction of the vignette.
+///
+/// A deliberate departure from `main.js:1988`, which sets `opacity` to the raw
+/// `vignetteAlpha` and so draws an identical flash whether the hit took you
+/// from 100 to 90 or from 20 to 10. Scaling the flash by how much hull is
+/// already gone makes the effect say something the health bar cannot say in
+/// peripheral vision: the same shot reads as a tap when you are fresh and as a
+/// scream when you are nearly dead. At zero hull the gain is 1 and the rim is
+/// at full strength.
+const VIGNETTE_HEALTHY_GAIN: f32 = 0.45;
+
 /// Reduces one simulation frame to the pixels it implies.
 ///
 /// Pure, and deliberately free of Bevy — which is what lets the tests below
@@ -726,9 +737,13 @@ fn model(frame: &Frame, time: f32, seated: bool, locked: bool, feed: &KillFeed) 
         },
 
         // `camTel.hitFlash = vignetteAlpha` (`main.js:1942`) — the ship view's
-        // hit flash and the vignette's opacity are the same quantity, so the
-        // HUD reads it off the local `ShipView` rather than needing its own.
-        vignette: (me.hit_flash.clamp(0.0, 1.0) * VIGNETTE_STEPS).round() as u8,
+        // hit flash drives the vignette, so the HUD reads it off the local
+        // `ShipView` rather than needing its own decay. The hull term is the
+        // departure; see [`VIGNETTE_HEALTHY_GAIN`].
+        vignette: (me.hit_flash.clamp(0.0, 1.0)
+            * (VIGNETTE_HEALTHY_GAIN + (1.0 - VIGNETTE_HEALTHY_GAIN) * (1.0 - hp01))
+            * VIGNETTE_STEPS)
+            .round() as u8,
 
         // `match_timer` alone is not the test: it holds the match's full
         // duration before the clock starts and in modes that have no clock,
@@ -1816,17 +1831,34 @@ fn charge_gradient(overload: bool) -> BackgroundGradient {
 /// So the colours here are deliberately not the CSS's. They are much darker
 /// reds at lower alpha, chosen so that ordinary alpha compositing lands on the
 /// same place multiply does over this scene: a red-black rim that darkens
-/// towards the corners and leaves the centre clear. The stop *positions* and
-/// the shape are unchanged, and the opacity ramp is still the hit flash.
+/// towards the corners and leaves the centre clear.
+///
+/// **The stop positions are not the CSS's either, and that is the fix.** CSS's
+/// bare `ellipse at center` is *farthest-corner*: the ellipse is grown until it
+/// passes through the corner, so its `100%` is out past the screen and the
+/// edges of the viewport sit at about 71%. `bevy_ui`'s `FarthestCorner`
+/// resolves to `(half_width, half_height)` instead — an ellipse through the
+/// *side midpoints* — so every stop lands a factor of 1.41 further in than the
+/// CSS meant it to. Transcribing 40/80/110 against that put half the screen
+/// past the second stop and both far corners past the third, which is why a
+/// single hit washed the whole viewport flat red rather than darkening its rim.
+///
+/// The stops below are re-derived for Bevy's ellipse: nothing at all inside
+/// 70%, the ramp entirely in the outer margin, and 100% *is* the edge of the
+/// screen — the last stop only ever reaches the four corners, which sit at
+/// 141%. The peak alpha is capped well short of opaque, because this effect
+/// must never be able to hide what is shooting at you. Checked on screen at
+/// the worst case the model can produce: a hit landing at 40 HP, which is the
+/// full-strength frame of the flash and still leaves the centre clean.
 fn vignette_gradient(alpha: f32) -> BackgroundGradient {
     BackgroundGradient::from(RadialGradient {
-        // CSS's `ellipse at center` with no explicit extent is farthest-corner.
         shape: RadialGradientShape::FarthestCorner,
         position: UiPosition::CENTER,
         stops: vec![
-            ColorStop::new(rgba(140, 0, 0, 0.0), percent(40)),
-            ColorStop::new(rgba(120, 0, 0, 0.35 * alpha), percent(80)),
-            ColorStop::new(rgba(90, 0, 0, 0.7 * alpha), percent(110)),
+            ColorStop::new(rgba(140, 0, 0, 0.0), percent(70)),
+            ColorStop::new(rgba(120, 0, 0, 0.12 * alpha), percent(90)),
+            ColorStop::new(rgba(96, 0, 0, 0.22 * alpha), percent(100)),
+            ColorStop::new(rgba(70, 0, 0, 0.38 * alpha), percent(130)),
         ],
         ..default()
     })
@@ -2973,16 +3005,136 @@ mod tests {
         assert!(!dead.alive);
     }
 
-    /// The vignette reads the local ship's hit flash, which is the same
-    /// quantity `main.js:1942` copies into `camTel.hitFlash`.
+    /// The vignette rides the local ship's hit flash — the quantity
+    /// `main.js:1942` copies into `camTel.hitFlash` — scaled by how much hull
+    /// is already gone. No flash, no vignette, however badly hurt you are:
+    /// this is a *hit* indicator, not a health bar.
     #[test]
     fn the_vignette_follows_the_hit_flash() {
         let mut f = frame(healthy());
         assert_eq!(model(&f, 0.0, false).vignette, 0);
+
         f.ships[0].hit_flash = 1.0;
-        assert_eq!(model(&f, 0.0, false).vignette, VIGNETTE_STEPS as u8);
+        let fresh = model(&f, 0.0, false).vignette;
+        assert_eq!(
+            fresh,
+            (VIGNETTE_HEALTHY_GAIN * VIGNETTE_STEPS).round() as u8
+        );
+
+        // Linear in the flash, at a fixed hull.
         f.ships[0].hit_flash = 0.5;
-        assert_eq!(model(&f, 0.0, false).vignette, VIGNETTE_STEPS as u8 / 2);
+        assert_eq!(model(&f, 0.0, false).vignette, fresh / 2);
+    }
+
+    /// The stops of the vignette at a given opacity, as `(percent, alpha)`.
+    fn vignette_stops(alpha: f32) -> Vec<(f32, f32)> {
+        let BackgroundGradient(gradients) = vignette_gradient(alpha);
+        let [Gradient::Radial(radial)] = &gradients[..] else {
+            panic!("the vignette is one radial gradient");
+        };
+        radial
+            .stops
+            .iter()
+            .map(|stop| {
+                let Val::Percent(at) = stop.point else {
+                    panic!("stops are authored in percent");
+                };
+                (at, stop.color.alpha())
+            })
+            .collect()
+    }
+
+    /// **`bevy_ui`'s `FarthestCorner` is not CSS's.**
+    ///
+    /// CSS grows the ellipse until it passes through the farthest *corner*, so
+    /// `100%` is off-screen and the viewport edges sit at about 71%. Bevy
+    /// resolves the same name to `(half_width, half_height)` — an ellipse
+    /// through the side *midpoints* — so a stop transcribed from the CSS lands
+    /// a factor of 1.41 further in than it was authored to. That is the whole
+    /// reason one hit used to flood the screen, and it is invisible in the
+    /// source, so it is pinned here.
+    #[test]
+    fn the_gradient_ellipse_runs_through_the_screen_edge_not_the_corner() {
+        let size = Vec2::new(1920.0, 1080.0);
+        let extent = RadialGradientShape::FarthestCorner.resolve(Vec2::ZERO, 1.0, size, size);
+        assert_eq!(extent, size / 2.0, "100% is the edge midpoint");
+
+        // So the corner is out at sqrt(2) in this ellipse's own metric, and
+        // any stop beyond 100% only ever reaches the corners.
+        let corner = (size / 2.0) / extent;
+        assert!((corner.length() - std::f32::consts::SQRT_2).abs() < 1e-5);
+    }
+
+    /// It has to read as a rim. The centre of the screen is where the reticle,
+    /// the target brackets and whatever is shooting at you all live, and the
+    /// damage feedback must never be able to cover them.
+    #[test]
+    fn the_vignette_is_a_rim_and_leaves_the_centre_alone() {
+        let stops = vignette_stops(1.0);
+        let (first_at, first_alpha) = stops[0];
+
+        assert!(first_alpha == 0.0, "the innermost stop must be clear");
+        assert!(
+            first_at >= 55.0,
+            "the clear centre only reaches {first_at}% of the way to the edge"
+        );
+
+        // Monotonic outward, and never remotely opaque even at full strength.
+        for pair in stops.windows(2) {
+            assert!(pair[1].0 > pair[0].0, "stops out of order");
+            assert!(pair[1].1 >= pair[0].1, "the rim lightens outward");
+        }
+        let peak = stops.last().expect("stops").1;
+        assert!(peak <= 0.5, "peak alpha {peak} is a wash, not a rim");
+
+        // The edge of the screen — 100%, per the test above — is the darkest
+        // thing the player sees outside the four corners.
+        let at_edge = stops
+            .iter()
+            .find(|(at, _)| *at == 100.0)
+            .expect("a stop on the screen edge")
+            .1;
+        assert!(at_edge <= 0.35, "the screen edge sits at {at_edge}");
+    }
+
+    /// The state the report came in about: badly hurt, and still able to see.
+    #[test]
+    fn a_hit_at_forty_hitpoints_is_still_a_rim() {
+        let mut f = frame(HudState {
+            hp: 40,
+            hp01: 0.4,
+            ..healthy()
+        });
+        f.ships[0].hit_flash = 1.0;
+        let alpha = f32::from(model(&f, 0.0, false).vignette) / VIGNETTE_STEPS;
+
+        // Louder than a scratch at full health, quieter than a killing blow.
+        assert!((0.6..0.9).contains(&alpha), "severity at 40 HP: {alpha}");
+
+        let stops = vignette_stops(alpha);
+        assert_eq!(stops[0].1, 0.0, "the centre is untouched");
+        assert!(
+            stops.last().expect("stops").1 < 0.4,
+            "the corners are still translucent"
+        );
+    }
+
+    /// The departure from the JS: the same hit reads harder the closer the
+    /// hull is to gone, and reaches full strength only at zero.
+    #[test]
+    fn the_vignette_bites_harder_as_the_hull_goes() {
+        let hit = |hp01: f32| {
+            let mut f = frame(HudState { hp01, ..healthy() });
+            f.ships[0].hit_flash = 1.0;
+            model(&f, 0.0, false).vignette
+        };
+
+        assert!(hit(0.4) > hit(1.0), "a hit at 40% hull is the louder one");
+        assert!(hit(0.0) > hit(0.4));
+        assert_eq!(hit(0.0), VIGNETTE_STEPS as u8, "a dead hull maxes it out");
+        // Still a rim and not a wash: nothing here ever exceeds full opacity,
+        // and `vignette_gradient` caps the darkest stop well under it.
+        assert!(hit(0.0) <= VIGNETTE_STEPS as u8);
     }
 
     /// `fmtTime`: whole seconds, rounded up, zero-padded.

@@ -60,12 +60,19 @@
 //!
 //! # Where the camera comes from
 //!
-//! There is exactly one camera in this client — `camera.rs`'s, carrying the
-//! whole Ultra stack (HDR, bloom, ACES, vignette), the environment map
+//! There is exactly one camera that draws the *match* — `camera.rs`'s, carrying
+//! the whole Ultra stack (HDR, bloom, ACES, vignette), the environment map
 //! `skybox.rs` hangs on it, and the render target `hud.rs` resolves as
-//! `bevy_ui`'s default. A second camera would have to duplicate all of that and
-//! would make the "highest-order camera" pick ambiguous, so [`seat_camera`]
-//! moves the one that exists.
+//! `bevy_ui`'s default. Another camera for the flight view would have to
+//! duplicate all of that and would make the "highest-order camera" pick
+//! ambiguous, so [`seat_camera`] moves the one that exists.
+//!
+//! It is no longer the only `Camera3d` in the world, though, and that mattered:
+//! `ui.rs` runs one off-screen for the menu's rotating ship, and both queries
+//! here used to say `With<Camera3d>` and ask for a single match. Two cameras
+//! make that an error, not a choice, so `V` hid the HUD and the canopy and then
+//! left the view in the chase camera — the whole cockpit, invisible from
+//! inside. Both now filter on [`FlightCamera`].
 //!
 //! Doing that safely is the subtle part. `camera.rs::follow` writes the chase
 //! pose in `PostUpdate` `.before(TransformSystems::Propagate)`, and it is
@@ -88,6 +95,7 @@ use bevy::render::render_resource::Face;
 use spaceships_sim as sim;
 
 use crate::audio::AudioCommands;
+use crate::camera::FlightCamera;
 use crate::scene::ShipRoot;
 use crate::sim_bridge::SimFrame;
 use crate::LOCAL_ID;
@@ -98,10 +106,17 @@ use crate::LOCAL_ID;
 
 /// Where the pilot sits in a given hull, and how big the tub around them is.
 ///
-/// Authored in **ship-local** units, exactly as `cockpit.js` authors them. The
+/// Authored in **unfitted ship** units, exactly as `cockpit.js` authors them:
+/// the model's own geometry, turned into ship axes but not otherwise moved. The
 /// glTF is rotated `-PI/2` about Y by `scene.rs` (as `ship.js:45` does), which
 /// maps model `(x, y, z)` to ship `(-z, y, x)`: ship forward is `+z`, and the
 /// pilot's right is therefore `-x`.
+///
+/// [`CockpitProfile::fitted`] then applies `scene::ship_fit` — the same scale
+/// and nose-ward shift the hull itself gets — so the anchors below can be read
+/// straight off a measurement of the glb. For `spaceship.glb` and
+/// `spaceshipADMIN.glb` that fit is the identity and the two spaces coincide,
+/// which is why the numbers in the first two profiles are unchanged.
 ///
 /// The JS scales the whole ship group by `SHIP_SCALE = 1.5` and these anchors
 /// ride along with it; `scene.rs` leaves the ship root at unit scale, so the
@@ -177,20 +192,112 @@ const ADMIN_PROFILE: CockpitProfile = CockpitProfile {
     lamp: 0xffd39a,
 };
 
-/// `getCockpitProfile(isAdmin)`.
+/// `jet.glb` (`Accent_Cockpit`: unfitted ship x ±0.268, y -0.192..0.154,
+/// z 0.780..1.974; the bubble's centreline crown is y 0.154 at z 1.43).
 ///
-/// `scene.rs` only loads `spaceship.glb`, so this returns the default one
-/// unless `SPACESHIPS_ADMIN_COCKPIT` is set, which exists so the other profile
-/// can be looked at at all. When the client learns to pick a hull, that flag
-/// becomes the `isLocalAdmin` the JS computes from the pilot name.
-fn profile(is_admin: bool) -> CockpitProfile {
-    if is_admin {
-        ADMIN_PROFILE
-    } else {
-        DEFAULT_PROFILE
+/// This airframe is a real aircraft and its canopy is a *cut-out patch of the
+/// upper skin*, not a blister sitting proud of a fuselage, so there is far less
+/// room than the first two profiles have: the bubble is 0.54 across and 0.35
+/// deep where the other is 1.0 across. Everything here is therefore measured
+/// off the canopy rather than scaled from the default — the eye sits 0.03 under
+/// the crown, the panel plane stops 0.07 short of the windscreen bow, and the
+/// bulkhead lands on the canopy's rear edge.
+///
+/// The tub is 0.284 half-width against the glass's 0.268 — proud by the same
+/// ratio the default profile is, and for the same reason.
+const JET_PROFILE: CockpitProfile = CockpitProfile {
+    // Set aft of the bubble's crown rather than under it. `build_interior`
+    // plants the stick a fixed 0.30 ahead of the eye, so on a cockpit this
+    // short the panel closes to within twice that and the grip rises straight
+    // through the radar scope. Moving the seat back is what re-opens the angle
+    // between them; the crown is 0.03 above the eye either way.
+    eye: Vec3::new(0.0, 0.121, 1.300),
+    fov_deg: 84.0,
+    // `hw` is the arch radius as well as the tub's half-width, and the crown
+    // therefore sits `rail_y + hw` above the floor. Held out past the glass by
+    // more than the other two profiles hold theirs, because on a canopy this
+    // shallow the difference is the only headroom the pilot gets.
+    hw: 0.320,
+    floor_y: -0.262,
+    rail_y: -0.089,
+    back_z: 0.767,
+    // Low enough that the sightline over it clears the nose deck, which falls
+    // away to y -0.10 by the radome: this hull's whole forward view *is* its
+    // own nose, and a panel authored to the default's proportions covered it.
+    dash_top: -0.030,
+    dash_z: 1.909,
+    accent: 0x5fd8ff,
+    lamp: 0x9fd0ff,
+};
+
+impl CockpitProfile {
+    /// Lifts anchors authored against the model's own geometry into the ship
+    /// space the interior is actually built in.
+    ///
+    /// `scene::ship_fit` reduces the whole hull fit to `q' = scale * (q +
+    /// offset)` in ship space, so a point transforms whole, a plane coordinate
+    /// transforms on its own axis, and a half-width is simply scaled. Nothing
+    /// else in the profile is a length: the field of view and the two colours
+    /// pass through.
+    ///
+    /// This is the piece that was missing. `jet.glb` is fitted at 1.62 and
+    /// shifted 3.2 units nose-ward, and a cockpit that ignored that put the
+    /// pilot's head out among the tailfins with the panel buried in the
+    /// fuselage — the hull moves, the seat does not.
+    const fn fitted(self, scale: f32, offset: Vec3) -> CockpitProfile {
+        CockpitProfile {
+            eye: Vec3::new(
+                scale * (self.eye.x + offset.x),
+                scale * (self.eye.y + offset.y),
+                scale * (self.eye.z + offset.z),
+            ),
+            hw: self.hw * scale,
+            floor_y: scale * (self.floor_y + offset.y),
+            rail_y: scale * (self.rail_y + offset.y),
+            back_z: scale * (self.back_z + offset.z),
+            dash_z: scale * (self.dash_z + offset.z),
+            dash_top: scale * (self.dash_top + offset.y),
+            ..self
+        }
     }
 }
 
+/// Which hull the pilot is strapped into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hull {
+    /// `spaceship.glb`.
+    Default,
+    /// `spaceshipADMIN.glb`.
+    Admin,
+    /// `jet.glb`.
+    Jet,
+}
+
+/// `getCockpitProfile(isAdmin)`, plus the hull `scene.rs` is actually flying.
+///
+/// The admin flag is `SPACESHIPS_ADMIN_COCKPIT`, which exists so that profile
+/// can be looked at at all; when the client learns to pick a hull it becomes
+/// the `isLocalAdmin` the JS computes from the pilot name. The jet comes from
+/// `SPACESHIPS_SHIP_MODEL`, read through `scene::ship_model` so there is one
+/// answer to "which model is flying" rather than two.
+fn hull() -> Hull {
+    if admin_hull() {
+        Hull::Admin
+    } else if crate::scene::ship_model().contains("jet") {
+        // The same substring test `scene::model_fit` splits on, so the profile
+        // and the fit can never disagree about which hull this is.
+        Hull::Jet
+    } else {
+        Hull::Default
+    }
+}
+
+/// Whether to sit in the admin hull.
+///
+/// Kept as its own function rather than folded into [`hull`] with a `cfg` so
+/// that `Hull::Admin` is constructed in code the compiler sees on **both**
+/// targets — a `cfg`'d early return leaves the variant provably unreachable on
+/// wasm, and dead code there is a warning.
 fn admin_hull() -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -200,6 +307,17 @@ fn admin_hull() -> bool {
     {
         false
     }
+}
+
+/// The profile for a hull, in the ship space the interior is built in.
+fn profile(hull: Hull) -> CockpitProfile {
+    let base = match hull {
+        Hull::Default => DEFAULT_PROFILE,
+        Hull::Admin => ADMIN_PROFILE,
+        Hull::Jet => JET_PROFILE,
+    };
+    let (scale, offset) = crate::scene::ship_fit();
+    base.fitted(scale, offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,11 +416,17 @@ impl Plugin for CockpitPlugin {
 
 /// Which camera the player is looking through.
 ///
-/// `main.js` persists this in `localStorage['spaceships:viewMode']`; this client
-/// has no settings store yet, so it starts in third person unless
-/// `SPACESHIPS_COCKPIT` is set — which exists for the same reason
-/// `SPACESHIPS_SCREENSHOT` does, so a visual check can capture this view without
-/// anyone being there to press `V`.
+/// `main.js` persists this in `localStorage['spaceships:viewMode']`, which the
+/// display's `COCKPIT VIEW` row stands in for: `ui.rs`'s `mirror_cockpit_flag`
+/// keeps [`ViewMode::first_person`] and that row equal in **both** directions,
+/// so the menu switch actually seats the pilot and a `V` pressed in flight is
+/// what the row reads when they open the display again. This resource is the
+/// authority; the row is a view of it.
+///
+/// `SPACESHIPS_COCKPIT` seeds it, which exists for the same reason
+/// `SPACESHIPS_SCREENSHOT` does: so a visual check can capture this view
+/// without anyone being there to press `V`. It is a starting value and not an
+/// override — once the app is running, `V` and the menu row both move it.
 #[derive(Resource)]
 pub struct ViewMode {
     /// What `V` last selected.
@@ -340,10 +464,61 @@ struct Head {
     shake_amp: f32,
 }
 
+/// What the pilot's hands are asking the head to do this frame.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Look {
+    /// `Alt` — over the shoulder.
+    Back,
+    /// Right mouse held, carrying this frame's travel in pixels.
+    Free(Vec2),
+    /// Neither, so the head damps home.
+    Boresight,
+}
+
 impl Head {
     /// `snap()`: centre the head, kill the shake.
     fn snap(&mut self) {
         *self = Head::default();
+    }
+
+    /// One frame of head movement — the whole of `FirstPersonCamera.update`
+    /// except reading the hardware.
+    ///
+    /// Split out from [`drive_head`] and left free of Bevy on purpose. The
+    /// failure modes in here are all arithmetic — a lean that never returns to
+    /// centre, a free-look clamp applied to the wrong axis, damping that is not
+    /// frame-rate independent — and every one of them is a still frame away
+    /// from looking correct. The tests at the foot of the module drive this
+    /// directly instead.
+    fn update(&mut self, look: Look, steer: (f32, f32), boosting: bool, hit_flash: f32, dt: f32) {
+        match look {
+            Look::Back => {
+                self.yaw = damp(self.yaw, LOOK_BACK_YAW, 9.0, dt);
+                self.pitch = damp(self.pitch, 0.0, 9.0, dt);
+            }
+            Look::Free(delta) => {
+                self.yaw -= delta.x * LOOK_SENSITIVITY;
+                self.pitch -= delta.y * LOOK_SENSITIVITY;
+                self.yaw = self.yaw.clamp(-MAX_YAW, MAX_YAW);
+                self.pitch = self.pitch.clamp(-MAX_PITCH, MAX_PITCH);
+            }
+            // Damped return to boresight.
+            Look::Boresight => {
+                self.yaw = damp(self.yaw, 0.0, 7.0, dt);
+                self.pitch = damp(self.pitch, 0.0, 7.0, dt);
+            }
+        }
+
+        // Automatic lean into the turn, from the ship's effective steering.
+        let (sx, sy) = steer;
+        self.lean_yaw = damp(self.lean_yaw, -sx * AUTO_LEAN_YAW, 5.0, dt);
+        self.lean_pitch = damp(self.lean_pitch, -sy * AUTO_LEAN_PITCH, 5.0, dt);
+
+        // Airframe shake: a constant rumble under boost, plus a decaying kick
+        // on damage. `ShipView::hit_flash` is the same 1 -> 0 envelope the
+        // damage vignette rides.
+        self.shake_t += dt;
+        self.shake_amp = if boosting { 0.0030 } else { 0.0 } + hit_flash * 0.014;
     }
 }
 
@@ -353,7 +528,11 @@ fn toggle_view(
     frame: Res<SimFrame>,
     mut view: ResMut<ViewMode>,
     mut head: ResMut<Head>,
-    mut cam: Query<&mut Projection, With<Camera3d>>,
+    // `FlightCamera` and not `Camera3d`: the menu's ship preview is a second
+    // one, and `single_mut` over two cameras returns an error rather than a
+    // camera. See the marker's own note — this query silently matching nothing
+    // is what broke the cockpit.
+    mut cam: Query<&mut Projection, With<FlightCamera>>,
     mut third_person: Local<Option<PerspectiveProjection>>,
 ) {
     if keys.just_pressed(KeyCode::KeyV) {
@@ -385,7 +564,7 @@ fn toggle_view(
     };
     let saved = third_person.get_or_insert_with(|| persp.clone());
     if seated {
-        persp.fov = profile(admin_hull()).fov_deg * DEG;
+        persp.fov = profile(hull()).fov_deg * DEG;
         persp.near = COCKPIT_NEAR;
     } else {
         *persp = saved.clone();
@@ -894,7 +1073,7 @@ fn build_cockpit(
         return;
     };
 
-    let profile = profile(admin_hull());
+    let profile = profile(hull());
     let palette = Palette::new(&profile, &mut meshes, &mut materials);
 
     let root = commands
@@ -1555,41 +1734,26 @@ fn drive_head(
     frame: Res<SimFrame>,
     mut head: ResMut<Head>,
 ) {
-    let dt = time.delta_secs();
     if !view.seated {
         return;
     }
 
-    let look_back = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
-    let free_look = !look_back && buttons.pressed(MouseButton::Right);
-
-    if look_back {
-        head.yaw = damp(head.yaw, LOOK_BACK_YAW, 9.0, dt);
-        head.pitch = damp(head.pitch, 0.0, 9.0, dt);
-    } else if free_look {
-        head.yaw -= motion.delta.x * LOOK_SENSITIVITY;
-        head.pitch -= motion.delta.y * LOOK_SENSITIVITY;
-        head.yaw = head.yaw.clamp(-MAX_YAW, MAX_YAW);
-        head.pitch = head.pitch.clamp(-MAX_PITCH, MAX_PITCH);
+    let look = if keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight) {
+        Look::Back
+    } else if buttons.pressed(MouseButton::Right) {
+        Look::Free(motion.delta)
     } else {
-        // Damped return to boresight.
-        head.yaw = damp(head.yaw, 0.0, 7.0, dt);
-        head.pitch = damp(head.pitch, 0.0, 7.0, dt);
-    }
+        Look::Boresight
+    };
 
-    // Automatic lean into the turn, from the ship's effective steering.
-    let (sx, sy) = steer(&frame.0);
-    head.lean_yaw = damp(head.lean_yaw, -sx * AUTO_LEAN_YAW, 5.0, dt);
-    head.lean_pitch = damp(head.lean_pitch, -sy * AUTO_LEAN_PITCH, 5.0, dt);
-
-    // Airframe shake: a constant rumble under boost, plus a decaying kick on
-    // damage. `ShipView::hit_flash` is the same 1 -> 0 envelope the JS's damage
-    // vignette rides.
     let me = local_ship(&frame.0);
-    head.shake_t += dt;
-    let boosting = me.is_some_and(|s| s.flags.contains(sim::world::ShipFlags::BOOSTING));
-    let hit_flash = me.map_or(0.0, |s| s.hit_flash);
-    head.shake_amp = if boosting { 0.0030 } else { 0.0 } + hit_flash * 0.014;
+    head.update(
+        look,
+        steer(&frame.0),
+        me.is_some_and(|s| s.flags.contains(sim::world::ShipFlags::BOOSTING)),
+        me.map_or(0.0, |s| s.hit_flash),
+        time.delta_secs(),
+    );
 }
 
 /// The steering the head and the stick lean with.
@@ -1630,7 +1794,7 @@ type CameraPose<'w, 's> = Query<
     'w,
     's,
     (&'static mut Transform, &'static mut GlobalTransform),
-    (With<Camera3d>, Without<ShipRoot>),
+    (With<FlightCamera>, Without<ShipRoot>),
 >;
 
 /// `FirstPersonCamera._apply`: put the camera at the eye anchor, looking where
@@ -2019,6 +2183,20 @@ fn set_visible(q: &mut Query<&mut Visibility>, entity: Entity, visible: bool) {
 #[derive(Resource, Default)]
 struct HullMode {
     applied: Option<bool>,
+    /// The materials [`HullMode::applied`] was applied *to*.
+    ///
+    /// The mode alone is not enough to early out on, and that was a real bug: a
+    /// glTF instantiates a frame or two after the ship entity appears, so a
+    /// pilot already seated when the match starts — which is exactly what
+    /// `SPACESHIPS_COCKPIT` does — latched `Some(true)` against an empty walk
+    /// and never forced the hull single-sided when the model finally arrived.
+    /// The result is a solid black wall across the canopy that no amount of
+    /// pressing `V` clears, because the latch says the work is already done.
+    ///
+    /// Comparing the material list instead makes the state a function of what
+    /// is actually on screen, so a model that turns up late, or a paint job
+    /// that swaps every handle for a clone, re-applies on its own.
+    covers: Vec<Handle<StandardMaterial>>,
     /// Each hull material with the sidedness the glTF gave it, so third person
     /// gets exactly what it had.
     restore: Vec<(Handle<StandardMaterial>, bool, Option<Face>)>,
@@ -2085,19 +2263,40 @@ fn sync_hull(
                 set_visible(&mut visibility, entity, true);
             }
             if let Ok(MeshMaterial3d(handle)) = meshes.get(entity) {
-                hull_materials.push(handle.clone());
+                // Distinct materials, not distinct meshes. `paint_and_upgrade`
+                // clones once per authored material and shares the clone across
+                // every mesh using it, so `spaceship.glb`'s six nodes hand back
+                // the same handle six times — and saving the same material six
+                // times captures the *forced* sidedness as if it were the
+                // glTF's own, which is how the restore below used to leave the
+                // hull single-sided for good.
+                if !hull_materials.contains(handle) {
+                    hull_materials.push(handle.clone());
+                }
             }
         }
     }
 
-    if mode.applied == Some(fp) {
+    if mode.applied == Some(fp) && (!fp || mode.covers == hull_materials) {
         return;
     }
+
+    // Always unwind first. Re-applying on top of a partly-applied set would
+    // record `Face::Back` as the value to restore to.
+    for (handle, double_sided, cull) in std::mem::take(&mut mode.restore) {
+        if let Some(mut mat) = materials.get_mut(&handle) {
+            mat.double_sided = double_sided;
+            mat.cull_mode = cull;
+        }
+    }
     mode.applied = Some(fp);
+    mode.covers.clear();
 
     if fp {
-        mode.restore.clear();
         for handle in hull_materials {
+            // A handle whose asset has not landed yet is simply left out of
+            // `covers`, so the comparison above brings this system back for it
+            // next frame.
             let Some(mut mat) = materials.get_mut(&handle) else {
                 continue;
             };
@@ -2105,13 +2304,7 @@ fn sync_hull(
                 .push((handle.clone(), mat.double_sided, mat.cull_mode));
             mat.double_sided = false;
             mat.cull_mode = Some(Face::Back);
-        }
-    } else {
-        for (handle, double_sided, cull) in std::mem::take(&mut mode.restore) {
-            if let Some(mut mat) = materials.get_mut(&handle) {
-                mat.double_sided = double_sided;
-                mat.cull_mode = cull;
-            }
+            mode.covers.push(handle);
         }
     }
 }
@@ -2357,9 +2550,22 @@ fn glyph(ch: char) -> u16 {
 mod tests {
     use super::*;
 
+    /// Every profile as it is actually built: the jet's anchors are authored
+    /// against `jet.glb`'s own geometry and only mean anything once
+    /// `scene::model_fit`'s scale and nose-ward shift are on them.
+    fn built_profiles() -> [CockpitProfile; 3] {
+        [
+            DEFAULT_PROFILE.fitted(1.0, Vec3::ZERO),
+            ADMIN_PROFILE.fitted(1.0, Vec3::ZERO),
+            // `scene::ship_fit()` for `jet.glb`: 1.62, with `model_fit`'s
+            // (1.98, 0.20, 0.0) turned into ship axes by the -90 degree yaw.
+            JET_PROFILE.fitted(1.62, Vec3::new(0.0, 0.20, 1.98)),
+        ]
+    }
+
     #[test]
-    fn both_profiles_describe_a_tub_the_pilot_fits_in() {
-        for p in [DEFAULT_PROFILE, ADMIN_PROFILE] {
+    fn every_profile_describes_a_tub_the_pilot_fits_in() {
+        for p in built_profiles() {
             assert!(p.rail_y > p.floor_y, "the rail is above the floor");
             assert!(p.eye.y > p.rail_y, "the eye clears the canopy rail");
             assert!(p.dash_z > p.eye.z, "the panel is ahead of the pilot");
@@ -2370,11 +2576,55 @@ mod tests {
         }
     }
 
+    /// A hull whose fit is the identity — which is both of the originals — must
+    /// come through untouched, or this scheme would have moved the one cockpit
+    /// that was already right.
+    #[test]
+    fn an_identity_fit_leaves_a_profile_alone() {
+        for p in [DEFAULT_PROFILE, ADMIN_PROFILE, JET_PROFILE] {
+            assert_eq!(p.fitted(1.0, Vec3::ZERO), p);
+        }
+    }
+
+    /// The bug the jet profile exists to fix: the seat has to follow the hull.
+    ///
+    /// `jet.glb`'s canopy, measured with the node transforms applied and then
+    /// carried through `scene::ship_fit`, occupies ship x ±0.435, y 0.013..0.573,
+    /// z 4.471..6.406. Unfitted, the default profile puts the pilot at
+    /// (0, 1.26, 0.40) — four units aft of that glass and three quarters of a
+    /// unit above it, which is out among the tailfins.
+    #[test]
+    fn the_jet_pilot_sits_inside_the_jets_canopy() {
+        const CANOPY_Z: (f32, f32) = (4.471, 6.406);
+        const CANOPY_CROWN: f32 = 0.573;
+
+        let p = JET_PROFILE.fitted(1.62, Vec3::new(0.0, 0.20, 1.98));
+        assert!(
+            p.eye.z > CANOPY_Z.0 && p.eye.z < CANOPY_Z.1,
+            "eye outside the canopy lengthwise: {}",
+            p.eye.z
+        );
+        assert!(
+            p.eye.y < CANOPY_CROWN,
+            "the pilot's head is through the glass: {}",
+            p.eye.y
+        );
+        // The panel is ahead of the pilot but still under the windscreen bow,
+        // and the bulkhead is behind them but not out past the canopy's rear
+        // edge — either would leave scenery hanging outside the aircraft.
+        assert!(p.dash_z > p.eye.z && p.dash_z < CANOPY_Z.1);
+        assert!(p.back_z < p.eye.z && p.back_z >= CANOPY_Z.0 - 0.1);
+
+        // And the failure this replaces, stated as a fact so it cannot come
+        // back: the unfitted anchors are nowhere near the aircraft.
+        assert!(DEFAULT_PROFILE.eye.z < CANOPY_Z.0 - 3.0);
+    }
+
     /// The layout is a chain of `min`s, and a profile that made any of them
     /// zero would leave an invisible panel rather than an error.
     #[test]
     fn the_dash_layout_leaves_room_for_three_displays() {
-        for p in [DEFAULT_PROFILE, ADMIN_PROFILE] {
+        for p in built_profiles() {
             let inner_half = p.hw - 0.20;
             let total_w = inner_half * 2.0;
             let gap = total_w * 0.022;
@@ -2431,6 +2681,107 @@ mod tests {
             1200.0
         )
         .is_none());
+    }
+
+    /// Runs the head for `secs` at 60 Hz under one steady set of inputs.
+    fn fly(head: &mut Head, look: Look, steer: (f32, f32), secs: f32) {
+        let dt = 1.0 / 60.0;
+        for _ in 0..(secs / dt) as u32 {
+            head.update(look, steer, false, 0.0, dt);
+        }
+    }
+
+    /// The head leans *into* the turn and comes back to centre when the stick
+    /// does. Both halves matter: a lean that tracked but never returned would
+    /// leave the pilot looking permanently off-axis after one turn.
+    #[test]
+    fn the_head_leans_into_a_turn_and_returns_to_centre() {
+        let mut head = Head::default();
+
+        // Full deflection right. The pilot's right is ship -x, so a positive
+        // steer leans the head to negative yaw — into the turn, not away.
+        fly(&mut head, Look::Boresight, (1.0, 0.0), 2.0);
+        assert!(
+            (head.lean_yaw + AUTO_LEAN_YAW).abs() < 1e-3,
+            "did not reach full lean: {}",
+            head.lean_yaw
+        );
+        assert!(head.lean_yaw < 0.0, "leaned away from the turn");
+
+        // Full deflection left mirrors it exactly.
+        let mut other = Head::default();
+        fly(&mut other, Look::Boresight, (-1.0, 0.0), 2.0);
+        assert!((other.lean_yaw - AUTO_LEAN_YAW).abs() < 1e-3);
+
+        // Pitch is the same story on the other axis.
+        let mut nose_up = Head::default();
+        fly(&mut nose_up, Look::Boresight, (0.0, 1.0), 2.0);
+        assert!((nose_up.lean_pitch + AUTO_LEAN_PITCH).abs() < 1e-3);
+
+        // Stick centred: the lean bleeds off.
+        fly(&mut head, Look::Boresight, (0.0, 0.0), 2.0);
+        assert!(head.lean_yaw.abs() < 1e-3, "lean stuck: {}", head.lean_yaw);
+    }
+
+    /// Free-look is clamped, and the clamp is per axis. Getting the two
+    /// crossed would let the pilot roll their head 110 degrees vertically —
+    /// which looks like the horizon coming apart, not like a bug.
+    #[test]
+    fn free_look_stays_inside_its_clamp() {
+        let mut head = Head::default();
+
+        // A mouse flung far past the stop, in both directions, on both axes.
+        fly(
+            &mut head,
+            Look::Free(Vec2::new(-4000.0, -4000.0)),
+            (0.0, 0.0),
+            1.0,
+        );
+        assert!(
+            (head.yaw - MAX_YAW).abs() < 1e-6,
+            "yaw ran past: {}",
+            head.yaw
+        );
+        assert!(
+            (head.pitch - MAX_PITCH).abs() < 1e-6,
+            "pitch ran past: {}",
+            head.pitch
+        );
+
+        fly(
+            &mut head,
+            Look::Free(Vec2::new(4000.0, 4000.0)),
+            (0.0, 0.0),
+            1.0,
+        );
+        assert!((head.yaw + MAX_YAW).abs() < 1e-6);
+        assert!((head.pitch + MAX_PITCH).abs() < 1e-6);
+
+        // Releasing the button walks it home.
+        fly(&mut head, Look::Boresight, (0.0, 0.0), 3.0);
+        assert!(head.yaw.abs() < 1e-3 && head.pitch.abs() < 1e-3);
+    }
+
+    /// `Alt` looks over the shoulder and holds there, and the pitch centres so
+    /// the pilot is not craning at the floor while they do it.
+    #[test]
+    fn looking_back_swings_all_the_way_round() {
+        let mut head = Head::default();
+        fly(
+            &mut head,
+            Look::Free(Vec2::new(0.0, -400.0)),
+            (0.0, 0.0),
+            0.1,
+        );
+        assert!(head.pitch > 0.0);
+
+        fly(&mut head, Look::Back, (0.0, 0.0), 2.0);
+        assert!((head.yaw - LOOK_BACK_YAW).abs() < 1e-3, "{}", head.yaw);
+        assert!(
+            head.pitch.abs() < 1e-3,
+            "pitch did not centre: {}",
+            head.pitch
+        );
     }
 
     /// Frame-rate independence is the whole reason `damp` is not a `lerp`: one
