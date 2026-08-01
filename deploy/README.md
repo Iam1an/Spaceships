@@ -94,8 +94,10 @@ read the same database file, so no migration is involved in either direction.
 
 - Node is **v26.1.0**. The hand-rolled `WSConn` exists because of a `ws`
   regression on Node 25 — the `ws` package is still a dependency but unused.
-- `.env` holds `JWT_SECRET`. The unit loads it with `EnvironmentFile=` and no
-  leading `-`, so a missing file stops the service rather than silently falling
-  back to the dev default, which would invalidate every existing token.
+- `.env` holds `JWT_SECRET`, and pm2 does **not** load it automatically — the
+  running server picks it up because `server/index.js` reads it itself. If the
+  Rust server replaces it, the secret has to be passed explicitly on the pm2
+  command line or via `pm2 set`, or every existing token silently stops
+  validating and all 19 accounts are logged out.
 - `spaceshipADMIN.glb` is 4.9 MB and is fetched on every session regardless of
   ownership (`main.js:100`). Worth making conditional.
