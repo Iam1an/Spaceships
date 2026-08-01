@@ -3727,6 +3727,7 @@ fn read_input(
     mut setup: ResMut<MatchSetup>,
     mut launch: MessageWriter<LaunchRequest>,
     hovered: Query<(&Control, &Interaction), Changed<Interaction>>,
+    mut audio: ResMut<crate::audio::AudioCommands>,
 ) {
     let Some(nodes) = nodes else { return };
 
@@ -3795,6 +3796,12 @@ fn read_input(
     } else {
         cur
     };
+    // The tube should sound like one: a relay tick as the cursor steps. Fired
+    // only on an actual move, so holding a direction at a list end is silent
+    // instead of buzzing against the wrap.
+    if next != cur {
+        audio.play(crate::audio::Sfx::UiMove);
+    }
     menu.focus[page] = next;
     // Arrowing onto a row *is* choosing it. The armory's detail panel and the
     // solo brief both describe "the selection", and a cursor that moved without
@@ -3806,6 +3813,7 @@ fn read_input(
     );
 
     if keys.just_pressed(KeyCode::Escape) && !menu.pinned {
+        audio.play(crate::audio::Sfx::UiBack);
         match menu.screen.back() {
             Some(s) => menu.go(s),
             None => menu.say("NO PAGE BELOW"),
@@ -3813,6 +3821,7 @@ fn read_input(
         return;
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter) {
+        audio.play(crate::audio::Sfx::UiSelect);
         fire = Some(nodes.controls[list[next as usize] as usize].action);
     }
 

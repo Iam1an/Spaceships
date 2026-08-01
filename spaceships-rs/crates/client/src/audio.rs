@@ -129,6 +129,12 @@ pub enum Sfx {
     Hitmarker,
     /// Countermeasures away.
     FlareDeploy,
+    /// Menu cursor moving: a dry relay tick.
+    UiMove,
+    /// Menu selection: the same tick with a low thunk under it.
+    UiSelect,
+    /// Backing out of a page.
+    UiBack,
 }
 
 impl Sfx {
@@ -141,11 +147,14 @@ impl Sfx {
         Sfx::RockBreak,
         Sfx::Hitmarker,
         Sfx::FlareDeploy,
+        Sfx::UiMove,
+        Sfx::UiSelect,
+        Sfx::UiBack,
     ];
 }
 
 /// How many [`Sfx`] variants there are.
-const SFX_COUNT: usize = 6;
+const SFX_COUNT: usize = 9;
 
 /// One row of `SOUNDS` + `VOLUMES` + `PLAY_THROTTLE`.
 struct SfxDef {
@@ -190,6 +199,25 @@ const SFX: [SfxDef; SFX_COUNT] = [
     SfxDef {
         path: "sounds/flare_deploy.mp3",
         volume: 0.55,
+        throttle: 0.0,
+    },
+    SfxDef {
+        // The menu is a CRT, so its cursor should sound like a relay closing
+        // rather than a UI beep. Held down, the rail scrolls fast, so this is
+        // throttled a little tighter than its own 50 ms length -- otherwise
+        // held-arrow navigation turns into a buzz.
+        path: "sounds/ui_move.mp3",
+        volume: 0.30,
+        throttle: 0.045,
+    },
+    SfxDef {
+        path: "sounds/ui_select.mp3",
+        volume: 0.40,
+        throttle: 0.0,
+    },
+    SfxDef {
+        path: "sounds/ui_back.mp3",
+        volume: 0.32,
         throttle: 0.0,
     },
 ];
