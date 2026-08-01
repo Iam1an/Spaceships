@@ -44,7 +44,12 @@ const VIEW_BLEND: f32 = 0.25;
 /// fallback for a camera it cannot read one from. The punch normally captures
 /// whatever the projection actually holds when it starts, because `cockpit.rs`
 /// swaps this out for the seated profile on `V`.
-pub const BASE_FOV: f32 = std::f32::consts::FRAC_PI_4;
+///
+/// `main.js:45` is `new THREE.PerspectiveCamera(75, ...)` — three.js takes
+/// **degrees**, vertical. Bevy takes radians, and its default is 45 degrees, so
+/// leaving it defaulted made the view a third narrower than the game it is
+/// reproducing: everything looked magnified and the field of view read wrong.
+pub const BASE_FOV: f32 = 75.0 * std::f32::consts::PI / 180.0;
 
 /// The camera's smoothed up vector. In Three.js this is `camera.up`, a mutable
 /// field on the camera object; Bevy's `Transform::look_at` takes up as an

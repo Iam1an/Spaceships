@@ -671,7 +671,21 @@ fn fixed_tick(
     mut latch: ResMut<EdgeLatch>,
     mut frame: ResMut<SimFrame>,
     mut roster: ResMut<Roster>,
+    lobby: Option<Res<crate::ui::LobbyOpen>>,
 ) {
+    // The lobby is not an overlay on a running game: while it is up, the match
+    // is frozen. Without this the world keeps ticking behind the menu, so bots
+    // hunt and kill a player who is reading a mission brief and cannot fly.
+    // The JS has the same property for a different reason -- there, no game
+    // exists until the lobby calls `startGame`.
+    //
+    // Input is still latched (above, in `PreUpdate`), so a key pressed on the
+    // frame the menu closes is not swallowed; the latch simply drains into the
+    // first tick that actually runs.
+    if lobby.is_some_and(|l| l.0) {
+        return;
+    }
+
     let mut player = input.0;
     latch.drain_into(&mut player);
 

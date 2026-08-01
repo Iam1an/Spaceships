@@ -104,6 +104,31 @@ fn ship_model() -> String {
     SHIP_MODEL.to_owned()
 }
 
+/// Scale and nose-ward offset applied to the model, in model space.
+///
+/// The camera anchors on the ship's *origin*, and the two models put their
+/// origin in very different places. `spaceship.glb`'s body sits **1.44 units
+/// ahead of and 0.22 above** its origin — measured with node transforms
+/// applied, which is what actually renders — while `jet.glb` is centred on its
+/// own bounding box. Flying the jet unadjusted therefore hangs the body back
+/// and low from the point the chase camera frames, so it sits at the bottom of
+/// the screen behind the HUD instead of near the middle.
+///
+/// The jet is also 23% narrower across the span, which is the dimension a chase
+/// camera reads as "how big is my ship", so it is scaled to match.
+///
+/// Numbers are model space, before `ship.js`'s -90 degree yaw and before
+/// `SHIP_SCALE`. Nose is +x.
+fn model_fit(model: &str) -> (f32, Vec3) {
+    if model.contains("jet") {
+        // span 4.17 -> 5.43 to match the ship it replaces, then the origin
+        // moved to the same fraction along the hull the old model used.
+        (5.43 / 4.17, Vec3::new(1.98, 0.22, 0.0))
+    } else {
+        (1.0, Vec3::ZERO)
+    }
+}
+
 /// `upgradeMaterials`'s `anisotropy: 8`.
 const ANISOTROPY: u16 = 8;
 
@@ -1185,7 +1210,14 @@ fn sample_ships(
                         // the simulation says the nose is local +z. Correcting
                         // it on a child keeps the root transform the
                         // simulation's own.
-                        Transform::from_rotation(Quat::from_rotation_y(-FRAC_PI_2)),
+                        {
+                            let (fit_scale, fit_offset) = model_fit(&ship_model());
+                            Transform::from_rotation(Quat::from_rotation_y(-FRAC_PI_2))
+                                .with_scale(Vec3::splat(fit_scale))
+                                .with_translation(
+                                    Quat::from_rotation_y(-FRAC_PI_2) * (fit_offset * fit_scale),
+                                )
+                        },
                     ))
                     // Paint and Ultra's material treatment, once the glTF
                     // hierarchy actually exists.
