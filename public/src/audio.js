@@ -6,6 +6,7 @@ const SOUNDS = {
   impact: 'sounds/impact.mp3',
   rockbreak: 'sounds/rockbreak.mp3',
   hitmarker_2: 'sounds/hitmarker_2.mp3',
+  flare_deploy: 'sounds/flare_deploy.mp3',
   music: 'sounds/dumb_Eflatmin.mp3',
 };
 const VOLUMES = {
@@ -16,6 +17,7 @@ const VOLUMES = {
   impact: 0.45,
   rockbreak: 0.55,
   hitmarker_2: 0.25,
+  flare_deploy: 0.55,
   music: 1.0,
 };
 const PLAY_THROTTLE = {

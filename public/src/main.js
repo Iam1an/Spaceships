@@ -1472,7 +1472,7 @@ export async function startGame(opts = {}) {
     if (nowKeyQ && !prevKeyQ && myAlive && flaresLeft > 0) {
       missileSystem.deployFlare(ship.position.clone(), ship.quaternion, myId);
       flaresLeft--;
-      audio.play('shoot');
+      audio.play('flare_deploy');
       audio.warn('flare');
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
