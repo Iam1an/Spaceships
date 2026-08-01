@@ -82,6 +82,28 @@ use crate::sim_bridge::{pos, rot, SimFrame, SimSet, LOCAL_ID};
 /// and is 4.9 MB, which is a decision for later, not a default.
 const SHIP_MODEL: &str = "spaceship.glb";
 
+/// Which model to fly, so an alternative can be judged in motion rather than
+/// from stills.
+///
+/// `SPACESHIPS_SHIP_MODEL=jet.glb` flies the converted F-22 (7,249 triangles,
+/// against `spaceship.glb`'s 516). It is not the default yet: it is 23%
+/// narrower and 22% shorter than the ship it would replace, and it is centred
+/// on its own bounding box where the old model's origin sits well forward — so
+/// it frames differently in the chase camera. Both are decisions to make after
+/// flying it.
+///
+/// Native only. On the web there is no process environment, so the constant
+/// stands.
+fn ship_model() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(name) = std::env::var("SPACESHIPS_SHIP_MODEL") {
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    SHIP_MODEL.to_owned()
+}
+
 /// `upgradeMaterials`'s `anisotropy: 8`.
 const ANISOTROPY: u16 = 8;
 
@@ -773,7 +795,7 @@ fn setup(
         // 0.19: `GltfAssetLabel::Scene(0).from_asset(..)` is unchanged, but the
         // asset it resolves to is a `WorldAsset` (was `Scene`) and the
         // component that instantiates it is `WorldAssetRoot` (was `SceneRoot`).
-        ship: assets.load(bevy::gltf::GltfAssetLabel::Scene(0).from_asset(SHIP_MODEL)),
+        ship: assets.load(bevy::gltf::GltfAssetLabel::Scene(0).from_asset(ship_model())),
         rock_meshes: (0..rules.world.asteroid_field.variant_count)
             .map(|v| meshes.add(rock_mesh(v)))
             .collect(),

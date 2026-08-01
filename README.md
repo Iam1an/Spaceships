@@ -290,6 +290,12 @@ This game and all its code, assets, and design are the exclusive property of the
 | Game creator & Logic | **Ian** |
 | Online play & backend infrastructure | **Gheat** |
 
+### Third-party assets
+
+`public/jet.glb` (the fighter model) is derived from a Sketchfab model under CC-BY-4.0, which requires the following credit:
+
+> This work is based on "Modern Jet Fighter Low Poly Game Ready Free" (https://sketchfab.com/3d-models/modern-jet-fighter-low-poly-game-ready-free-cd2bd715dcd14dc4b47ebaeb2403fb89) by Hdjusj (https://sketchfab.com/Hdjusj) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+
 ---
 
 <div align="center">
