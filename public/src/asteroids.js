@@ -54,6 +54,28 @@ const BASE_MAT = new THREE.MeshStandardMaterial({
 function spinScaleFor(tier) {
   return tier === 'huge' ? 0.10 : tier === 'big' ? 0.18 : tier === 'medium' ? 0.32 : 0.5;
 }
+// Shared by both field constructors so solo fields can be damaged too, not just
+// server-driven ones.
+function makeMutators(group, list) {
+  function destroy(id) {
+    const idx = list.findIndex((a) => a.id === id);
+    if (idx < 0) return null;
+    const a = list[idx];
+    group.remove(a.mesh);
+    a.mesh.material.dispose();
+    list.splice(idx, 1);
+    return a;
+  }
+  function setHp(id, hp) {
+    const a = list.find((x) => x.id === id);
+    if (a) {
+      a.hp = hp;
+      a.hitFlash = 1;
+    }
+  }
+  return { destroy, setHp };
+}
+
 export function createAsteroidFieldFromData(data = []) {
   const group = new THREE.Group();
   group.name = 'Asteroids';
@@ -82,22 +104,7 @@ export function createAsteroidFieldFromData(data = []) {
       }
     }
   }
-  function destroy(id) {
-    const idx = list.findIndex((a) => a.id === id);
-    if (idx < 0) return null;
-    const a = list[idx];
-    group.remove(a.mesh);
-    a.mesh.material.dispose();
-    list.splice(idx, 1);
-    return a;
-  }
-  function setHp(id, hp) {
-    const a = list.find((x) => x.id === id);
-    if (a) {
-      a.hp = hp;
-      a.hitFlash = 1;
-    }
-  }
+  const { destroy, setHp } = makeMutators(group, list);
   return { group, list, update, destroy, setHp };
 }
 export function createAsteroidField({ count = 60, radius = 400, avoid = [] } = {}) {
@@ -174,7 +181,7 @@ export function createAsteroidField({ count = 60, radius = 400, avoid = [] } = {
     );
 
     group.add(mesh);
-    list.push({ mesh, radius: size * 0.95, spin, hp: tier.hp, hitFlash: 0, tier: tier.name });
+    list.push({ id: list.length + 1, mesh, radius: size * 0.95, spin, hp: tier.hp, hitFlash: 0, tier: tier.name });
   }
   function update(dt) {
     for (const a of list) {
@@ -189,7 +196,8 @@ export function createAsteroidField({ count = 60, radius = 400, avoid = [] } = {
     }
   }
 
-  return { group, list, update };
+  const { destroy, setHp } = makeMutators(group, list);
+  return { group, list, update, destroy, setHp };
 }
 function pseudoNoise(x, y, z, seed) {
   const s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + seed * 4.7) * 43758.5453;
