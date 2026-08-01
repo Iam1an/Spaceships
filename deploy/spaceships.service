@@ -1,0 +1,50 @@
+[Unit]
+Description=Spaceships Game Server
+Documentation=https://gheat.net/spaceships
+After=network.target
+
+# Don't thrash if it is crash-looping on a bad deploy -- five failures inside a
+# minute and systemd gives up, leaving `systemctl status` to say why. These
+# belong in [Unit], not [Service]; systemd silently ignores them if misplaced.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=gheat
+WorkingDirectory=/var/www/Gheat.net/spaceships
+
+# JWT_SECRET lives here. Without it the server falls back to a dev default and
+# every existing token stops validating -- so a missing file must be an error,
+# not a shrug. `EnvironmentFile=` (no leading `-`) makes systemd refuse to start
+# rather than start with the wrong secret.
+EnvironmentFile=/var/www/Gheat.net/spaceships/.env
+
+# Caddy reverse-proxies /spaceships/* and /ws to this port, so it is not a
+# preference. See /etc/caddy/Caddyfile.
+Environment=PORT=4000
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/node server/index.js
+
+# The whole point: the process was running bare, so a crash or a reboot took
+# the game down until someone noticed.
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spaceships
+
+# Modest hardening. The server needs to write pilots.db in its own directory
+# and bind a port, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
