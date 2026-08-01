@@ -4,33 +4,50 @@ import { createDash } from './dash.js';
 // Cockpit profiles are authored in SHIP-LOCAL units, before SHIP_SCALE (1.5) is applied
 // by main.js. Both GLB models face +X and are rotated -PI/2 about Y in ship.js, which maps
 // model (x, y, z) -> ship (-z, y, x). That is why ship forward is +Z everywhere in main.js.
+// With forward +Z and up +Y in a right-handed frame, the pilot's RIGHT is -X.
 //
-// Anchors below were measured from the GLB node hierarchy with node transforms applied:
+// Anchors were measured from the GLB node hierarchy with node transforms applied:
 //
 //   spaceship.glb       Cockpit node   ship-local x[-0.5..0.5] y[-0.1..1.2] z[0.1..2.6]
 //   spaceshipADMIN.glb  Cylinder.002   ship-local x[-0.2..0.2] y[0.6..0.9]  z[3.2..4.6]
-//                       (the 'glass' material — a small blister far forward)
 //
-// The admin canopy glass is far too small to sit inside literally, so its interior shell is
-// built larger than the real blister. That is safe because the exterior hull and the interior
-// are never visible at the same time: interior renders only in first person, and the hull is
-// culled only in first person (see setExteriorVisible in main.js).
+// The interior is built larger than the real canopy glass. That is safe because the exterior
+// hull and the interior are never visible at the same time (see setExteriorVisible in main.js).
+//
+// Layout follows a real fighter: the tub sides only rise to a canopy RAIL at roughly shoulder
+// height, and everything above is open bubble canopy carried on two thin hoops. A boxed-in
+// roof and full-height walls are what made the first pass feel like a grey crate.
 
 export const COCKPIT_PROFILES = {
   default: {
     id: 'default',
-    // Seated eye point, upper half of the canopy volume, set back so the dash reads ahead.
     eye: new THREE.Vector3(0, 0.60, 1.15),
-    fov: 82,
-    tub: { halfWidth: 0.66, floorY: -0.02, ceilY: 1.28, backZ: 0.05, dashZ: 2.15 },
-    accent: 0x66ddff,
+    fov: 84,
+    tub: {
+      halfWidth: 0.66,
+      floorY: -0.02,
+      railY: 0.38,   // canopy rail: top of the solid tub sides
+      ceilY: 1.30,   // apex of the canopy hoops
+      backZ: 0.05,
+      dashZ: 2.15,
+    },
+    accent: 0x5fd8ff,
+    lampColor: 0x9fd0ff,
   },
   admin: {
     id: 'admin',
     eye: new THREE.Vector3(0, 0.74, 3.55),
-    fov: 84,
-    tub: { halfWidth: 0.74, floorY: 0.08, ceilY: 1.34, backZ: 2.70, dashZ: 4.55 },
+    fov: 86,
+    tub: {
+      halfWidth: 0.74,
+      floorY: 0.08,
+      railY: 0.52,
+      ceilY: 1.44,
+      backZ: 2.70,
+      dashZ: 4.55,
+    },
     accent: 0xffc451,
+    lampColor: 0xffd39a,
   },
 };
 
@@ -38,31 +55,29 @@ export function getCockpitProfile(isAdmin) {
   return isAdmin ? COCKPIT_PROFILES.admin : COCKPIT_PROFILES.default;
 }
 
-// Shared low-poly kit, driven entirely by the profile's `tub` box + eye anchor, so both ships
-// get proportionally correct interiors from the same code.
 export function createCockpit(profile) {
-  const { eye, tub, accent } = profile;
-  const { halfWidth: HW, floorY, ceilY, backZ, dashZ } = tub;
+  const { eye, tub, accent, lampColor } = profile;
+  const { halfWidth: HW, floorY, railY, backZ, dashZ } = tub;
 
   const group = new THREE.Group();
   group.name = 'CockpitInterior';
 
-  const panelMat = new THREE.MeshStandardMaterial({
-    color: 0x333b44, roughness: 0.9, metalness: 0.1, emissive: 0x11161d, emissiveIntensity: 1,
+  // Real cockpits are near-black. Keeping albedo very low is what lets the emissive strips
+  // and instrument glow read as the actual light sources in here.
+  const panelMat = new THREE.MeshStandardMaterial({ color: 0x0e1216, roughness: 0.95, metalness: 0.05 });
+  const frameMat = new THREE.MeshStandardMaterial({ color: 0x1a2027, roughness: 0.6, metalness: 0.5 });
+  const trimMat = new THREE.MeshStandardMaterial({ color: 0x252c34, roughness: 0.5, metalness: 0.6 });
+  const rubberMat = new THREE.MeshStandardMaterial({ color: 0x080a0c, roughness: 1.0, metalness: 0.0 });
+  const seatMat = new THREE.MeshStandardMaterial({ color: 0x121619, roughness: 0.98, metalness: 0.0 });
+  const strapMat = new THREE.MeshStandardMaterial({ color: 0x3a3527, roughness: 0.95, metalness: 0.0 });
+  const stickMat = new THREE.MeshStandardMaterial({ color: 0x0b0e11, roughness: 0.92, metalness: 0.06 });
+
+  const glowMat = (hex) => new THREE.MeshBasicMaterial({ color: hex, toneMapped: false });
+  const accentMat = glowMat(accent);
+  const glassMat = new THREE.MeshBasicMaterial({
+    color: 0x18313f, transparent: true, opacity: 0.16,
+    side: THREE.DoubleSide, depthWrite: false, toneMapped: false,
   });
-  const frameMat = new THREE.MeshStandardMaterial({
-    color: 0x515c68, roughness: 0.55, metalness: 0.45, emissive: 0x14191f, emissiveIntensity: 1,
-  });
-  const rubberMat = new THREE.MeshStandardMaterial({
-    color: 0x1c2126, roughness: 1.0, metalness: 0.0,
-  });
-  const seatMat = new THREE.MeshStandardMaterial({
-    color: 0x2d3238, roughness: 0.95, metalness: 0.02,
-  });
-  const strapMat = new THREE.MeshStandardMaterial({
-    color: 0x59503a, roughness: 0.95, metalness: 0.0,
-  });
-  const accentMat = new THREE.MeshBasicMaterial({ color: accent });
 
   const box = (w, h, d, mat, x, y, z) => {
     const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
@@ -71,113 +86,154 @@ export function createCockpit(profile) {
     return m;
   };
 
-  const strut = (a, b, r, mat) => {
-    const from = new THREE.Vector3(...a);
-    const dir = new THREE.Vector3(...b).sub(from);
-    const len = dir.length();
-    const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 8), mat);
-    m.position.copy(from).addScaledVector(dir, 0.5);
-    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+  const dashTopY = eye.y - 0.22;
+  const dashBotY = floorY + 0.04;
+  const railZ0 = backZ;
+  const railZ1 = dashZ - 0.10;
+  const railLen = railZ1 - railZ0;
+  const railMidZ = (railZ0 + railZ1) / 2;
+
+  // ---- floor: solid under the seat, glazed forward so you can see beneath you -----------
+  const glassStartZ = eye.z + 0.18;
+  box(HW * 2, 0.04, glassStartZ - backZ, panelMat, 0, floorY, (backZ + glassStartZ) / 2);
+  const chin = new THREE.Mesh(
+    new THREE.PlaneGeometry(HW * 1.9, dashZ - glassStartZ), glassMat,
+  );
+  chin.rotation.x = -Math.PI / 2;
+  chin.position.set(0, floorY + 0.005, (glassStartZ + dashZ) / 2);
+  group.add(chin);
+  // ribs, so the chin window reads as glazing rather than a hole in the floor
+  for (const x of [-HW * 0.62, 0, HW * 0.62]) {
+    box(0.022, 0.03, dashZ - glassStartZ, frameMat, x, floorY, (glassStartZ + dashZ) / 2);
+  }
+  box(HW * 1.9, 0.03, 0.03, frameMat, 0, floorY, dashZ - 0.02);
+
+  // ---- tub sides: only up to the canopy rail ---------------------------------------------
+  for (const s of [-1, 1]) {
+    box(0.04, railY - floorY, railLen, panelMat, s * HW, (floorY + railY) / 2, railMidZ);
+    // rail cap plus the light strip washing down into the tub
+    box(0.075, 0.05, railLen, trimMat, s * (HW - 0.02), railY + 0.02, railMidZ);
+    box(0.022, 0.012, railLen * 0.86, accentMat, s * (HW - 0.055), railY - 0.012, railMidZ);
+  }
+  box(HW * 2, railY - floorY, 0.04, panelMat, 0, (floorY + railY) / 2, backZ);
+
+  // ---- side consoles, kept below the rail -------------------------------------------------
+  const conLen = (dashZ - 0.18) - backZ;
+  const conZ = (backZ + dashZ - 0.18) / 2;
+  for (const s of [-1, 1]) {
+    const c = box(0.17, 0.20, conLen, frameMat, s * (HW - 0.10), floorY + 0.20, conZ);
+    c.rotation.z = s * 0.10;
+    // switch banks: rows of tiny lit caps, the main "cockpit full of lights" read
+    for (let i = 0; i < 7; i++) {
+      const z = conZ - conLen * 0.34 + i * (conLen * 0.11);
+      const hue = i % 3 === 0 ? 0xff5a3c : i % 3 === 1 ? 0x46ff9b : 0xffd24a;
+      box(0.055, 0.022, 0.038, trimMat, s * (HW - 0.075), floorY + 0.30, z);
+      box(0.030, 0.010, 0.030, glowMat(hue), s * (HW - 0.135), floorY + 0.312, z);
+    }
+  }
+
+  // ---- instrument panel + glareshield ------------------------------------------------------
+  const dash = box(HW * 1.8, dashTopY - dashBotY, 0.06, panelMat,
+    0, (dashTopY + dashBotY) / 2, dashZ - 0.06);
+  dash.rotation.x = 0.30;
+  const hood = box(HW * 1.85, 0.04, 0.28, trimMat, 0, dashTopY + 0.055, dashZ - 0.21);
+  hood.rotation.x = -0.22;
+  // downward wash from under the glareshield onto the panel
+  box(HW * 1.5, 0.010, 0.020, glowMat(lampColor), 0, dashTopY + 0.030, dashZ - 0.33);
+
+  // ---- canopy: two thin hoops, nothing else above the rail ---------------------------------
+  const hoop = (z, radius, tube) => {
+    const m = new THREE.Mesh(new THREE.TorusGeometry(radius, tube, 6, 20, Math.PI), frameMat);
+    m.position.set(0, railY, z);
     group.add(m);
     return m;
   };
+  const rearHoopZ = eye.z - 0.34;
+  hoop(railZ1, HW, 0.017);              // windscreen bow
+  hoop(rearHoopZ, HW * 0.99, 0.015);    // rear hoop, behind the head
+  // slim spine linking the two, well above the sightline
+  box(0.026, 0.026, railZ1 - rearHoopZ, frameMat,
+    0, railY + HW - 0.02, (railZ1 + rearHoopZ) / 2);
 
-  const innerLen = dashZ - backZ;
-  const dashTopY = eye.y - 0.28;
-  const dashBotY = floorY + 0.04;
-  // Walls and roof stop beside/behind the pilot; everything forward of this is canopy glass,
-  // otherwise the shell closes in and the forward view becomes a letterbox slot.
-  const wallFrontZ = eye.z + 0.30;
-  const roofFrontZ = eye.z + 0.12;
-  const tubLen = wallFrontZ - backZ;
-  const tubMidZ = (backZ + wallFrontZ) / 2;
-
-  // ---- shell -------------------------------------------------------------------------
-  box(HW * 2, 0.05, innerLen, panelMat, 0, floorY, (backZ + dashZ) / 2);           // floor pan
-  box(0.05, ceilY - floorY, tubLen, panelMat, -HW, (floorY + ceilY) / 2, tubMidZ); // left wall
-  box(0.05, ceilY - floorY, tubLen, panelMat, HW, (floorY + ceilY) / 2, tubMidZ);  // right wall
-  box(HW * 2, 0.05, roofFrontZ - backZ, panelMat, 0, ceilY, (backZ + roofFrontZ) / 2); // roof
-  box(HW * 2, ceilY - floorY, 0.05, panelMat, 0, (floorY + ceilY) / 2, backZ);     // bulkhead
-
-  // ---- side consoles -----------------------------------------------------------------
-  for (const s of [-1, 1]) {
-    const conLen = (dashZ - 0.14) - backZ;
-    const conZ = (backZ + dashZ - 0.14) / 2;
-    const c = box(0.16, 0.26, conLen, frameMat,
-      s * (HW - 0.09), floorY + 0.28, conZ);
-    c.rotation.z = s * 0.12;
-    // glowing edge strip along the console top
-    box(0.02, 0.012, conLen * 0.8, accentMat,
-      s * (HW - 0.17), floorY + 0.425, conZ);
-  }
-
-  // ---- instrument panel + glareshield ------------------------------------------------
-  const dash = box(HW * 1.85, dashTopY - dashBotY, 0.07, panelMat,
-    0, (dashTopY + dashBotY) / 2, dashZ - 0.06);
-  dash.rotation.x = 0.30; // top leans away from the pilot
-  const hood = box(HW * 1.9, 0.045, 0.26, frameMat, 0, dashTopY + 0.05, dashZ - 0.20);
-  hood.rotation.x = -0.22;
-
-  // ---- canopy frame ------------------------------------------------------------------
-  for (const s of [-1, 1]) {
-    // A-pillar: dash outer corner up and back to the roof leading edge.
-    strut([s * HW * 0.97, dashTopY, dashZ - 0.10],
-      [s * HW * 0.93, ceilY - 0.04, roofFrontZ], 0.019, frameMat);
-    // canopy rail along the top of each wall
-    box(0.045, 0.045, tubLen, frameMat, s * (HW - 0.02), ceilY - 0.05, tubMidZ);
-  }
-  // overhead spine
-  box(0.05, 0.05, roofFrontZ - backZ, frameMat, 0, ceilY - 0.04, (backZ + roofFrontZ) / 2);
-
-  // ---- ejection seat -----------------------------------------------------------------
+  // ---- ejection seat -------------------------------------------------------------------------
   const seatZ = eye.z - 0.26;
-  box(0.52, 0.10, 0.44, seatMat, 0, floorY + 0.20, seatZ + 0.06);            // seat pan
-  const back = box(0.50, 0.72, 0.10, seatMat, 0, eye.y - 0.12, seatZ - 0.18);
-  back.rotation.x = -0.10;                                                    // seat back
-  box(0.34, 0.16, 0.10, rubberMat, 0, eye.y + 0.26, seatZ - 0.20);           // headrest
+  box(0.50, 0.09, 0.44, seatMat, 0, floorY + 0.17, seatZ + 0.06);
+  const back = box(0.48, 0.74, 0.09, seatMat, 0, eye.y - 0.14, seatZ - 0.18);
+  back.rotation.x = -0.10;
+  box(0.32, 0.15, 0.10, rubberMat, 0, eye.y + 0.28, seatZ - 0.20);
   for (const s of [-1, 1]) {
-    box(0.07, 0.42, 0.34, seatMat, s * 0.26, eye.y - 0.22, seatZ - 0.02);    // bolsters
-    const strap = box(0.07, 0.46, 0.03, strapMat, s * 0.17, eye.y - 0.40, seatZ + 0.22);
-    strap.rotation.x = 0.55;                                                  // harness
+    box(0.06, 0.44, 0.34, seatMat, s * 0.25, eye.y - 0.24, seatZ - 0.02);
+    const strap = box(0.07, 0.46, 0.03, strapMat, s * 0.17, eye.y - 0.42, seatZ + 0.22);
+    strap.rotation.x = 0.55;
   }
 
-  // ---- control stick (pivots at its base) --------------------------------------------
+  // ---- centre stick, between the pilot's knees ------------------------------------------------
   const stick = new THREE.Group();
-  stick.position.set(-(HW - 0.13), floorY + 0.40, eye.z + 0.26);
+  stick.position.set(0, floorY + 0.02, eye.z + 0.30);
   group.add(stick);
-  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.024, 0.030, 0.20, 10), frameMat);
-  shaft.position.y = 0.10;
-  stick.add(shaft);
-  const boot = new THREE.Mesh(new THREE.CylinderGeometry(0.060, 0.080, 0.06, 10), rubberMat);
-  boot.position.y = 0.025;
+  const boot = new THREE.Mesh(new THREE.CylinderGeometry(0.072, 0.095, 0.07, 10), rubberMat);
+  boot.position.y = 0.03;
   stick.add(boot);
-  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.070, 0.14, 0.085), rubberMat);
-  grip.position.y = 0.25;
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.030, 0.24, 10), stickMat);
+  shaft.position.y = 0.13;
+  stick.add(shaft);
+  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.056, 0.15, 0.078), stickMat);
+  grip.position.y = 0.29;
+  grip.rotation.x = -0.16;
   stick.add(grip);
-  const trigger = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.035, 0.02), accentMat);
-  trigger.position.set(0, 0.25, 0.050);
+  const gripTop = new THREE.Mesh(new THREE.BoxGeometry(0.060, 0.028, 0.082), trimMat);
+  gripTop.position.set(0, 0.365, 0.013);
+  gripTop.rotation.x = -0.16;
+  stick.add(gripTop);
+  const trigger = new THREE.Mesh(new THREE.BoxGeometry(0.026, 0.038, 0.018), accentMat);
+  trigger.position.set(0, 0.28, 0.048);
   stick.add(trigger);
+  const hat = new THREE.Mesh(new THREE.BoxGeometry(0.030, 0.014, 0.030), glowMat(0xff5a3c));
+  hat.position.set(0, 0.358, -0.022);
+  stick.add(hat);
 
-  // ---- throttle lever (pivots on the left console) -----------------------------------
+  // ---- throttle lever, left console --------------------------------------------------------------
   const throttle = new THREE.Group();
-  throttle.position.set(HW - 0.13, floorY + 0.44, eye.z + 0.04);
+  throttle.position.set(HW - 0.14, floorY + 0.34, eye.z + 0.02);
   group.add(throttle);
-  const tArm = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.26), frameMat);
+  const tArm = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.045, 0.26), frameMat);
   tArm.position.z = 0.12;
   throttle.add(tArm);
-  const tKnob = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.09, 0.09), rubberMat);
+  const tKnob = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.085, 0.10), rubberMat);
   tKnob.position.z = 0.26;
   throttle.add(tKnob);
+  const tLed = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.010, 0.022), accentMat);
+  tLed.position.set(0, 0.048, 0.26);
+  throttle.add(tLed);
 
-  // ---- instruments -------------------------------------------------------------------
+  // ---- rudder pedals, seen through the chin glazing ------------------------------------------------
+  for (const s of [-1, 1]) {
+    const pedal = box(0.115, 0.135, 0.022, stickMat, s * 0.20, floorY + 0.065, eye.z + 0.72);
+    pedal.rotation.x = 0.62;
+    box(0.05, 0.016, 0.24, frameMat, s * 0.20, floorY + 0.018, eye.z + 0.60);
+  }
+
+  // ---- centre panel detail, between the two displays ----------------------------------------
+  // Sits above the stick, so it adds lit clutter without anything obscuring it.
+  for (let i = 0; i < 3; i++) {
+    const y = dashTopY - 0.055 - i * 0.055;
+    box(0.075, 0.030, 0.030, trimMat, 0, y, dashZ - 0.19);
+    box(0.042, 0.014, 0.030, glowMat(i === 0 ? 0xff5a3c : i === 1 ? 0xffd24a : 0x46ff9b),
+      0, y + 0.009, dashZ - 0.205);
+  }
+
+  // ---- fill light ------------------------------------------------------------------------------------
+  // High and behind the head. Sitting it just above the stick meant a decay-2 point light
+  // was effectively inside the grip, washing the whole thing out to pale grey.
+  const lamp = new THREE.PointLight(lampColor, 1.3, 2.6, 2);
+  lamp.position.set(0, railY + 0.38, eye.z - 0.06);
+  group.add(lamp);
+  const panelLamp = new THREE.PointLight(accent, 0.8, 0.75, 2);
+  panelLamp.position.set(0, dashTopY + 0.02, dashZ - 0.15);
+  group.add(panelLamp);
+
   const dash2 = createDash(profile, accent);
   group.add(dash2.group);
-
-  // ---- cockpit fill light ------------------------------------------------------------
-  // Keeps the interior readable on every map regardless of scene lighting.
-  const lamp = new THREE.PointLight(0xbcd6ff, 3.0, 4.5, 2);
-  lamp.position.set(0, ceilY - 0.14, eye.z + 0.15);
-  group.add(lamp);
 
   // Tag everything so ship.js colour customisation and main.js exterior culling skip it.
   group.userData.isInterior = true;
@@ -192,10 +248,9 @@ export function createCockpit(profile) {
       const sx = tel?.steerX ?? 0;
       const sy = tel?.steerY ?? 0;
       const thr = tel?.throttle01 ?? 0;
-      // Stick pulls back to pitch up (steerY < 0 is nose-up in main.js).
-      stick.rotation.x = THREE.MathUtils.damp(stick.rotation.x, sy * 0.34, 12, dt);
-      stick.rotation.z = THREE.MathUtils.damp(stick.rotation.z, sx * 0.34, 12, dt);
-      // Idle fully back, firewalled fully forward.
+      // Stick pulls back to pitch up; steering right tilts the grip toward -X (pilot's right).
+      stick.rotation.x = THREE.MathUtils.damp(stick.rotation.x, sy * 0.30, 12, dt);
+      stick.rotation.z = THREE.MathUtils.damp(stick.rotation.z, sx * 0.30, 12, dt);
       throttle.rotation.x = THREE.MathUtils.damp(
         throttle.rotation.x, THREE.MathUtils.lerp(0.55, -0.55, thr), 8, dt);
       dash2.update(dt, tel);
