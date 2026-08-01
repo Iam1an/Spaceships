@@ -642,7 +642,29 @@ pub enum ServerMessage {
         spawns: BTreeMap<PlayerId, Spawn>,
         /// The generated asteroid field. Empty (`[]`, never `null`) on the
         /// terrain map.
+        ///
+        /// This is the largest frame the protocol sends — measured at 16,399
+        /// bytes, essentially all of it these records — and it arrives at the
+        /// worst possible moment, while assets are still loading. On a mobile
+        /// connection it is a visible hitch.
+        ///
+        /// Prefer [`seed`](Self::Start::seed) where the peer supports it: the
+        /// simulation generates fields deterministically from a seed, so eight
+        /// bytes reproduce what sixty records describe. Kept because the shipped
+        /// JS client has no generator and reads this array directly; a Rust
+        /// client that received a seed can ignore it.
         asteroids: Vec<Asteroid>,
+        /// Seed for deterministic asteroid field generation.
+        ///
+        /// `None` from the JS server, which has no generator. When present, a
+        /// client with `spaceships-sim` can reproduce
+        /// [`asteroids`](Self::Start::asteroids) exactly rather than reading it
+        /// off the wire — same tier table, same positions, same ids.
+        ///
+        /// Skipped when absent so the frame stays byte-identical to what the JS
+        /// server emits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<u64>,
         /// Map the match is played on.
         map: MapKind,
         /// Bots the host must drive. Non-empty only for the host.

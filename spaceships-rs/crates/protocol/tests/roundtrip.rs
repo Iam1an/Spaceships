@@ -453,9 +453,12 @@ fn server_start() {
         ServerMessage::Start {
             spawns,
             asteroids,
+            seed,
             map,
             bot_assignments,
         } => {
+            // The JS server has no generator, so a frame from it carries none.
+            assert_eq!(seed, None);
             assert_eq!(map, MapKind::Space);
             assert_eq!(spawns.len(), 2);
             assert_eq!(
@@ -502,9 +505,12 @@ fn server_start_with_bot_on_terrain() {
         ServerMessage::Start {
             spawns,
             asteroids,
+            seed,
             map,
             bot_assignments,
         } => {
+            // The JS server has no generator, so a frame from it carries none.
+            assert_eq!(seed, None);
             assert_eq!(map, MapKind::Terrain);
             assert!(asteroids.is_empty());
             assert!(spawns.contains_key(&-7));
@@ -875,6 +881,7 @@ fn tag_spelling_is_exact() {
         ServerMessage::Start {
             spawns: Default::default(),
             asteroids: vec![],
+            seed: None,
             map: MapKind::Space,
             bot_assignments: vec![],
         },

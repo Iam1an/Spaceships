@@ -728,9 +728,17 @@ impl Lobby {
         room.team_kills = [0, 0];
         room.match_end = Some(now + Duration::from_millis(MATCH_DURATION_MS));
 
+        // `asteroids` is still sent because the shipped JS client has no
+        // generator and reads the array directly. `seed` is additive: a client
+        // built on `spaceships-sim` can regenerate the identical field from it
+        // and ignore the records. Dropping the array — this frame is 16,399
+        // bytes, essentially all of it those sixty records, and it lands while
+        // assets are still loading — needs the client to signal that it can,
+        // which is a capability handshake this protocol does not have yet.
         let start_msg = ServerMessage::Start {
             spawns,
             asteroids: room.asteroids.clone(),
+            seed: Some(seed),
             map,
             bot_assignments,
         };
