@@ -64,8 +64,11 @@
 //! Controls: `W`/`S` throttle, arrows steer, `A`/`D` roll, `Space` brake/drift,
 //! `Shift` boost.
 
+mod audio;
 mod camera;
+mod hud;
 mod input;
+mod net;
 mod scene;
 mod sim_bridge;
 mod skybox;
@@ -144,6 +147,9 @@ fn main() {
         scene::ScenePlugin,
         camera::FollowCameraPlugin,
         skybox::SkyboxPlugin,
+        audio::AudioPlugin,
+        hud::HudPlugin,
+        net::NetPlugin,
     ))
     .add_systems(Update, report_frame_time);
 
