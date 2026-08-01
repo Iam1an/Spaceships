@@ -1,0 +1,1 @@
+//! campaign simulation. Implementation pending.

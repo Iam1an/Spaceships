@@ -49,71 +49,37 @@
 //!
 //! # Status
 //!
-//! Skeleton. The [`world`] module is intentionally empty: the `World` struct and
-//! the tick signature are being designed separately, and guessing at them here
-//! would create a shape the real design has to fight. What *is* here is the
-//! infrastructure that is needed regardless of how the rest lands:
+//! Foundations, plus the rules and state layer. What exists today:
 //!
 //! - [`math::Vec3`] — replaces `THREE.Vector3`, which the JS uses everywhere.
 //! - [`rng::Rng`] — the seeded generator that makes reproducible asteroid fields
 //!   possible.
+//! - [`collision`] — swept sphere/sphere and sphere/box tests. These replace the
+//!   once-per-frame point-in-sphere checks in `bullets.js`, which a 780 u/s
+//!   bullet outruns: it covers 39 units per step and the things it is shot at
+//!   are 4–7 units across, so it passes through most of them without ever being
+//!   tested against them.
+//! - [`rules`] — every game constant, defined exactly once. The JS writes its
+//!   rules twice, on the client and on the server, and they have drifted; this
+//!   module resolves each divergence and records the decision next to the value.
+//! - [`world`] — the simulation state, the tick contract, and the flat
+//!   [`world::Frame`] the JS renderer consumes.
+//!
+//! Still to land: the behaviour. Ship physics, damage resolution, projectile
+//! ballistics, missile homing, and bot AI all read the types in [`world`] and
+//! the numbers in [`rules`], and none of them exist yet.
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod asteroids;
+pub mod bot;
+pub mod bullets;
+pub mod campaign;
+pub mod collision;
 pub mod math;
+pub mod missiles;
 pub mod rng;
-
-pub mod world {
-    //! Simulation state and the fixed-timestep tick.
-    //!
-    //! Deliberately empty pending a separate design pass. When it lands it will
-    //! own:
-    //!
-    //! - `World` — the full authoritative state of one match: ships, bullets,
-    //!   missiles, flares, asteroids, team scores, match clock.
-    //! - `Input` — one frame of player intent (throttle, pitch/yaw/roll, fire,
-    //!   boost, brake, missile, flare). Intent only, never derived state.
-    //! - `tick(&mut World, &[Input], dt: f64)` or similar — one fixed step. `dt`
-    //!   is a constant supplied by the caller ([`TICK_HZ`] below), never a
-    //!   measured frame time.
-    //! - `Event` — what the tick produced that the outside world cares about
-    //!   (hits, deaths, asteroid destruction), returned to the caller rather
-    //!   than sent anywhere from in here.
-    //!
-    //! Ports of the existing JS live in `public/src/`: ship flight model and
-    //! collision in `main.js`, projectiles in `bullets.js` / `missiles.js` /
-    //! `beams.js`, field generation in `asteroids.js`, and the bot AI in
-    //! `bot.js`.
-
-    /// Fixed simulation rate.
-    ///
-    /// The JS client sends `state` updates at 20 Hz (`STATE_INTERVAL = 1 / 20`
-    /// in `main.js`) while rendering at display rate. The simulation step is a
-    /// separate, faster fixed rate; callers accumulate real elapsed time and run
-    /// a whole number of ticks, keeping the remainder for the next frame.
-    ///
-    /// The value is a placeholder until the tick design lands.
-    pub const TICK_HZ: f64 = 60.0;
-
-    /// Duration of one fixed simulation step, in seconds.
-    pub const TICK_DT: f64 = 1.0 / TICK_HZ;
-}
-
-pub mod entity {
-    //! Entity identity and per-entity state.
-    //!
-    //! Deliberately empty pending the `World` design. It will hold the ship,
-    //! projectile, and asteroid records, plus the id type shared with the
-    //! transport layer (positive for players, negative for bots — see
-    //! `spaceships-protocol`'s `PlayerId`).
-}
-
-pub mod collision {
-    //! Broad- and narrow-phase collision queries.
-    //!
-    //! Deliberately empty pending the `World` design. It will hold the
-    //! sphere/sphere, sphere/box, and ray/sphere tests that `main.js` currently
-    //! implements inline (`collideSphereWithBox`, `raySphereDist`,
-    //! `castWorldRay`).
-}
+pub mod rules;
+pub mod ship;
+pub mod world;
