@@ -1339,9 +1339,21 @@ fn paint_and_upgrade(
                 mat.base_color = painted.with_alpha(mat.base_color.alpha());
 
                 // -- Ultra's `sweepScene` -------------------------------------
-                // Ships get `metalness: 0.55, roughness: 0.34`.
-                mat.metallic = 0.55;
-                mat.perceptual_roughness = 0.34;
+                // Ultra's `sweepScene` gives ships `metalness: 0.55,
+                // roughness: 0.34`, and forcing that here overrode whatever the
+                // model was authored with. Those numbers were tuned against
+                // `spaceship.glb` -- six flat-shaded Blender primitives, where a
+                // hard specular reads as sci-fi panelling. On a smooth aircraft
+                // hull the same values read as polished chrome, which is not
+                // what a painted airframe looks like.
+                //
+                // The model's own values now stand. `jet.glb` carries 0.0 / 0.72
+                // for the hull and 0.1 / 0.22 for the canopy glass; the old ship
+                // carries 0.0 / 0.5. Both are sane, and a future model that
+                // wants a metal finish can simply say so.
+                //
+                // Everything else Ultra does -- anisotropy, the environment
+                // intensity sweep, the emissive boost -- still applies below.
                 // `emissiveIntensity *= glowBoost` (1.7) — pushing emissive
                 // past 1.0 is what makes the bloom pass bite. Safe to apply
                 // unconditionally now that the material is this ship's own.

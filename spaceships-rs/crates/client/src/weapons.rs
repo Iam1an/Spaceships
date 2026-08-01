@@ -1581,9 +1581,10 @@ mod tests {
     fn a_boosting_ship_smokes_from_both_nozzles() {
         let fx = emit_one_tick(ShipFlags::BOOSTING, [0.0, 0.0, 90.0]);
 
-        // 45 Hz per nozzle against a 60 Hz tick is 0.75 of a particle owed per
-        // nozzle per tick, so the first tick emits nothing and banks the debt.
-        // What must hold is that the debt is being kept at all.
+        // The emitter owes `rate * dt` particles a nozzle each tick, which is
+        // below one at any sane tick rate, so the first tick emits nothing and
+        // banks the debt. What must hold is that the debt is kept at all --
+        // asserting a count here would pin the test to a tick rate.
         let debt = fx.trail_debt.get(&1).copied().unwrap_or(0.0);
         assert!(debt > 0.0, "a boosting ship should owe trail particles");
 
@@ -1603,15 +1604,22 @@ mod tests {
                 vel: [0.0, 0.0, 90.0],
                 ..Default::default()
             });
-        for _ in 0..8 {
+        // Enough ticks for the debt to clear several times over, expressed in
+        // seconds rather than ticks so the expectation follows `TICK_HZ`
+        // instead of being pinned to whatever it happened to be.
+        let seconds = 8.0 / 60.0;
+        let ticks = (seconds * sim::world::TICK_HZ).round() as u32;
+        for _ in 0..ticks {
             app.update();
         }
         let fx = app.world_mut().remove_resource::<Effects>().unwrap();
 
-        // Eight ticks at 45 Hz is six particles a nozzle, twelve in all.
+        // Two nozzles at `EMIT_BOOST.rate` for `seconds`, give or take the
+        // particle in flight at each end.
+        let expected = (EMIT_BOOST.rate * seconds as f32 * 2.0).round() as usize;
         assert!(
-            (10..=14).contains(&fx.motes.len()),
-            "expected ~12 motes after 8 ticks of boost, got {}",
+            fx.motes.len().abs_diff(expected) <= 2,
+            "expected about {expected} motes after {seconds:.3}s of boost, got {}",
             fx.motes.len()
         );
 

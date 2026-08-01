@@ -1554,7 +1554,16 @@ impl BotRules {
         attack_too_close: 35.0,
         evade_duration: 0.6,
 
-        aim_offset_max: 14.0,
+        // `bot.js:32` is 14.0, and that was tuned against a bot hit radius of
+        // 4.0. Unifying the hit radius took bots to 6.0 -- 50% wider, so about
+        // 2.25x the cross-section -- and they became markedly deadlier than the
+        // game this reproduces. Widening the wander restores roughly the
+        // original hit rate without giving bots back a private geometry, which
+        // is the thing the unification existed to remove.
+        //
+        // 14.0 * (6.0 / 4.0) keeps error proportional to the target they are
+        // now being handed.
+        aim_offset_max: 21.0,
         aim_offset_drift: 12.0,
         aim_ref_dist: 200.0,
         aim_track_rate: 10.0,

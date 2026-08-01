@@ -170,7 +170,10 @@ struct SfxDef {
 const SFX: [SfxDef; SFX_COUNT] = [
     SfxDef {
         path: "sounds/shoot.mp3",
-        volume: 0.28,
+        // Below the JS's 0.28. The gun fires twenty times a second and its clip
+        // is the most-heard sound in the game by a wide margin; at parity it
+        // masks the voice warnings, the hitmarker and the impacts.
+        volume: 0.16,
         // The gun fires every 0.05 s and a bolt every 0.03 s would still be a
         // machine-gun; without this the clip retriggers faster than it decays
         // and the mix turns to mud. `PLAY_THROTTLE.shoot` in the JS.
@@ -459,7 +462,11 @@ const WARNINGS: [WarnDef; WARN_COUNT] = [
 ];
 
 /// Playback level for every callout. `WARN_VOLUME` in the JS.
-const WARN_VOLUME: f32 = 0.7;
+/// Voice callouts sit above the effects, not level with them.
+///
+/// The JS mixes them at the same nominal level as the gun, which buries them
+/// under sustained fire -- exactly when a warning matters most.
+const WARN_VOLUME: f32 = 0.95;
 
 /// A callout must not be able to interrupt itself.
 ///

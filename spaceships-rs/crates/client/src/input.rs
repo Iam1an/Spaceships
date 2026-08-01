@@ -29,6 +29,23 @@ impl Plugin for InputPlugin {
     }
 }
 
+/// Aim sensitivity multiplier, on top of the DPI correction.
+///
+/// The browser hands the JS an OS-accelerated delta; winit hands us a raw one,
+/// and no constant reproduces an acceleration curve. 1.0 is the literal port —
+/// `SPACESHIPS_MOUSE=1.4` and so on for taste.
+fn mouse_sensitivity() -> f32 {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(v) = std::env::var("SPACESHIPS_MOUSE") {
+        if let Ok(f) = v.parse::<f32>() {
+            if f.is_finite() && f > 0.0 {
+                return f;
+            }
+        }
+    }
+    1.0
+}
+
 /// The aiming cursor, in pixels from screen centre.
 ///
 /// `input.js:65`–`:73` does **not** treat the mouse as a rate control. It keeps
@@ -90,9 +107,21 @@ fn gather_input(
     // horizontal range is deliberately not half the width, so aim sensitivity
     // does not change with aspect ratio.
     let half_h = (window.height() * 0.5).max(1.0);
+
+    // The delta has to be brought into the same units as that clamp, and it is
+    // not already there. `AccumulatedMouseMotion` is winit's raw
+    // `DeviceEvent::MouseMotion` — **physical** device units — while
+    // `Window::height` is logical. On a 2x display that made the mouse twice as
+    // sensitive as the browser's `movementX`, which is CSS pixels.
+    //
+    // Raw also means unaccelerated, where the browser hands the JS a delta the
+    // OS has already curved. There is no way to reproduce that exactly, so
+    // `SPACESHIPS_MOUSE` scales the result for anyone who wants it heavier or
+    // lighter than the 1:1 the JS implies.
+    let scale = mouse_sensitivity() / window.scale_factor().max(0.5);
     if !free_look {
-        virt.x = (virt.x + motion.delta.x).clamp(-half_h, half_h);
-        virt.y = (virt.y + motion.delta.y).clamp(-half_h, half_h);
+        virt.x = (virt.x + motion.delta.x * scale).clamp(-half_h, half_h);
+        virt.y = (virt.y + motion.delta.y * scale).clamp(-half_h, half_h);
     }
 
     out.0 = sim::world::Input {
