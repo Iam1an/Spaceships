@@ -66,12 +66,14 @@
 
 mod audio;
 mod camera;
+mod cockpit;
 mod hud;
 mod input;
 mod net;
 mod scene;
 mod sim_bridge;
 mod skybox;
+mod weapons;
 
 use bevy::asset::AssetPlugin;
 use bevy::prelude::*;
@@ -150,6 +152,8 @@ fn main() {
         audio::AudioPlugin,
         hud::HudPlugin,
         net::NetPlugin,
+        weapons::WeaponsPlugin,
+        cockpit::CockpitPlugin,
     ))
     .add_systems(Update, report_frame_time);
 
