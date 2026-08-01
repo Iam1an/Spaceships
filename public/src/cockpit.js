@@ -33,15 +33,19 @@ export const COCKPIT_PROFILES = {
       ceilY: 1.56,   // apex of the canopy hoops
       backZ: -0.70,
       dashZ: 1.50,
+      dashTop: 1.04,   // panel top; the canopy rail lines up with it
     },
     accent: 0x5fd8ff,
     lampColor: 0x9fd0ff,
   },
   admin: {
     id: 'admin',
-    // Seat position reverted after moving it back put the footwell below the hull's spine
-    // cylinder (ship-local z -1.9..6.9, top y 0.9), which then punched up through the floor
-    // between the pilot's legs. Only the rail is lowered, to open the outboard view.
+    // Seat kept where it reads best. Two hull facts constrain this one hard: the spine
+    // cylinder (ship-local z -1.9..6.9, top y 0.9) passes straight through the cockpit, so
+    // dropping the floor to see more ship makes the spine punch through the footwell; and
+    // the only structure forward of z 4.6 is that same thin spine, so there is very little
+    // ship ahead of the seat to see in the first place. Raising the seat clear of the spine
+    // pushed the panel far enough below the eye that the instruments left the screen.
     eye: new THREE.Vector3(0, 1.16, 4.15),
     fov: 86,
     tub: {
@@ -51,6 +55,7 @@ export const COCKPIT_PROFILES = {
       ceilY: 1.58,
       backZ: 3.05,
       dashZ: 5.15,
+      dashTop: 0.94,
     },
     accent: 0xffc451,
     lampColor: 0xffd39a,
@@ -92,8 +97,11 @@ export function createCockpit(profile) {
     return m;
   };
 
-  const dashTopY = eye.y - 0.22;
-  const dashBotY = floorY + 0.04;
+  const dashTopY = tub.dashTop;
+  // Panel depth is fixed rather than measured down to the floor: on the admin hull the
+  // floor sits high (clear of the spine), which would otherwise leave a 0.13-deep panel.
+  // The panel simply hangs below the floor's front edge there.
+  const dashBotY = dashTopY - 0.36;
   const railZ0 = backZ;
   const railZ1 = dashZ - 0.10;
   const railLen = railZ1 - railZ0;
@@ -142,7 +150,7 @@ export function createCockpit(profile) {
   const dash = box(HW * 1.8, dashTopY - dashBotY, 0.06, panelMat,
     0, (dashTopY + dashBotY) / 2, dashZ - 0.06);
   dash.rotation.x = 0.30;
-  const hood = box(HW * 1.85, 0.04, 0.28, trimMat, 0, dashTopY + 0.055, dashZ - 0.21);
+  const hood = box(HW * 1.85, 0.035, 0.20, trimMat, 0, dashTopY + 0.045, dashZ - 0.17);
   hood.rotation.x = -0.22;
   // downward wash from under the glareshield onto the panel
   box(HW * 1.5, 0.010, 0.020, glowMat(lampColor), 0, dashTopY + 0.030, dashZ - 0.33);

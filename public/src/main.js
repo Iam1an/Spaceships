@@ -439,7 +439,8 @@ export async function startGame(opts = {}) {
   function syncShipVisibility() {
     const fp = inCockpit();
     applyExteriorMode(fp);
-    cockpit.group.visible = fp;
+    // Dev hook: hide the interior to inspect what the hull looks like from the eye point.
+    cockpit.group.visible = fp && !window.__fpHideInterior;
     // The 3D dash replaces the DOM meters, which would otherwise sit right on top of it.
     document.body.classList.toggle('cockpit-view', fp);
   }
@@ -463,6 +464,10 @@ export async function startGame(opts = {}) {
   window.__fpDebug = () => ({
     viewMode, inCockpit: inCockpit(), profile: cockpitProfile.id, fov: camera.fov,
     contacts: camTel.contacts.length,
+    exterior: ship.children.filter((c) => !c.userData?.isInterior).flatMap((c) => {
+      const out = []; c.traverse((o) => { if (o.isMesh) out.push(`${o.name}:${o.visible ? 'v' : 'h'}`); });
+      return out;
+    }),
   });
   syncShipVisibility();
   activeCam().snap();

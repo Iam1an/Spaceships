@@ -61,8 +61,11 @@ function faceAtEye(mesh, eye) {
 export function createDash(profile, accent) {
   const { eye, tub } = profile;
   const { halfWidth: HW, floorY, dashZ } = tub;
-  const dashTopY = eye.y - 0.22;
-  const dashBotY = floorY + 0.04;
+  const dashTopY = tub.dashTop;
+  // Panel depth is fixed rather than measured down to the floor: on the admin hull the
+  // floor sits high (clear of the spine), which would otherwise leave a 0.13-deep panel.
+  // The panel simply hangs below the floor's front edge there.
+  const dashBotY = dashTopY - 0.36;
   const panelH = dashTopY - dashBotY;
   const accentHex = '#' + new THREE.Color(accent).getHexString();
 
@@ -189,32 +192,33 @@ export function createDash(profile, accent) {
   // --- annunciators on the glareshield -----------------------------------------------------
   //   TGT  — your reticle is aligned on an enemy   (main.js bestAlignment < 22)
   //   MSL  — an enemy missile is locking YOU       (missileSystem.isTargetingLocal)
-  const lampGeo = new THREE.BoxGeometry(HW * 0.26, 0.048, 0.02);
-  const mkLamp = (x, onColor) => {
+  // Split outboard rather than sitting as one centred plate: on a long-nosed hull the centre
+  // of the glareshield is exactly the sightline to your own nose, and the plate covered it.
+  const lampGeo = new THREE.BoxGeometry(HW * 0.28, 0.050, 0.02);
+  const mkLamp = (x, onColor, text) => {
     const mat = new THREE.MeshBasicMaterial({ color: 0x0b0f13, toneMapped: false });
     const m = new THREE.Mesh(lampGeo, mat);
-    m.position.set(x, dashTopY + 0.052, dashZ - 0.255);
+    m.position.set(x, dashTopY + 0.048, dashZ - 0.255);
     faceAtEye(m, eye);
     group.add(m);
+    const cap = createScreen(HW * 0.34, HW * 0.10, (ctx, s, keyOnly) => {
+      if (keyOnly) return 'static';
+      ctx.fillStyle = '#6d8698';
+      // 40px-tall canvas: a 54px baseline drew the caption off the bottom edge.
+      ctx.font = 'bold 26px monospace';
+      ctx.fillText(text, 8, 31);
+      return null;
+    }, 128, 40);
+    cap.mesh.position.set(x, dashTopY + 0.098, dashZ - 0.285);
+    faceAtEye(cap.mesh, eye);
+    group.add(cap.mesh);
+    cap.redraw({});
     return { mat, on: new THREE.Color(onColor), off: new THREE.Color(0x0b0f13) };
   };
   // lookAt spins these planes 180 degrees about Y, mirroring texture space relative to world
   // space, so the lamp X is flipped to line up under its label.
-  const tgtLamp = mkLamp(HW * 0.34, 0x38ff9b);
-  const mslLamp = mkLamp(-HW * 0.34, 0xff3b30);
-
-  const labels = createScreen(HW * 0.78, HW * 0.14, (ctx, s, keyOnly) => {
-    if (keyOnly) return 'static';
-    ctx.fillStyle = '#6d8698';
-    ctx.font = 'bold 23px monospace';
-    ctx.fillText('TGT LOCK', 8, 84);
-    ctx.fillText('MSL WARN', 138, 84);
-    return null;
-  });
-  labels.mesh.position.set(0, dashTopY + 0.098, dashZ - 0.295);
-  faceAtEye(labels.mesh, eye);
-  group.add(labels.mesh);
-  labels.redraw({});
+  const tgtLamp = mkLamp(HW * 0.66, 0x38ff9b, 'TGT');
+  const mslLamp = mkLamp(-HW * 0.66, 0xff3b30, 'MSL');
 
   let blink = 0;
 
