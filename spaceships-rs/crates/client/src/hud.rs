@@ -343,7 +343,14 @@ const VIGNETTE_STEPS: f32 = 64.0;
 ///
 /// Pure, and deliberately free of Bevy — which is what lets the tests below
 /// assert the no-change property directly.
-fn model(frame: &Frame, time: f32) -> HudModel {
+fn model(frame: &Frame, time: f32, seated: bool) -> HudModel {
+    // Seated in the cockpit, the 3D instrument panel *is* the HUD, so the flat
+    // overlay stands down entirely. `main.js:1` does the same with
+    // `document.body.classList.toggle('cockpit-view', fp)` — without it the
+    // bottom bars sit on top of the panel.
+    if seated {
+        return HudModel::default();
+    }
     // `ShipFlags::LOCAL` is set by `sim_bridge::ship_view` for the ship whose
     // id matches `World::local_id`. Before the first tick there is no frame and
     // no ship, and the HUD stays hidden rather than drawing a dead one.
@@ -1192,6 +1199,7 @@ fn vignette_gradient(alpha: f32) -> BackgroundGradient {
 fn sync_hud(
     frame: Res<SimFrame>,
     time: Res<Time>,
+    view: Res<crate::cockpit::ViewMode>,
     nodes: Option<Res<HudNodes>>,
     mut applied: ResMut<AppliedHud>,
     mut q_node: Query<&mut Node>,
@@ -1206,7 +1214,7 @@ fn sync_hud(
 ) {
     let Some(nodes) = nodes else { return };
 
-    let next = model(&frame.0, time.elapsed_secs());
+    let next = model(&frame.0, time.elapsed_secs(), view.seated);
     let prev = applied.0;
 
     // The early-out. On a frame where nothing the player can see has changed —
@@ -1615,9 +1623,9 @@ mod tests {
     #[test]
     fn an_unchanged_frame_produces_an_unchanged_model() {
         let f = frame(healthy());
-        let a = model(&f, 0.0);
-        let b = model(&f, 1.0 / 60.0);
-        let c = model(&f, 10.0);
+        let a = model(&f, 0.0, false);
+        let b = model(&f, 1.0 / 60.0, false);
+        let c = model(&f, 10.0, false);
         assert_eq!(a, b);
         assert_eq!(a, c);
     }
@@ -1625,7 +1633,7 @@ mod tests {
     /// Losing hit points moves the health fields and nothing else.
     #[test]
     fn damage_moves_only_the_health_fields() {
-        let before = model(&frame(healthy()), 0.0);
+        let before = model(&frame(healthy()), 0.0, false);
         let after = model(
             &frame(HudState {
                 hp: 60,
@@ -1633,6 +1641,7 @@ mod tests {
                 ..healthy()
             }),
             0.0,
+            false,
         );
 
         assert_ne!(before.hp, after.hp);
@@ -1653,7 +1662,7 @@ mod tests {
     /// The health hue is `main.js:1979`'s: 120 (green) at full, 0 (red) at zero.
     #[test]
     fn the_health_hue_runs_green_to_red() {
-        assert_eq!(model(&frame(healthy()), 0.0).hp_hue, 120);
+        assert_eq!(model(&frame(healthy()), 0.0, false).hp_hue, 120);
         let dead = model(
             &frame(HudState {
                 hp: 0,
@@ -1661,6 +1670,7 @@ mod tests {
                 ..healthy()
             }),
             0.0,
+            false,
         );
         assert_eq!(dead.hp_hue, 0);
     }
@@ -1693,6 +1703,7 @@ mod tests {
                 ..healthy()
             }),
             0.0,
+            false,
         );
         let beam = model(
             &frame(HudState {
@@ -1701,6 +1712,7 @@ mod tests {
                 ..healthy()
             }),
             0.0,
+            false,
         );
 
         assert!(!bullet.overheated);
@@ -1719,6 +1731,7 @@ mod tests {
                     ..healthy()
                 }),
                 0.0,
+                false,
             )
             .charge
         };
@@ -1737,7 +1750,7 @@ mod tests {
     fn animations_are_still_while_their_condition_is_false() {
         let calm = frame(healthy());
         for t in [0.0, 0.05, 0.1, 0.3, 0.7, 5.0] {
-            let m = model(&calm, t);
+            let m = model(&calm, t, false);
             assert_eq!(m.pulse, 0, "pulse must not advance at rest");
             assert!(!m.lock_blink, "blink must not advance at rest");
         }
@@ -1750,9 +1763,9 @@ mod tests {
             missile_lock_warning: true,
             ..healthy()
         });
-        assert!(model(&locked, 0.0).lock_blink);
-        assert!(!model(&locked, BLINK_HALF_PERIOD).lock_blink);
-        assert!(model(&locked, BLINK_HALF_PERIOD * 2.0).lock_blink);
+        assert!(model(&locked, 0.0, false).lock_blink);
+        assert!(!model(&locked, BLINK_HALF_PERIOD, false).lock_blink);
+        assert!(model(&locked, BLINK_HALF_PERIOD * 2.0, false).lock_blink);
     }
 
     #[test]
@@ -1762,19 +1775,30 @@ mod tests {
             overcharge01: 1.0,
             ..healthy()
         });
-        assert_eq!(model(&hot, 0.0).pulse, 0);
-        assert_eq!(model(&hot, PULSE_HALF_PERIOD).pulse, PULSE_STEPS);
-        assert_eq!(model(&hot, PULSE_HALF_PERIOD * 2.0).pulse, 0);
+        assert_eq!(model(&hot, 0.0, false).pulse, 0);
+        assert_eq!(model(&hot, PULSE_HALF_PERIOD, false).pulse, PULSE_STEPS);
+        assert_eq!(model(&hot, PULSE_HALF_PERIOD * 2.0, false).pulse, 0);
+    }
+
+    /// Seated in the cockpit, the flat overlay stands down entirely — the 3D
+    /// instrument panel is the HUD. Without this the bottom bars draw on top of
+    /// the panel, which is what `main.js`'s `cockpit-view` body class prevents.
+    #[test]
+    fn the_overlay_stands_down_in_the_cockpit() {
+        let mut f = frame(healthy());
+        f.ships[0].flags = ShipFlags::LOCAL.with(ShipFlags::ALIVE);
+        assert!(model(&f, 0.0, false).present, "third person draws the HUD");
+        assert!(!model(&f, 0.0, true).present, "seated hides it");
     }
 
     /// A dead ship shows the banner; a frame with no local ship shows nothing.
     #[test]
     fn the_hud_hides_itself_when_there_is_no_ship() {
-        assert!(!model(&Frame::new(), 0.0).present);
+        assert!(!model(&Frame::new(), 0.0, false).present);
 
         let mut f = frame(healthy());
         f.ships[0].flags = ShipFlags::LOCAL;
-        let dead = model(&f, 0.0);
+        let dead = model(&f, 0.0, false);
         assert!(dead.present);
         assert!(!dead.alive);
     }
@@ -1784,11 +1808,11 @@ mod tests {
     #[test]
     fn the_vignette_follows_the_hit_flash() {
         let mut f = frame(healthy());
-        assert_eq!(model(&f, 0.0).vignette, 0);
+        assert_eq!(model(&f, 0.0, false).vignette, 0);
         f.ships[0].hit_flash = 1.0;
-        assert_eq!(model(&f, 0.0).vignette, VIGNETTE_STEPS as u8);
+        assert_eq!(model(&f, 0.0, false).vignette, VIGNETTE_STEPS as u8);
         f.ships[0].hit_flash = 0.5;
-        assert_eq!(model(&f, 0.0).vignette, VIGNETTE_STEPS as u8 / 2);
+        assert_eq!(model(&f, 0.0, false).vignette, VIGNETTE_STEPS as u8 / 2);
     }
 
     /// `fmtTime`: whole seconds, rounded up, zero-padded.
@@ -1806,6 +1830,7 @@ mod tests {
                 ..healthy()
             }),
             0.0,
+            false,
         );
         assert_eq!(fmt_clock(m.clock), "5:00");
         assert!(m.match_on);
