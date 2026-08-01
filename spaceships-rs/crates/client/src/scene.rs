@@ -36,18 +36,47 @@
 //!
 //! Rotation is **slerp**, never lerp: see [`Pose::mix`]. Spawns and teleports
 //! must not interpolate at all: see [`Interp::spawned`] and [`Interp::snap`].
+//!
+//! # Per-entity appearance, without a material per entity
+//!
+//! Two things here vary per entity and would each, done the obvious way, cost a
+//! material asset per entity: the asteroid damage tint and the ship hit flash.
+//! `asteroids.js` does exactly that — `BASE_MAT.clone()` per rock so it can set
+//! `emissive` — and it is the reason the JS client's sixty asteroids are sixty
+//! draw calls instead of six. See `main.rs` on why this port exists.
+//!
+//! The two are solved differently, on purpose:
+//!
+//! - **Asteroids** keep **one** [`RockMaterial`] across the whole field. The
+//!   per-rock state is packed into [`MeshTag`], a `u32` that rides in the
+//!   per-instance mesh uniform, and [`DamageFlash`]'s fragment shader unpacks
+//!   it. `MeshTag` is not part of the batch key, so sixty rocks flashing
+//!   independently are still six batches — one per mesh variant. Nothing is
+//!   cloned and no material is written at runtime.
+//! - **Ships** do clone, once each, at spawn. Ten ships in ten colours are ten
+//!   materials however it is arranged, and `main.rs` says as much; ten is not
+//!   sixty and they are not the bottleneck. The flash then writes those
+//!   already-per-ship materials, gated on `Changed` so an unhit ship writes
+//!   nothing.
+//!
+//! `SPACESHIPS_BATCHES=1` prints the count. If it starts tracking the entity
+//! count, something has gone back to cloning — see [`report_batches`].
 
-use bevy::asset::RenderAssetUsages;
+use bevy::asset::{uuid_handle, RenderAssetUsages};
 use bevy::image::{ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor};
 use bevy::light::{CascadeShadowConfigBuilder, NotShadowCaster};
+use bevy::mesh::MeshTag;
+use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
+use bevy::render::render_resource::AsBindGroup;
+use bevy::shader::{Shader, ShaderRef};
 use bevy::world_serialization::{WorldAsset, WorldAssetRoot, WorldInstanceReady};
-use std::f32::consts::FRAC_PI_2;
+use std::f32::consts::{FRAC_PI_2, PI};
 
 use spaceships_sim as sim;
 
-use crate::sim_bridge::{pos, rot, SimFrame, SimSet};
+use crate::sim_bridge::{pos, rot, SimFrame, SimSet, LOCAL_ID};
 
 /// The player model, at the asset root. `spaceshipADMIN.glb` is the other one
 /// and is 4.9 MB, which is a decision for later, not a default.
@@ -78,6 +107,98 @@ const TELEPORT_DIST_SQ: f32 = {
     let d = TOP_SPEED * sim::world::TICK_DT * 8.0;
     (d * d) as f32
 };
+
+/// The luminance below which a ship's authored material is an **accent**
+/// rather than **hull**.
+///
+/// `isAccentMesh` (`ship.js:34`) and the customizer's preview
+/// (`customization.js:155`) both split on `0.2126 r + 0.7152 g + 0.0722 b <
+/// 0.35`, and the customizer's split is the one the player actually sees when
+/// they pick their colours — so it is a contract, not a heuristic. The JS also
+/// checks the mesh *name* for `cockpit`/`engine`/`window`/`glass`, which is the
+/// half that does not survive a model swap; the luminance test is the half that
+/// does, and it is the only one used here.
+///
+/// Rec. 709 coefficients on **linear** components, because that is what
+/// `THREE.Color` holds after the glTF loader has converted `baseColorFactor`
+/// into the renderer's working space. [`LinearRgba`] is the same quantity.
+const ACCENT_LUMA: f32 = 0.35;
+
+/// A `0xRRGGBB` literal as an sRGB colour.
+///
+/// Exists so that every colour constant below can be diffed against the
+/// JS or CSS it came from character for character, which is the only way a
+/// table copied out of another language stays honest. `Srgba::hex` does the
+/// same job at runtime and from a string; this is the same thing for a `const`.
+const fn hex(rgb: u32) -> Srgba {
+    Srgba::rgb(
+        ((rgb >> 16) & 0xff) as f32 / 255.0,
+        ((rgb >> 8) & 0xff) as f32 / 255.0,
+        (rgb & 0xff) as f32 / 255.0,
+    )
+}
+
+/// Hull colour when nothing is saved. `customization.js:8`.
+const DEFAULT_HULL: Srgba = hex(0x9f_b6cc);
+
+/// Accent colour when nothing is saved. `customization.js:11`.
+const DEFAULT_ACCENT: Srgba = hex(0x2a_3340);
+
+/// The two team hulls, `--color-blue` and `--color-red` from `index.html`'s
+/// design tokens — the same pair the scoreboard, the match HUD, and the
+/// friend/foe markers already use, so a ship reads as its team at a glance.
+const TEAM_HULL: [Srgba; 2] = [hex(0x66_ddff), hex(0xff_5566)];
+
+/// `main.js:538`. The fallback for a pilot whose colours have not arrived yet,
+/// keyed by id so two of them are never the same.
+const PALETTE: [Srgba; 8] = [
+    hex(0xff_5577),
+    hex(0x55_ff88),
+    hex(0xff_cc55),
+    hex(0xaa_66ff),
+    hex(0x55_ddff),
+    hex(0xff_99cc),
+    hex(0xff_8833),
+    hex(0x99_ff55),
+];
+
+/// Emissive added to a struck ship at `hit_flash == 1`.
+///
+/// Chosen against the bloom prefilter rather than by eye. `camera.rs` sets
+/// `threshold: 0.9, threshold_softness: 0.4`, so the soft knee starts around
+/// 0.7 and a flash meant to *bloom* rather than merely brighten has to clear
+/// it; 3.6 is four times over, and still on the knee a fifth of a second later,
+/// when `HIT_FLASH_DECAY_RATE` has taken it to a quarter.
+///
+/// **The other channels are what keep it red.** ACES pulls anything much past
+/// 1.0 toward white, so a flash with every channel over the knee comes out
+/// white however saturated the ratio was — which is what a first pass at
+/// `(6.0, 1.2, 0.9)` looked like on screen. Green and blue are held under 0.9
+/// deliberately, so the tonemapper has something left to desaturate *toward*
+/// and the hull reads as flaring red rather than blowing out.
+///
+/// Red-hot rather than the rock's orange: a ship taking fire and a rock
+/// chipping have to be distinguishable in peripheral vision.
+const SHIP_FLASH: LinearRgba = LinearRgba::rgb(3.6, 0.5, 0.35);
+
+/// Emissive added to a struck asteroid at `hit_flash == 1`.
+///
+/// `asteroids.js:103` is `emissive.setRGB(f, f * 0.6, f * 0.3)` — an orange
+/// ramp peaking at 1.0, which under Ultra is then multiplied by `glowBoost`
+/// (1.7). That sits barely over this pipeline's bloom threshold, so the JS's
+/// ratio is kept exactly and only the magnitude is raised, to 2.4. Same
+/// reasoning as [`SHIP_FLASH`] on why it is not raised further: at 4.0 the
+/// green channel also saturates and sixty rocks flash white instead of orange.
+const ROCK_FLASH: LinearRgba = LinearRgba::rgb(2.4, 2.4 * 0.6, 2.4 * 0.3);
+
+/// Ultra's `glowBoost` (`graphics.js:379`), the one multiplier that turns an
+/// authored glow colour into one the bloom pass can see. See [`glow`].
+const GLOW_BOOST: f32 = 1.7;
+
+/// What a rock's albedo is multiplied by once its HP reaches zero — a scorched,
+/// slightly warm darkening, so a nearly-dead asteroid reads as chewed up before
+/// it breaks. Interpolated toward white as HP returns to full.
+const ROCK_SCORCH: LinearRgba = LinearRgba::rgb(0.45, 0.38, 0.34);
 
 /// `|dot|` between two unit quaternions is `cos(theta / 2)`, so this is a
 /// quarter turn — 94 rad/s against an authored `PITCH_RATE` of 1.75. A rotation
@@ -252,6 +373,259 @@ impl Interp {
 #[derive(Component)]
 pub struct Snap;
 
+// ---------------------------------------------------------------------------
+// The asteroid damage tint, without a material per rock
+// ---------------------------------------------------------------------------
+
+/// The rock shader, built from [`DAMAGE_FLASH_WGSL`] at startup.
+///
+/// A UUID handle and an inline source string rather than a `.wgsl` in the asset
+/// root, for two reasons. The asset root is `public/`, shared with the Three.js
+/// client, and a Bevy-only shader does not belong in it; and `build-wasm.sh`
+/// copies a named list of assets into `web/assets/`, so a file there is a second
+/// place to remember. Compiled in, it cannot go missing on either target.
+const DAMAGE_FLASH_SHADER: Handle<Shader> = uuid_handle!("6ff1b6b6-0e94-4d75-9a3d-1a7c2f0e5b41");
+
+/// The whole of the damage tint, as a fragment shader.
+///
+/// It is `pbr.wgsl`'s forward path with two lines inserted, and the two lines
+/// read their inputs from `MeshTag` — a `u32` that lives in the *per-instance*
+/// mesh uniform, next to the model matrix. That is the entire trick, and it is
+/// why this does not cost a draw call: the batch key is `(mesh, material,
+/// pipeline)`, and the tag is in none of them. Sixty rocks with sixty different
+/// flash values are still six batches.
+///
+/// The alternative Bevy usually reaches for — a storage buffer in the material,
+/// indexed by instance — needs the same instance index and does not work on
+/// WebGL2, which has no storage buffers. The tag does.
+const DAMAGE_FLASH_WGSL: &str = r#"
+#import bevy_pbr::forward_io::{VertexOutput, FragmentOutput}
+#import bevy_pbr::mesh_functions::get_tag
+#import bevy_pbr::pbr_fragment::pbr_input_from_standard_material
+#import bevy_pbr::pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing}
+#import bevy_pbr::pbr_types::STANDARD_MATERIAL_FLAGS_UNLIT_BIT
+
+struct DamageFlash {
+    // rgb: the emissive added at full flash. a: a plain multiplier on it.
+    flash: vec4<f32>,
+    // rgb: what albedo is multiplied by at zero HP. a: unused.
+    scorch: vec4<f32>,
+}
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> damage: DamageFlash;
+
+@fragment
+fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
+    // The per-instance half. See `pack_damage` on the Rust side for the layout.
+    let tag = get_tag(in.instance_index);
+    let flash01 = f32(tag >> 16u) * (1.0 / 65535.0);
+    let hp01 = f32(tag & 0xffffu) * (1.0 / 65535.0);
+
+    var pbr_input = pbr_input_from_standard_material(in, is_front);
+
+    // Persistent damage: albedo walks toward `scorch` as HP falls.
+    let wear = mix(damage.scorch.rgb, vec3<f32>(1.0), hp01);
+    pbr_input.material.base_color = vec4<f32>(
+        pbr_input.material.base_color.rgb * wear,
+        pbr_input.material.base_color.a
+    );
+
+    // The hit itself: an additive emissive pulse for the bloom pass to find.
+    pbr_input.material.emissive = vec4<f32>(
+        pbr_input.material.emissive.rgb + damage.flash.rgb * (flash01 * damage.flash.a),
+        pbr_input.material.emissive.a
+    );
+
+    pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
+
+    var out: FragmentOutput;
+    if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {
+        out.color = apply_pbr_lighting(pbr_input);
+    } else {
+        out.color = pbr_input.material.base_color;
+    }
+    out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    return out;
+}
+"#;
+
+/// The constants the rock shader reads. **Not** the per-rock state — this is one
+/// buffer shared by the whole field, and the only reason it is a uniform at all
+/// is so the ramp can be retuned without editing WGSL.
+///
+/// Two `Vec4`s rather than a `Vec3` and a float: WebGL2 requires 16-byte-aligned
+/// uniform struct members, and `vec3` is the classic way to get that wrong.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+struct DamageFlash {
+    #[uniform(100)]
+    flash: Vec4,
+    #[uniform(100)]
+    scorch: Vec4,
+}
+
+impl MaterialExtension for DamageFlash {
+    fn fragment_shader() -> ShaderRef {
+        ShaderRef::Handle(DAMAGE_FLASH_SHADER)
+    }
+}
+
+/// The one material all sixty asteroids share.
+type RockMaterial = ExtendedMaterial<StandardMaterial, DamageFlash>;
+
+/// Packs a rock's damage state into the 32 bits of [`MeshTag`].
+///
+/// `flash` in the high half, `hp01` in the low half, both as unsigned
+/// normalized 16-bit. 16 bits is far more than either needs — the flash decays
+/// over 15 ticks and HP tops out at 50 — but a `u32` is what the tag *is*, and
+/// splitting it evenly means neither field can be the one that runs out.
+///
+/// Quantizing is not a cost here, it is the point: an unchanged tag is not
+/// re-extracted, so a field of rocks nobody is shooting writes nothing at all.
+fn pack_damage(flash: f32, hp01: f32) -> u32 {
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u32;
+    (q(flash) << 16) | q(hp01)
+}
+
+/// The HP an asteroid of this size started with.
+///
+/// [`RockView`](sim::world::RockView) carries `hp` but not the tier that set
+/// it, and a fraction is what the shader wants. The tiers' size ranges do not
+/// overlap, so `size` recovers the tier exactly — and taking it from
+/// [`sim::rules::ASTEROID_TIERS`] rather than a local table is what stops the
+/// renderer's idea of "damaged" drifting from the simulation's.
+fn rock_max_hp(size: f32) -> i32 {
+    let tiers = sim::rules::ASTEROID_TIERS;
+    for tier in tiers {
+        if size as f64 <= tier.max_size {
+            return tier.hp;
+        }
+    }
+    tiers[tiers.len() - 1].hp
+}
+
+/// A rock's damage state, ready for [`MeshTag`].
+fn rock_tag(view: &sim::world::RockView) -> MeshTag {
+    let max = rock_max_hp(view.size).max(1) as f32;
+    MeshTag(pack_damage(view.hit_flash, view.hp as f32 / max))
+}
+
+// ---------------------------------------------------------------------------
+// Ship paint
+// ---------------------------------------------------------------------------
+
+/// The colours one ship is painted in, decided when it spawns.
+///
+/// `applyColorsToShip` (`ship.js:21`) takes exactly this pair and splits the
+/// model's meshes between them; see [`ACCENT_LUMA`] for how the split is made.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+struct ShipPaint {
+    hull: Color,
+    accent: Color,
+}
+
+/// The materials a ship owns, and the emissive each of them settled on once the
+/// Ultra sweep was done with it.
+///
+/// Cloned per ship, which is the one place in this file that is allowed to be:
+/// ten ships with ten different hulls are ten materials however you arrange it,
+/// and ten is not sixty. The base emissive is kept because [`flash_ships`]
+/// *adds* to it — an engine bell that glows on its own must still glow after a
+/// flash has come and gone.
+#[derive(Component)]
+struct ShipSkin(Vec<(Handle<StandardMaterial>, LinearRgba)>);
+
+/// The damage flash the ship's materials are currently showing.
+///
+/// A component and not just a read of `SimFrame` so that [`flash_ships`] can be
+/// driven by `Changed`: a ship nobody has hit writes no materials at all, which
+/// matters because writing one re-uploads its bind group.
+#[derive(Component, Clone, Copy, PartialEq, Default)]
+struct HitFlash(f32);
+
+/// The two ways a ship's emissive can come to need rewriting: the flash moved,
+/// or the materials it writes have only just been created. See [`flash_ships`]
+/// for why the second one is not redundant.
+type NeedsFlash = Or<(Changed<HitFlash>, Changed<ShipSkin>)>;
+
+/// The paint a ship arrives in.
+///
+/// Three cases, and they are the three the JS has. The local pilot wears the
+/// colours they chose. Anyone on a team wears the team's, which is the only
+/// thing `Frame` can tell us about a stranger — see the module docs on what is
+/// missing. Anyone else gets a stable per-id colour from `main.js`'s palette,
+/// which is what `createShip({ tint })` does for a pilot whose `colors` message
+/// has not arrived.
+fn paint_for(view: &sim::world::ShipView) -> ShipPaint {
+    if view.id == LOCAL_ID {
+        return ShipPaint {
+            hull: saved_color(
+                "spaceships:shipColor",
+                "SPACESHIPS_HULL_COLOR",
+                DEFAULT_HULL,
+            ),
+            accent: saved_color(
+                "spaceships:shipAccentColor",
+                "SPACESHIPS_ACCENT_COLOR",
+                DEFAULT_ACCENT,
+            ),
+        };
+    }
+    let hull = match usize::try_from(view.team) {
+        Ok(team) if team < TEAM_HULL.len() => TEAM_HULL[team],
+        // Unassigned, or a team index the palette has outgrown.
+        _ => PALETTE[view.id.unsigned_abs() as usize % PALETTE.len()],
+    };
+    ShipPaint {
+        hull: hull.into(),
+        accent: DEFAULT_ACCENT.into(),
+    }
+}
+
+/// Whether an authored material is an **accent** rather than **hull**.
+///
+/// `isAccentMesh` (`ship.js:34`), minus the mesh-name half. The name test —
+/// `cockpit`/`engine`/`window`/`glass` — is the part tied to one particular
+/// model's node names, and a model swap silently turns it into a no-op that
+/// still compiles. The luminance test is a property of the *material* and
+/// survives, which is why it is the one this file keys off; the worst a swap
+/// can do is move a panel between the two groups.
+fn is_accent(base_color: Color) -> bool {
+    let c = LinearRgba::from(base_color);
+    0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue < ACCENT_LUMA
+}
+
+/// One saved colour, from wherever this build keeps them.
+///
+/// On the web that is `localStorage`, the same two keys `customization.js`
+/// writes, so the colours a pilot picks in the lobby are the ones the Bevy
+/// client flies in. Off the web there is no `localStorage` and no lobby yet, so
+/// an environment variable stands in — enough to see the split working, and the
+/// line to replace when the native build grows a profile store.
+fn saved_color(web_key: &str, native_env: &str, fallback: Srgba) -> Color {
+    let stored = read_setting(web_key, native_env);
+    stored
+        .as_deref()
+        .and_then(|s| Srgba::hex(s).ok())
+        .unwrap_or(fallback)
+        .into()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_setting(web_key: &str, _native_env: &str) -> Option<String> {
+    web_sys::window()?
+        .local_storage()
+        .ok()
+        .flatten()?
+        .get_item(web_key)
+        .ok()
+        .flatten()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_setting(_web_key: &str, native_env: &str) -> Option<String> {
+    std::env::var(native_env).ok()
+}
+
 /// Handles the sync systems need but must not reload every frame.
 #[derive(Resource)]
 struct SceneAssets {
@@ -259,7 +633,8 @@ struct SceneAssets {
     ship: Handle<WorldAsset>,
     /// Six deformed icospheres, matching `asteroids.js`'s six variants.
     rock_meshes: Vec<Handle<Mesh>>,
-    rock_material: Handle<StandardMaterial>,
+    /// One material for the whole field. See [`DamageFlash`].
+    rock_material: Handle<RockMaterial>,
 }
 
 pub struct ScenePlugin;
@@ -267,12 +642,22 @@ pub struct ScenePlugin;
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Registry>()
+            // The asteroid field's material. One `MaterialPlugin` per material
+            // *type*, not per material — the sixty rocks still share one asset.
+            .add_plugins(MaterialPlugin::<RockMaterial>::default())
             .add_systems(Startup, setup)
             // Sampling is per *tick*. `FixedUpdate`, after `SimSet`, is the
             // only place `prev` and `curr` are guaranteed to be consecutive
             // ticks — see the module docs on why sampling in `Update` freezes
             // on a frame that ran no tick and lurches on one that ran two.
-            .add_systems(FixedUpdate, (sample_ships, sample_rocks).after(SimSet))
+            // `flash_ships` is chained after the samplers because it is driven
+            // by `Changed<HitFlash>`, and `sample_ships` is what changes it.
+            .add_systems(
+                FixedUpdate,
+                ((sample_ships, sample_rocks), flash_ships)
+                    .chain()
+                    .after(SimSet),
+            )
             // Drawing is per *frame*. `AfterFixedMainLoop` is where Bevy's own
             // docs put this: the fixed loop has finished, so
             // `overstep_fraction` is the leftover accumulator and nothing else
@@ -282,8 +667,54 @@ impl Plugin for ScenePlugin {
             .add_systems(
                 RunFixedMainLoop,
                 draw_interpolated.in_set(RunFixedMainLoopSystems::AfterFixedMainLoop),
-            );
+            )
+            .add_systems(Update, report_batches);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Draw-call instrumentation
+// ---------------------------------------------------------------------------
+
+/// `SPACESHIPS_BATCHES=1` logs the scene's batch keys once, four seconds in.
+///
+/// Bevy collapses the opaque phase by `(mesh, material)` — instances sharing a
+/// pair are drawn as one indirect call — so the number of distinct pairs is
+/// what a draw-call count is *counting*, and it is the number to watch when
+/// adding a per-entity effect. If it tracks the entity count, the effect was
+/// built the way `asteroids.js` builds its damage tint and the port has
+/// reproduced the thing it exists to avoid.
+///
+/// Hand-rolled for the same reason as `main.rs`'s frame-time readout: a
+/// diagnostic this cheap is not worth a plugin tree, and wgpu offers no draw
+/// call counter to read instead.
+fn report_batches(
+    time: Res<Time>,
+    mut done: Local<bool>,
+    standard: Query<(&Mesh3d, &MeshMaterial3d<StandardMaterial>)>,
+    rocks: Query<(&Mesh3d, &MeshMaterial3d<RockMaterial>)>,
+) {
+    if *done || time.elapsed_secs() < 4.0 || std::env::var_os("SPACESHIPS_BATCHES").is_none() {
+        return;
+    }
+    *done = true;
+
+    let mut keys = std::collections::BTreeSet::new();
+    let mut n = 0usize;
+    for (mesh, mat) in &standard {
+        n += 1;
+        keys.insert((format!("{:?}", mesh.id()), format!("{:?}", mat.id())));
+    }
+    let standard_keys = keys.len();
+    for (mesh, mat) in &rocks {
+        n += 1;
+        keys.insert((format!("{:?}", mesh.id()), format!("{:?}", mat.id())));
+    }
+    info!(
+        "batches: {n} mesh entities -> {} batch keys ({standard_keys} standard, {} rock)",
+        keys.len(),
+        keys.len() - standard_keys,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +726,8 @@ fn setup(
     assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut rock_materials: ResMut<Assets<RockMaterial>>,
+    mut shaders: ResMut<Assets<Shader>>,
 ) {
     let rules = sim::rules::Rules::DEFAULT;
 
@@ -322,34 +755,20 @@ fn setup(
     ));
 
     // -- Motherships ----------------------------------------------------------
-    // Placeholder boxes at the two spawn hulls, straight off `World::boxes`, so
-    // that flying into one visibly bounces — `resolve_world_collisions` already
-    // does the physics.
-    //
-    // TODO(art): the JS has real mothership geometry. These are the collision
-    // volumes, drawn.
-    let hull = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.20, 0.24, 0.30),
-        // Ultra's hull treatment: "authored flat-matte; a little metal and a
-        // tight roughness is what gives them specular highlights".
-        perceptual_roughness: 0.34,
-        metallic: 0.55,
-        ..default()
-    });
-    for z in [-rules.world.mothership_z, rules.world.mothership_z] {
-        let h = rules.world.mothership_half;
-        commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(
-                h.x as f32 * 2.0,
-                h.y as f32 * 2.0,
-                h.z as f32 * 2.0,
-            ))),
-            MeshMaterial3d(hull.clone()),
-            Transform::from_xyz(0.0, 0.0, z as f32),
-        ));
-    }
+    install_motherships(&mut commands, &mut meshes, &mut materials, &rules);
 
     // -- Shared handles -------------------------------------------------------
+    // The rock shader is compiled in rather than loaded; see
+    // [`DAMAGE_FLASH_SHADER`] for why. Inserting it here rather than in
+    // `Plugin::build` keeps every asset this module owns in one place, and is
+    // still long before the first frame the pipeline is specialized for.
+    shaders
+        .insert(
+            &DAMAGE_FLASH_SHADER,
+            Shader::from_wgsl(DAMAGE_FLASH_WGSL, "spaceships/damage_flash.wgsl"),
+        )
+        .expect("a uuid handle has no generation to be stale");
+
     commands.insert_resource(SceneAssets {
         // 0.19: `GltfAssetLabel::Scene(0).from_asset(..)` is unchanged, but the
         // asset it resolves to is a `WorldAsset` (was `Scene`) and the
@@ -358,14 +777,225 @@ fn setup(
         rock_meshes: (0..rules.world.asteroid_field.variant_count)
             .map(|v| meshes.add(rock_mesh(v)))
             .collect(),
-        rock_material: materials.add(StandardMaterial {
-            // `asteroids.js` maps `sounds/asteroid.jpg` with a 1.5x repeat.
-            base_color_texture: Some(sharp_texture(&assets, "sounds/asteroid.jpg")),
-            perceptual_roughness: 0.95,
-            metallic: 0.05,
-            ..default()
+        rock_material: rock_materials.add(RockMaterial {
+            base: StandardMaterial {
+                // `asteroids.js` maps `sounds/asteroid.jpg` with a 1.5x repeat.
+                base_color_texture: Some(sharp_texture(&assets, "sounds/asteroid.jpg")),
+                perceptual_roughness: 0.95,
+                metallic: 0.05,
+                ..default()
+            },
+            extension: DamageFlash {
+                flash: Vec4::new(ROCK_FLASH.red, ROCK_FLASH.green, ROCK_FLASH.blue, 1.0),
+                scorch: Vec4::new(ROCK_SCORCH.red, ROCK_SCORCH.green, ROCK_SCORCH.blue, 0.0),
+            },
         }),
     });
+}
+
+/// The two team hulls from `mothership.js`, at `±mothership_z`.
+///
+/// Every dimension is derived from [`WorldRules::mothership_half`], which is
+/// the box `resolve_world_collisions` already bounces ships off — so the thing
+/// you see and the thing you hit cannot drift apart. It happens to be exactly
+/// the JS's `W = 90, H = 36, L = 70`, which is the point.
+///
+/// Meshes and materials are built once and shared by both ships, so the pair
+/// costs the batch keys of one. The hangar mouth is at local `+z` and the far
+/// mothership is turned to face the middle, matching `main.js:158`.
+///
+/// [`WorldRules::mothership_half`]: sim::rules::WorldRules::mothership_half
+fn install_motherships(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    rules: &sim::rules::Rules,
+) {
+    let half = rules.world.mothership_half;
+    let (w, h, l) = (
+        half.x as f32 * 2.0,
+        half.y as f32 * 2.0,
+        half.z as f32 * 2.0,
+    );
+
+    // Straight off `mothership.js` — and deliberately *not* the ship's
+    // `0.55 / 0.34`. Ultra's `sweepScene` only passes `metalness`/`roughness`
+    // for the object literally named `Ship`; everything else keeps what it was
+    // authored with and only picks up the anisotropy and env-intensity sweep.
+    let hull = materials.add(StandardMaterial {
+        base_color: hex(0x4a_5366).into(),
+        perceptual_roughness: 0.5,
+        metallic: 0.55,
+        ..default()
+    });
+    let accent = materials.add(StandardMaterial {
+        base_color: hex(0x22_2a36).into(),
+        perceptual_roughness: 0.7,
+        metallic: 0.45,
+        ..default()
+    });
+    let recess = materials.add(StandardMaterial {
+        base_color: hex(0x0a_1220).into(),
+        perceptual_roughness: 0.9,
+        ..default()
+    });
+    // The three `MeshBasicMaterial`s. See [`glow`].
+    let engine_glow = materials.add(glow(hex(0xff_7733), GLOW_BOOST));
+    let door_glow = materials.add(StandardMaterial {
+        // The plane's `opacity: 0.65` folded into the colour, because the
+        // additive blend has no use for an alpha channel and leaving it there
+        // only invites a question about which of the two is doing the work.
+        alpha_mode: AlphaMode::Add,
+        ..glow(hex(0x66_ccff), GLOW_BOOST * 0.65)
+    });
+    let runway = materials.add(glow(hex(0xff_d97a), GLOW_BOOST));
+
+    let hull_mesh = meshes.add(Cuboid::new(w, h, l));
+    let stripe_mesh = meshes.add(Cuboid::new(w * 1.005, 1.6, l * 1.005));
+    let ring_mesh = meshes.add(Cylinder::new(3.5, 2.0));
+    let ring_glow_mesh = meshes.add(Circle::new(3.2));
+
+    // The hangar mouth. `mothership.js:33` onwards, with the depths named so
+    // the shield plane's own z can be *derived* from the two solids it has to
+    // sit in front of rather than transcribed — see `door_z`.
+    let (door_w, door_h) = (32.0f32, 18.0f32);
+    let (frame_z, frame_d) = (l / 2.0 + 0.1, 1.2);
+    let (inset_z, inset_d) = (l / 2.0 - 2.0, 6.0);
+    let frame_mesh = meshes.add(Cuboid::new(door_w + 4.0, door_h + 4.0, frame_d));
+    let inset_mesh = meshes.add(Cuboid::new(door_w, door_h, inset_d));
+    let door_mesh = meshes.add(Rectangle::new(door_w - 1.0, door_h - 1.0));
+    let lamp_mesh = meshes.add(Sphere::new(0.4).mesh().uv(6, 4));
+
+    // **The one number here that is not the JS's.**
+    //
+    // `mothership.js:56` puts the shield plane at `L / 2 + 0.55`, which is
+    // behind *both* solids at the mouth: the frame slab's front face is at
+    // `L / 2 + 0.7` and the recess box's is at `L / 2 + 1.0`, so the plane is
+    // depth-rejected and draws nothing. Confirmed on screen — the blue in the
+    // JS hangar is its point light, and the additive plane it is supposedly
+    // there for has never been visible.
+    //
+    // Derived rather than transcribed so it cannot come loose if either solid
+    // is retuned, and called out because everything else about this hull is a
+    // transcription: a silent 0.65 would be exactly the kind of drift
+    // `rules.rs` exists to prevent.
+    let door_z = (frame_z + frame_d / 2.0).max(inset_z + inset_d / 2.0) + 0.2;
+
+    for z in [-rules.world.mothership_z, rules.world.mothership_z] {
+        let facing = if z > 0.0 {
+            Quat::from_rotation_y(PI)
+        } else {
+            Quat::IDENTITY
+        };
+        commands
+            .spawn((
+                Transform::from_xyz(0.0, 0.0, z as f32).with_rotation(facing),
+                Visibility::default(),
+                // `graphics.js`: big background props stay out of the shadow
+                // pass. A 90-unit box 600 units out contributes nothing a
+                // two-cascade map can resolve.
+                NotShadowCaster,
+            ))
+            .with_children(|hull_of| {
+                hull_of.spawn((Mesh3d(hull_mesh.clone()), MeshMaterial3d(hull.clone())));
+
+                for y in [-10.0f32, 10.0] {
+                    hull_of.spawn((
+                        Mesh3d(stripe_mesh.clone()),
+                        MeshMaterial3d(accent.clone()),
+                        Transform::from_xyz(0.0, y, 0.0),
+                    ));
+                }
+
+                // Three engine bells out the back, each with an additive disc
+                // behind it. Bevy's `Cylinder` is Y-up like three's, so the
+                // quarter-turn about X is the same correction.
+                for x in [-22.0f32, 0.0, 22.0] {
+                    hull_of.spawn((
+                        Mesh3d(ring_mesh.clone()),
+                        MeshMaterial3d(accent.clone()),
+                        Transform::from_xyz(x, -2.0, -l / 2.0 - 0.5)
+                            .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                    ));
+                    hull_of.spawn((
+                        Mesh3d(ring_glow_mesh.clone()),
+                        MeshMaterial3d(engine_glow.clone()),
+                        Transform::from_xyz(x, -2.0, -l / 2.0 - 1.6)
+                            .with_rotation(Quat::from_rotation_y(PI)),
+                    ));
+                }
+
+                // The hangar mouth: a raised frame, a dark recess, and the
+                // shield plane across it.
+                hull_of.spawn((
+                    Mesh3d(frame_mesh.clone()),
+                    MeshMaterial3d(accent.clone()),
+                    Transform::from_xyz(0.0, 0.0, frame_z),
+                ));
+                hull_of.spawn((
+                    Mesh3d(inset_mesh.clone()),
+                    MeshMaterial3d(recess.clone()),
+                    Transform::from_xyz(0.0, 0.0, inset_z),
+                ));
+                hull_of.spawn((
+                    Mesh3d(door_mesh.clone()),
+                    MeshMaterial3d(door_glow.clone()),
+                    Transform::from_xyz(0.0, 0.0, door_z),
+                    NotShadowCaster,
+                ));
+                hull_of.spawn((
+                    PointLight {
+                        color: hex(0x66_ccff).into(),
+                        intensity: 4.0e6,
+                        range: 100.0,
+                        // 0.19's name for `shadows_enabled`, same as on
+                        // `DirectionalLight` above.
+                        shadow_maps_enabled: false,
+                        ..default()
+                    },
+                    Transform::from_xyz(0.0, 0.0, l / 2.0 + 6.0),
+                ));
+
+                // Approach lights along the lip, six a side.
+                for i in [-3i32, -2, -1, 1, 2, 3] {
+                    for y in [-10.0f32, 10.0] {
+                        hull_of.spawn((
+                            Mesh3d(lamp_mesh.clone()),
+                            MeshMaterial3d(runway.clone()),
+                            Transform::from_xyz(
+                                (i as f32 / 3.0) * (w / 2.0 - 4.0),
+                                y,
+                                l / 2.0 + 0.3,
+                            ),
+                        ));
+                    }
+                }
+            });
+    }
+}
+
+/// A `MeshBasicMaterial` stand-in: unlit, with its colour pushed past 1.0.
+///
+/// Three.js "basic" is unlit and writes its colour straight out. Bevy's
+/// spelling is `unlit`, which takes `base_color` and skips lighting — and
+/// **skips `emissive` with it**, since emissive is added inside
+/// `apply_pbr_lighting`. So the brightness has to live in `base_color` and
+/// nowhere else; an `unlit` material with a bright emissive and a dim
+/// base_color renders dim, silently, which is the trap this function exists to
+/// close.
+///
+/// Which is also exactly what the JS does. `upgradeMaterials`
+/// (`graphics.js:413`) reaches into every additive basic material and calls
+/// `m.color.multiplyScalar(glowBoost)` — on the linear colour, three.js having
+/// stored it that way since r152 — because "pushing the colour past 1.0 is what
+/// makes the bloom pass actually bite".
+fn glow(color: Srgba, scale: f32) -> StandardMaterial {
+    let c = LinearRgba::from(color);
+    StandardMaterial {
+        base_color: LinearRgba::rgb(c.red * scale, c.green * scale, c.blue * scale).into(),
+        unlit: true,
+        ..default()
+    }
 }
 
 /// Loads a texture with Ultra's 8x anisotropic filtering.
@@ -503,7 +1133,7 @@ fn sample_ships(
     frame: Res<SimFrame>,
     scene: Res<SceneAssets>,
     mut reg: ResMut<Registry>,
-    mut q: Query<(&mut Interp, &mut Visibility, Has<Snap>), With<ShipRoot>>,
+    mut q: Query<(&mut Interp, &mut Visibility, &mut HitFlash, Has<Snap>), With<ShipRoot>>,
 ) {
     for view in &frame.0.ships {
         // Boss hitboxes are never drawn — they exist so one damage path can
@@ -522,24 +1152,36 @@ fn sample_ships(
                     // First tick: no previous pose, so both ends are this one.
                     Interp::spawned(pose),
                     Visibility::default(),
+                    HitFlash::default(),
+                    paint_for(view),
                 ))
-                .with_child((
-                    WorldAssetRoot(scene.ship.clone()),
-                    // `ship.js:45` does exactly this: the model's nose rests
-                    // along +x (its `gun` node is at x = 3.81), and the
-                    // simulation says the nose is local +z. Correcting it on a
-                    // child keeps the root transform the simulation's own.
-                    Transform::from_rotation(Quat::from_rotation_y(-FRAC_PI_2)),
-                ))
-                // Ultra's per-ship material treatment, applied once the glTF
-                // hierarchy actually exists.
-                .observe(ultra_material_sweep)
+                .with_children(|ship| {
+                    ship.spawn((
+                        WorldAssetRoot(scene.ship.clone()),
+                        // `ship.js:45` does exactly this: the model's nose
+                        // rests along +x (its `gun` node is at x = 3.81), and
+                        // the simulation says the nose is local +z. Correcting
+                        // it on a child keeps the root transform the
+                        // simulation's own.
+                        Transform::from_rotation(Quat::from_rotation_y(-FRAC_PI_2)),
+                    ))
+                    // Paint and Ultra's material treatment, once the glTF
+                    // hierarchy actually exists.
+                    //
+                    // On the *model* entity, not the ship root:
+                    // `WorldInstanceReady` is triggered on the entity that
+                    // holds the `WorldAssetRoot`, it does not propagate, and an
+                    // observer on the parent therefore never runs. That is why
+                    // this is `with_children` and not `with_child` — the latter
+                    // hands back the parent's `EntityCommands`.
+                    .observe(paint_and_upgrade);
+                })
                 .id()
         });
 
         // Miss on the tick the entity was spawned — `Interp::spawned` above
         // already holds this pose, and the commands have not been applied yet.
-        if let Ok((mut interp, mut vis, marked)) = q.get_mut(entity) {
+        if let Ok((mut interp, mut vis, mut flash, marked)) = q.get_mut(entity) {
             if marked {
                 commands.entity(entity).remove::<Snap>();
             }
@@ -555,18 +1197,16 @@ fn sample_ships(
             } else {
                 Visibility::Hidden
             };
+
+            // `set_if_neq` and not a plain write: this is what keeps
+            // `flash_ships` off the material assets of the nine ships nobody
+            // shot this tick.
+            flash.set_if_neq(HitFlash(view.hit_flash));
         }
 
-        // TODO(team colours): `applyColorsToShip` in `ship.js` recolours hull
-        // vs. accent meshes per team, picking accents by name
-        // (cockpit/engine/window/glass) or by luma < 0.35. The walk is already
-        // written in `ultra_material_sweep`; it needs `GltfMaterialName` and
-        // the team from `view.team`.
         // TODO(trails): `BOOSTING`/`BRAKING` are already in `view.flags` and are
         // what `trails.js` emits from. See the module docs on batching before
         // adding a mesh per trail segment.
-        // TODO(hit flash): `view.hit_flash` should drive an emissive pulse,
-        // which under Ultra is what the bloom pass catches.
     }
 
     // A ship that left the frame left the match.
@@ -579,54 +1219,150 @@ fn sample_ships(
     });
 }
 
-/// Ultra's `upgradeMaterials`, for the ship: metal hull, tight roughness, and
-/// anisotropic sampling on whatever maps the glTF brought with it.
+/// `applyColorsToShip` and Ultra's `upgradeMaterials`, in one walk of one ship.
 ///
 /// Fires on [`WorldInstanceReady`], because until the glTF has been
-/// instantiated there is no hierarchy to walk. This mutates the shared
-/// `StandardMaterial` assets rather than cloning per entity, which is what the
-/// JS does too — `_upgraded` is a `WeakSet` guarding exactly that.
-fn ultra_material_sweep(
+/// instantiated there is no hierarchy to walk. `ready.entity` is the entity
+/// carrying [`WorldAssetRoot`] — the ship root's child — so the paint is read
+/// back up through [`ChildOf`].
+///
+/// **Every material is cloned.** The glTF's own materials are shared by every
+/// instance of the model, so painting one in place would paint all ten ships
+/// the same colour — and the old in-place sweep had a quieter version of the
+/// same bug, multiplying the shared `emissive` by `glowBoost` once *per ship*.
+/// The clone is per ship, not per mesh entity: a model whose hull is four
+/// meshes over one material still ends up with one hull material.
+///
+/// This is the exception the module docs allow, and it does not generalise —
+/// see [`DamageFlash`] for the sixty-rock case, where cloning is exactly the
+/// bottleneck this port exists to escape.
+fn paint_and_upgrade(
     ready: On<WorldInstanceReady>,
+    mut commands: Commands,
     children: Query<&Children>,
+    parents: Query<&ChildOf>,
+    paints: Query<&ShipPaint>,
     meshes: Query<&MeshMaterial3d<StandardMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
+    let Ok(&ChildOf(root)) = parents.get(ready.entity) else {
+        return;
+    };
+    let Ok(paint) = paints.get(root) else {
+        return;
+    };
+
+    // Source material -> the clone this ship uses, so meshes sharing an
+    // authored material keep sharing one here.
+    let mut cloned: HashMap<AssetId<StandardMaterial>, Handle<StandardMaterial>> = HashMap::new();
+    let mut skin = Vec::new();
+
     for descendant in children.iter_descendants(ready.entity) {
-        let Ok(MeshMaterial3d(handle)) = meshes.get(descendant) else {
-            continue;
-        };
-        let Some(mut mat) = materials.get_mut(handle) else {
+        let Ok(MeshMaterial3d(source)) = meshes.get(descendant) else {
             continue;
         };
 
-        // `sweepScene`: ships get `metalness: 0.55, roughness: 0.34`.
-        mat.metallic = 0.55;
-        mat.perceptual_roughness = 0.34;
+        let handle = match cloned.get(&source.id()) {
+            Some(handle) => handle.clone(),
+            None => {
+                let Some(mut mat) = materials.get(source).cloned() else {
+                    continue;
+                };
 
-        // `emissiveIntensity *= glowBoost` (1.7) — pushing emissive past 1.0 is
-        // what makes the bloom pass bite.
-        mat.emissive *= 1.7;
+                // -- The paint ------------------------------------------------
+                let painted = if is_accent(mat.base_color) {
+                    paint.accent
+                } else {
+                    paint.hull
+                };
+                // Alpha is the model's, not the palette's: a canopy authored
+                // translucent must stay translucent.
+                mat.base_color = painted.with_alpha(mat.base_color.alpha());
 
-        // The anisotropy half of `upgradeMaterials`. Textures inside the glTF
-        // were loaded by the gltf loader with its own sampler, so they are
-        // patched here rather than at load time.
-        for tex in [
-            mat.base_color_texture.as_ref(),
-            mat.emissive_texture.as_ref(),
-            mat.metallic_roughness_texture.as_ref(),
-            mat.normal_map_texture.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(mut image) = images.get_mut(tex) {
-                image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-                    anisotropy_clamp: ANISOTROPY,
-                    ..ImageSamplerDescriptor::linear()
-                });
+                // -- Ultra's `sweepScene` -------------------------------------
+                // Ships get `metalness: 0.55, roughness: 0.34`.
+                mat.metallic = 0.55;
+                mat.perceptual_roughness = 0.34;
+                // `emissiveIntensity *= glowBoost` (1.7) — pushing emissive
+                // past 1.0 is what makes the bloom pass bite. Safe to apply
+                // unconditionally now that the material is this ship's own.
+                mat.emissive *= 1.7;
+
+                // The anisotropy half of `upgradeMaterials`. Textures inside
+                // the glTF were loaded by the gltf loader with its own sampler,
+                // so they are patched here rather than at load time. The images
+                // stay shared — only the materials are cloned.
+                for tex in [
+                    mat.base_color_texture.as_ref(),
+                    mat.emissive_texture.as_ref(),
+                    mat.metallic_roughness_texture.as_ref(),
+                    mat.normal_map_texture.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(mut image) = images.get_mut(tex) {
+                        image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                            anisotropy_clamp: ANISOTROPY,
+                            ..ImageSamplerDescriptor::linear()
+                        });
+                    }
+                }
+
+                let emissive = mat.emissive;
+                let handle = materials.add(mat);
+                skin.push((handle.clone(), emissive));
+                cloned.insert(source.id(), handle.clone());
+                handle
             }
+        };
+
+        commands
+            .entity(descendant)
+            .insert(MeshMaterial3d(handle.clone()));
+    }
+
+    commands.entity(root).insert(ShipSkin(skin));
+}
+
+/// Drives a struck ship's emissive from `view.hit_flash`.
+///
+/// The JS has no equivalent — `hitFlash` is asteroid-only there, and a player
+/// being hit is communicated with a red screen vignette, which tells you
+/// nothing about *someone else* taking fire. Under a pipeline with bloom, an
+/// emissive pulse is the read: the hull flares for the quarter-second the
+/// simulation's flash lasts and the bloom pass smears it, so a hit lands
+/// visibly from across the field.
+///
+/// `Changed<HitFlash>` is doing real work. Writing a `StandardMaterial` marks it
+/// modified, which re-prepares its bind group; without the filter this would do
+/// that for every ship on every tick forever.
+///
+/// `Changed<ShipSkin>` is the other half, and it is not decoration. The skin is
+/// inserted by [`paint_and_upgrade`] when the glTF finishes loading, which is
+/// tens of frames after the ship entity exists — so on `HitFlash` alone, a
+/// flash that arrived while the model was still loading would be seen by a
+/// query that matched nothing, and then never seen again, because the next tick
+/// the flash is *unchanged*. That is a stuck flash, not a missed one: whatever
+/// value it was left at is what the ship wears until it is hit again. It showed
+/// up as a hit that rendered on one run of the same build and not the next.
+fn flash_ships(
+    ships: Query<(&ShipSkin, &HitFlash), NeedsFlash>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for (skin, &HitFlash(flash)) in &ships {
+        for (handle, base) in &skin.0 {
+            let Some(mut mat) = materials.get_mut(handle) else {
+                continue;
+            };
+            // Added, not assigned: an engine bell that glows on its own has to
+            // still glow once the flash has decayed to nothing.
+            mat.emissive = LinearRgba::rgb(
+                base.red + SHIP_FLASH.red * flash,
+                base.green + SHIP_FLASH.green * flash,
+                base.blue + SHIP_FLASH.blue * flash,
+            );
         }
     }
 }
@@ -636,7 +1372,7 @@ fn sample_rocks(
     frame: Res<SimFrame>,
     scene: Res<SceneAssets>,
     mut reg: ResMut<Registry>,
-    mut q: Query<(&mut Interp, Has<Snap>), With<Rock>>,
+    mut q: Query<(&mut Interp, &mut MeshTag, Has<Snap>), With<Rock>>,
 ) {
     for view in &frame.0.asteroids {
         let pose = Pose::of_rock(view);
@@ -656,23 +1392,26 @@ fn sample_rocks(
                     // tick's write.
                     pose.transform(),
                     Interp::spawned(pose),
+                    // The damage tint, in full. Everything else about this rock
+                    // is shared with the other fifty-nine.
+                    rock_tag(view),
                 ))
                 .id()
         });
 
-        if let Ok((mut interp, marked)) = q.get_mut(entity) {
+        if let Ok((mut interp, mut tag, marked)) = q.get_mut(entity) {
             if marked {
                 commands.entity(entity).remove::<Snap>();
                 interp.snap(pose);
             } else {
                 interp.advance(pose);
             }
-        }
 
-        // TODO(damage tint): `view.hp` and `view.hit_flash` drive the flash in
-        // `asteroids.js:101`. A per-rock material would defeat the shared-handle
-        // batching below; the right shape is a material extension with a
-        // per-instance uniform, or packing the flash into a vertex colour.
+            // `asteroids.js:101`, but as a per-instance number rather than a
+            // material clone. `set_if_neq` is what keeps a quiet field from
+            // re-extracting sixty mesh uniforms every tick.
+            tag.set_if_neq(rock_tag(view));
+        }
     }
 
     // Destroyed rocks leave the frame.
@@ -1016,6 +1755,245 @@ mod tests {
         interp.advance(flipped);
 
         assert_same(interp.at(0.0), flipped);
+    }
+
+    // -- The hull/accent split ----------------------------------------------
+
+    /// The contract the customizer's preview is built on, and the one thing
+    /// about the ship model this file is allowed to assume. If a model swap
+    /// changes which meshes come out accent, that is a re-authoring decision;
+    /// if it changes *where the line is*, the customizer and the game disagree
+    /// about what the player picked.
+    #[test]
+    fn the_accent_split_is_luma_below_zero_point_three_five() {
+        // Straddling the threshold on a pure grey, where luma is the value.
+        assert!(is_accent(Color::LinearRgba(LinearRgba::rgb(
+            0.34, 0.34, 0.34
+        ))));
+        assert!(!is_accent(Color::LinearRgba(LinearRgba::rgb(
+            0.36, 0.36, 0.36
+        ))));
+
+        // Rec. 709 and not an average: green carries most of the weight, blue
+        // almost none. A saturated blue is an accent at a value a green of the
+        // same value is nowhere near.
+        assert!(is_accent(Color::LinearRgba(LinearRgba::rgb(0.0, 0.0, 1.0))));
+        assert!(!is_accent(Color::LinearRgba(LinearRgba::rgb(
+            0.0, 0.5, 0.0
+        ))));
+    }
+
+    /// The two authored defaults have to land on opposite sides, or the
+    /// customizer's two colours are one colour.
+    #[test]
+    fn the_default_hull_and_accent_land_on_opposite_sides() {
+        assert!(!is_accent(DEFAULT_HULL.into()));
+        assert!(is_accent(DEFAULT_ACCENT.into()));
+    }
+
+    /// **The split is not a fixed point, and that is why it is applied
+    /// exactly once.**
+    ///
+    /// Team red (`#ff5566`) is a *dark* colour by Rec. 709 luma — linear
+    /// (1.0, 0.07, 0.11) comes to 0.27 — so a hull painted red would classify
+    /// as an accent if it were ever fed back through [`is_accent`]. Nothing
+    /// does today: [`paint_and_upgrade`] runs on `WorldInstanceReady`, reads
+    /// the *authored* colour, and never re-derives the split from a material it
+    /// has already written. This pins the reason, so that a later "just re-run
+    /// the sweep on team change" reads as the bug it would be — every red ship
+    /// would come out with its hull and its accents swapped.
+    #[test]
+    fn painting_is_not_a_fixed_point_of_the_split() {
+        assert!(
+            !is_accent(TEAM_HULL[0].into()),
+            "team blue is a bright colour"
+        );
+        assert!(is_accent(TEAM_HULL[1].into()), "team red is a dark one");
+    }
+
+    // -- Ship paint ----------------------------------------------------------
+
+    fn ship(id: sim::world::EntityId, team: i32) -> sim::world::ShipView {
+        sim::world::ShipView {
+            id,
+            team,
+            ..sim::world::ShipView::default()
+        }
+    }
+
+    /// The local pilot wears their own colours whatever team they are on —
+    /// `main.js:781` reads `getSavedShipColor()` for the player and only ever
+    /// consults the team for *other* people's markers.
+    ///
+    /// Reads the environment on native, so this asserts the fallback rather
+    /// than the override; `SPACESHIPS_HULL_COLOR` set in the shell would be
+    /// testing the shell.
+    #[test]
+    fn the_local_pilot_keeps_their_own_colours() {
+        if std::env::var_os("SPACESHIPS_HULL_COLOR").is_some() {
+            return;
+        }
+        let paint = paint_for(&ship(LOCAL_ID, 0));
+        assert_eq!(paint.hull, Color::from(DEFAULT_HULL));
+        assert_eq!(paint.accent, Color::from(DEFAULT_ACCENT));
+    }
+
+    #[test]
+    fn a_teamed_stranger_wears_the_team_colour() {
+        assert_eq!(paint_for(&ship(7, 0)).hull, Color::from(TEAM_HULL[0]));
+        assert_eq!(paint_for(&ship(8, 1)).hull, Color::from(TEAM_HULL[1]));
+    }
+
+    /// `team == -1` is "unassigned", which is every ship before the host
+    /// presses Launch. `createShip({ tint: PALETTE[id % PALETTE.length] })`.
+    #[test]
+    fn an_unassigned_stranger_falls_back_to_the_palette() {
+        for id in 2..20 {
+            let want = PALETTE[id as usize % PALETTE.len()];
+            assert_eq!(paint_for(&ship(id, -1)).hull, Color::from(want));
+        }
+    }
+
+    // -- The asteroid damage tag ---------------------------------------------
+
+    /// The two fields must not bleed into each other: this is one `u32` doing
+    /// the work of two floats, and getting the shift wrong makes a rock at full
+    /// health flash permanently.
+    #[test]
+    fn the_damage_tag_keeps_its_two_halves_apart() {
+        assert_eq!(pack_damage(0.0, 0.0), 0);
+        assert_eq!(pack_damage(1.0, 0.0), 0xffff_0000);
+        assert_eq!(pack_damage(0.0, 1.0), 0x0000_ffff);
+        assert_eq!(pack_damage(1.0, 1.0), u32::MAX);
+    }
+
+    /// Out-of-range input has to clamp, not wrap. An `as u32` cast of a
+    /// negative float is 0 and of a huge one saturates, but neither is
+    /// something to rely on when the alternative is one `clamp`.
+    #[test]
+    fn the_damage_tag_clamps() {
+        assert_eq!(pack_damage(-1.0, 2.0), 0x0000_ffff);
+        assert_eq!(pack_damage(2.0, -1.0), 0xffff_0000);
+    }
+
+    /// Round-trips through the shader's arithmetic to within a quantization
+    /// step, which is what 16 bits buys and is three orders of magnitude finer
+    /// than the eye resolves in a quarter-second flash.
+    #[test]
+    fn the_damage_tag_survives_the_round_trip() {
+        for &flash in &[0.0, 0.25, 0.5, 0.75, 1.0] {
+            for &hp in &[0.0, 0.1, 0.5, 1.0] {
+                let tag = pack_damage(flash, hp);
+                let got_flash = (tag >> 16) as f32 / 65535.0;
+                let got_hp = (tag & 0xffff) as f32 / 65535.0;
+                assert!(
+                    (got_flash - flash).abs() < 1e-4,
+                    "flash {flash} -> {got_flash}"
+                );
+                assert!((got_hp - hp).abs() < 1e-4, "hp {hp} -> {got_hp}");
+            }
+        }
+    }
+
+    /// `RockView` carries `hp` but not the tier that set it, so the fraction
+    /// the shader wants is recovered from `size`. Every tier's own size range
+    /// has to come back with that tier's HP, or a chipped huge rock reads as a
+    /// nearly-dead small one.
+    #[test]
+    fn a_rocks_maximum_hp_comes_back_from_its_size() {
+        for tier in sim::rules::ASTEROID_TIERS {
+            for size in [
+                tier.min_size,
+                (tier.min_size + tier.max_size) / 2.0,
+                tier.max_size,
+            ] {
+                assert_eq!(
+                    rock_max_hp(size as f32),
+                    tier.hp,
+                    "size {size} should be the {} HP tier",
+                    tier.hp
+                );
+            }
+        }
+    }
+
+    /// Nothing generates one, but a rock larger than the table must not divide
+    /// by zero or fall off the end.
+    #[test]
+    fn an_oversized_rock_takes_the_last_tier() {
+        let last = sim::rules::ASTEROID_TIERS[sim::rules::ASTEROID_TIERS.len() - 1];
+        assert_eq!(rock_max_hp(1_000.0), last.hp);
+    }
+
+    /// A full-health rock is undimmed and unlit; a destroyed one is fully
+    /// scorched. The shader's `mix(scorch, 1, hp01)` depends on the *ends*
+    /// being exactly these two.
+    #[test]
+    fn a_rocks_tag_tracks_its_damage() {
+        let rock = |hp: i32, hit_flash: f32| sim::world::RockView {
+            id: 3,
+            hp,
+            size: 20.0, // the 30 HP tier
+            hit_flash,
+            ..sim::world::RockView::default()
+        };
+
+        assert_eq!(rock_tag(&rock(30, 0.0)), MeshTag(pack_damage(0.0, 1.0)));
+        assert_eq!(rock_tag(&rock(0, 1.0)), MeshTag(pack_damage(1.0, 0.0)));
+        assert_eq!(rock_tag(&rock(15, 0.5)), MeshTag(pack_damage(0.5, 0.5)));
+    }
+
+    /// The whole reason the tag is quantized: an untouched field writes
+    /// nothing, so `set_if_neq` never marks sixty mesh uniforms dirty.
+    #[test]
+    fn an_untouched_rock_produces_an_unchanged_tag() {
+        let rock = sim::world::RockView {
+            id: 1,
+            hp: 5,
+            size: 6.0,
+            hit_flash: 0.0,
+            ..sim::world::RockView::default()
+        };
+        assert_eq!(rock_tag(&rock), rock_tag(&rock));
+        assert_eq!(rock_tag(&rock), MeshTag(pack_damage(0.0, 1.0)));
+    }
+
+    // -- Flash brightness ----------------------------------------------------
+
+    /// Both halves of the brightness choice, and the second half was found on
+    /// screen rather than reasoned to.
+    ///
+    /// A flash has to clear `camera.rs`'s prefilter or it is a colour change
+    /// nobody reads as a hit — and it has to leave *one channel under it*, or
+    /// ACES desaturates the lot and a hit reads as a white blowout with no hue
+    /// at all. The first `SHIP_FLASH`, `(6.0, 1.2, 0.9)`, failed the second
+    /// half: it looked like the ship had been overexposed, not shot.
+    #[test]
+    fn a_flash_blooms_without_going_white() {
+        const KNEE: f32 = 0.9;
+        for (what, flash) in [("ship", SHIP_FLASH), ("rock", ROCK_FLASH)] {
+            let peak = flash.red.max(flash.green).max(flash.blue);
+            let floor = flash.red.min(flash.green).min(flash.blue);
+            assert!(
+                peak > KNEE,
+                "the {what} flash peaks at {peak}, under the knee"
+            );
+            assert!(
+                floor < KNEE,
+                "every channel of the {what} flash is over the knee; ACES will \
+                 desaturate it to white"
+            );
+        }
+    }
+
+    /// `asteroids.js:103` is `setRGB(f, f * 0.6, f * 0.3)`. The magnitude is
+    /// this pipeline's business — the JS's peaks at 1.0 and this one has an HDR
+    /// target to fill — but the *hue* is authored, and scaling the whole ramp
+    /// is how it stays the same orange.
+    #[test]
+    fn the_rock_flash_keeps_the_js_ramp() {
+        assert!((ROCK_FLASH.green / ROCK_FLASH.red - 0.6).abs() < 1e-5);
+        assert!((ROCK_FLASH.blue / ROCK_FLASH.red - 0.3).abs() < 1e-5);
     }
 
     /// The other half of the threshold, and the one that would silently ruin

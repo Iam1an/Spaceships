@@ -8,6 +8,7 @@
 //!
 //! Bindings follow `main.js`.
 
+use bevy::input::mouse::MouseButton;
 use bevy::prelude::*;
 use spaceships_sim as sim;
 
@@ -25,7 +26,11 @@ impl Plugin for InputPlugin {
     }
 }
 
-fn gather_input(keys: Res<ButtonInput<KeyCode>>, mut out: ResMut<PlayerInput>) {
+fn gather_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut out: ResMut<PlayerInput>,
+) {
     let axis = |neg: KeyCode, pos: KeyCode| -> f64 {
         f64::from(keys.pressed(pos)) - f64::from(keys.pressed(neg))
     };
@@ -42,9 +47,12 @@ fn gather_input(keys: Res<ButtonInput<KeyCode>>, mut out: ResMut<PlayerInput>) {
         // hence Up in the `neg` slot.
         arrow_x: axis(KeyCode::ArrowLeft, KeyCode::ArrowRight),
         arrow_y: axis(KeyCode::ArrowUp, KeyCode::ArrowDown),
-        // Q is fine-aim *and* the flare key in the JS; flares win there, so
-        // fine-aim gets left-control here.
-        arrow_fine: keys.pressed(KeyCode::ControlLeft),
+        // Q is fine-aim *and* the flare key, and in the JS it is genuinely
+        // both at once rather than one winning: `main.js:1240` reads it held
+        // for the slower arrow ramp, `:1108` reads its rising edge for the
+        // flare. Left-control is kept as a second fine-aim binding for anyone
+        // who would rather not slow their turn every time they pop a decoy.
+        arrow_fine: keys.pressed(KeyCode::KeyQ) || keys.pressed(KeyCode::ControlLeft),
 
         // Roll. `main.js:1249`.
         roll: axis(KeyCode::KeyD, KeyCode::KeyA),
@@ -61,18 +69,32 @@ fn gather_input(keys: Res<ButtonInput<KeyCode>>, mut out: ResMut<PlayerInput>) {
         boost: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
         free_look: keys.pressed(KeyCode::AltLeft),
 
-        // Edge-triggered actions. `just_pressed` is exactly the debounce the JS
-        // input layer does by hand (`main.js:1390`, `:1446`, `:1034`).
+        // Weapons.
         //
-        // TODO(weapons): the simulation's `Input` accepts these today, but
-        // nothing consumes them yet — `sim::bullets` and `sim::missiles` are
-        // not in `sim_bridge::tick`, so these currently go nowhere. They are
-        // wired anyway so the binding table is complete in one place.
-        fire: keys.pressed(KeyCode::KeyF),
+        // `fire` is held, not edged: the gun's rate of fire is a *rule*
+        // (`weapons.gun_cooldown`), applied by `sim::bullets::fire_gun`, so
+        // the client's job is to report the trigger down and nothing more.
+        // `main.js:1490` is the same test — `input.lmb || keys.has('KeyF') ||
+        // gp.fire` — and left mouse is the primary binding, F the fallback for
+        // anyone flying on the keyboard scheme.
+        //
+        // The rest are edge-triggered, and `just_pressed` is exactly the
+        // `prevKeyE`/`prevKeyQ`/`prevKeyP` debounce the JS keeps by hand
+        // (`main.js:1415`, `:1108`, `:1380`).
+        //
+        // Note that these still go nowhere in this build: `sim_bridge::tick`
+        // does not call `sim::bullets` or `sim::missiles`, so nothing consumes
+        // them and `Frame`'s projectile lists stay empty. The bindings are
+        // complete here so that the day the projectile phases land in the
+        // bridge, no input work is left to do — and so the whole binding table
+        // is legible in one place rather than half-here and half-pending.
+        fire: keys.pressed(KeyCode::KeyF) || mouse.pressed(MouseButton::Left),
         fire_missile: keys.just_pressed(KeyCode::KeyE),
         deploy_flare: keys.just_pressed(KeyCode::KeyQ),
         toggle_gun: keys.just_pressed(KeyCode::KeyP),
-        toggle_aim_assist: keys.just_pressed(KeyCode::KeyT),
+        // C, not T: `main.js:1385` (`prevKeyC`). T is not bound to anything in
+        // the JS at all.
+        toggle_aim_assist: keys.just_pressed(KeyCode::KeyC),
 
         // Unset, and named here so the list above is visibly exhaustive:
         // `steer_x`/`steer_y` (mouse), `throttle_notches` (wheel),
