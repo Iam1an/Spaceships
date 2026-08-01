@@ -67,7 +67,101 @@ record the log even if nothing reads it yet.
 
 ---
 
-## 2. Falls out of the replay system nearly free
+## 2. EMP
+
+Blind them instead of killing them. The cockpit goes dark, the aim cone
+disappears, and for a few seconds everyone in range has to fly and shoot by
+eye.
+
+### Why it fits
+
+The counterplay pattern that makes missiles the best weapon in the game is a
+decision on *both* sides. An EMP is the same shape: the attacker spends a
+charged resource and picks a moment; the victim has to keep fighting without
+the crutches they had a second ago.
+
+It also justifies the cockpit view. `cockpit.js` and `dash.js` already render
+an instrument panel, a radar with live contact blips, and TGT/MSL annunciators
+— all of which can go dark. That is a far better EMP than a screen flash.
+
+### What it disables
+
+- Cockpit lighting, instrument panel, radar (`cockpit.js`, `dash.js`)
+- Aim assist entirely — no cone, no pull, no lead marker (`main.js`, grep
+  `solveIntercept` and the aim-assist block)
+- Target boxes, target labels, missile lock, and the lock warning
+- HUD bars, if we want it to bite harder
+
+**Not** flight controls. Taking away someone's ability to steer is frustrating,
+not tense. Take away their *information*, leave them their hands.
+
+### Charge mechanic
+
+Cannot be spammed and cannot be respawn-cycled: the EMP builds charge over time
+and the meter does **not** reset on death, so dying does not refund it and a
+fresh spawn does not arrive armed. Full charge is the cost; the timing is the
+skill.
+
+### Open design questions
+
+- **Does it blind allies too?** "Everyone's cockpit going dark" is the more
+  interesting version — it makes an EMP genuinely risky to fire inside a
+  furball and self-limiting without a balance patch. Worth trying friendly
+  blinding first.
+- **Aim assist is forced on for keyboard and mobile schemes.** So an EMP hurts
+  those players much harder than mouse players, who lose a crutch rather than
+  their aim. Either soften the assist loss on those schemes, or lean in and
+  make it a known matchup — but decide deliberately rather than shipping the
+  accident.
+- **Give the victim something to do.** A "reboot" input — mash a key to restore
+  systems faster — turns dead time into agency. Otherwise the victim is just
+  waiting, which is the least fun state in any game.
+- Should it kill the audio warnings below? A dead cockpit that also goes silent
+  is a genuinely unsettling few seconds.
+
+---
+
+## 3. Audio warnings ("Bitchin' Betty")
+
+F-16-style spoken warnings: *"PULL UP"*, *"TERRAIN"*, *"CAUTION TERRAIN"*,
+*"ALTITUDE"*, *"MISSILE LOCK"*, *"OVER-G"*.
+
+### Why this is the best effort-to-payoff item in the backlog
+
+Almost every trigger already exists in the code and is currently only expressed
+visually. This is mostly wiring plus audio clips.
+
+| Warning | Trigger that already exists |
+|---|---|
+| **PULL UP** / **TERRAIN** / **CAUTION TERRAIN** | `getTerrainHeight` and `TERRAIN_KILL_CLEARANCE` in `terrain.js` — ground contact is instant death on Sierras |
+| **ALTITUDE, ALTITUDE** | same, at a softer threshold |
+| **MISSILE LOCK** | `#missile-lock-warning` already blinks red at 0.25 s |
+| **OVER-G** | the brake-charge overcharge — `BRAKE_OVERCHARGE_WARN` at 1.0 s, damage at 2.0 s, 10 HP/s. This mapping is exact. |
+| **LOW FUEL** | `MAX_BOOST` 10 s tank |
+| **WINCHESTER** / low ammo | `MAX_AMMO` 90 |
+| **WARNING** at low HP | existing hit vignette threshold |
+
+It also solves a real problem rather than just adding flavour: in the cockpit
+view, and any time you are using free-look, you cannot see the HUD. Audio is
+the only channel that still reaches you while you are looking over your
+shoulder — which is exactly when you are being shot at.
+
+### Design notes that matter
+
+- **Priority hierarchy, not a queue.** Real aircraft rank warnings and let the
+  urgent one interrupt. *PULL UP* must cut off *low fuel* mid-word. Without
+  this, five warnings talk over each other and the feature becomes noise.
+- **Per-warning cooldown**, or it nags. The classic failure mode is *"PULL UP"*
+  firing forty times in a canyon run until players mute the game.
+- **Duck music, not SFX.** Music and SFX already have separate volume sliders;
+  the warning should sit above the music and below a missile detonation.
+- Pairs with the existing cockpit annunciators — the light and the voice should
+  fire together, so the same information reaches you whether you are looking in
+  or out.
+
+---
+
+## 4. Falls out of the replay system nearly free
 
 - **Killcam.** A replay bounded to the 5 seconds before your death, from the
   killer's view.
@@ -80,7 +174,7 @@ record the log even if nothing reads it yet.
 
 ---
 
-## 3. Netcode: rollback
+## 5. Netcode: rollback
 
 A deterministic simulation is the hard prerequisite for rollback netcode — the
 thing that makes fighting games feel lagless online. The client predicts
@@ -92,7 +186,7 @@ foundation is already in place.
 
 ---
 
-## 4. Known gameplay issues found during the port
+## 6. Known gameplay issues found during the port
 
 Real behaviors in the current game, each verified against the source. Some are
 bugs, some are probably-unintended design. Decide individually.
@@ -113,7 +207,7 @@ bugs, some are probably-unintended design. Decide individually.
 
 ---
 
-## 5. Other ideas
+## 7. Other ideas
 
 - **Replace the pixel filter with a real post chain.** `PIXEL_SCALE = 3` renders
   to a third-res target and upscales. In Bevy this is a post-processing pass,
