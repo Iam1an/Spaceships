@@ -161,7 +161,72 @@ shoulder — which is exactly when you are being shot at.
 
 ---
 
-## 4. Falls out of the replay system nearly free
+## 4. Intro cinematic
+
+The thing that plays before the menu. Two admin jets, one trickshot, one cut.
+
+### The sequence
+
+1. **Exterior.** An admin jet pulls a **Kvochur's Bell** — vertical, bleed to
+   zero airspeed, hang on thrust, then the nose falls through tail-first —
+   rolling into a spin on the way out.
+2. It **dumps flares** mid-pivot and a missile goes wide through the burn.
+3. A **second admin jet blasts past** close enough to shake the camera.
+4. **Hard cut to the interior** of the jet that fired the missile — cockpit
+   view, instruments live.
+5. That pilot **free-looks around and up**, tracking the other jet.
+6. **MISSILE LOCK.** The reticle goes red, the warning blinks, the voice
+   callout fires.
+7. They **explode.** Everything goes dark. Title.
+
+The joke is the reversal: you follow the shooter's missile, then find out you
+were watching the wrong aircraft the whole time.
+
+### Why it is cheaper than it looks
+
+**The intro is a replay.** Everything above is either the sim running or a
+camera looking at it, and section 1 already builds both:
+
+| Beat | What it needs | Status |
+|---|---|---|
+| The Bell, spin, flares, missile | a recorded input log, replayed | replay system |
+| Exterior chase and the fly-by | keyframed camera path | replay system |
+| The cut to the other pilot | "click a player to switch view" | replay system |
+| Cockpit interior, free-look up | `cockpit.js`, `fpcamera.js` | **exists** |
+| Missile lock reticle + warning | `#missile-lock-warning`, `lock.mp3` | **exists** |
+| Explosion, fade to black | `shipdeath`, `#campaign-warp-flash` | **exists** |
+| Both jets in admin skins | `spaceshipADMIN.glb` | **exists** |
+
+So this is not an animation to author frame by frame — it is a *saved match*
+plus a camera track. Build the replay system and the intro becomes a
+content-authoring job rather than an engineering one. Determinism means it
+plays identically every time, on every machine, forever.
+
+### The Bell is already flyable
+
+The manoeuvre needs the aircraft to rotate independently of where its momentum
+is carrying it. That is exactly what drift mode does — `DRIFT_GRIP` 0.3 and
+`DRIFT_DRAG` 0.9 decouple facing from velocity. A Bell is: pitch vertical,
+enter drift, let throttle bleed, hold the hang, then let the nose fall through
+while the velocity vector keeps pointing up.
+
+Worth flying by hand first to confirm it reads well on screen. If it does not,
+the flight model may need a touch more authority at low speed — better to find
+that out before building a cinematic around it.
+
+### Notes
+
+- **Skippable from frame one.** Any key. No exceptions, no "hold to skip".
+- Play it on first launch and from a menu item, not on every boot.
+- The audio does a lot of work here: engine doppler on the fly-by, then the
+  lock tone, then near-silence for the cut to black. `stopWarnings()` exists
+  for exactly that kind of hard cut.
+- Consider ending on the same nebula skybox the menu uses, so the intro
+  dissolves into the lobby rather than cutting to it.
+
+---
+
+## 5. Falls out of the replay system nearly free
 
 - **Killcam.** A replay bounded to the 5 seconds before your death, from the
   killer's view.
@@ -174,7 +239,7 @@ shoulder — which is exactly when you are being shot at.
 
 ---
 
-## 5. Netcode: rollback
+## 6. Netcode: rollback
 
 A deterministic simulation is the hard prerequisite for rollback netcode — the
 thing that makes fighting games feel lagless online. The client predicts
@@ -186,7 +251,7 @@ foundation is already in place.
 
 ---
 
-## 6. Known gameplay issues found during the port
+## 7. Known gameplay issues found during the port
 
 Real behaviors in the current game, each verified against the source. Some are
 bugs, some are probably-unintended design. Decide individually.
@@ -207,7 +272,7 @@ bugs, some are probably-unintended design. Decide individually.
 
 ---
 
-## 7. Other ideas
+## 8. Other ideas
 
 - **Replace the pixel filter with a real post chain.** `PIXEL_SCALE = 3` renders
   to a third-res target and upscales. In Bevy this is a post-processing pass,
