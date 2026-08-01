@@ -27,7 +27,7 @@ use bevy::post_process::bloom::{Bloom, BloomPrefilter};
 use bevy::post_process::effect_stack::{ChromaticAberration, Vignette};
 use bevy::prelude::*;
 
-use crate::sim_bridge::{pos, rot, SimFrame};
+use crate::scene::ShipRoot;
 use crate::LOCAL_ID;
 
 /// `ThirdPersonCamera.distance`.
@@ -123,8 +123,23 @@ pub fn spawn_camera(mut commands: Commands) {
     ));
 }
 
-fn follow(frame: Res<SimFrame>, time: Res<Time>, mut cam: Query<(&mut Transform, &mut ChaseCam)>) {
-    let Some(me) = frame.0.ships.iter().find(|s| s.id == LOCAL_ID) else {
+// Reads the ship's *interpolated* `Transform`, not its pose in `SimFrame`.
+//
+// `SimFrame` holds the last completed tick, so at 60 Hz sim on a 144 Hz display
+// it is a staircase. Chasing it directly leaves a periodic 60 Hz wobble that the
+// exponential damping below only partly filters — measured at 0.13 units peak to
+// peak for a boosting ship, about 11 px at 720p. `scene::draw_interpolated` has
+// already written the smoothed pose to this entity by the time `PostUpdate`
+// runs, and reading that instead takes the residual to zero.
+//
+// The `Without` bounds are load-bearing: both queries touch `Transform`, and
+// Bevy cannot prove the archetypes are disjoint without them.
+fn follow(
+    ships: Query<(&ShipRoot, &Transform), Without<ChaseCam>>,
+    time: Res<Time>,
+    mut cam: Query<(&mut Transform, &mut ChaseCam), Without<ShipRoot>>,
+) {
+    let Some((_, me)) = ships.iter().find(|(root, _)| root.0 == LOCAL_ID) else {
         return;
     };
     let Ok((mut tf, mut chase)) = cam.single_mut() else {
@@ -132,8 +147,8 @@ fn follow(frame: Res<SimFrame>, time: Res<Time>, mut cam: Query<(&mut Transform,
     };
 
     let dt = time.delta_secs();
-    let ship_pos = pos(me.pos);
-    let q = rot(me.quat);
+    let ship_pos = me.translation;
+    let q = me.rotation;
 
     // The ship's own axes. The nose is local +z, so "back" is local -z.
     let back = q * Vec3::NEG_Z;

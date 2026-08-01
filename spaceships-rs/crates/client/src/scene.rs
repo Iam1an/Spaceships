@@ -8,6 +8,34 @@
 //! Lighting and materials target **Ultra Graphics**
 //! (`public/src/graphics.js`), not the default forward path. See
 //! [`crate::camera`] for the post-processing half of that.
+//!
+//! # Render interpolation
+//!
+//! The simulation is fixed-step at [`sim::world::TICK_HZ`] and the display is
+//! not — 144 Hz here, so most frames run no tick at all and some run two.
+//! Applying the latest tick's transform directly held an entity still for two
+//! or three frames and then jumped it, which read as the ship stuttering back
+//! and forth. The fix is the standard one and it is split across two schedules:
+//!
+//! - **[`sample_ships`] / [`sample_rocks`] run in `FixedUpdate`**, once per
+//!   *tick*, and push each entity's pose into an [`Interp`] — `prev` and
+//!   `curr`, two consecutive ticks.
+//! - **[`draw_interpolated`] runs in `RunFixedMainLoop`**, once per *frame*,
+//!   and writes `Transform = prev.mix(curr, alpha)` where `alpha` is
+//!   [`Time<Fixed>::overstep_fraction`] — how far the fixed accumulator has run
+//!   past the tick it last executed.
+//!
+//! Sampling has to be on the tick, not the frame: a frame that ran no tick
+//! would otherwise record `prev == curr` and freeze, and a frame that ran two
+//! would skip one and lurch.
+//!
+//! This is *purely visual*. Nothing interpolated is ever read back — `sim`
+//! stays authoritative, [`SimFrame`] stays the last tick verbatim, and the
+//! renderer draws one tick (16.7 ms) behind it, which is the latency this
+//! trades for smoothness.
+//!
+//! Rotation is **slerp**, never lerp: see [`Pose::mix`]. Spawns and teleports
+//! must not interpolate at all: see [`Interp::spawned`] and [`Interp::snap`].
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor};
@@ -28,6 +56,35 @@ const SHIP_MODEL: &str = "spaceship.glb";
 /// `upgradeMaterials`'s `anisotropy: 8`.
 const ANISOTROPY: u16 = 8;
 
+/// The rules, so the teleport thresholds below are *derived* rather than
+/// guessed at. `rules.rs` is where a number like this is allowed to live, and
+/// re-deriving it here is how it cannot drift.
+const RULES: sim::rules::Rules = sim::rules::Rules::DEFAULT;
+
+/// The fastest a ship can legitimately travel: full throttle, boosting, with a
+/// fully charged brake-release on top.
+const TOP_SPEED: f64 =
+    RULES.ship.max_throttle * RULES.ship.boost_factor + RULES.ship.brake_boost_bonus_max;
+
+/// Squared distance one tick may cover before the renderer calls it a teleport
+/// rather than motion.
+///
+/// Eight ticks of [`TOP_SPEED`] — roughly 25 units. Comfortably above anything
+/// `resolve_world_collisions` can push a ship out by in a single step, and two
+/// orders of magnitude below the several hundred units a respawn or a campaign
+/// warp moves it. This is the backstop under [`Snap`] and
+/// `SimEvent::ShipRespawned`, for a discontinuity nobody announced.
+const TELEPORT_DIST_SQ: f32 = {
+    let d = TOP_SPEED * sim::world::TICK_DT * 8.0;
+    (d * d) as f32
+};
+
+/// `|dot|` between two unit quaternions is `cos(theta / 2)`, so this is a
+/// quarter turn — 94 rad/s against an authored `PITCH_RATE` of 1.75. A rotation
+/// that large in one tick is a respawn resetting the ship's attitude, not a
+/// roll.
+const TELEPORT_DOT: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
 /// Marks the root entity of a ship. The glTF model hangs off this as a child;
 /// this entity's transform is the simulation's, unmodified.
 ///
@@ -35,7 +92,6 @@ const ANISOTROPY: u16 = 8;
 /// system which does not have the registry — a trail emitter, a nameplate, the
 /// HUD's lock-on marker — can still tell which ship it is looking at.
 #[derive(Component)]
-#[expect(dead_code, reason = "read by systems this slice does not have yet")]
 pub struct ShipRoot(pub sim::world::EntityId);
 
 /// Marks an asteroid entity. Carries its id for the same reason.
@@ -50,6 +106,151 @@ struct Registry {
     ships: HashMap<sim::world::EntityId, Entity>,
     rocks: HashMap<u32, Entity>,
 }
+
+// ---------------------------------------------------------------------------
+// Render interpolation
+// ---------------------------------------------------------------------------
+
+/// One tick's pose: the part of a [`Transform`] the simulation drives.
+///
+/// A `Transform` would do, but a distinct type is what keeps the *sampled* pose
+/// and the *drawn* transform from being confused for one another — the drawn
+/// one is a blend of two samples and is never what any tick said.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pose {
+    translation: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+}
+
+impl Pose {
+    /// A ship, straight off its `ShipView`.
+    fn of_ship(view: &sim::world::ShipView) -> Pose {
+        Pose {
+            translation: pos(view.pos),
+            // Normalized because `Quat::slerp` is only defined on unit
+            // quaternions and this one has just been narrowed from `f64`. The
+            // simulation's is a unit quaternion; this only repairs the last
+            // bits the cast cost.
+            rotation: rot(view.quat).normalize(),
+            scale: Vec3::ONE,
+        }
+    }
+
+    /// An asteroid, straight off its `RockView`.
+    fn of_rock(view: &sim::world::RockView) -> Pose {
+        Pose {
+            translation: pos(view.pos),
+            // The simulation reports asteroid attitude as Euler angles, which
+            // wrap. Converting to a quaternion *before* interpolating is not a
+            // convenience: interpolating the angles themselves would reverse a
+            // rock's spin every time one of them crossed pi.
+            rotation: Quat::from_euler(EulerRot::XYZ, view.rot[0], view.rot[1], view.rot[2]),
+            // The rock meshes are unit-radius, so `size` is the scale directly.
+            scale: Vec3::splat(view.size),
+        }
+    }
+
+    /// The pose `alpha` of the way from `self` to `to`.
+    ///
+    /// Rotation is **slerp, not lerp**. Lerping two quaternions and
+    /// renormalizing traverses the arc at a non-constant rate — quickest at the
+    /// ends, slowest through the middle — so a ship holding one steady roll
+    /// would visibly speed up and slow down *within* every tick, which is a
+    /// different artifact from the judder this exists to remove and no less
+    /// obvious. `Quat::slerp` also negates `to` when the dot product comes out
+    /// negative, which is what takes the short way round: `q` and `-q` are the
+    /// same orientation, but the arcs from them to a third quaternion are not,
+    /// and the wrong one is a 350-degree spin where the ship turned 10.
+    fn mix(self, to: Pose, alpha: f32) -> Pose {
+        Pose {
+            translation: self.translation.lerp(to.translation, alpha),
+            rotation: self.rotation.slerp(to.rotation, alpha),
+            scale: self.scale.lerp(to.scale, alpha),
+        }
+    }
+
+    /// Whether `next` is somewhere this pose could have *moved* to in one tick,
+    /// as opposed to been placed at. See [`TELEPORT_DIST_SQ`].
+    fn is_continuous_to(self, next: Pose) -> bool {
+        self.translation.distance_squared(next.translation) <= TELEPORT_DIST_SQ
+            && self.rotation.dot(next.rotation).abs() >= TELEPORT_DOT
+    }
+
+    fn transform(self) -> Transform {
+        Transform {
+            translation: self.translation,
+            rotation: self.rotation,
+            scale: self.scale,
+        }
+    }
+}
+
+/// The two consecutive ticks a rendered entity is drawn between.
+///
+/// A component rather than a side table so that it despawns with the entity it
+/// describes — a `Frame` id that gets reused after a despawn cannot then pick up
+/// the previous occupant's pose and streak across the map.
+#[derive(Component, Clone, Copy, Debug)]
+struct Interp {
+    /// The tick before last.
+    prev: Pose,
+    /// The last tick. The simulation's actual, authoritative state.
+    curr: Pose,
+}
+
+impl Interp {
+    /// An entity that appeared this tick.
+    ///
+    /// Both ends are the same pose, so it draws exactly where the simulation
+    /// put it from its very first frame. Anything else gives a brand new
+    /// entity a `prev` it never had — whatever the spawn bundle happened to
+    /// carry, which for the old `Transform::default()` on an asteroid was the
+    /// origin, and a field seeded at radius 400 then flies in from the middle
+    /// of the moon.
+    fn spawned(at: Pose) -> Interp {
+        Interp { prev: at, curr: at }
+    }
+
+    /// Records this tick's pose as motion, to be interpolated from the last.
+    ///
+    /// Falls back to [`Interp::snap`] for a step too large to be motion, which
+    /// is the unannounced-teleport backstop.
+    fn advance(&mut self, next: Pose) {
+        if self.curr.is_continuous_to(next) {
+            self.prev = self.curr;
+            self.curr = next;
+        } else {
+            self.snap(next);
+        }
+    }
+
+    /// Records this tick's pose as a discontinuity: do not interpolate, the
+    /// entity is simply *there* now.
+    ///
+    /// Respawn and the campaign warp are the cases. Interpolating across either
+    /// draws the ship as a streak the length of the map, over one tick.
+    fn snap(&mut self, to: Pose) {
+        self.prev = to;
+        self.curr = to;
+    }
+
+    /// The pose to draw, `alpha` of the way through the current tick interval.
+    fn at(&self, alpha: f32) -> Pose {
+        self.prev.mix(self.curr, alpha)
+    }
+}
+
+/// Marks a rendered entity as having been moved discontinuously: its next
+/// sample snaps instead of interpolating.
+///
+/// Two other routes reach the same [`Interp::snap`], and this is the one for a
+/// system that *knows* it teleported something — insert it in the same frame as
+/// the move and the sampler consumes it on the next tick. The other two are
+/// `SimEvent::ShipRespawned`, which the simulation announces on its own, and
+/// the [`TELEPORT_DIST_SQ`] guard, which catches whatever announces nothing.
+#[derive(Component)]
+pub struct Snap;
 
 /// Handles the sync systems need but must not reload every frame.
 #[derive(Resource)]
@@ -67,16 +268,21 @@ impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Registry>()
             .add_systems(Startup, setup)
-            // `Update` after the fixed step, so a frame that ran a tick renders
-            // that tick rather than the previous one.
-            //
-            // TODO(interpolation): at 60 Hz sim and a 144 Hz display this snaps
-            // to the last tick, which shows as judder. The fix is the standard
-            // one — keep the previous transform and lerp by
-            // `Time<Fixed>::overstep_fraction()` in `RunFixedMainLoop`'s
-            // `AfterFixedMainLoop` set. Left out here because it is a
-            // smoothness change, not a pipeline one.
-            .add_systems(Update, (sync_ships, sync_rocks).after(SimSet));
+            // Sampling is per *tick*. `FixedUpdate`, after `SimSet`, is the
+            // only place `prev` and `curr` are guaranteed to be consecutive
+            // ticks — see the module docs on why sampling in `Update` freezes
+            // on a frame that ran no tick and lurches on one that ran two.
+            .add_systems(FixedUpdate, (sample_ships, sample_rocks).after(SimSet))
+            // Drawing is per *frame*. `AfterFixedMainLoop` is where Bevy's own
+            // docs put this: the fixed loop has finished, so
+            // `overstep_fraction` is the leftover accumulator and nothing else
+            // will consume it, and it still lands before `Update` and
+            // `PostUpdate` — which is to say before the chase camera reads the
+            // scene and before `TransformSystems::Propagate`.
+            .add_systems(
+                RunFixedMainLoop,
+                draw_interpolated.in_set(RunFixedMainLoopSystems::AfterFixedMainLoop),
+            );
     }
 }
 
@@ -273,15 +479,31 @@ fn install_space_lights(commands: &mut Commands, rules: &sim::rules::Rules) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-frame sync
+// Per-tick sampling
 // ---------------------------------------------------------------------------
 
-fn sync_ships(
+/// Whether the simulation announced that this ship was placed rather than
+/// moved this tick.
+///
+/// `SimEvent::ShipRespawned` is the simulation saying so itself, which is the
+/// signal to prefer: respawn and the campaign warp both go through it, and it
+/// needs no threshold. It is a linear scan of a list that holds single digits,
+/// against a ship list that holds ten, so there is nothing to index here.
+fn was_placed(frame: &sim::world::Frame, id: sim::world::EntityId) -> bool {
+    frame.events.iter().any(|e| {
+        matches!(
+            e,
+            sim::world::SimEvent::ShipRespawned { id: respawned, .. } if *respawned == id
+        )
+    })
+}
+
+fn sample_ships(
     mut commands: Commands,
     frame: Res<SimFrame>,
     scene: Res<SceneAssets>,
     mut reg: ResMut<Registry>,
-    mut q: Query<(&mut Transform, &mut Visibility), With<ShipRoot>>,
+    mut q: Query<(&mut Interp, &mut Visibility, Has<Snap>), With<ShipRoot>>,
 ) {
     for view in &frame.0.ships {
         // Boss hitboxes are never drawn — they exist so one damage path can
@@ -290,11 +512,15 @@ fn sync_ships(
             continue;
         }
 
+        let pose = Pose::of_ship(view);
+
         let entity = *reg.ships.entry(view.id).or_insert_with(|| {
             commands
                 .spawn((
                     ShipRoot(view.id),
-                    Transform::from_translation(pos(view.pos)).with_rotation(rot(view.quat)),
+                    pose.transform(),
+                    // First tick: no previous pose, so both ends are this one.
+                    Interp::spawned(pose),
                     Visibility::default(),
                 ))
                 .with_child((
@@ -311,9 +537,19 @@ fn sync_ships(
                 .id()
         });
 
-        if let Ok((mut tf, mut vis)) = q.get_mut(entity) {
-            tf.translation = pos(view.pos);
-            tf.rotation = rot(view.quat);
+        // Miss on the tick the entity was spawned — `Interp::spawned` above
+        // already holds this pose, and the commands have not been applied yet.
+        if let Ok((mut interp, mut vis, marked)) = q.get_mut(entity) {
+            if marked {
+                commands.entity(entity).remove::<Snap>();
+            }
+            if marked || was_placed(&frame.0, view.id) {
+                interp.snap(pose);
+            } else {
+                interp.advance(pose);
+            }
+
+            // Discrete, so it is set on the tick and never blended.
             *vis = if view.flags.contains(sim::world::ShipFlags::ALIVE) {
                 Visibility::Inherited
             } else {
@@ -395,14 +631,16 @@ fn ultra_material_sweep(
     }
 }
 
-fn sync_rocks(
+fn sample_rocks(
     mut commands: Commands,
     frame: Res<SimFrame>,
     scene: Res<SceneAssets>,
     mut reg: ResMut<Registry>,
-    mut q: Query<&mut Transform, With<Rock>>,
+    mut q: Query<(&mut Interp, Has<Snap>), With<Rock>>,
 ) {
     for view in &frame.0.asteroids {
+        let pose = Pose::of_rock(view);
+
         let entity = *reg.rocks.entry(view.id).or_insert_with(|| {
             // The variant is simulation state precisely so every client picks
             // the same mesh. `RockView` does not carry it, so it is rederived
@@ -413,16 +651,22 @@ fn sync_rocks(
                     Rock(view.id),
                     Mesh3d(scene.rock_meshes[variant].clone()),
                     MeshMaterial3d(scene.rock_material.clone()),
-                    Transform::default(),
+                    // Was `Transform::default()`, which put every rock at the
+                    // origin for the one frame between spawning it and the next
+                    // tick's write.
+                    pose.transform(),
+                    Interp::spawned(pose),
                 ))
                 .id()
         });
 
-        if let Ok(mut tf) = q.get_mut(entity) {
-            tf.translation = pos(view.pos);
-            // The rock meshes are unit-radius, so `size` is the scale directly.
-            tf.scale = Vec3::splat(view.size);
-            tf.rotation = Quat::from_euler(EulerRot::XYZ, view.rot[0], view.rot[1], view.rot[2]);
+        if let Ok((mut interp, marked)) = q.get_mut(entity) {
+            if marked {
+                commands.entity(entity).remove::<Snap>();
+                interp.snap(pose);
+            } else {
+                interp.advance(pose);
+            }
         }
 
         // TODO(damage tint): `view.hp` and `view.hit_flash` drive the flash in
@@ -439,6 +683,29 @@ fn sync_rocks(
         }
         live
     });
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame draw
+// ---------------------------------------------------------------------------
+
+/// Draws every sampled entity between its last two ticks.
+///
+/// The whole of the judder fix, and the only system that writes a `Transform`
+/// the simulation did not produce.
+///
+/// `alpha` comes from [`Time<Fixed>::overstep_fraction`] — Bevy 0.19's name for
+/// the fixed accumulator's leftover, as a 0..1 fraction of one timestep. Read
+/// in `RunFixedMainLoopSystems::AfterFixedMainLoop` it is exactly "how long ago
+/// the last tick ran", which is what makes it the blend factor. The clamp is
+/// belt and braces: the fixed loop leaves it below 1 by construction, but a
+/// paused or rate-scaled `Time<Virtual>` is not this system's problem to
+/// diagnose.
+fn draw_interpolated(fixed: Res<Time<Fixed>>, mut q: Query<(&Interp, &mut Transform)>) {
+    let alpha = fixed.overstep_fraction().clamp(0.0, 1.0);
+    for (interp, mut tf) in &mut q {
+        *tf = interp.at(alpha).transform();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,4 +776,272 @@ fn value_noise(x: f32, y: f32, z: f32, o: &[f32; 6]) -> f32 {
     let b = (y * 2.1 + o[2]).sin() * (z * 1.9 + o[3]).cos();
     let c = (z * 1.5 + o[4]).sin() * (x * 2.3 + o[5]).cos();
     (a + b + c) / 3.0
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// The interpolation math only. Everything below is pure — [`Pose`] and
+/// [`Interp`] were split out from the systems precisely so that the part with
+/// the failure modes (long-way rotation, interpolating in from the origin,
+/// streaking across a teleport) can be tested without standing up an `App`, a
+/// window, or a render device.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::PI;
+
+    /// Tolerance on positions and scales.
+    const EPS: f32 = 1e-4;
+
+    /// Tolerance on *angles*, in radians. Two orders looser than [`EPS`] and it
+    /// has to be: `Quat::angle_between` is `2 * acos(|dot|)`, and `acos` near 1
+    /// is where a float loses half its bits — an f32 quaternion one ulp off
+    /// unit already reads as 7e-4 rad of rotation. This is still 0.1 of a
+    /// degree, which is far tighter than anything the eye resolves at 144 Hz.
+    const ROT_EPS: f32 = 2e-3;
+
+    fn deg(d: f32) -> f32 {
+        d * PI / 180.0
+    }
+
+    /// Two poses are the same pose. Rotation is compared as a *rotation*, not
+    /// as four numbers: `q` and `-q` are the same orientation, and slerp
+    /// returns whichever of the two lay on the short arc.
+    #[track_caller]
+    fn assert_same(got: Pose, want: Pose) {
+        assert!(
+            got.translation.abs_diff_eq(want.translation, EPS),
+            "translation {:?} != {:?}",
+            got.translation,
+            want.translation
+        );
+        assert!(
+            got.rotation.angle_between(want.rotation) < ROT_EPS,
+            "rotation {:?} != {:?}",
+            got.rotation,
+            want.rotation
+        );
+        assert!(
+            got.scale.abs_diff_eq(want.scale, EPS),
+            "scale {:?} != {:?}",
+            got.scale,
+            want.scale
+        );
+    }
+
+    fn pose(x: f32, yaw_deg: f32) -> Pose {
+        Pose {
+            translation: Vec3::new(x, 0.0, 0.0),
+            rotation: Quat::from_rotation_y(deg(yaw_deg)),
+            scale: Vec3::ONE,
+        }
+    }
+
+    // -- The ends of the interval -------------------------------------------
+
+    #[test]
+    fn alpha_zero_is_the_previous_tick() {
+        let interp = Interp {
+            prev: pose(10.0, 0.0),
+            curr: pose(20.0, 90.0),
+        };
+        assert_same(interp.at(0.0), interp.prev);
+    }
+
+    #[test]
+    fn alpha_one_is_the_current_tick() {
+        let interp = Interp {
+            prev: pose(10.0, 0.0),
+            curr: pose(20.0, 90.0),
+        };
+        assert_same(interp.at(1.0), interp.curr);
+    }
+
+    #[test]
+    fn alpha_half_is_halfway() {
+        let interp = Interp {
+            prev: pose(10.0, 0.0),
+            curr: pose(20.0, 90.0),
+        };
+        assert_same(interp.at(0.5), pose(15.0, 45.0));
+    }
+
+    // -- Rotation -----------------------------------------------------------
+
+    /// The reason this is slerp and not lerp.
+    ///
+    /// A quaternion lerp crosses the chord rather than the arc, so
+    /// renormalizing it sweeps the angle fastest at the ends and slowest
+    /// through the middle. On a ship holding one steady roll that is a visible
+    /// speed-up and slow-down inside every tick. Slerp's four quarter-steps are
+    /// equal; the same test run against a lerp is asserted to fail, so this
+    /// cannot pass by accident if someone swaps the call.
+    #[test]
+    fn rotation_sweeps_at_a_constant_rate() {
+        let interp = Interp {
+            prev: pose(0.0, 0.0),
+            curr: pose(0.0, 150.0),
+        };
+
+        let step = |a: f32, b: f32| interp.at(a).rotation.angle_between(interp.at(b).rotation);
+        let quarter = deg(150.0) / 4.0;
+        for (a, b) in [(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0)] {
+            let got = step(a, b);
+            assert!(
+                (got - quarter).abs() < 1e-3,
+                "slerp {a}..{b} swept {got} rad, expected {quarter}"
+            );
+        }
+
+        // And the naive alternative does not have that property.
+        let lerped =
+            |a: f32| (interp.prev.rotation * (1.0 - a) + interp.curr.rotation * a).normalize();
+        let first = lerped(0.0).angle_between(lerped(0.25));
+        let middle = lerped(0.25).angle_between(lerped(0.5));
+        assert!(
+            (first - middle).abs() > 1e-2,
+            "a lerp is supposed to sweep unevenly; got {first} then {middle}"
+        );
+    }
+
+    /// A 10-degree turn written as +350 must interpolate 5 degrees the short
+    /// way, not 175 the long way. This is the case where the two candidate
+    /// quaternions `q` and `-q` differ, and getting it wrong spins a ship
+    /// almost all the way round inside one tick.
+    #[test]
+    fn rotation_takes_the_short_way_around() {
+        let interp = Interp {
+            prev: pose(0.0, 0.0),
+            curr: pose(0.0, 350.0),
+        };
+
+        let mid = interp.at(0.5).rotation;
+
+        // Rotating +Z by theta about Y gives (sin theta, 0, cos theta). The
+        // short way is theta = -5 degrees, so x is *negative*; the long way is
+        // +175, which would put x near +0.09 and z near -1.
+        let z = mid * Vec3::Z;
+        assert!(
+            z.abs_diff_eq(Vec3::new(deg(-5.0).sin(), 0.0, deg(-5.0).cos()), EPS),
+            "went the long way: +Z ended up at {z:?}"
+        );
+        assert!(mid.angle_between(Quat::IDENTITY) < deg(6.0));
+    }
+
+    /// Asteroid attitude arrives as Euler angles, which wrap. A rock spinning
+    /// through pi must keep spinning: interpolating the angles themselves would
+    /// average +3.13 and -3.13 to zero and snap it back to its rest pose every
+    /// time it came round.
+    #[test]
+    fn a_rock_spinning_through_pi_does_not_reverse() {
+        let rock = |y: f32| sim::world::RockView {
+            id: 7,
+            hp: 5,
+            pos: [0.0; 3],
+            rot: [0.0, y, 0.0],
+            size: 1.0,
+            hit_flash: 0.0,
+        };
+
+        let mut interp = Interp::spawned(Pose::of_rock(&rock(3.13)));
+        interp.advance(Pose::of_rock(&rock(-3.13)));
+
+        // Continuous, so it interpolated rather than snapping...
+        assert_ne!(interp.prev.rotation, interp.curr.rotation);
+        // ...and halfway between them is half a turn, not no turn.
+        let z = interp.at(0.5).rotation * Vec3::Z;
+        assert!(z.z < -0.999, "halfway through the wrap +Z was {z:?}");
+    }
+
+    // -- Spawns -------------------------------------------------------------
+
+    /// A rock or ship that appeared this tick has no previous pose. It must
+    /// draw where the simulation put it, not slide in from the origin.
+    #[test]
+    fn a_spawn_does_not_interpolate_in_from_the_origin() {
+        let at = Pose {
+            translation: Vec3::new(-320.0, 40.0, 180.0),
+            rotation: Quat::from_rotation_x(deg(30.0)),
+            scale: Vec3::splat(12.0),
+        };
+        let interp = Interp::spawned(at);
+
+        for alpha in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert_same(interp.at(alpha), at);
+        }
+    }
+
+    // -- Teleports ----------------------------------------------------------
+
+    /// Respawn and the campaign warp. Interpolating across one draws the ship
+    /// as a streak the length of the map.
+    #[test]
+    fn a_snap_does_not_interpolate() {
+        let mut interp = Interp {
+            prev: pose(10.0, 0.0),
+            curr: pose(20.0, 90.0),
+        };
+
+        let respawn = Pose {
+            translation: Vec3::new(0.0, 0.0, -540.0),
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        };
+        interp.snap(respawn);
+
+        for alpha in [0.0, 0.5, 1.0] {
+            assert_same(interp.at(alpha), respawn);
+        }
+    }
+
+    /// The backstop, for a discontinuity that arrives without a
+    /// `SimEvent::ShipRespawned` to announce it.
+    #[test]
+    fn an_impossible_jump_snaps_instead_of_streaking() {
+        let mut interp = Interp::spawned(pose(0.0, 0.0));
+        let elsewhere = pose(600.0, 0.0);
+        interp.advance(elsewhere);
+
+        assert_same(interp.at(0.0), elsewhere);
+        assert_same(interp.at(0.5), elsewhere);
+    }
+
+    /// ...and an attitude reset in place, which moves nothing.
+    #[test]
+    fn an_impossible_turn_snaps_too() {
+        let mut interp = Interp::spawned(pose(0.0, 0.0));
+        let flipped = pose(0.0, 180.0);
+        interp.advance(flipped);
+
+        assert_same(interp.at(0.0), flipped);
+    }
+
+    /// The other half of the threshold, and the one that would silently ruin
+    /// the fix: real motion at the fastest the flight model allows must still
+    /// interpolate. If someone tightens [`TELEPORT_DIST_SQ`], a boosting ship
+    /// snaps every tick and the judder is back.
+    #[test]
+    fn top_speed_is_still_motion() {
+        let step = (TOP_SPEED * sim::world::TICK_DT) as f32;
+        let mut interp = Interp::spawned(pose(0.0, 0.0));
+        interp.advance(pose(step, 0.0));
+
+        assert_same(interp.at(0.0), pose(0.0, 0.0));
+        assert_same(interp.at(1.0), pose(step, 0.0));
+    }
+
+    /// And so must the fastest authored rotation.
+    #[test]
+    fn the_fastest_roll_is_still_motion() {
+        let per_tick = (RULES.ship.roll_rate * sim::world::TICK_DT) as f32;
+        let mut interp = Interp::spawned(pose(0.0, 0.0));
+        interp.advance(pose(0.0, per_tick * 180.0 / PI));
+
+        assert!(
+            interp.prev.rotation.angle_between(interp.curr.rotation) > 0.0,
+            "a roll at the authored rate was mistaken for a teleport"
+        );
+    }
 }

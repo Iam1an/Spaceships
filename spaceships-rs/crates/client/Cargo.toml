@@ -15,6 +15,11 @@ rust-version = "1.95"
 # The whole point: the renderer reads the simulation, never the reverse.
 spaceships-sim.workspace = true
 
+# The 35 wire messages. Plain serde/JSON, no platform assumptions, so the same
+# crate compiles for both transports in `net.rs` without a single `cfg`.
+spaceships-protocol.workspace = true
+serde_json.workspace = true
+
 # Pinned exactly. Bevy renames core types every release (this crate was written
 # against 0.19: `SceneRoot` is `WorldAssetRoot`, `EventReader` is
 # `MessageReader`, `shadows_enabled` is `shadow_maps_enabled`), so a caret
@@ -85,6 +90,14 @@ features = [
   # forever rather than reporting. See `HUD_FONT` in `hud.rs` for the swap.
   "default_font",
 
+  # -- audio ---------------------------------------------------------------
+  # NOT implied by "3d"; `default-features = false` dropped it. `bevy_audio`
+  # brings rodio (cpal on native, WebAudio on wasm) plus AudioPlayer/AudioSink.
+  # `mp3` because every file in public/sounds/ is one and nothing else decodes
+  # them — it routes through symphonia, pure Rust, builds for wasm unchanged.
+  "bevy_audio",
+  "mp3",
+
   # -- image formats -------------------------------------------------------
   # png: the glTF's embedded textures. jpeg: "moon Texture.jpg", for when the
   # moon lands. ktx2+zstd_rust: bevy's own tonemapping LUTs are ktx2/zstd.
@@ -118,3 +131,63 @@ features = ["webgl2"]
 # `__getrandom_v03_custom` that reads like a Bevy problem and is not one.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "=0.3.4", default-features = false, features = ["wasm_js"] }
+wasm-bindgen = "=0.2.126"
+
+# ── net.rs, native half ──────────────────────────────────────────────────────
+# The socket runs on one dedicated OS thread with a current-thread tokio
+# runtime; see the `native` module in src/net.rs for why it is not on Bevy's
+# `IoTaskPool` (tokio-tungstenite needs a tokio reactor in scope, and Bevy's
+# executor is `async_executor`, which does not provide one).
+#
+# All three are `workspace = true` rather than re-pinned here: the server
+# already pins tokio `=1.53.1`, tokio-tungstenite `=0.30.0`, and futures-util
+# `=0.3.33`, and a second pin in this file is a second thing to forget to bump.
+# Cargo's feature unification means the server's feature set is what gets built
+# for a workspace-wide `cargo build` regardless of what this crate asks for.
+#
+# No TLS feature. `default = [connect, handshake]` speaks `ws://` only; `wss://`
+# needs `features = ["rustls-tls-webpki-roots"]` and roughly 15 more crates in
+# the lockfile. `connect()` in net.rs rejects a `wss://` URL with a message
+# naming that line rather than failing inside the handshake. The native build is
+# the desktop/dev client and talks to a local server; the browser build reaches
+# production, and there the browser owns TLS.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
+# ── net.rs, wasm half ────────────────────────────────────────────────────────
+# No socket crate: the browser already has one. `web-sys` is a facade over
+# `window.WebSocket`, so the whole wasm transport is four `Closure`s and a
+# queue, and none of tungstenite's framing, masking, or handshake code is
+# compiled at all.
+#
+# Versions match what Bevy already resolved (wasm-bindgen 0.2.126 / web-sys
+# 0.3.103), so this adds no new lockfile entries — and wasm-bindgen in
+# particular *must* match, because build-wasm.sh checks the CLI against the
+# lockfile and a mismatched schema hash fails the bindgen step.
+
+# getrandom has no default backend on wasm32-unknown-unknown; something in the
+# graph (wgpu -> uuid, and bevy's own asset ids) pulls it in. Needs both this
+# feature and `RUSTFLAGS=--cfg getrandom_backend="wasm_js"` at build time — see
+# build-wasm.sh. Missing either produces a link error about
+# `__getrandom_v03_custom` that reads like a Bevy problem and is not one.
+getrandom = { version = "=0.3.4", default-features = false, features = ["wasm_js"] }
+
+# Every DOM type net.rs touches, named explicitly — web-sys gates all 1700+ of
+# its bindings behind features and compiles only what is asked for.
+# `Window`/`Location`/`Storage` are for deriving the socket URL and the JWT from
+# the page the way `public/src/lobby/net.js` does.
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "=0.3.103"
+features = [
+  "BinaryType",
+  "CloseEvent",
+  "ErrorEvent",
+  "Event",
+  "Location",
+  "MessageEvent",
+  "Storage",
+  "WebSocket",
+  "Window",
+]

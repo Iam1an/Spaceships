@@ -43,6 +43,28 @@ pub struct SimWorld(pub SimWorldState);
 ///
 /// Kept in a resource and refilled in place rather than returned by value, so
 /// that after the first few seconds no tick allocates — see [`Frame::clear`].
+///
+/// # This is the last *tick*, not the last frame
+///
+/// It changes at [`TICK_HZ`], which is not the display's rate. Anything that
+/// reads a position or an orientation straight out of here and puts it on
+/// screen will hold still for two or three frames and then jump — that is
+/// exactly the judder [`crate::scene`]'s interpolation exists to remove, and it
+/// re-appears in whatever reads around it.
+///
+/// The rule of thumb: **discrete state** (hit points, ammo, flags, events,
+/// scores) is correct to read here, because it has no meaningful in-between
+/// value. **Continuous state** — anything a camera, a trail, a nameplate, or a
+/// lock-on marker positions itself from — wants the interpolated pose that
+/// `scene` writes onto the entity's `Transform`, not `ShipView::pos`.
+///
+/// > `camera.rs` currently reads `ShipView::pos`/`quat` from here. Its
+/// > exponential damping filters most of the resulting staircase out, but not
+/// > all of it: measured against this tick rate at 144 Hz, a boosting ship
+/// > wobbles about 11 px at 720p against a camera that chases the raw value,
+/// > and 0 px against one that chases the interpolated pose. Fixing it means
+/// > following the `ShipRoot` entity's `Transform` instead, which is a change
+/// > in `camera.rs`.
 #[derive(Resource, Default)]
 pub struct SimFrame(pub Frame);
 
@@ -70,6 +92,13 @@ impl Plugin for SimPlugin {
             // accumulator is exactly the "accumulate real time and run a whole
             // number of ticks" the contract asks for, so the two agree without
             // any bookkeeping of our own.
+            //
+            // The *remainder* that accumulator carries — `Time<Fixed>`'s
+            // `overstep_fraction()` — is what `scene.rs` blends this tick and
+            // the last one by. That is the only thing outside this module that
+            // depends on the rate, and it depends on it in the one direction
+            // that is safe: reading how far through a tick the display is,
+            // never feeding anything back.
             .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
             .add_systems(FixedUpdate, fixed_tick.in_set(SimSet));
     }
