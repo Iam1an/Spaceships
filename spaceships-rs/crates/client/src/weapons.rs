@@ -161,7 +161,34 @@ const FLARE_GLOW_R: f32 = 1.10;
 const MAX_MOTES: usize = 320;
 
 /// `main.js` `TRAIL_OFFSETS`: the two engine nozzles, in ship-local space.
-const TRAIL_OFFSETS: [Vec3; 2] = [Vec3::new(-2.2, -0.05, -1.8), Vec3::new(2.2, -0.05, -1.8)];
+///
+/// These are the *old* model's, and they sit at x = ±2.2 on a hull about 8
+/// units across — which is out at the wings. That was right for `spaceship.glb`
+/// (six Blender primitives with engines on the outboard sections) and is wrong
+/// for anything shaped like an aircraft, where the exhaust is a pair of nozzles
+/// close to the centreline at the tail.
+const TRAIL_OFFSETS_LEGACY: [Vec3; 2] = [Vec3::new(-2.2, -0.05, -1.8), Vec3::new(2.2, -0.05, -1.8)];
+
+/// Nozzle positions for the F-22 airframe (`jet.glb`).
+///
+/// Twin nozzles inboard at the tail: x = ±0.62, slightly below the centreline,
+/// and further aft than the old model's because the hull actually extends
+/// there. Derived from the converted mesh's own rear extent rather than
+/// guessed.
+const TRAIL_OFFSETS_JET: [Vec3; 2] = [Vec3::new(-0.62, -0.08, -3.5), Vec3::new(0.62, -0.08, -3.5)];
+
+/// Exhaust origins for whichever hull is flying.
+///
+/// Keyed off the same `SPACESHIPS_SHIP_MODEL` switch `scene.rs` reads, so the
+/// trails follow the model rather than needing a second decision. When the jet
+/// becomes the default this collapses to one constant.
+fn trail_offsets() -> [Vec3; 2] {
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var("SPACESHIPS_SHIP_MODEL").is_ok_and(|m| m.contains("jet")) {
+        return TRAIL_OFFSETS_JET;
+    }
+    TRAIL_OFFSETS_LEGACY
+}
 
 /// One row of `main.js`'s `EMIT_CONFIG`.
 struct EmitMode {
@@ -657,7 +684,7 @@ fn emit_trails(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
         let quat = rot(ship.quat);
         let base = to_vec3(ship.pos);
 
-        for offset in TRAIL_OFFSETS {
+        for offset in trail_offsets() {
             let nozzle = base + quat * offset;
             for _ in 0..n {
                 let j = mode.jitter;
@@ -1586,7 +1613,7 @@ mod tests {
 
         // Every one of them sits at a nozzle, not at the hull origin.
         for m in &fx.motes {
-            let d = TRAIL_OFFSETS
+            let d = trail_offsets()
                 .iter()
                 .map(|o| m.pos.distance(*o))
                 .fold(f32::INFINITY, f32::min);
