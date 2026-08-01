@@ -24,7 +24,7 @@ import { createWarpEffect } from './warp.js';
 import {
   ULTRA, rendererParams, configureRenderer, createComposer, createUltraSkybox,
   applyEnvironment, applySkyEnvironment, sweepScene, installSpaceLights,
-  upgradeTerrainSun,
+  upgradeTerrainSun, installContextLossGuard, contextLossMessage,
 } from './graphics.js';
 let started = false;
 export async function startGame(opts = {}) {
@@ -38,6 +38,11 @@ export async function startGame(opts = {}) {
   renderer.shadowMap.type = THREE.BasicShadowMap;
   configureRenderer(renderer);
   document.body.appendChild(renderer.domElement);
+  let contextLost = false;
+  installContextLossGuard(renderer, () => {
+    contextLost = true;
+    document.body.appendChild(contextLossMessage());
+  });
   const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2500);
   const BASE_FOV = camera.fov;
   // The retro filter and the ultra pipeline are opposing looks; ultra wins.
@@ -65,6 +70,9 @@ export async function startGame(opts = {}) {
   }
   const ultraFx = createComposer(renderer, scene, camera);
   function renderFrame(dt = 0.016) {
+    // Drawing into a lost context throws on every frame; the guard has already
+    // put an explanation on screen.
+    if (contextLost) return;
     if (ultraFx) {
       ultraFx.render(dt);
     } else if (pixelEnabled) {
