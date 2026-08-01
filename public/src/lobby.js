@@ -95,6 +95,21 @@ pixelFilterInput.checked = localStorage.getItem(SAVED_PIXEL_KEY) !== '0';
 pixelFilterInput.addEventListener('change', () => {
   localStorage.setItem(SAVED_PIXEL_KEY, pixelFilterInput.checked ? '1' : '0');
 });
+// Ultra graphics is read once at game start, so the toggle only takes effect on
+// the next launch. Off by default.
+const ultraGraphicsInput = document.getElementById('ultraGraphicsInput');
+const SAVED_ULTRA_KEY = 'spaceships:ultraGraphics';
+function syncPixelAvailability() {
+  const on = ultraGraphicsInput.checked;
+  pixelFilterInput.disabled = on;
+  pixelFilterInput.closest('label').style.opacity = on ? '0.4' : '';
+}
+ultraGraphicsInput.checked = localStorage.getItem(SAVED_ULTRA_KEY) === '1';
+syncPixelAvailability();
+ultraGraphicsInput.addEventListener('change', () => {
+  localStorage.setItem(SAVED_ULTRA_KEY, ultraGraphicsInput.checked ? '1' : '0');
+  syncPixelAvailability();
+});
 const enemyTrailsInput = document.getElementById('enemyTrailsInput');
 const SAVED_ENEMY_TRAILS = 'spaceships:enemyTrails';
 enemyTrailsInput.checked = localStorage.getItem(SAVED_ENEMY_TRAILS) !== '0';

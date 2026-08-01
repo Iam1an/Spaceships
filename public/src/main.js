@@ -21,20 +21,27 @@ import { createBotAI } from './bot.js';
 import { createTouchHud } from './touchhud.js';
 import { getSavedShipColor, getSavedAccentColor, getSavedTrailColor, getSavedTrailShape } from './customization.js';
 import { createWarpEffect } from './warp.js';
+import {
+  ULTRA, rendererParams, configureRenderer, createComposer, createUltraSkybox,
+  applyEnvironment, applySkyEnvironment, sweepScene, installSpaceLights,
+  upgradeTerrainSun,
+} from './graphics.js';
 let started = false;
 export async function startGame(opts = {}) {
   if (started) return;
   started = true;
   const scene = new THREE.Scene();
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  const renderer = new THREE.WebGLRenderer(rendererParams({ antialias: true }));
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.BasicShadowMap;
+  configureRenderer(renderer);
   document.body.appendChild(renderer.domElement);
   const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2500);
   const BASE_FOV = camera.fov;
-  const pixelEnabled = localStorage.getItem('spaceships:pixelFilter') !== '0';
+  // The retro filter and the ultra pipeline are opposing looks; ultra wins.
+  const pixelEnabled = !ULTRA && localStorage.getItem('spaceships:pixelFilter') !== '0';
   const PIXEL_SCALE = 3;
   const pixelRT = pixelEnabled ? new THREE.WebGLRenderTarget(
     Math.max(1, Math.floor(window.innerWidth / PIXEL_SCALE)),
@@ -56,8 +63,11 @@ export async function startGame(opts = {}) {
     );
     postScene.add(quad);
   }
-  function renderFrame() {
-    if (pixelEnabled) {
+  const ultraFx = createComposer(renderer, scene, camera);
+  function renderFrame(dt = 0.016) {
+    if (ultraFx) {
+      ultraFx.render(dt);
+    } else if (pixelEnabled) {
       renderer.setRenderTarget(pixelRT);
       renderer.render(scene, camera);
       renderer.setRenderTarget(null);
@@ -73,7 +83,7 @@ export async function startGame(opts = {}) {
     if (!isLoading) return;
     const dt = Math.min(0.05, clock.getDelta());
     warpEffect.update(dt);
-    renderFrame();
+    renderFrame(dt);
     requestAnimationFrame(loadingLoop);
   }
   loadingLoop();
@@ -87,7 +97,7 @@ export async function startGame(opts = {}) {
   camera.updateProjectionMatrix();
   let terrainSun = null;
   if (isTerrainMap) {
-    scene.add(new THREE.AmbientLight(0xfff8e8, 0.60));
+    scene.add(new THREE.AmbientLight(0xfff8e8, ULTRA ? 0.28 : 0.60));
     terrainSun = new THREE.DirectionalLight(0xfff5cc, 1.4);
     terrainSun.position.set(0, 500, 0);
     terrainSun.castShadow = true;
@@ -102,6 +112,13 @@ export async function startGame(opts = {}) {
     scene.add(terrainSun);
     scene.background = new THREE.Color(0x6fa8d4);
     scene.fog = new THREE.Fog(0xbbd5f0, 1400, 4800);
+    upgradeTerrainSun(terrainSun);
+    applySkyEnvironment(scene, renderer, 0x6fa8d4, 0x4a4335);
+  } else if (ULTRA) {
+    installSpaceLights(scene);
+    const sky = createUltraSkybox();
+    scene.background = sky;
+    applyEnvironment(scene, renderer, sky);
   } else {
     scene.add(new THREE.AmbientLight(0xffffff, 0.35));
     const sun = new THREE.DirectionalLight(0xffffff, 1.1);
@@ -3444,12 +3461,24 @@ export async function startGame(opts = {}) {
     e.preventDefault();
     if (scoreboardEl) scoreboardEl.classList.toggle('visible');
   }, true);
+  // Ships, bolts and debris spawn throughout the match, so the ultra material
+  // pass runs on a slow cadence rather than once. Already-upgraded materials
+  // are tracked in a WeakSet, so repeat sweeps only cost the traversal.
+  let ultraSweepTimer = 0;
+  function ultraSweep(dt) {
+    if (!ULTRA) return;
+    ultraSweepTimer -= dt;
+    if (ultraSweepTimer > 0) return;
+    ultraSweepTimer = 0.5;
+    sweepScene(scene);
+  }
   function loop() {
     try {
       const dt = Math.min(0.05, clock.getDelta());
       update(dt);
       touchHud.update();
-      renderFrame();
+      ultraSweep(dt);
+      renderFrame(dt);
     } catch (err) {
       console.error('Game loop error:', err);
     }
@@ -3459,6 +3488,7 @@ export async function startGame(opts = {}) {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    if (ultraFx) ultraFx.setSize(window.innerWidth, window.innerHeight);
     if (pixelRT) {
       pixelRT.setSize(
         Math.max(1, Math.floor(window.innerWidth / PIXEL_SCALE)),
