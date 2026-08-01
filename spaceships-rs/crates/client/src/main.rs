@@ -73,6 +73,8 @@ mod net;
 mod scene;
 mod sim_bridge;
 mod skybox;
+mod ui;
+mod warp;
 mod weapons;
 
 use bevy::asset::AssetPlugin;
@@ -154,6 +156,8 @@ fn main() {
         net::NetPlugin,
         weapons::WeaponsPlugin,
         cockpit::CockpitPlugin,
+        ui::UiPlugin,
+        warp::WarpPlugin,
     ))
     .add_systems(Update, report_frame_time);
 
