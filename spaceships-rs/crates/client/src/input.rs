@@ -113,7 +113,11 @@ fn gather_input(
         arrow_fine: keys.pressed(KeyCode::KeyQ) || keys.pressed(KeyCode::ControlLeft),
 
         // Roll. `main.js:1249`.
-        roll: axis(KeyCode::KeyD, KeyCode::KeyA),
+        // Sign matters and was inverted. `main.js:1255`-`:1256` is
+        // `KeyD -> roll += RATE`, `KeyA -> roll -= RATE`, so D is positive.
+        // `axis(neg, pos)` returns `pos - neg`, which means D belongs in the
+        // `pos` slot -- the other way round rolled left when you pressed D.
+        roll: axis(KeyCode::KeyA, KeyCode::KeyD),
 
         // Throttle. W/S is the continuous axis; the mouse wheel's discrete
         // notches and the touch HUD's absolute override are the other two
