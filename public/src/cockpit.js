@@ -21,35 +21,41 @@ import { createDash } from './dash.js';
 export const COCKPIT_PROFILES = {
   default: {
     id: 'default',
-    eye: new THREE.Vector3(0, 0.60, 1.15),
+    // Seated forward in the blister (which spans ship-local z 0.1..2.6) and above the
+    // fuselage spine, so the view is over the nose rather than into it.
+    eye: new THREE.Vector3(0, 1.02, 1.80),
     fov: 84,
     tub: {
       halfWidth: 0.66,
-      floorY: -0.02,
-      railY: 0.38,   // canopy rail: top of the solid tub sides
+      floorY: 0.40,
+      railY: 0.80,   // canopy rail: top of the solid tub sides
       ceilY: 1.30,   // apex of the canopy hoops
-      backZ: 0.05,
-      dashZ: 2.15,
+      backZ: 0.70,
+      dashZ: 2.80,
     },
     accent: 0x5fd8ff,
     lampColor: 0x9fd0ff,
   },
   admin: {
     id: 'admin',
-    eye: new THREE.Vector3(0, 0.74, 3.55),
+    eye: new THREE.Vector3(0, 1.16, 4.15),
     fov: 86,
     tub: {
       halfWidth: 0.74,
-      floorY: 0.08,
-      railY: 0.52,
-      ceilY: 1.44,
-      backZ: 2.70,
-      dashZ: 4.55,
+      floorY: 0.54,
+      railY: 0.94,
+      ceilY: 1.58,
+      backZ: 3.05,
+      dashZ: 5.15,
     },
     accent: 0xffc451,
     lampColor: 0xffd39a,
   },
 };
+
+// Cockpit lamps and interior meshes share this layer so the lamps cannot spill onto the
+// exterior hull. Interior meshes stay on layer 0 as well, so the camera still renders them.
+export const COCKPIT_LAYER = 1;
 
 export function getCockpitProfile(isAdmin) {
   return isAdmin ? COCKPIT_PROFILES.admin : COCKPIT_PROFILES.default;
@@ -74,10 +80,6 @@ export function createCockpit(profile) {
 
   const glowMat = (hex) => new THREE.MeshBasicMaterial({ color: hex, toneMapped: false });
   const accentMat = glowMat(accent);
-  const glassMat = new THREE.MeshBasicMaterial({
-    color: 0x18313f, transparent: true, opacity: 0.16,
-    side: THREE.DoubleSide, depthWrite: false, toneMapped: false,
-  });
 
   const box = (w, h, d, mat, x, y, z) => {
     const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
@@ -93,20 +95,20 @@ export function createCockpit(profile) {
   const railLen = railZ1 - railZ0;
   const railMidZ = (railZ0 + railZ1) / 2;
 
-  // ---- floor: solid under the seat, glazed forward so you can see beneath you -----------
-  const glassStartZ = eye.z + 0.18;
-  box(HW * 2, 0.04, glassStartZ - backZ, panelMat, 0, floorY, (backZ + glassStartZ) / 2);
-  const chin = new THREE.Mesh(
-    new THREE.PlaneGeometry(HW * 1.9, dashZ - glassStartZ), glassMat,
-  );
-  chin.rotation.x = -Math.PI / 2;
-  chin.position.set(0, floorY + 0.005, (glassStartZ + dashZ) / 2);
-  group.add(chin);
-  // ribs, so the chin window reads as glazing rather than a hole in the floor
-  for (const x of [-HW * 0.62, 0, HW * 0.62]) {
-    box(0.022, 0.03, dashZ - glassStartZ, frameMat, x, floorY, (glassStartZ + dashZ) / 2);
+  // ---- floor: solid, with a raised footwell deck ----------------------------------------
+  // A glazed floor read as a missing floor rather than a window, so the tub is closed now.
+  // Downward context comes from the hull itself, which stays drawn in first person.
+  box(HW * 2, 0.04, dashZ - backZ, panelMat, 0, floorY, (backZ + dashZ) / 2);
+  // tread plates + a longitudinal rib, so the floor isn't a single flat slab
+  for (const x of [-HW * 0.60, HW * 0.60]) {
+    box(0.30, 0.022, (dashZ - eye.z) * 0.8, trimMat, x, floorY + 0.03, eye.z + (dashZ - eye.z) * 0.5);
   }
-  box(HW * 1.9, 0.03, 0.03, frameMat, 0, floorY, dashZ - 0.02);
+  box(0.09, 0.035, dashZ - backZ, frameMat, 0, floorY + 0.028, (backZ + dashZ) / 2);
+  // footwell lighting, washing up off the deck
+  for (const s of [-1, 1]) {
+    box(0.016, 0.008, (dashZ - eye.z) * 0.6, glowMat(lampColor),
+      s * (HW - 0.30), floorY + 0.045, eye.z + (dashZ - eye.z) * 0.55);
+  }
 
   // ---- tub sides: only up to the canopy rail ---------------------------------------------
   for (const s of [-1, 1]) {
@@ -213,23 +215,18 @@ export function createCockpit(profile) {
     box(0.05, 0.016, 0.24, frameMat, s * 0.20, floorY + 0.018, eye.z + 0.60);
   }
 
-  // ---- centre panel detail, between the two displays ----------------------------------------
-  // Sits above the stick, so it adds lit clutter without anything obscuring it.
-  for (let i = 0; i < 3; i++) {
-    const y = dashTopY - 0.055 - i * 0.055;
-    box(0.075, 0.030, 0.030, trimMat, 0, y, dashZ - 0.19);
-    box(0.042, 0.014, 0.030, glowMat(i === 0 ? 0xff5a3c : i === 1 ? 0xffd24a : 0x46ff9b),
-      0, y + 0.009, dashZ - 0.205);
-  }
-
   // ---- fill light ------------------------------------------------------------------------------------
   // High and behind the head. Sitting it just above the stick meant a decay-2 point light
   // was effectively inside the grip, washing the whole thing out to pale grey.
+  // Scoped to COCKPIT_LAYER so they light the interior only. Now that the hull stays drawn
+  // in first person, unscoped point lights this close blew its inner surfaces out to white.
   const lamp = new THREE.PointLight(lampColor, 1.3, 2.6, 2);
   lamp.position.set(0, railY + 0.38, eye.z - 0.06);
+  lamp.layers.set(COCKPIT_LAYER);
   group.add(lamp);
   const panelLamp = new THREE.PointLight(accent, 0.8, 0.75, 2);
   panelLamp.position.set(0, dashTopY + 0.02, dashZ - 0.15);
+  panelLamp.layers.set(COCKPIT_LAYER);
   group.add(panelLamp);
 
   const dash2 = createDash(profile, accent);
@@ -239,7 +236,12 @@ export function createCockpit(profile) {
   group.userData.isInterior = true;
   group.traverse((o) => {
     o.userData.isInterior = true;
-    if (o.isMesh) { o.castShadow = false; o.receiveShadow = false; }
+    if (o.isMesh) {
+      o.castShadow = false;
+      o.receiveShadow = false;
+      // Keep layer 0 (so the camera draws it) and add the cockpit lighting layer.
+      o.layers.enable(COCKPIT_LAYER);
+    }
   });
 
   return {

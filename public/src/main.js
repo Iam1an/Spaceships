@@ -405,20 +405,40 @@ export async function startGame(opts = {}) {
   const camTel = {
     steerX: 0, steerY: 0, throttle01: 0, speed: 0, hpFrac: 1, boosting: false,
     missiles: 0, flares: 0, heat01: 1, gunMode: 'bullet', boost01: 1, charge01: 0,
-    targetLock: false, missileLock: false, hitFlash: 0,
+    targetLock: false, missileLock: false, hitFlash: 0, contacts: [],
   };
-  // The exterior hull is never drawn in first person. The fighter's single-sided materials
-  // would show through the floor, and the admin ship's DoubleSide hull (ship.js:47) is fully
-  // opaque from the inside. The cockpit interior replaces it entirely.
-  function setExteriorVisible(v) {
+  // Arena scale: the two motherships sit at z -600 and +600, so a 500-unit scope showed
+  // an empty screen for most of a match.
+  const RADAR_RANGE = 1200;
+  const _radarQ = new THREE.Quaternion();
+  const _radarV = new THREE.Vector3();
+  // In first person the hull stays DRAWN, so you can see your own nose, wings and engines
+  // from the cockpit rather than floating in a detached box. It is forced to FrontSide, which
+  // back-face culls everything enclosing the eye — the admin hull is authored DoubleSide
+  // (ship.js:47) and would otherwise be a solid black wall from the inside. Only the canopy
+  // shell itself is hidden, since the cockpit interior provides its own.
+  const CANOPY_RE = /cockpit|canopy|glass|windshield|window/i;
+  const isCanopyMesh = (o) => CANOPY_RE.test(o.name || '') || CANOPY_RE.test(o.material?.name || '');
+  function applyExteriorMode(fp) {
     for (const child of ship.children) {
       if (child.userData?.isInterior) continue;
-      child.visible = v;
+      child.traverse((o) => {
+        if (!o.isMesh || !o.material) return;
+        if (o.userData._origSide === undefined) o.userData._origSide = o.material.side;
+        if (fp) {
+          o.material.side = THREE.FrontSide;
+          o.visible = !isCanopyMesh(o);
+        } else {
+          o.material.side = o.userData._origSide;
+          o.visible = true;
+        }
+      });
+      child.visible = true;
     }
   }
   function syncShipVisibility() {
     const fp = inCockpit();
-    setExteriorVisible(!fp);
+    applyExteriorMode(fp);
     cockpit.group.visible = fp;
     // The 3D dash replaces the DOM meters, which would otherwise sit right on top of it.
     document.body.classList.toggle('cockpit-view', fp);
@@ -442,7 +462,7 @@ export async function startGame(opts = {}) {
   }
   window.__fpDebug = () => ({
     viewMode, inCockpit: inCockpit(), profile: cockpitProfile.id, fov: camera.fov,
-    exteriorVisible: ship.children.some((c) => !c.userData?.isInterior && c.visible),
+    contacts: camTel.contacts.length,
   });
   syncShipVisibility();
   activeCam().snap();
@@ -1861,6 +1881,21 @@ export async function startGame(opts = {}) {
       camTel.boost01 = boostMeter / MAX_BOOST;
       camTel.charge01 = brakeCharge;
       camTel.hitFlash = vignetteAlpha;
+      // Radar contacts, rotated into the ship's frame so the scope reads heading-up.
+      // Offsets stay in world units (no worldToLocal, which would divide by SHIP_SCALE).
+      camTel.contacts.length = 0;
+      _radarQ.copy(ship.quaternion).invert();
+      for (const r of remotePlayers.values()) {
+        if (!r.alive || !r.hasTarget) continue;
+        _radarV.subVectors(r.ship.position, ship.position);
+        if (_radarV.lengthSq() > RADAR_RANGE * RADAR_RANGE) continue;
+        _radarV.applyQuaternion(_radarQ);
+        camTel.contacts.push({
+          x: _radarV.x / RADAR_RANGE,
+          z: _radarV.z / RADAR_RANGE,
+          hostile: !(myTeam !== undefined && myTeam !== null && r.team === myTeam),
+        });
+      }
       camTel.targetLock = hasTargetLock;
       camTel.missileLock = _missileLocked;
       // Dev hook: force instrument states from the console to check the panel without combat.

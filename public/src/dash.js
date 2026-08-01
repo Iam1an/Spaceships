@@ -11,10 +11,10 @@ const CW = 256;
 const CH = 128;
 
 // A canvas-backed screen that redraws only when its rendered values actually change.
-function createScreen(w, h, drawFn) {
+function createScreen(w, h, drawFn, cw = CW, ch = CH) {
   const canvas = document.createElement('canvas');
-  canvas.width = CW;
-  canvas.height = CH;
+  canvas.width = cw;
+  canvas.height = ch;
   const ctx = canvas.getContext('2d');
   const tex = new THREE.CanvasTexture(canvas);
   tex.magFilter = THREE.NearestFilter;
@@ -29,7 +29,7 @@ function createScreen(w, h, drawFn) {
       if (key === lastKey) return;
       lastKey = key;
       ctx.fillStyle = '#05080b';
-      ctx.fillRect(0, 0, CW, CH);
+      ctx.fillRect(0, 0, cw, ch);
       drawFn(ctx, state, false);
       tex.needsUpdate = true;
     },
@@ -72,12 +72,15 @@ export function createDash(profile, accent) {
   // Usable panel width is only what sits BETWEEN the side consoles (0.17 wide, centred at
   // HW - 0.10), otherwise the outer displays end up buried inside the console boxes.
   const innerHalf = HW - 0.20;
-  let scrW = innerHalf * 0.88;
-  const scrH = Math.min(scrW / 2, panelH * 0.82);
+  const totalW = innerHalf * 2;
+  const gap = totalW * 0.022;
+  const radarS = Math.min(totalW * 0.26, panelH * 0.80);
+  let scrW = (totalW - radarS - gap * 2) / 2;
+  const scrH = Math.min(scrW / 2, panelH * 0.80);
   scrW = scrH * 2;
-  const scrX = scrW / 2 + 0.035;
+  const scrX = radarS / 2 + gap + scrW / 2;
   const screenZ = dashZ - 0.20;
-  const screenY = dashTopY - scrH / 2 - 0.03;
+  const screenY = dashTopY - Math.max(scrH, radarS) / 2 - 0.03;
 
   // --- flight display (pilot's left; +X renders on screen-left) --------------------------
   const flight = createScreen(scrW, scrH, (ctx, s, keyOnly) => {
@@ -128,10 +131,54 @@ export function createDash(profile, accent) {
   faceAtEye(weapons.mesh, eye);
   group.add(weapons.mesh);
 
+  // --- radar scope, panel centre ----------------------------------------------------------
+  // Heading-up: contacts arrive already rotated into the ship's frame by main.js. lookAt
+  // mirrors texture space against world space, so canvas-right corresponds to ship -X.
+  const RS = 160;
+  let sweep = 0;
+  const radar = createScreen(radarS, radarS, (ctx, s, keyOnly) => {
+    // Key changes every frame so the memoisation in createScreen never skips the sweep.
+    // Returning null here would match the initial lastKey and the scope would never draw.
+    if (keyOnly) return `${sweep.toFixed(3)}:${(s.contacts ?? []).length}`;
+    const c = RS / 2;
+    ctx.strokeStyle = '#1d3a4a';
+    ctx.lineWidth = 3;
+    for (const r of [0.33, 0.66, 1.0]) {
+      ctx.beginPath();
+      ctx.arc(c, c, c * r * 0.92, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(c, c - c * 0.92); ctx.lineTo(c, c + c * 0.92);
+    ctx.moveTo(c - c * 0.92, c); ctx.lineTo(c + c * 0.92, c);
+    ctx.stroke();
+    // sweep arm
+    ctx.strokeStyle = accentHex;
+    ctx.globalAlpha = 0.75;
+    ctx.beginPath();
+    ctx.moveTo(c, c);
+    ctx.lineTo(c + Math.sin(sweep) * c * 0.92, c - Math.cos(sweep) * c * 0.92);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    for (const ct of s.contacts ?? []) {
+      const px = c - ct.x * c * 0.92;
+      const py = c - ct.z * c * 0.92;
+      ctx.fillStyle = ct.hostile ? '#ff4d4d' : '#46ff9b';
+      ctx.fillRect(px - 5, py - 5, 10, 10);
+    }
+    // own ship
+    ctx.fillStyle = '#eaf6ff';
+    ctx.fillRect(c - 3, c - 3, 6, 6);
+    return null;
+  }, RS, RS);
+  radar.mesh.position.set(0, screenY, screenZ);
+  faceAtEye(radar.mesh, eye);
+  group.add(radar.mesh);
+
   // Emissive bezels so the displays read as lit panels set into the dash.
-  for (const x of [scrX, -scrX]) {
+  for (const [x, w, h] of [[scrX, scrW, scrH], [-scrX, scrW, scrH], [0, radarS, radarS]]) {
     const bez = new THREE.Mesh(
-      new THREE.PlaneGeometry(scrW + 0.016, scrH + 0.016),
+      new THREE.PlaneGeometry(w + 0.016, h + 0.016),
       new THREE.MeshBasicMaterial({ color: accent, toneMapped: false }),
     );
     bez.position.set(x, screenY, screenZ + 0.004);
@@ -176,6 +223,8 @@ export function createDash(profile, accent) {
     update(dt, s) {
       flight.redraw(s);
       weapons.redraw(s);
+      sweep = (sweep + dt * 2.2) % (Math.PI * 2);
+      radar.redraw(s);
       blink += dt;
       // Missile warning blinks fast and urgent; target lock pulses slower and steadier.
       const mslOn = s.missileLock && (blink % 0.34) < 0.17;
