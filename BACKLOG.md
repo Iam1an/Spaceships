@@ -363,9 +363,46 @@ flying over.
 
 ---
 
-## 7. Replace the ship models
+## 7. Replace the ship models — make them fighter jets
 
-The default ship reads as blocks because it geometrically is.
+The default ship reads as blocks because it geometrically is. It should also
+stop being a generic spaceship.
+
+### The design has already drifted to combat aviation
+
+Nearly everything added recently is a modern fighter, not a spacecraft:
+
+- F-16-style voice warnings — *pull up*, *bingo*, *chaff, flares*, Over-G
+- A cockpit with an instrument panel, radar, and TGT/MSL annunciators
+- Kvochur's Bell as the intro manoeuvre — a real aerobatic figure
+- Flares and chaff as missile countermeasures
+- Bombing runs with escorts and interceptors
+- Sierras, a terrain map built for low flying
+
+The models are close to the last thing still saying "spaceship". Making them
+jets does not add a theme — it finishes the one already there.
+
+**It also makes sourcing far easier.** Good fighter jet models are abundant and
+cheap; good original spaceship models are neither.
+
+### Setting question to settle
+
+Jets fly in the space map alongside a moon, motherships and an asteroid field.
+That combination works — it is the Macross / Ace Combat register — but it should
+be a decision, not an accident. Two coherent readings:
+
+- **Atmospheric fighters that also operate in space.** Keep both maps, lean into
+  the contrast.
+- **Terrain becomes the primary setting**, space the exotic one. This is the
+  direction the bombing missions and the terrain rebuild already point.
+
+### Licence caution on real aircraft
+
+Military airframe *shapes* are generally usable, but manufacturer names, logos
+and markings are trademarked, and the game is claimed as exclusive property.
+Safest is an original or "inspired-by" design rather than a badged F-16. A
+fictional 5th-generation jet also avoids arguments about flight-model realism
+that a named real aircraft invites.
 
 ### Measured
 
@@ -408,15 +445,18 @@ mapping — otherwise ship customization, which is a purchasable unlock, breaks.
 This needs 3D art, which is not something that can be generated here. Realistic
 routes:
 
-- **CC0 libraries** — Quaternius and Kenney both publish sci-fi and space kits
-  free with no attribution. Quality varies; some are deliberately low-poly and
-  would reproduce the current problem.
-- **Sketchfab**, filtered to CC0 or CC-BY. Wide range, check the licence per
-  model.
-- **Marketplaces** — TurboSquid, CGTrader, the Unity and Unreal asset stores.
-  Paid, but game-ready with LODs and textures already done.
-- **Commission** — ArtStation or Fiverr. The only route that gets a ship
-  designed *for* this game rather than adapted to it.
+- **Meshy** (meshy.ai) — pre-made assets are CC0, commercial use, no
+  attribution, and ship as `.glb` with PBR maps (albedo, normal, roughness)
+  already embedded. Closest match to the target spec above.
+- **Sketchfab** — filter to CC0 / CC-BY / free. Known-good hits include an ~11k
+  triangle game-ready jet with embedded textures, and a free low-poly collection
+  covering F-14 through F-35. Check the licence per model, every time.
+- **Marketplaces** — CGTrader and TurboSquid have thousands of fighter jets,
+  many game-ready with LODs and PBR maps already done. Paid, but the pipeline
+  work is finished.
+- **Commission** — ArtStation or Fiverr. The only route that gets an airframe
+  designed *for* this game, and the one that sidesteps the trademark question
+  entirely.
 
 Note the licence: the README claims the game as exclusive property, so CC0 or a
 purchased commercial licence is the safe ground. CC-BY requires attribution in
