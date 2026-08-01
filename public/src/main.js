@@ -464,10 +464,6 @@ export async function startGame(opts = {}) {
   window.__fpDebug = () => ({
     viewMode, inCockpit: inCockpit(), profile: cockpitProfile.id, fov: camera.fov,
     contacts: camTel.contacts.length,
-    exterior: ship.children.filter((c) => !c.userData?.isInterior).flatMap((c) => {
-      const out = []; c.traverse((o) => { if (o.isMesh) out.push(`${o.name}:${o.visible ? 'v' : 'h'}`); });
-      return out;
-    }),
   });
   syncShipVisibility();
   activeCam().snap();
@@ -1475,8 +1471,12 @@ export async function startGame(opts = {}) {
             } else if (isSolo) {
               applyHitToBot(hitTargetId, 10, opts.you, myTeam);
             }
-          } else if (hitAsteroidId !== null && ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'asteroid-hit', id: hitAsteroidId }));
+          } else if (hitAsteroidId !== null && hitAsteroidId !== undefined) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'asteroid-hit', id: hitAsteroidId }));
+            } else if (isSolo) {
+              damageAsteroidLocal(hitAsteroidId);
+            }
             bullets.spawnExplosion(end, 0.6);
             audio.play('impact');
           }
@@ -1610,6 +1610,8 @@ export async function startGame(opts = {}) {
       (asteroidId) => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'asteroid-hit', id: asteroidId }));
+        } else if (isSolo) {
+          damageAsteroidLocal(asteroidId);
         }
         audio.play('impact');
       },
@@ -2144,6 +2146,22 @@ export async function startGame(opts = {}) {
       ws.send(JSON.stringify({ type: 'self-damage', dmg }));
     } else if (isSolo) {
       applyPlayerDamageLocal(dmg);
+    }
+  }
+  // Solo mirror of the server's 'asteroid-hit' handling (server/index.js). Without this,
+  // asteroids only ever took damage in multiplayer -- every solo hit was sent to a socket
+  // that does not exist and silently dropped.
+  function damageAsteroidLocal(id) {
+    if (id === undefined || id === null || !asteroids.destroy) return;
+    const a = asteroids.list.find((x) => x.id === id);
+    if (!a || a.hp <= 0) return;
+    a.hp = Math.max(0, a.hp - 1);
+    a.hitFlash = 1;
+    if (a.hp > 0) return;
+    const rec = asteroids.destroy(id);
+    if (rec) {
+      bullets.spawnExplosion(rec.mesh.position, rec.radius);
+      audio.play('rockbreak', distanceVol(rec.mesh.position));
     }
   }
   function resolveCollisions() {
