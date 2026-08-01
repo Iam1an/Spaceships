@@ -61,7 +61,9 @@ const WARN_COOLDOWN = {
   pull_up: 1.6, altitude: 3.0, caution: 4.0,
   warning: 6.0, master_caution: 4.0,
   lock: 3.0, rwr_lock: 3.0,
-  bingo: 12.0, flare: 0.6, jammer: 5.0,
+  // flare is a 3.4s phrase ("chaff, flares"), so its cooldown has to exceed
+  // its own length or a second press cuts the callout off mid-sentence.
+  bingo: 12.0, flare: 4.5, jammer: 5.0,
   tws_search: 4.0, tws_lock: 4.0, tws_launch_1: 3.0, tws_launch_2: 3.0,
 };
 const WARN_VOLUME = 0.7;
