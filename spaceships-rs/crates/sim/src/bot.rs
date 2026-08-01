@@ -17,16 +17,18 @@
 //! `b.isLocal`, and `bullets.js:37` sets `isLocal` only for
 //! `faction === 'self'` — a bot fires as `'ally'` or `'enemy'`. So the bolt the
 //! player saw (effective radius 6.5) was never the one that hit them (radius
-//! 4.0, no swept test, different collision order). Here [`fire_bullet`] pushes
-//! exactly one [`Bullet`] into [`World::bullets`], the same list the player's
-//! gun fills, and `bullets.rs` steps and resolves it. This module contains no
-//! ballistics at all.
+//! 4.0, no swept test, different collision order). Here [`fire_bullet`] calls
+//! [`crate::bullets::spawn_bullet`] with [`crate::bullets::BulletSpawn::gun`] —
+//! the player's own launcher — so exactly one [`crate::world::Bullet`] lands in
+//! [`World::bullets`] and `bullets.rs` steps and resolves it. This module
+//! contains no ballistics at all.
 //!
 //! **2. Bots used their own ship hit radius.** `bot.js:31`+`:52` computed
 //! `BULLET_HIT_R = SHIP_RADIUS + 0.5 = 4.0` against the player's 6.0/7.0, so a
 //! bot had to close roughly 35 % nearer than a player for identical geometry.
-//! There is no radius in this module: the spawned [`Bullet`] carries
-//! `owner_coarse_aim`, and `bullets.rs` asks [`Ship::hit_radius`], which reads
+//! There is no radius in this module: the spawned [`crate::world::Bullet`]
+//! carries `owner_coarse_aim`, and `bullets.rs` asks [`Ship::hit_radius`],
+//! which reads
 //! [`crate::rules::ShipRules::hit_radius`].
 //!
 //! **3. Bots got no spawn invulnerability.** `main.js:3199` (`applyHitToBot`)
@@ -75,13 +77,25 @@
 
 use std::f64::consts::PI;
 
-use crate::math::Vec3;
+use crate::bullets::{spawn_bullet, BulletSpawn};
+use crate::math::{quat_from_axis_angle as axis_angle, quat_mul, quat_normalize, Vec3};
 use crate::rng::Rng;
 use crate::rules::Rules;
 use crate::world::{
-    BotFsm, BotState, Bullet, EntityId, Missile, MissileTarget, Quat, Ship, ShipKind, SimEvent,
-    Team, WeaponKind, World,
+    BotFsm, BotState, EntityId, Missile, MissileTarget, Quat, Ship, ShipKind, SimEvent, Team,
+    WeaponKind, World,
 };
+
+/// The deterministic transcendentals, under the name this module has always
+/// used for them.
+///
+/// They were defined here, in a private `dmath` module, while `math` was
+/// read-only to wave-1 agents. `missiles.rs` independently hand-rolled `acos`
+/// and `pow` for the same reason. All of it now lives in [`crate::math::det`],
+/// unchanged — [`crate::math::det::sin`] and [`crate::math::det::cos`] are
+/// bit-identical to the versions this module shipped over the `[0, π]` domain
+/// it uses — and this alias keeps every call site and test spelling intact.
+use crate::math::det as dmath;
 
 // ---------------------------------------------------------------------------
 // Terrain
@@ -500,7 +514,7 @@ fn plan_bot(
 /// The mutable half of a bot's tick: write the pose, spawn the projectiles,
 /// report the events.
 fn apply_plan(world: &mut World, index: usize, plan: &Plan, events: &mut Vec<SimEvent>) {
-    let (id, team, coarse) = {
+    let (id, team) = {
         let ship = &mut world.ships[index];
         ship.pos = plan.pos;
         ship.vel = plan.vel;
@@ -516,11 +530,11 @@ fn apply_plan(world: &mut World, index: usize, plan: &Plan, events: &mut Vec<Sim
         if plan.flare {
             ship.flares_left = ship.flares_left.saturating_sub(1);
         }
-        (ship.id, ship.team, ship.coarse_aim)
+        (ship.id, ship.team)
     };
 
     if let Some(shot) = plan.bullet {
-        fire_bullet(world, id, team, coarse, shot, events);
+        fire_bullet(world, index, shot, events);
     }
     if let Some((shot, target)) = plan.missile {
         fire_missile(world, id, team, shot, target, events);
@@ -533,37 +547,21 @@ fn apply_plan(world: &mut World, index: usize, plan: &Plan, events: &mut Vec<Sim
     }
 }
 
-/// Appends one bullet to [`World::bullets`] — the single bullet path.
+/// Fires one round from the bot at `index` through the *player's* launcher.
 ///
-/// This is the whole of the defect-1 fix. `bot.js:301` spawned a render bolt
-/// *and* a shadow projectile; there is one list now, and it is the list the
-/// player's gun writes to, so a bot's shot is stepped by the same swept test,
-/// resolved against the same [`Ship::hit_radius`], and drawn from the same
-/// record. No ballistics live in this module.
-fn fire_bullet(
-    world: &mut World,
-    owner: EntityId,
-    owner_team: Option<Team>,
-    owner_coarse_aim: bool,
-    shot: Shot,
-    events: &mut Vec<SimEvent>,
-) {
-    let key = world.take_projectile_key();
-    let w = &world.rules.weapons;
-    world.bullets.push(Bullet {
-        key,
-        pos: shot.origin,
-        // The swept test's first segment starts at the muzzle: a bullet has no
-        // history before it exists, and seeding `prev_pos` anywhere else would
-        // sweep it back through the ship that fired it.
-        prev_pos: shot.origin,
-        vel: shot.dir * w.bullet_speed,
-        life: w.bullet_life,
-        owner,
-        owner_team,
-        owner_coarse_aim,
-        damage: w.gun_damage,
-    });
+/// This is the whole of the defect-1 fix, and it is now literally one call.
+/// `bot.js:301` spawned a render bolt *and* a shadow projectile; wave-1 got as
+/// far as one list but still built the [`crate::world::Bullet`] record by hand,
+/// duplicating [`BulletSpawn::gun`] field for field. It goes through
+/// [`spawn_bullet`] instead, so speed, life, damage, the coarse-aim flag, the
+/// key allocation and the `prev_pos == pos` invariant all come from the one
+/// place the player's gun reads them, and a change there cannot leave bots
+/// behind. No ballistics live in this module.
+fn fire_bullet(world: &mut World, index: usize, shot: Shot, events: &mut Vec<SimEvent>) {
+    let rules = world.rules;
+    let spawn = BulletSpawn::gun(&rules, shot.origin, shot.dir, &world.ships[index]);
+    let owner = spawn.owner;
+    spawn_bullet(world, spawn);
     events.push(SimEvent::Fired {
         owner,
         weapon: WeaponKind::Bullet,
@@ -884,48 +882,11 @@ fn choose_evade_dir(rng: &mut Rng) -> Vec3 {
 // Orientation
 // ---------------------------------------------------------------------------
 
-/// The ship's nose direction: local `+z` rotated by `q`.
-///
-/// `bot.js` writes `tmpFwd.set(0, 0, 1).applyQuaternion(record.ship.quaternion)`
-/// four times a tick.
-#[must_use]
-pub fn forward(q: Quat) -> Vec3 {
-    rotate_vec(q, Vec3::Z)
-}
-
-/// `v` rotated by `q`, following `THREE.Vector3.applyQuaternion` operation for
-/// operation so a ported expression keeps its rounding.
-fn rotate_vec(q: Quat, v: Vec3) -> Vec3 {
-    let tx = 2.0 * (q.y * v.z - q.z * v.y);
-    let ty = 2.0 * (q.z * v.x - q.x * v.z);
-    let tz = 2.0 * (q.x * v.y - q.y * v.x);
-    Vec3::new(
-        v.x + q.w * tx + q.y * tz - q.z * ty,
-        v.y + q.w * ty + q.z * tx - q.x * tz,
-        v.z + q.w * tz + q.x * ty - q.y * tx,
-    )
-}
-
-/// `a * b`, in `THREE.Quaternion.multiplyQuaternions` order.
-fn quat_mul(a: Quat, b: Quat) -> Quat {
-    Quat::new(
-        a.x * b.w + a.w * b.x + a.y * b.z - a.z * b.y,
-        a.y * b.w + a.w * b.y + a.z * b.x - a.x * b.z,
-        a.z * b.w + a.w * b.z + a.x * b.y - a.y * b.x,
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-    )
-}
-
-/// Unit-length `q`, or the identity if `q` is degenerate — which is what
-/// `THREE.Quaternion.normalize` does with a zero quaternion.
-fn quat_normalize(q: Quat) -> Quat {
-    let len = (q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w).sqrt();
-    if len == 0.0 || !len.is_finite() {
-        return Quat::IDENTITY;
-    }
-    let inv = 1.0 / len;
-    Quat::new(q.x * inv, q.y * inv, q.z * inv, q.w * inv)
-}
+// The nose direction, the quaternion product, the renormalize and the
+// axis-angle constructor all live in `math` now — see the note on the `dmath`
+// alias above. `axis_angle` keeps its local name because that is what
+// `bot.js:70`/`:75` call the operation.
+pub use crate::math::forward;
 
 /// `cos(1e-3)`: the JS `angle < 1e-3` early-out (`bot.js:66`) rewritten as a
 /// cosine comparison so no inverse trigonometry is needed. A literal rather
@@ -980,131 +941,6 @@ fn rotate_toward(q: Quat, from: Vec3, to: Vec3, max_angle: f64) -> Quat {
     };
 
     quat_normalize(quat_mul(step, q))
-}
-
-/// A rotation of `angle` about the unit vector `axis`, for `angle` in `[0, π]`.
-/// `THREE.Quaternion.setFromAxisAngle`.
-fn axis_angle(axis: Vec3, angle: f64) -> Quat {
-    let half = angle * 0.5;
-    let s = dmath::sin(half);
-    Quat::new(axis.x * s, axis.y * s, axis.z * s, dmath::cos(half))
-}
-
-// ---------------------------------------------------------------------------
-// Deterministic transcendentals
-// ---------------------------------------------------------------------------
-
-/// The only transcendental functions this module uses, built so that they are
-/// reproducible.
-///
-/// `f64::sin`, `f64::cos` and `f64::exp` are *not* guaranteed to give identical
-/// bits across platforms or libm versions — they are accurate by convention,
-/// not by the standard — and this crate must produce the same result on a
-/// server and in WASM. Each function here is a truncated Taylor series
-/// evaluated with `+`, `-`, `*` and `/` only, all of which IEEE-754 requires to
-/// be correctly rounded, so the result depends on nothing but the input bits.
-///
-/// The series are cut where the next term falls below `1e-18` over the argument
-/// range these callers use, so the values agree with libm to within an ulp or
-/// two. That closeness is a convenience for anyone A/B-ing against the JS;
-/// determinism rests on self-consistency, not on agreeing with libm.
-mod dmath {
-    use std::f64::consts::PI;
-
-    /// Series terms for `sin` on `[0, π/2]`.
-    const SIN_TERMS: u32 = 10;
-    /// Series terms for `cos` on `[0, π/2]`.
-    const COS_TERMS: u32 = 11;
-    /// Series terms for `exp(-x)` on `[0, 0.5]`.
-    const EXP_TERMS: u32 = 17;
-
-    /// Above this, `e^-x` underflows to zero anyway and the halving loop would
-    /// spin for no reason.
-    const EXP_MAX: f64 = 745.0;
-
-    /// `sin(x)` for `x` in `[0, π]`.
-    pub fn sin(x: f64) -> f64 {
-        debug_assert!((0.0..=PI + 1e-9).contains(&x), "sin domain is [0, PI]");
-        // sin(π - x) == sin(x), which folds the range into [0, π/2] where the
-        // series is shortest.
-        let x = if x > PI * 0.5 { PI - x } else { x };
-        sin_quarter(x)
-    }
-
-    /// `cos(x)` for `x` in `[0, π]`.
-    pub fn cos(x: f64) -> f64 {
-        debug_assert!((0.0..=PI + 1e-9).contains(&x), "cos domain is [0, PI]");
-        // cos(π - x) == -cos(x).
-        if x > PI * 0.5 {
-            -cos_quarter(PI - x)
-        } else {
-            cos_quarter(x)
-        }
-    }
-
-    /// `e^-x` for `x >= 0` — the `1 - e^(-rate * dt)` smoothing that every
-    /// `THREE.MathUtils.damp` call in `bot.js` is built from.
-    pub fn exp_neg(x: f64) -> f64 {
-        if x.is_nan() || x <= 0.0 {
-            // `NaN` has no sensible answer, but 1.0 yields a lerp factor of
-            // zero rather than poisoning a position with it.
-            return 1.0;
-        }
-        if x >= EXP_MAX {
-            return 0.0;
-        }
-        // Halve until the argument is small enough for a short series, then
-        // square back up. Halving and squaring only touch the exponent, so they
-        // add no reproducibility risk.
-        let mut y = x;
-        let mut halvings = 0u32;
-        while y > 0.5 {
-            y *= 0.5;
-            halvings += 1;
-        }
-        let mut r = exp_neg_small(y);
-        for _ in 0..halvings {
-            r *= r;
-        }
-        r
-    }
-
-    /// `sin(x)` for `x` in `[0, π/2]`.
-    fn sin_quarter(x: f64) -> f64 {
-        let y = x * x;
-        let mut term = x;
-        let mut sum = x;
-        for k in 1..=SIN_TERMS {
-            let n = f64::from(2 * k) * f64::from(2 * k + 1);
-            term = -term * y / n;
-            sum += term;
-        }
-        sum
-    }
-
-    /// `cos(x)` for `x` in `[0, π/2]`.
-    fn cos_quarter(x: f64) -> f64 {
-        let y = x * x;
-        let mut term = 1.0;
-        let mut sum = 1.0;
-        for k in 1..=COS_TERMS {
-            let n = f64::from(2 * k - 1) * f64::from(2 * k);
-            term = -term * y / n;
-            sum += term;
-        }
-        sum
-    }
-
-    /// `e^-x` for `x` in `[0, 0.5]`.
-    fn exp_neg_small(x: f64) -> f64 {
-        let mut term = 1.0;
-        let mut sum = 1.0;
-        for n in 1..=EXP_TERMS {
-            term = term * -x / f64::from(n);
-            sum += term;
-        }
-        sum
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -407,10 +407,12 @@ pub struct Impact {
 /// These are two different questions and the JS answers them in two places.
 ///
 /// - **Skipped entirely** (the projectile passes through): the owner, a ship on
-///   the owner's team, a dead ship, an asteroid already at zero hit points.
+///   the owner's team, a dead ship, an asteroid already at zero hit points, and
+///   the caller-supplied hull when the shot came from the capital ship itself.
 ///   `bullets.js:139`–`:140` and `main.js:1049`–`:1050` both `continue` past
 ///   these rather than consuming the shot, so a friendly in the line of fire is
-///   not cover.
+///   not cover. The hull clause is new — the JS had no boss test here at all —
+///   and is spelled out at the call site below.
 /// - **Blocks but takes no damage**: a ship inside its spawn-protection window.
 ///   `bullets.js` checks only `r.alive`, so the bolt is consumed and the hit
 ///   report the client sends is then rejected by `server/index.js:942`. Damage
@@ -496,8 +498,25 @@ pub fn resolve_impact(world: &World, sweep: &Sweep, hulls: HullVolumes<'_>) -> O
     }
 
     // 4. Caller-supplied hulls — the campaign capital ship.
-    if let Some((part, t)) = sweep_hulls(sweep.origin, sweep.motion, sweep.radius, hulls) {
-        keep(Target::Hull { part }, t);
+    //
+    // A hull is not solid to its own guns. The only caller-supplied hull in the
+    // game is the capital ship, and the capital ship shoots: `campaign.rs`
+    // pushes its turret rounds into this very list with `owner`
+    // [`crate::rules::BOSS_ID_BASE`]. A turret pivot sits above the deck but the
+    // shot descends toward the player and re-enters the hull within about thirty
+    // units, so without this the boss consumes every round it fires and takes
+    // its own [`crate::rules::WeaponRules::boss_bullet_damage`] for it — it
+    // shoots itself to death and the player is never fired at.
+    //
+    // This is the same rule the ship loop applies two blocks down as
+    // `s.id == sweep.owner`, and the same one `server/index.js:940` applies to
+    // every hit: nothing damages its owner. It could not arise in the JS, where
+    // `bullets.js` had no boss test at all and the hull was the beam's private
+    // 95-unit proxy sphere.
+    if !is_boss_hitbox(sweep.owner) {
+        if let Some((part, t)) = sweep_hulls(sweep.origin, sweep.motion, sweep.radius, hulls) {
+            keep(Target::Hull { part }, t);
+        }
     }
 
     // 5. Ships, moving.

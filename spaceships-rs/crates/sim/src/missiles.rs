@@ -81,10 +81,13 @@
 //! sphere with a rejection method that needs only `sqrt`. See
 //! [`random_unit_vector`].
 //!
-//! **These two functions do not belong in this module.** They are general math
-//! and every other ported module will want them (`ship.rs` alone needs
-//! `0.001^(dt*k/6)`, `drift_drag^dt` and `1 - e^(-rate*dt)`). They live here
-//! only because `math.rs` is not this module's to edit.
+//! **These two functions do not belong in this module** — and they no longer
+//! live here. They are general math and every other ported module wants them
+//! (`ship.rs` alone needs `0.001^(dt*k/6)`, `drift_drag^dt` and
+//! `1 - e^(-rate*dt)`), so they are [`crate::math::det::acos`] and
+//! [`crate::math::det::pow`] now, unchanged, alongside the `sin`/`cos`/`exp`
+//! series `bot.rs` had hand-rolled in parallel. The names below are re-exports
+//! so nothing that referred to them has to move.
 //!
 //! # What stayed in JS
 //!
@@ -95,12 +98,14 @@
 //! [`SimEvent::Explosion`] and [`SimEvent::FlareBurst`] and lets the renderer
 //! decide what a detonation looks like.
 
-use crate::collision::{swept_sphere_aabb, swept_sphere_sphere, Aabb, Sphere};
+use crate::collision::{
+    swept_sphere_aabb, swept_sphere_sphere, swept_sphere_vs_moving_sphere, Aabb, Sphere,
+};
 use crate::math::Vec3;
 use crate::rng::Rng;
 use crate::world::{
-    EntityId, ExplosionKind, Flare, Missile, MissileTarget, Quat, Ship, ShipKind, SimEvent, Team,
-    World,
+    is_boss_hitbox, EntityId, ExplosionKind, Flare, Missile, MissileTarget, Ship, ShipKind,
+    SimEvent, Team, World,
 };
 
 // ---------------------------------------------------------------------------
@@ -177,6 +182,13 @@ pub enum DetonationCause {
     /// It reached a ship. Damage has already been applied to that ship's hit
     /// points by [`update`]; the fields describe what was applied so a caller
     /// can score it, or report it to a server, without recomputing anything.
+    ///
+    /// **One exception**: a boss hitbox ([`crate::world::is_boss_hitbox`]) is
+    /// reported but *not* damaged, because the twenty hitboxes share one pool
+    /// that `campaign.rs` owns. `killed` is then always `false` and the caller
+    /// must route `damage` through
+    /// [`crate::campaign::apply_boss_damage`]. Same contract as
+    /// `bullets::HullPart::Hitbox`.
     Ship {
         /// Who was hit.
         id: EntityId,
@@ -230,257 +242,31 @@ pub struct Detonation {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic replacements for the two transcendentals the port needs
+// Shared math
 // ---------------------------------------------------------------------------
 
 /// Arccosine, in radians, built only from IEEE-exact operations.
 ///
-/// # Why this is not `f64::acos`
-///
-/// The homing steer needs the angle between the missile's heading and its
-/// desired heading (`missiles.js:347`, `Math.acos`). `f64::acos` dispatches to
-/// the platform's libm, and libm implementations of the inverse trigonometric
-/// functions are not required to be correctly rounded — they differ in the last
-/// bits between glibc, musl, Apple's libm and the WASM toolchain's. A last-bit
-/// difference in the angle changes the steering factor
-/// `turn_rate * dt / angle`, which changes the heading, which compounds over an
-/// eight-second flight. Server and client would disagree about where the
-/// missile went.
-///
-/// This implementation uses only `+ - * /`, `sqrt` and a bit mask, all of which
-/// IEEE-754 requires to be correctly rounded, so it produces identical bits on
-/// x86-64, aarch64 and wasm32.
-///
-/// The rational approximation is the one from Sun's fdlibm `__ieee754_acos`
-/// (Copyright (C) 1993 by Sun Microsystems, Inc.; permission to use, copy,
-/// modify and distribute is freely granted provided the notice is preserved),
-/// which is the ancestor of the routine in most libms. Accuracy is under an
-/// ulp; the tests check it against `f64::acos` over the whole domain.
-///
-/// Returns `0.0` at `x >= 1`, `pi` at `x <= -1`, and `NaN` for a `NaN` input.
-/// Out-of-range inputs clamp rather than being rejected, because a `dot` of two
-/// unit vectors can land a hair outside `[-1, 1]` through rounding.
-#[must_use]
-pub fn acos_deterministic(x: f64) -> f64 {
-    // Coefficients of the fdlibm rational R(z) = P(z) / Q(z), which
-    // approximates (asin(s) - s) / s^3. Written as the shortest decimal that
-    // round-trips to the same double as fdlibm's own literal.
-    const PS0: f64 = 0.166_666_666_666_666_66;
-    const PS1: f64 = -0.325_565_818_622_400_9;
-    const PS2: f64 = 0.201_212_532_134_862_93;
-    const PS3: f64 = -0.040_055_534_500_679_41;
-    const PS4: f64 = 0.000_791_534_994_289_814_5;
-    const PS5: f64 = 3.479_331_075_960_212e-5;
-    const QS1: f64 = -2.403_394_911_734_414;
-    const QS2: f64 = 2.020_945_760_233_505_7;
-    const QS3: f64 = -0.688_283_971_605_453_3;
-    const QS4: f64 = 0.077_038_150_555_901_94;
-    /// `pi / 2`, high half — and the nearest double to `pi / 2`, so the
-    /// standard constant is exactly fdlibm's `pio2_hi`.
-    const PIO2_HI: f64 = core::f64::consts::FRAC_PI_2;
-    /// The part of `pi / 2` that does not fit in [`PIO2_HI`].
-    const PIO2_LO: f64 = 6.123_233_995_736_766e-17;
-    /// `2^-57`: below this, `acos(x)` is `pi / 2` to the last bit.
-    const TINY: f64 = 6.938_893_903_907_228e-18;
-    /// `pi`. fdlibm spells this `3.14159265358979311600e+00`, which is the
-    /// same double.
-    const PI: f64 = core::f64::consts::PI;
-
-    fn rational(z: f64) -> f64 {
-        let p = z * (PS0 + z * (PS1 + z * (PS2 + z * (PS3 + z * (PS4 + z * PS5)))));
-        let q = 1.0 + z * (QS1 + z * (QS2 + z * (QS3 + z * QS4)));
-        p / q
-    }
-
-    if x.is_nan() {
-        return f64::NAN;
-    }
-    if x >= 1.0 {
-        return 0.0;
-    }
-    if x <= -1.0 {
-        return PI + 2.0 * PIO2_LO;
-    }
-    if x.abs() < 0.5 {
-        if x.abs() <= TINY {
-            return PIO2_HI + PIO2_LO;
-        }
-        let z = x * x;
-        let r = rational(z);
-        return PIO2_HI - (x - (PIO2_LO - x * r));
-    }
-    if x < 0.0 {
-        let z = (1.0 + x) * 0.5;
-        let s = z.sqrt();
-        let r = rational(z);
-        let w = r * s - PIO2_LO;
-        return PI - 2.0 * (s + w);
-    }
-    let z = (1.0 - x) * 0.5;
-    let s = z.sqrt();
-    // The top half of `s`, exactly. `df * df` is then exact, which is what lets
-    // the correction `c` recover the bits `sqrt` had to drop.
-    let df = f64::from_bits(s.to_bits() & 0xffff_ffff_0000_0000);
-    let c = (z - df * df) / (s + df);
-    let r = rational(z);
-    let w = r * s + c;
-    2.0 * (df + w)
-}
+/// Now [`crate::math::det::acos`]. It was written here, as a port of Sun's
+/// fdlibm `__ieee754_acos`, while `math.rs` was read-only to this module — the
+/// module docs above already said it did not belong here. It is unchanged, so
+/// every bit this module ever produced it still produces; only the address
+/// moved.
+pub use crate::math::det::acos as acos_deterministic;
 
 /// `base.powf(exp)` for a strictly positive, finite `base`, built only from
 /// IEEE-exact operations.
 ///
-/// # Why this is not `f64::powf`
-///
-/// `missiles.js:467` decays a flare's velocity with `Math.pow(0.22, dt)`, the
-/// standard framerate-independent drag idiom, which appears again all over
-/// `main.js` (`0.001^(dt * k / 6)`, `drift_drag^dt`). `powf` is a composition of
-/// `log` and `exp` in the platform's libm and is *not* bit-identical across
-/// platforms — and a flare's position is not cosmetic, it decides whether a
-/// missile is seduced. Two machines that disagree about where a flare drifted
-/// disagree about whether a missile turned.
-///
-/// Computed as `exp2(exp * log2(base))`, with both halves built from `+ - * /`
-/// and bit manipulation. Accuracy is a few ulps, far tighter than anything the
-/// simulation can observe; what matters is that they are the *same* few ulps
-/// everywhere.
-///
-/// Returns `NaN` for a non-positive or non-finite `base`, or a non-finite
-/// `exp`.
-#[must_use]
-pub fn pow_deterministic(base: f64, exp: f64) -> f64 {
-    // `base <= 0.0` is false for a NaN base; `is_finite` is what catches it.
-    if base <= 0.0 || !base.is_finite() || !exp.is_finite() {
-        return f64::NAN;
-    }
-    if exp == 0.0 || base == 1.0 {
-        return 1.0;
-    }
-    exp2_deterministic(exp * log2_deterministic(base))
-}
-
-/// Base-2 logarithm of a strictly positive, finite `x`, from exact operations.
-///
-/// Splits `x` into `m * 2^k` with `m` in `[1/sqrt(2), sqrt(2))` — exact, it is
-/// a bit operation — then evaluates `ln(m)` as the odd series `2 * atanh(s)`
-/// with `s = (m - 1) / (m + 1)`, so `|s| <= 0.1716`. Eleven terms put the
-/// remainder below `1e-17` relative, which is under the last bit.
-fn log2_deterministic(x: f64) -> f64 {
-    /// `sqrt(2)`, the split point that keeps `|s|` smallest.
-    const SQRT_2: f64 = core::f64::consts::SQRT_2;
-    /// `1 / ln(2)`.
-    const LOG2_E: f64 = core::f64::consts::LOG2_E;
-    /// `2^54`, to lift a subnormal into the normal range.
-    const TWO_54: f64 = 18_014_398_509_481_984.0;
-
-    let mut bits = x.to_bits();
-    let mut biased_exp = ((bits >> 52) & 0x7ff) as i32;
-    if biased_exp == 0 {
-        let lifted = x * TWO_54;
-        bits = lifted.to_bits();
-        biased_exp = ((bits >> 52) & 0x7ff) as i32 - 54;
-    }
-    // The mantissa with the exponent forced to zero, i.e. `m` in `[1, 2)`.
-    let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
-    let mut k = biased_exp - 1023;
-    if m > SQRT_2 {
-        m *= 0.5;
-        k += 1;
-    }
-
-    let s = (m - 1.0) / (m + 1.0);
-    let z = s * s;
-    // 1 + z/3 + z^2/5 + ... + z^10/21, by Horner.
-    let poly = 1.0
-        + z * (1.0 / 3.0
-            + z * (1.0 / 5.0
-                + z * (1.0 / 7.0
-                    + z * (1.0 / 9.0
-                        + z * (1.0 / 11.0
-                            + z * (1.0 / 13.0
-                                + z * (1.0 / 15.0
-                                    + z * (1.0 / 17.0 + z * (1.0 / 19.0 + z * (1.0 / 21.0))))))))));
-    let ln_m = 2.0 * s * poly;
-    f64::from(k) + ln_m * LOG2_E
-}
-
-/// `2^y`, from exact operations.
-///
-/// Splits `y` into a nearest integer `n` and a remainder with magnitude at most
-/// `0.5`, evaluates `exp(remainder * ln 2)` by its Taylor series — the argument
-/// is at most `0.347`, where sixteen terms are already below the last bit — and
-/// scales by `2^n`, which is exact.
-fn exp2_deterministic(y: f64) -> f64 {
-    /// `ln(2)`.
-    const LN_2: f64 = core::f64::consts::LN_2;
-
-    if y.is_nan() {
-        return f64::NAN;
-    }
-    if y >= 1024.0 {
-        return f64::INFINITY;
-    }
-    if y <= -1075.0 {
-        return 0.0;
-    }
-    let n = if y >= 0.0 {
-        (y + 0.5).floor()
-    } else {
-        (y - 0.5).ceil()
-    };
-    let r = (y - n) * LN_2;
-
-    let mut term = 1.0;
-    let mut sum = 1.0;
-    let mut k = 1.0;
-    while k <= 16.0 {
-        term = term * r / k;
-        sum += term;
-        k += 1.0;
-    }
-    sum * two_pow(n as i32)
-}
-
-/// `2^n` for an integer `n`, assembled from the exponent field. Exact.
-fn two_pow(n: i32) -> f64 {
-    if n > 1023 {
-        f64::INFINITY
-    } else if n >= -1022 {
-        f64::from_bits(((n + 1023) as u64) << 52)
-    } else if n >= -1074 {
-        // Subnormal: the value is a single mantissa bit.
-        f64::from_bits(1u64 << (n + 1074))
-    } else {
-        0.0
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Quaternion helper
-// ---------------------------------------------------------------------------
-
-/// `v` rotated by the unit quaternion `q`.
-///
-/// [`Quat`] is deliberately a data type with no operations, and `math.rs` — the
-/// module its docs point at — is not this module's to edit, so the one rotation
-/// a missile needs lives here. This is `THREE.Vector3.applyQuaternion` term for
-/// term, so a ported call site produces the same bits the JS did.
-fn rotate(q: Quat, v: Vec3) -> Vec3 {
-    let tx = 2.0 * (q.y * v.z - q.z * v.y);
-    let ty = 2.0 * (q.z * v.x - q.x * v.z);
-    let tz = 2.0 * (q.x * v.y - q.y * v.x);
-    Vec3::new(
-        v.x + q.w * tx + q.y * tz - q.z * ty,
-        v.y + q.w * ty + q.z * tx - q.x * tz,
-        v.z + q.w * tz + q.x * ty - q.y * tx,
-    )
-}
+/// Now [`crate::math::det::pow`]; see [`acos_deterministic`] for why it moved.
+pub use crate::math::det::pow as pow_deterministic;
 
 /// The direction a ship's nose points: its local `+z` in world space.
-#[must_use]
-pub fn forward(quat: Quat) -> Vec3 {
-    rotate(quat, Vec3::Z)
-}
+///
+/// Now [`crate::math::forward`], built on the one [`crate::math::quat_rotate`].
+/// This module carried a private `rotate` because [`crate::math::Quat`] used
+/// to be a data type with no operations; `ship.rs` and `bot.rs` carried the
+/// identical routine for the identical reason.
+pub use crate::math::forward;
 
 // ---------------------------------------------------------------------------
 // Lock-on
@@ -1003,10 +789,17 @@ fn steer(heading: Vec3, desired: Vec3, turn_rate: f64, dt: f64) -> Vec3 {
 
 /// Advances every missile and flare in `world` by `dt`.
 ///
-/// Call this once per tick, after ships have moved. It owns [`World::missiles`]
-/// and [`World::flares`] entirely: it moves them, resolves what they hit,
-/// applies missile damage to [`World::ships`], and removes whatever stopped
-/// existing.
+/// Call this once per tick, in the **projectile phase — before ships move**. It
+/// owns [`World::missiles`] and [`World::flares`] entirely: it moves them,
+/// resolves what they hit, applies missile damage to [`World::ships`], and
+/// removes whatever stopped existing.
+///
+/// The ordering requirement is the same one `bullets.rs` documents, and for the
+/// same reason: a ship carries no `prev_pos`, so its step segment can only be
+/// reconstructed as `pos .. pos + vel * dt`, which is correct exactly while
+/// `pos` is still the start-of-step pose. (An earlier draft of this module said
+/// "after ships have moved"; that was written when ships were swept as
+/// stationary and there was no tick to be wrong about.)
 ///
 /// - `volumes` are extra solids to detonate against — see [`Volume`]. Pass
 ///   `&[]` when there are none.
@@ -1134,7 +927,7 @@ fn step_missile(
     let motion = vel * dt;
     missile.pos = start + motion;
 
-    let Some((t, kind)) = first_contact(world, missile, start, motion, volumes) else {
+    let Some((t, kind)) = first_contact(world, missile, start, motion, volumes, dt) else {
         return false;
     };
     let contact = start + motion * t;
@@ -1150,6 +943,7 @@ fn first_contact(
     start: Vec3,
     motion: Vec3,
     volumes: &[Volume],
+    dt: f64,
 ) -> Option<(f64, HitKind)> {
     let weapons = &world.rules.weapons;
     let body = weapons.missile_radius;
@@ -1207,9 +1001,16 @@ fn first_contact(
         // `missiles.js` never saw it, so a missile gets the plain radius — or
         // the campaign's override, which is the fix this port exists for.
         let sphere = Sphere::new(s.pos, s.hit_radius(&world.rules, false));
+        // Ships move during the step too. `update` runs before the movers, so
+        // `Ship::pos` is the start-of-step pose and `vel * dt` is the
+        // displacement over the same interval the missile covers — the identical
+        // convention `bullets::resolve_impact` uses, and the reason both must
+        // run in the same phase. `swept_sphere_vs_moving_sphere` reduces
+        // bit-for-bit to the stationary sweep when the target is parked, so a
+        // world of stationary targets is unaffected.
         keep_earliest(
             &mut best,
-            swept_sphere_sphere(start, motion, body, sphere),
+            swept_sphere_vs_moving_sphere(start, motion, body, sphere, s.vel * dt),
             HitKind::Ship(idx),
         );
     }
@@ -1241,8 +1042,22 @@ fn resolve_contact(
         HitKind::Ship(idx) => {
             let damage = world.rules.weapons.missile_damage;
             let respawn_delay = world.rules.combat.respawn_delay;
+            let id = world.ships[idx].id;
+            if is_boss_hitbox(id) {
+                // The boss is one hit-point pool behind twenty hitboxes
+                // (`main.js:2719`, `applyBossHit`). Running the ordinary ship
+                // damage path over them would "kill" hitboxes individually and
+                // leave twenty different numbers where the HUD wants one. The
+                // contact is reported and `campaign.rs` decides what it costs,
+                // which is exactly what `bullets.rs` already does with its
+                // `HullPart::Hitbox`.
+                return DetonationCause::Ship {
+                    id,
+                    damage,
+                    killed: false,
+                };
+            }
             let ship = &mut world.ships[idx];
-            let id = ship.id;
             ship.hp = (ship.hp - damage).max(0);
             ship.hit_flash = 1.0;
             ship.health_idle_damage = 0.0;
@@ -1333,7 +1148,7 @@ fn update_flares(world: &mut World, dt: f64) {
 mod tests {
     use super::*;
     use crate::rules::Rules;
-    use crate::world::{Asteroid, AsteroidTier, MapKind, Mode, Obstacle};
+    use crate::world::{Asteroid, AsteroidTier, MapKind, Mode, Obstacle, Quat};
 
     fn v(x: f64, y: f64, z: f64) -> Vec3 {
         Vec3::new(x, y, z)

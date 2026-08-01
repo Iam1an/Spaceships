@@ -37,12 +37,20 @@
 //! `Math.pow(x, 1.6)` response curve, and the terrain heightfield is seven sine
 //! octaves.
 //!
-//! Every one of those calls is funnelled through the handful of functions in
-//! the "transcendental surface" section below, and **nothing else in this module
+//! `setFromAxisAngle` is no longer among them: it is
+//! [`crate::math::quat_from_axis_angle`], which draws its sine and cosine from
+//! [`crate::math::det`] and is therefore deterministic.
+//!
+//! The rest are funnelled through the handful of functions in the
+//! "transcendental surface" section below, and **nothing else in this module
 //! calls a transcendental function directly**. If server-versus-WASM agreement
 //! ever needs hand-rolled implementations, those functions plus
-//! [`raw_terrain_height`] are the complete list of things to replace. Everything
-//! else here is `+ - * /` and `sqrt`, which IEEE-754 requires to be exact.
+//! [`raw_terrain_height`] are the complete list of things to replace — and
+//! [`crate::math::det`] already has `exp` and `pow`, so `damp`, `pow_blend`,
+//! `drag_factor` and `steer_curve` are a one-line change each whenever the
+//! resulting last-bit shift in the flight model is acceptable to make.
+//! Everything else here is `+ - * /` and `sqrt`, which IEEE-754 requires to be
+//! exact.
 //!
 //! # Sweeping, and where it is and is not applied
 //!
@@ -176,15 +184,6 @@ fn steer_curve(x: f64, exponent: f64) -> f64 {
     js_sign(x) * x.abs().powf(exponent)
 }
 
-/// `(sin(a), cos(a))`. The only place quaternion construction reads either.
-///
-/// **Transcendental.** Calls `sin` and `cos`.
-#[inline]
-#[must_use]
-fn sin_cos(a: f64) -> (f64, f64) {
-    (a.sin(), a.cos())
-}
-
 // ---------------------------------------------------------------------------
 // Small numeric helpers
 // ---------------------------------------------------------------------------
@@ -226,93 +225,20 @@ fn smoothstep(t: f64) -> f64 {
 // Quaternions
 // ---------------------------------------------------------------------------
 //
-// [`crate::world::Quat`] is storage only, and its docs say rotation algebra
-// "belongs beside `Vec3` in `math`". It is not there yet, and `math` is not this
-// module's to edit, so the operations the flight model needs live here. They are
-// `pub` because missiles, bots and the campaign turrets will all want them;
-// moving them to `math` later is a re-export away.
-
-/// Composes two rotations: the rotation `b` applied *in the frame of* `a`.
-///
-/// Matches `THREE.Quaternion.multiplyQuaternions(a, b)` term for term, which is
-/// what `ship.quaternion.multiply(q)` performs at `main.js:1252`.
-#[inline]
-#[must_use]
-pub fn quat_mul(a: Quat, b: Quat) -> Quat {
-    Quat::new(
-        a.x * b.w + a.w * b.x + a.y * b.z - a.z * b.y,
-        a.y * b.w + a.w * b.y + a.z * b.x - a.x * b.z,
-        a.z * b.w + a.w * b.z + a.x * b.y - a.y * b.x,
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-    )
-}
-
-/// A rotation of `angle` radians about a unit `axis`.
-/// `THREE.Quaternion.setFromAxisAngle`.
-///
-/// **Transcendental** by way of [`sin_cos`].
-#[inline]
-#[must_use]
-pub fn quat_from_axis_angle(axis: Vec3, angle: f64) -> Quat {
-    let (s, c) = sin_cos(angle * 0.5);
-    Quat::new(axis.x * s, axis.y * s, axis.z * s, c)
-}
-
-/// Renormalizes a quaternion, returning the identity for a degenerate one.
-///
-/// `THREE.Quaternion.normalize`, which the flight model calls every frame
-/// (`main.js:1255`) so integration drift cannot denormalize the pose.
-#[inline]
-#[must_use]
-pub fn quat_normalize(q: Quat) -> Quat {
-    let len_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
-    if len_sq == 0.0 || !len_sq.is_finite() {
-        return Quat::IDENTITY;
-    }
-    let inv = 1.0 / len_sq.sqrt();
-    Quat::new(q.x * inv, q.y * inv, q.z * inv, q.w * inv)
-}
-
-/// Rotates `v` by `q`. `THREE.Vector3.applyQuaternion`, reproduced in the same
-/// operation order.
-#[inline]
-#[must_use]
-pub fn quat_rotate(q: Quat, v: Vec3) -> Vec3 {
-    // t = 2 * cross(q.xyz, v)
-    let tx = 2.0 * (q.y * v.z - q.z * v.y);
-    let ty = 2.0 * (q.z * v.x - q.x * v.z);
-    let tz = 2.0 * (q.x * v.y - q.y * v.x);
-    // v + q.w * t + cross(q.xyz, t)
-    Vec3::new(
-        v.x + q.w * tx + q.y * tz - q.z * ty,
-        v.y + q.w * ty + q.z * tx - q.x * tz,
-        v.z + q.w * tz + q.x * ty - q.y * tx,
-    )
-}
-
-/// The ship's nose direction: local `+z` in world space.
-///
-/// The JS builds this fresh as `new THREE.Vector3(0, 0, 1).applyQuaternion(q)`
-/// at half a dozen sites (`main.js:1280`, `:1288`, `:1425`, ...).
-#[inline]
-#[must_use]
-pub fn forward(q: Quat) -> Vec3 {
-    quat_rotate(q, Vec3::Z)
-}
-
-/// The ship's up direction: local `+y` in world space.
-#[inline]
-#[must_use]
-pub fn up(q: Quat) -> Vec3 {
-    quat_rotate(q, Vec3::Y)
-}
-
-/// The ship's right direction: local `+x` in world space.
-#[inline]
-#[must_use]
-pub fn right(q: Quat) -> Vec3 {
-    quat_rotate(q, Vec3::X)
-}
+// These lived here while `math` was read-only to this module, and `bot.rs` and
+// `missiles.rs` grew their own copies for the same reason. There is one
+// implementation now, beside `Vec3` where `world::Quat`'s docs always said it
+// belonged; these re-exports keep `ship::forward(..)` and friends working for
+// every existing caller and test.
+//
+// One behavioural note: `math::quat_from_axis_angle` builds its sine and cosine
+// from `math::det`, not from libm. This module's own version called `f64::sin`
+// and `f64::cos`, which are not bit-identical across platforms — the exact
+// hazard `bot.rs` hand-rolled its series to avoid. The flight model's remaining
+// libm calls are listed in the transcendental surface above; this one is gone.
+pub use crate::math::{
+    forward, quat_from_axis_angle, quat_mul, quat_normalize, quat_rotate, right, up,
+};
 
 // ---------------------------------------------------------------------------
 // The flight model

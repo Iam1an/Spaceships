@@ -67,6 +67,16 @@ use crate::math::Vec3;
 use crate::rng::Rng;
 use crate::rules::{Rules, BOSS_HITBOX_COUNT, BOSS_ID_BASE};
 
+/// Re-export of the orientation type, which now lives beside [`Vec3`] in
+/// [`crate::math`] along with the algebra that operates on it.
+///
+/// It used to be defined here, as storage only, with a doc comment saying that
+/// multiplication, `slerp`, and `from_axis_angle` "belong beside `Vec3` in
+/// `math`, which this module does not own". Three modules then wrote their own
+/// copies of that algebra. The type and its operations are now in one place;
+/// this alias keeps `world::Quat` a valid path for every existing caller.
+pub use crate::math::Quat;
+
 // ---------------------------------------------------------------------------
 // Timing
 // ---------------------------------------------------------------------------
@@ -154,75 +164,6 @@ impl Team {
             1 => Some(Team::One),
             _ => None,
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Orientation
-// ---------------------------------------------------------------------------
-
-/// A unit quaternion, in the same `(x, y, z, w)` order the JS puts on the wire.
-///
-/// This is a *data* type: storage, an identity, and array conversion. There is
-/// deliberately no multiplication, `slerp`, or `from_axis_angle` here — those
-/// belong beside [`crate::math::Vec3`] in `math`, which this module does not
-/// own. Anything that composes rotations should add them there rather than
-/// growing a second math module.
-///
-/// `#[repr(C)]` so it matches the `[f64; 4]` the protocol carries, making the
-/// conversions free.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(C)]
-pub struct Quat {
-    /// `x` component of the vector part.
-    pub x: f64,
-    /// `y` component of the vector part.
-    pub y: f64,
-    /// `z` component of the vector part.
-    pub z: f64,
-    /// Scalar part.
-    pub w: f64,
-}
-
-impl Quat {
-    /// No rotation. This is what `THREE.Quaternion` starts as, and what every
-    /// team-0 spawn uses (`server/index.js:480`).
-    pub const IDENTITY: Quat = Quat::new(0.0, 0.0, 0.0, 1.0);
-
-    /// A 180° rotation about `+y`: the team-1 spawn orientation, facing `-z`.
-    /// `server/index.js:481` (`[0, 1, 0, 0]`).
-    pub const FLIP_Y: Quat = Quat::new(0.0, 1.0, 0.0, 0.0);
-
-    /// Builds a quaternion from components. Not normalized — callers are
-    /// responsible for handing in a unit quaternion.
-    #[must_use]
-    pub const fn new(x: f64, y: f64, z: f64, w: f64) -> Self {
-        Quat { x, y, z, w }
-    }
-
-    /// Converts from the `[x, y, z, w]` array form used on the wire.
-    #[must_use]
-    pub const fn from_array(a: [f64; 4]) -> Self {
-        Quat::new(a[0], a[1], a[2], a[3])
-    }
-
-    /// Converts to the `[x, y, z, w]` array form used on the wire.
-    #[must_use]
-    pub const fn to_array(self) -> [f64; 4] {
-        [self.x, self.y, self.z, self.w]
-    }
-
-    /// True if every component is finite. Worth asserting at boundaries: a
-    /// `NaN` orientation poisons every derived direction within a tick.
-    #[must_use]
-    pub fn is_finite(self) -> bool {
-        self.x.is_finite() && self.y.is_finite() && self.z.is_finite() && self.w.is_finite()
-    }
-}
-
-impl Default for Quat {
-    fn default() -> Self {
-        Quat::IDENTITY
     }
 }
 

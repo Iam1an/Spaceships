@@ -65,9 +65,23 @@
 //! - [`world`] — the simulation state, the tick contract, and the flat
 //!   [`world::Frame`] the JS renderer consumes.
 //!
-//! Still to land: the behaviour. Ship physics, damage resolution, projectile
-//! ballistics, missile homing, and bot AI all read the types in [`world`] and
-//! the numbers in [`rules`], and none of them exist yet.
+//! And the behaviour, one module per subsystem:
+//!
+//! - [`ship`] — the flight model, the clocks, damage, death, respawn, and
+//!   ship-versus-world collision.
+//! - [`bullets`] — bolt ballistics, the hitscan beam, and every projectile
+//!   impact, all resolved as swept segments.
+//! - [`missiles`] — lock-on, homing, obstacle avoidance, flare seduction, and
+//!   detonation.
+//! - [`asteroids`] — seeded field generation, damage, and spin.
+//! - [`bot`] — target selection, pursuit, evasion, and weapon use.
+//! - [`campaign`] — waves, lives, checkpoints, and the capital ship.
+//!
+//! - [`tick`] — **the assembly.** [`tick::tick`] is the
+//!   [`world::TickFn`]: it decides what order those six run in, reconciles the
+//!   assumptions they were each written under, and produces the [`world::Frame`]
+//!   and the [`world::NetIntent`]s. Its module docs carry the phase order and
+//!   the reasoning behind every placement that is load-bearing.
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
@@ -82,4 +96,5 @@ pub mod missiles;
 pub mod rng;
 pub mod rules;
 pub mod ship;
+pub mod tick;
 pub mod world;

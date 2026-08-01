@@ -9,7 +9,7 @@
 //!
 //! What it deliberately does **not** own: ballistics, bot AI, ship physics, and
 //! asteroid generation. The boss's turret rounds are pushed into
-//! [`World::bullets`] as ordinary [`Bullet`]s carrying
+//! [`World::bullets`] as ordinary [`crate::world::Bullet`]s carrying
 //! [`WeaponRules::boss_bullet_damage`], so the bullets module moves them and
 //! resolves them against the player with exactly the rules every other bullet
 //! obeys. There is no second projectile list; `main.js:2327` (`bossBullets`) and
@@ -70,6 +70,7 @@
 //! [`WeaponRules::boss_bullet_damage`]: crate::rules::WeaponRules::boss_bullet_damage
 //! [`WeaponRules::boss_hitbox_radius`]: crate::rules::WeaponRules::boss_hitbox_radius
 
+use crate::bullets::{spawn_bullet, BulletSpawn};
 use crate::collision::{swept_sphere_aabb, Aabb};
 use crate::math::Vec3;
 use crate::rules::{
@@ -77,7 +78,7 @@ use crate::rules::{
     BOSS_TURRET_COUNT, BOSS_TURRET_MUZZLE, BOSS_TURRET_PIVOTS,
 };
 use crate::world::{
-    is_boss_hitbox, Bullet, CampaignHud, CampaignPhase, CampaignState, EntityId, Mode, Quat, Ship,
+    is_boss_hitbox, CampaignHud, CampaignPhase, CampaignState, EntityId, Mode, Quat, Ship,
     ShipKind, SimEvent, Team, Turret, WeaponKind, World,
 };
 
@@ -898,20 +899,17 @@ fn step_boss(world: &mut World, camp: &mut CampaignState, dt: f64, events: &mut 
     }
 
     for (muzzle, dir) in shots {
-        let key = world.take_projectile_key();
-        world.bullets.push(Bullet {
-            key,
-            pos: muzzle,
-            prev_pos: muzzle,
-            vel: dir * rules.weapons.boss_bullet_speed,
-            life: rules.weapons.boss_bullet_life,
-            owner: BOSS_ID_BASE,
-            // The capital ship is team 1 (`main.js:2741`), so friendly fire
-            // rejection keeps its rounds off its own hitboxes.
-            owner_team: Some(Team::One),
-            owner_coarse_aim: false,
-            damage: rules.weapons.boss_bullet_damage,
-        });
+        // One launcher for every round in the game. `BulletSpawn::boss_turret`
+        // carries the capital ship's own speed, life and damage; the list, the
+        // key allocation and the `prev_pos == pos` invariant are the ones the
+        // player's gun uses.
+        //
+        // The capital ship is team 1 (`main.js:2741`), so friendly-fire
+        // rejection keeps its rounds off its own hitboxes — and
+        // `bullets::resolve_impact` skips the caller-supplied hull for a shot
+        // this ship fired, so they do not detonate on its own deck either.
+        let spawn = BulletSpawn::boss_turret(&rules, muzzle, dir, BOSS_ID_BASE, Some(Team::One));
+        spawn_bullet(world, spawn);
         events.push(SimEvent::Fired {
             owner: BOSS_ID_BASE,
             weapon: WeaponKind::Bullet,
