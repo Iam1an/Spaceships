@@ -363,7 +363,74 @@ flying over.
 
 ---
 
-## 7. Falls out of the replay system nearly free
+## 7. Replace the ship models
+
+The default ship reads as blocks because it geometrically is.
+
+### Measured
+
+| Model | Triangles | Textures | File |
+|---|---|---|---|
+| `spaceship.glb` | **516** | **0** | 41 KB |
+| `spaceshipADMIN.glb` | 137,254 | **0** | 4.7 MB |
+
+516 triangles is PS1-era. At that budget the mesh cannot describe a curve — flat
+facets are the only thing it can represent, so no amount of shading or lighting
+will stop it looking faceted.
+
+**Neither model has a single texture.** All surface detail comes from flat
+material colour, so there are no panel lines, no normal map, no wear, no
+variation. That is the other half of why they read as untextured blocks.
+
+The admin ship is the opposite failure: 266x the triangles of the default, which
+is heavy even by modern standards and is why 4.7 MB loads every session
+regardless of whether the player owns it.
+
+### Target spec
+
+- **8,000–20,000 triangles.** Enough for real silhouette and curvature, cheap
+  enough for a dozen on screen.
+- **Textured**: albedo, normal, roughness/metallic. A normal map is what
+  actually sells surface detail — it does far more per byte than triangles.
+- **LODs**, so distant contacts are not full-detail.
+- Consistent budget between the default and admin ships. The admin ship should
+  be *nicer*, not 266x heavier.
+
+### Hard constraint on any replacement
+
+`customization.js` splits hull from accent by a **luminance threshold below
+0.35**, and `ship.js` applies the player's chosen colours to the resulting mesh
+groups. Any new model has to either respect that split or come with a revised
+mapping — otherwise ship customization, which is a purchasable unlock, breaks.
+
+### Sourcing
+
+This needs 3D art, which is not something that can be generated here. Realistic
+routes:
+
+- **CC0 libraries** — Quaternius and Kenney both publish sci-fi and space kits
+  free with no attribution. Quality varies; some are deliberately low-poly and
+  would reproduce the current problem.
+- **Sketchfab**, filtered to CC0 or CC-BY. Wide range, check the licence per
+  model.
+- **Marketplaces** — TurboSquid, CGTrader, the Unity and Unreal asset stores.
+  Paid, but game-ready with LODs and textures already done.
+- **Commission** — ArtStation or Fiverr. The only route that gets a ship
+  designed *for* this game rather than adapted to it.
+
+Note the licence: the README claims the game as exclusive property, so CC0 or a
+purchased commercial licence is the safe ground. CC-BY requires attribution in
+the build.
+
+### Pipeline work once models exist
+
+Converting and optimising the glb, generating LODs, wiring the hull/accent split,
+and validating the triangle budget are all mechanical and can be automated.
+Bevy loads glTF natively, so the format does not need to change.
+
+---
+
+## 8. Falls out of the replay system nearly free
 
 - **Killcam.** A replay bounded to the 5 seconds before your death, from the
   killer's view.
@@ -376,7 +443,7 @@ flying over.
 
 ---
 
-## 8. Netcode: rollback
+## 9. Netcode: rollback
 
 A deterministic simulation is the hard prerequisite for rollback netcode — the
 thing that makes fighting games feel lagless online. The client predicts
@@ -388,7 +455,7 @@ foundation is already in place.
 
 ---
 
-## 9. Known gameplay issues found during the port
+## 10. Known gameplay issues found during the port
 
 Real behaviors in the current game, each verified against the source. Some are
 bugs, some are probably-unintended design. Decide individually.
@@ -409,7 +476,7 @@ bugs, some are probably-unintended design. Decide individually.
 
 ---
 
-## 10. Other ideas
+## 11. Other ideas
 
 - **Replace the pixel filter with a real post chain.** `PIXEL_SCALE = 3` renders
   to a third-res target and upscales. In Bevy this is a post-processing pass,
