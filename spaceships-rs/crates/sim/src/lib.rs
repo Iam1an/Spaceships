@@ -76,9 +76,11 @@
 //! - [`asteroids`] — seeded field generation, damage, and spin.
 //! - [`bot`] — target selection, pursuit, evasion, and weapon use.
 //! - [`campaign`] — waves, lives, checkpoints, and the capital ship.
+//! - [`aim_assist`] — the local player's assisted aim: cone selection, bullet
+//!   intercept, line of sight, and the bounded pull on the ship's orientation.
 //!
 //! - [`tick`] — **the assembly.** [`tick::tick`] is the
-//!   [`world::TickFn`]: it decides what order those six run in, reconciles the
+//!   [`world::TickFn`]: it decides what order those seven run in, reconciles the
 //!   assumptions they were each written under, and produces the [`world::Frame`]
 //!   and the [`world::NetIntent`]s. Its module docs carry the phase order and
 //!   the reasoning behind every placement that is load-bearing.
@@ -86,6 +88,7 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod aim_assist;
 pub mod asteroids;
 pub mod bot;
 pub mod bullets;

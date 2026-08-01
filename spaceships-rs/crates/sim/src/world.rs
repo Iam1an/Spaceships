@@ -65,7 +65,7 @@
 
 use crate::math::Vec3;
 use crate::rng::Rng;
-use crate::rules::{Rules, BOSS_HITBOX_COUNT, BOSS_ID_BASE};
+use crate::rules::{AimProfile, Rules, BOSS_HITBOX_COUNT, BOSS_ID_BASE};
 
 /// Re-export of the orientation type, which now lives beside [`Vec3`] in
 /// [`crate::math`] along with the algebra that operates on it.
@@ -572,6 +572,20 @@ impl Ship {
     pub fn is_damageable(&self) -> bool {
         self.alive && self.invuln_timer <= 0.0
     }
+
+    /// This pilot's control scheme, as the enum the rules index by.
+    ///
+    /// [`Ship::coarse_aim`] is the stored form because
+    /// [`crate::bullets::Sweep`] only ever needs the bool; aim assist indexes
+    /// [`crate::rules::AimAssistRules::tuning`], which wants the enum.
+    #[must_use]
+    pub fn aim_profile(&self) -> AimProfile {
+        if self.coarse_aim {
+            AimProfile::Coarse
+        } else {
+            AimProfile::Precise
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -793,19 +807,46 @@ pub struct BoxVolume {
 // ---------------------------------------------------------------------------
 
 /// Aim assist's per-ship memory. `main.js:2027` (`applyAimAssist`).
+///
+/// One instance, on [`World`], for the local player: assist is a client-side
+/// aiming aid, and a headless server with no [`World::local_id`] never runs it.
+/// See [`crate::aim_assist`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AimAssistState {
     /// Whether assist is switched on. Forced on for coarse-aim pilots
-    /// (`main.js:996`).
+    /// (`main.js:996`); see [`crate::aim_assist::update`], which rewrites this
+    /// field rather than testing the profile at every read.
     pub enabled: bool,
     /// Smoothed assist strength, so engaging and releasing is not a step.
     pub strength_smoothed: f64,
     /// The target assist is currently holding, if any. Held targets get
     /// [`crate::rules::AimAssistTuning::sticky_dot_bonus`] so the assist does
     /// not flicker between two candidates at similar angles.
+    ///
+    /// This is `main.js`'s `lastAssistTargetId`, and it deliberately outlives
+    /// [`AimAssistState::has_target`]: releasing the assist by steering hard
+    /// keeps the memory of who you were on, so reacquiring after the input
+    /// settles snaps back to the same ship instead of picking afresh.
     pub target: Option<EntityId>,
+    /// Whether the assist is *currently* engaged on [`AimAssistState::target`].
+    /// `main.js`'s `assistHasTarget`. This, not `target`, is what the HUD lock
+    /// reads — see [`HudState::assist_target`].
+    pub has_target: bool,
     /// Unit direction toward the intercept point of the held target.
     pub target_dir: Vec3,
+}
+
+impl AimAssistState {
+    /// The target the HUD should draw a lock on: the held target, but only
+    /// while the assist is actually engaged on it.
+    #[must_use]
+    pub fn locked_target(&self) -> Option<EntityId> {
+        if self.has_target {
+            self.target
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,7 +1864,12 @@ pub struct HudState {
     /// Whether an enemy missile is tracking the local player, which triggers
     /// the lock warning. `missiles.js:282` (`isTargetingLocal`).
     pub missile_lock_warning: bool,
-    /// Aim-assist target, or `-1`.
+    /// The ship aim assist is currently pulling toward, or `-1` for none.
+    ///
+    /// [`AimAssistState::locked_target`], flattened. Drives the reticle lock,
+    /// the lead marker, and the cockpit's TGT annunciator, which is why it goes
+    /// back to `-1` the moment the assist releases — including while the player
+    /// is steering hard enough to break it.
     pub assist_target: i32,
     /// Seconds left on the match clock.
     pub match_timer: f32,

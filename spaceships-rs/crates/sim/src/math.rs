@@ -904,6 +904,96 @@ pub mod det {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ballistic prediction
+// ---------------------------------------------------------------------------
+
+/// Time until a projectile of speed `speed`, launched now from `self_pos`,
+/// reaches a target at `target_pos` moving at `target_vel`.
+///
+/// `main.js:633` (`solveIntercept`). Solves `|R + U t| = speed * t` for the
+/// smallest positive `t`, where `R` is the offset to the target and `U` the
+/// relative velocity, and returns `None` when there is no solution — the target
+/// is outrunning the projectile, or the geometry is degenerate.
+///
+/// Only `+ - * /` and `sqrt`, so it is bit-identical everywhere; see [`det`] for
+/// why that matters.
+///
+/// # On `self_vel`
+///
+/// Pass [`Vec3::ZERO`] for a gun in this game. A bullet is spawned with
+/// `direction * bullet_speed` and inherits nothing from the shooter
+/// (`bullets.js:44`), so the shooter's own motion must not enter the relative
+/// velocity. `bot.js:172` passes zero and is correct.
+///
+/// The JS player aim assist does **not**: `main.js:2047` passes `shipVelocity`,
+/// which solves for a projectile that carries the ship's momentum. The faster
+/// the player flies, the further the assisted reticle leads by an amount the
+/// bullet never makes up. Both Rust callers — [`crate::bot`] and
+/// [`crate::aim_assist`] — pass zero, and
+/// `aim_assist::tests::the_shooters_own_velocity_never_enters_the_intercept_solve`
+/// pins that so the JS bug cannot come back.
+///
+/// This lives here, next to [`Vec3`], because it has two call sites in two
+/// modules and a third copy is exactly how the JS ended up with the divergence
+/// above.
+///
+/// ```
+/// use spaceships_sim::math::{solve_intercept, Vec3};
+///
+/// // A target 100 units ahead, sitting still, and a 10 u/s projectile.
+/// let t = solve_intercept(Vec3::new(0.0, 0.0, 100.0), Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, 10.0);
+/// assert_eq!(t, Some(10.0));
+/// ```
+#[must_use]
+pub fn solve_intercept(
+    target_pos: Vec3,
+    target_vel: Vec3,
+    self_pos: Vec3,
+    self_vel: Vec3,
+    speed: f64,
+) -> Option<f64> {
+    let r = target_pos - self_pos;
+    let u = target_vel - self_vel;
+    let rr = r.length_squared();
+    let ru = r.dot(u);
+    let uu = u.length_squared();
+
+    let a = uu - speed * speed;
+    let b = 2.0 * ru;
+    let c = rr;
+
+    if a.abs() < 1e-6 {
+        // The target is closing at exactly projectile speed: the quadratic
+        // collapses to a linear equation.
+        if b.abs() < 1e-6 {
+            return None;
+        }
+        let t = -c / b;
+        return if t > 0.0 { Some(t) } else { None };
+    }
+
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let sd = disc.sqrt();
+    let t1 = (-b - sd) / (2.0 * a);
+    let t2 = (-b + sd) / (2.0 * a);
+    let mut t = f64::INFINITY;
+    if t1 > 0.0 {
+        t = t.min(t1);
+    }
+    if t2 > 0.0 {
+        t = t.min(t2);
+    }
+    if t.is_finite() {
+        Some(t)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Vec3;

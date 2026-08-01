@@ -1006,3 +1006,125 @@ fn a_solo_match_emits_no_network_traffic() {
         assert!(frame.net_out.is_empty(), "solo must not talk to a server");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Aim assist
+// ---------------------------------------------------------------------------
+
+/// A duel with the target 300 units downrange and 22 degrees off the nose —
+/// inside the 53-degree cone, well outside the dead angle.
+fn assisted_duel() -> World {
+    let mut world = duel(300.0);
+    world.ship_mut(2).expect("target").pos = Vec3::new(120.0, 0.0, 300.0);
+    world
+}
+
+#[test]
+fn aim_assist_turns_the_nose_and_lights_the_hud_through_the_tick() {
+    // `aim_assist::update` has its own unit tests. This one only asserts that
+    // the tick calls it at all, with the local ship, and that the result
+    // reaches both the ship's pose and `HudState`.
+    let want = Vec3::new(120.0, 0.0, 300.0).normalize();
+
+    let mut off = assisted_duel();
+    let frame = tick(&mut off, &[idle(1)], &[], TICK_DT);
+    assert_eq!(frame.hud.assist_target, -1, "assist is off by default");
+    assert_eq!(off.ship(1).expect("pilot").quat, Quat::IDENTITY);
+
+    let mut on = assisted_duel();
+    on.aim_assist.enabled = true;
+    let frame = tick(&mut on, &[idle(1)], &[], TICK_DT);
+    assert_eq!(
+        frame.hud.assist_target, 2,
+        "the HUD lock comes from the sim"
+    );
+
+    let nose = spaceships_sim::math::forward(on.ship(1).expect("pilot").quat);
+    assert!(
+        nose.dot(want) > Vec3::Z.dot(want),
+        "the nose should have moved toward the target, not away from it"
+    );
+    assert!(
+        nose.dot(want) < 1.0,
+        "and only part of the way: this is a nudge, not a snap"
+    );
+}
+
+#[test]
+fn the_c_key_toggles_aim_assist_through_the_tick() {
+    // Phase 5 owns the toggle and phase 4 owns the pull, so `C` lands on the
+    // step *after* the one it is pressed on — the same order `main.js` has, where
+    // `applyAimAssist` runs at `:1256` and the key edge is read at `:1385`.
+    let mut world = assisted_duel();
+    let press = Input {
+        id: 1,
+        toggle_aim_assist: true,
+        ..Input::default()
+    };
+
+    let frame = tick(&mut world, &[press], &[], TICK_DT);
+    assert_eq!(
+        frame.hud.assist_target, -1,
+        "the press has not taken effect yet"
+    );
+    assert!(world.aim_assist.enabled);
+
+    let frame = tick(&mut world, &[idle(1)], &[], TICK_DT);
+    assert_eq!(frame.hud.assist_target, 2);
+
+    let frame = tick(&mut world, &[press], &[], TICK_DT);
+    assert_eq!(frame.hud.assist_target, 2, "still on for this step");
+    assert!(!world.aim_assist.enabled);
+
+    let frame = tick(&mut world, &[idle(1)], &[], TICK_DT);
+    assert_eq!(frame.hud.assist_target, -1, "and off from the next one");
+}
+
+#[test]
+fn aim_assist_solves_against_the_start_of_step_poses() {
+    // Phase placement, pinned. `main.js:1256` runs the assist from inside the
+    // flight block, long before the remote interpolation at `:1721` and the bot
+    // update, so it always solves the intercept against where everything *was*
+    // at the top of the step. The remote below has a network pose waiting for
+    // it, so `interpolate_remotes` will move it during this same step: run the
+    // assist after that phase instead of before it and the direction below
+    // changes, and this fails.
+    let mut world = bare_world(0xA551, Mode::Skirmish);
+    push_ship(&mut world, 1, Team::Zero, Vec3::ZERO);
+    world.local_id = Some(1);
+    world.aim_assist.enabled = true;
+
+    let target_pos = Vec3::new(120.0, 0.0, 300.0);
+    let target_vel = Vec3::new(200.0, 0.0, 0.0);
+    let rules = world.rules;
+    let mut remote = Ship::spawn(2, ShipKind::Remote, target_pos, Quat::IDENTITY, &rules);
+    remote.team = Some(Team::One);
+    remote.invuln_timer = 0.0;
+    remote.vel = target_vel;
+    remote.interp.has_target = true;
+    remote.interp.target_pos = target_pos + target_vel * 0.05;
+    remote.interp.target_quat = Quat::IDENTITY;
+    world.ships.push(remote);
+
+    tick(&mut world, &[idle(1)], &[], TICK_DT);
+    assert_ne!(
+        world.ship(2).expect("target").pos,
+        target_pos,
+        "the remote must actually move this step, or the test proves nothing"
+    );
+
+    let t = spaceships_sim::math::solve_intercept(
+        target_pos,
+        target_vel,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        Rules::DEFAULT.weapons.bullet_speed,
+    )
+    .expect("the target is slower than a bullet");
+    let want = (target_pos + target_vel * t).normalize();
+    assert!(
+        world.aim_assist.target_dir.abs_diff_eq(want, 1e-12),
+        "aimed at {:?}, wanted {want:?}",
+        world.aim_assist.target_dir
+    );
+}

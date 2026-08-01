@@ -78,7 +78,9 @@
 use std::f64::consts::PI;
 
 use crate::bullets::{spawn_bullet, BulletSpawn};
-use crate::math::{quat_from_axis_angle as axis_angle, quat_mul, quat_normalize, Vec3};
+use crate::math::{
+    quat_from_axis_angle as axis_angle, quat_mul, quat_normalize, solve_intercept, Vec3,
+};
 use crate::rng::Rng;
 use crate::rules::Rules;
 use crate::world::{
@@ -355,8 +357,9 @@ fn plan_bot(
     // The intercept solve. The shooter velocity is deliberately zero: a bullet
     // in this game is spawned with `direction * bullet_speed` and inherits
     // nothing from the shooter (`bullets.js:44`), so the correct relative
-    // velocity is the target's alone. `bot.js:172` gets this right; see
-    // [`solve_intercept`] for the aim-assist call site that does not.
+    // velocity is the target's alone. `bot.js:172` gets this right, and so does
+    // [`crate::aim_assist`], which shares this solver — see
+    // [`crate::math::solve_intercept`] for the JS call site that does not.
     let lead_t = solve_intercept(
         target_pos,
         target_vel,
@@ -700,80 +703,6 @@ fn target_index(world: &World, id: EntityId) -> usize {
         .iter()
         .position(|s| s.id == id)
         .unwrap_or_default()
-}
-
-// ---------------------------------------------------------------------------
-// Aim prediction
-// ---------------------------------------------------------------------------
-
-/// Time until a projectile of speed `speed`, launched now from `self_pos`,
-/// reaches a target at `target_pos` moving at `target_vel`.
-///
-/// `main.js:633` (`solveIntercept`). Solves `|R + U t| = speed * t` for the
-/// smallest positive `t`, where `R` is the offset to the target and `U` the
-/// relative velocity, and returns `None` when there is no solution — the target
-/// is outrunning the projectile, or the geometry is degenerate.
-///
-/// # On `self_vel`
-///
-/// Pass [`Vec3::ZERO`] for a gun in this game. A bullet is spawned with
-/// `direction * bullet_speed` and inherits nothing from the shooter
-/// (`bullets.js:44`), so the shooter's own motion must not enter the relative
-/// velocity. `bot.js:172` passes zero and is correct.
-///
-/// The player's aim assist does **not**: `main.js:2047` passes `shipVelocity`,
-/// which solves for a projectile that carries the ship's momentum. The faster
-/// the player flies, the further the assisted reticle leads by an amount the
-/// bullet never makes up. That belongs to whoever ports aim assist, but it is
-/// the same helper, and it should move next to [`Vec3`] rather than being
-/// written a third time.
-#[must_use]
-pub fn solve_intercept(
-    target_pos: Vec3,
-    target_vel: Vec3,
-    self_pos: Vec3,
-    self_vel: Vec3,
-    speed: f64,
-) -> Option<f64> {
-    let r = target_pos - self_pos;
-    let u = target_vel - self_vel;
-    let rr = r.length_squared();
-    let ru = r.dot(u);
-    let uu = u.length_squared();
-
-    let a = uu - speed * speed;
-    let b = 2.0 * ru;
-    let c = rr;
-
-    if a.abs() < 1e-6 {
-        // The target is closing at exactly projectile speed: the quadratic
-        // collapses to a linear equation.
-        if b.abs() < 1e-6 {
-            return None;
-        }
-        let t = -c / b;
-        return if t > 0.0 { Some(t) } else { None };
-    }
-
-    let disc = b * b - 4.0 * a * c;
-    if disc < 0.0 {
-        return None;
-    }
-    let sd = disc.sqrt();
-    let t1 = (-b - sd) / (2.0 * a);
-    let t2 = (-b + sd) / (2.0 * a);
-    let mut t = f64::INFINITY;
-    if t1 > 0.0 {
-        t = t.min(t1);
-    }
-    if t2 > 0.0 {
-        t = t.min(t2);
-    }
-    if t.is_finite() {
-        Some(t)
-    } else {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------

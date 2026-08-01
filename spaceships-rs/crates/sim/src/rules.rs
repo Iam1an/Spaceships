@@ -251,6 +251,18 @@ pub struct AimAssistRules {
     /// Furthest range at which assist engages. `main.js:1002`
     /// (`ASSIST_RANGE`).
     pub range: f64,
+    /// Damping rate for [`crate::world::AimAssistState::strength_smoothed`], so
+    /// acquiring and losing a target ramps instead of stepping. `main.js:2063`
+    /// and `:2114` — the bare `6` in both `MathUtils.damp` calls.
+    pub strength_damp_rate: f64,
+    /// Damping rate for [`crate::world::AimAssistState::target_dir`] while the
+    /// same target is held, which is what stops the pull chattering as the
+    /// intercept point jitters. `main.js:2120` (the `12` in
+    /// `1 - Math.exp(-12 * dt)`).
+    pub dir_track_rate: f64,
+    /// Below this smoothed strength the pull is skipped entirely.
+    /// `main.js:2129`.
+    pub engage_epsilon: f64,
     /// Tuning for mouse pilots.
     pub precise: AimAssistTuning,
     /// Tuning for keyboard/touch pilots.
@@ -262,6 +274,9 @@ impl AimAssistRules {
     pub const DEFAULT: Self = Self {
         min_range: 0.0,
         range: 1000.0,
+        strength_damp_rate: 6.0,
+        dir_track_rate: 12.0,
+        engage_epsilon: 0.01,
         precise: AimAssistTuning {
             cone_dot: 0.60,
             sticky_dot_bonus: 0.05,
@@ -1896,6 +1911,39 @@ impl Rules {
             "aim_assist.range",
             "must exceed min_range",
         )?;
+        check(
+            self.aim_assist.strength_damp_rate > 0.0,
+            "aim_assist.strength_damp_rate",
+            "must be positive or assist never engages",
+        )?;
+        check(
+            self.aim_assist.dir_track_rate > 0.0,
+            "aim_assist.dir_track_rate",
+            "must be positive or the held direction never tracks",
+        )?;
+        for (intent_field, falloff_field, t) in [
+            (
+                "aim_assist.precise.intent_break",
+                "aim_assist.precise.falloff_start",
+                &self.aim_assist.precise,
+            ),
+            (
+                "aim_assist.coarse.intent_break",
+                "aim_assist.coarse.falloff_start",
+                &self.aim_assist.coarse,
+            ),
+        ] {
+            check(
+                t.intent_break > 0.0,
+                intent_field,
+                "must be positive: it is a divisor",
+            )?;
+            check(
+                t.falloff_start > t.dead_angle,
+                falloff_field,
+                "must exceed dead_angle: the gap between them is a divisor",
+            )?;
+        }
 
         Ok(())
     }

@@ -14,14 +14,14 @@
 //!   1  pre-race hold       a running trials countdown skips the whole step
 //!   2  clocks              cooldowns, invulnerability, respawn, regeneration
 //!   3  projectiles         bullets, then missiles + flares      <-- before movers
-//!   4  movers              player flight, remotes, bots, capital ship
+//!   4  movers              player flight, aim assist, remotes, bots, capital ship
 //!   5  weapons             triggers, launches, countermeasures  <-- after movers
 //!   6  field               asteroid spin and flash decay
 //!   7  match clock         countdown and end-of-match
 //!   8  outbound            time advances, then the periodic NetIntents
 //! ```
 //!
-//! Three of those placements are load-bearing.
+//! Four of those placements are load-bearing.
 //!
 //! **Projectiles run before anything moves (3 before 4).** Both
 //! [`crate::bullets::resolve_impact`] and [`crate::missiles::update`] sweep a
@@ -53,6 +53,28 @@
 //! is exactly the invariant [`crate::bullets::spawn_bullet`] documents when it
 //! seeds `prev_pos == pos`.
 //!
+//! **Aim assist runs inside the movers, immediately after the local flight
+//! model and before anything else moves.** `main.js:1256` calls
+//! `applyAimAssist` from the middle of the flight block, well before the remote
+//! interpolation at `:1721` and the bot update, so the assist sees every other
+//! ship at its *start-of-step* pose and solves the intercept against that.
+//! Running it here reproduces that exactly. Running it after the remote
+//! interpolation or the bot step would silently give the player half a tick of
+//! extra prediction the JS never had — pinned by `tests/tick_integration.rs`
+//! (`aim_assist_solves_against_the_start_of_step_poses`).
+//!
+//! It cannot go inside [`crate::ship::integrate`], which is the one place the
+//! JS puts it, because that function is the whole of `main.js:1200`–`:1330` —
+//! including the velocity and position integration the JS does *after* the
+//! assist. Splitting it in two to slot the assist into the middle would make
+//! every existing flight test read as a two-phase call for the sake of one
+//! caller. Instead `ship.rs` documents the composition rule ("it composes by
+//! premultiplying `Ship::quat` after this returns") and this phase honours it.
+//! The cost is that the step's velocity follows the *pre*-assist nose by one
+//! tick, which at 60 Hz and a 2.6 rad/s ceiling is a 0.04 rad heading error on
+//! the drift term and nothing at all on where the gun points, since the gun is
+//! fired from the post-assist pose in phase 5.
+//!
 //! **A campaign death is settled once, between the movers and the mission
 //! script.** [`crate::bullets`] and [`crate::missiles`] apply generic damage and
 //! set the generic [`crate::rules::CombatRules::respawn_delay`];
@@ -75,6 +97,7 @@
 //!
 //! [`Ship`]: crate::world::Ship
 
+use crate::aim_assist;
 use crate::asteroids;
 use crate::bot::{self, TerrainHeight};
 use crate::bullets::{self, BulletOutput, BulletSpawn, HullPart, HullVolumes, ShipBasis};
@@ -134,6 +157,7 @@ pub fn tick(world: &mut World, inputs: &[Input], events: &[NetEvent], dt: f64) -
 
     // -- 4. Movers ------------------------------------------------------------
     let flights = integrate_players(world, inputs, dt, &mut out);
+    steer_aim_assist(world, &flights, dt);
     interpolate_remotes(world, dt);
     step_bots(world, dt, &mut out);
     settle_campaign_death(world, local_was_alive, &mut out);
@@ -717,6 +741,27 @@ fn integrate_players(
     flights
 }
 
+/// Runs [`crate::aim_assist::update`] for the local player.
+///
+/// The only thing this adds is the release input: `main.js:1257` measures the
+/// player's intent as `max(|sx|, |sy|)` of the *processed* steering — after the
+/// deadzone, the response curve and the arrow-key ramp — which is exactly what
+/// [`crate::ship::integrate`] hands back in [`FlightStep::steer`]. Reading it
+/// from the flight step rather than from the raw [`Input`] is what keeps a
+/// gamepad's 0.04 stick drift from being mistaken for a deliberate correction.
+///
+/// A world with no local player (a headless server) does no work here.
+fn steer_aim_assist(world: &mut World, flights: &[(EntityId, FlightStep)], dt: f64) {
+    let Some(id) = world.local_id else {
+        return;
+    };
+    let Some((_, step)) = flights.iter().find(|(flown, _)| *flown == id) else {
+        return;
+    };
+    let steer_mag = step.steer[0].abs().max(step.steer[1].abs());
+    aim_assist::update(world, steer_mag, dt);
+}
+
 /// Routes brake-overcharge and collision damage through the one damage gate.
 ///
 /// [`crate::ship::integrate`] and [`crate::ship::resolve_world_collisions`] both
@@ -1117,7 +1162,7 @@ fn hud_state(world: &World, flights: &[(EntityId, FlightStep)]) -> HudState {
     let mut hud = HudState {
         match_timer: world.match_state.timer as f32,
         team_kills: world.match_state.team_kills,
-        assist_target: world.aim_assist.target.unwrap_or(-1),
+        assist_target: world.aim_assist.locked_target().unwrap_or(-1),
         trials: trials_hud(world),
         campaign: campaign::campaign_hud(world),
         ..HudState::default()
