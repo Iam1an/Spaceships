@@ -1020,6 +1020,12 @@ export async function startGame(opts = {}) {
   const BRAKE_OVERCHARGE_DAMAGE = 2.0;
   const BRAKE_OVERCHARGE_DPS = 10;
   let brakeOverchargeTime = 0;
+  // Previous-frame values, so voice warnings fire on the transition into a
+  // dangerous state rather than every frame it persists.
+  let prevMissileLocked = false;
+  let prevHpFrac = 1;
+  let prevBoostFrac = 1;
+  let prevOverchargeTime = 0;
   let selfDamageAccum = 0;
   let brakeCharge = 0;
   let prevBraking = false;
@@ -1351,6 +1357,26 @@ export async function startGame(opts = {}) {
     const _missileLocked = missileSystem.isTargetingLocal(localShipRecord) && myAlive;
     const _lockWarnEl = document.getElementById('missile-lock-warning');
     if (_lockWarnEl) _lockWarnEl.style.display = _missileLocked ? '' : 'none';
+    // Cockpit voice warnings. audio.warn() arbitrates priority and repeat
+    // rate; these only decide *when* a condition is true. Edge-triggered
+    // where the condition is a state change, level-triggered where the
+    // danger persists (terrain, handled in the terrain block below).
+    if (myAlive) {
+      if (_missileLocked && !prevMissileLocked) audio.warn('lock');
+      const _hpFrac = myHp / SHIP_MAX_HP;
+      if (_hpFrac <= 0.3 && prevHpFrac > 0.3) audio.warn('warning');
+      const _boostFrac = boostMeter / MAX_BOOST;
+      if (_boostFrac <= 0.2 && prevBoostFrac > 0.2) audio.warn('bingo');
+      // Over-G: the brake charge has gone past the warn threshold and is
+      // about to start doing damage.
+      if (brakeOverchargeTime > BRAKE_OVERCHARGE_WARN && prevOverchargeTime <= BRAKE_OVERCHARGE_WARN) {
+        audio.warn('master_caution');
+      }
+      prevHpFrac = _hpFrac;
+      prevBoostFrac = _boostFrac;
+    }
+    prevMissileLocked = _missileLocked;
+    prevOverchargeTime = brakeOverchargeTime;
     const nowKeyP = input.keys.has('KeyP');
     if (nowKeyP && !prevKeyP) {
       gunMode = gunMode === 'beam' ? 'bullet' : 'beam';
@@ -1447,6 +1473,7 @@ export async function startGame(opts = {}) {
       missileSystem.deployFlare(ship.position.clone(), ship.quaternion, myId);
       flaresLeft--;
       audio.play('shoot');
+      audio.warn('flare');
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           type: 'flare',
@@ -2249,6 +2276,16 @@ export async function startGame(opts = {}) {
     if (isTerrainMap) {
       const groundY = getTerrainHeight(ship.position.x, ship.position.z);
       const killY = groundY + TERRAIN_KILL_CLEARANCE;
+      // Ground proximity. Level-triggered on purpose — the danger persists,
+      // so the callout should keep repeating (at its cooldown) until you
+      // climb out, exactly like the real thing. Only warn while descending
+      // toward it, so a low fast pass held level stays quiet.
+      if (myAlive) {
+        const agl = ship.position.y - killY;
+        const descending = shipVelocity.y < -2;
+        if (agl < 45 && descending) audio.warn('pull_up');
+        else if (agl < 90) audio.warn('altitude');
+      }
       if (ship.position.y < killY) {
         ship.position.y = killY;
         if (shipVelocity.y < 0) shipVelocity.y *= -0.5;
