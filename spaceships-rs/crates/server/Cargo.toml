@@ -1,0 +1,17 @@
+[package]
+name = "spaceships-server"
+description = "Placeholder binary for the Rust port of the Spaceships game server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "spaceships-server"
+path = "src/main.rs"
+
+# Deliberately minimal. No axum, no tokio, no rusqlite yet — the HTTP/WebSocket
+# and persistence layers are not designed, and pulling in a runtime before that
+# decision is made would bias it. See the module docs in src/main.rs.
+[dependencies]
+spaceships-protocol = { workspace = true }

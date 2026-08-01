@@ -1,0 +1,15 @@
+[package]
+name = "spaceships-sim"
+description = "Deterministic, I/O-free simulation core for Spaceships."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Intentionally empty. See the crate-level docs in src/lib.rs: this crate must
+# stay free of I/O, rendering, networking, and wall-clock time so it can be
+# compiled to WASM for the browser and linked into the server unchanged, and so
+# both sides produce bit-identical results from the same inputs.
+[dependencies]
+
+[dev-dependencies]
