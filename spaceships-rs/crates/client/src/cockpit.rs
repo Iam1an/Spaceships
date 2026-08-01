@@ -613,16 +613,30 @@ impl CockpitPower {
     }
 }
 
+/// `G`, but only when `SPACESHIPS_EMP` is set — a dev hook for an effect with
+/// no weapon in front of it yet, kept off the shipped binding table.
+fn emp_test_key() -> Option<KeyCode> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var_os("SPACESHIPS_EMP").is_some() {
+        return Some(KeyCode::KeyG);
+    }
+    None
+}
+
 fn tick_power(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mut power: ResMut<CockpitPower>,
     mut audio: Option<ResMut<AudioCommands>>,
 ) {
-    // TODO(emp): the weapon does not exist yet, so `G` stands in for the event
+    // TODO(emp): the weapon does not exist yet, so this stands in for the event
     // that will eventually carry it. When it lands, this block is the only
     // thing that changes.
-    if keys.just_pressed(KeyCode::KeyG) {
+    //
+    // Behind `SPACESHIPS_EMP` rather than on a bare `G`: the JS binds no such
+    // key, and a port whose whole promise is that the controls are the same
+    // cannot quietly grow one for an unshipped weapon.
+    if emp_test_key().is_some_and(|k| keys.just_pressed(k)) {
         power.emp(4.0);
         // "Should it kill the audio warnings? A dead cockpit that also goes
         // silent is a genuinely unsettling few seconds." — BACKLOG.md §2.

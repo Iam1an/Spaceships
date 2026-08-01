@@ -26,6 +26,10 @@ impl Plugin for InputPlugin {
         // `PreUpdate` and `Update`.
         app.init_resource::<VirtualCursor>()
             .add_systems(PreUpdate, (grab_cursor, gather_input).chain());
+        // Not on wasm: the browser owns fullscreen and only grants it inside a
+        // user-gesture handler, which a Bevy system is not.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(PreUpdate, toggle_fullscreen);
     }
 }
 
@@ -62,10 +66,16 @@ struct VirtualCursor {
     y: f32,
 }
 
-/// Locks the pointer on click and releases it on Escape.
+/// Locks the pointer on click, and releases it on Escape or `O`.
 ///
 /// `main.js` requests pointer lock on the canvas for the same reason. Without
 /// a grab the mouse leaves the window mid-turn and aiming simply stops.
+///
+/// `O` is the JS's own binding for this (`main.js:1392`): it toggles pointer
+/// lock both ways, and it is gated on `!noMouseMode` there because a pilot on
+/// the keyboard scheme has no use for it. Escape is kept alongside it as the
+/// platform convention — winit surrenders the lock on Escape regardless, so
+/// pretending otherwise would only desync this state from the window's.
 fn grab_cursor(
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -83,16 +93,44 @@ fn grab_cursor(
         return;
     }
 
-    if mouse.just_pressed(MouseButton::Left) && cursor.grab_mode == CursorGrabMode::None {
+    let locked = cursor.grab_mode != CursorGrabMode::None;
+    let take = (mouse.just_pressed(MouseButton::Left) && !locked)
+        || (keys.just_pressed(KeyCode::KeyO) && !locked);
+    let release =
+        keys.just_pressed(KeyCode::Escape) || (keys.just_pressed(KeyCode::KeyO) && locked);
+
+    if take {
         // `Locked` is the pointer-lock equivalent. macOS supports it; where it
         // is unavailable winit falls back and the cursor stays confined, which
         // is still better than losing it out of the window.
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;
-    } else if keys.just_pressed(KeyCode::Escape) {
+    } else if release {
         cursor.grab_mode = CursorGrabMode::None;
         cursor.visible = true;
     }
+}
+
+/// `L` toggles fullscreen. `main.js:1401`.
+///
+/// The JS calls `requestFullscreen` on the document element; the native
+/// equivalent is the window's mode, and `Borderless(None)` is the one that
+/// matches — it takes the monitor the window is already on rather than moving
+/// it, which is what a browser going fullscreen does.
+#[cfg(not(target_arch = "wasm32"))]
+fn toggle_fullscreen(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut window: Single<&mut Window, With<PrimaryWindow>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyL) {
+        return;
+    }
+    window.mode = match window.mode {
+        bevy::window::WindowMode::Windowed => {
+            bevy::window::WindowMode::BorderlessFullscreen(bevy::window::MonitorSelection::Current)
+        }
+        _ => bevy::window::WindowMode::Windowed,
+    };
 }
 
 fn gather_input(
@@ -114,7 +152,10 @@ fn gather_input(
     // Right mouse is free-look in the JS (`main.js:1220`), and while it is held
     // the deltas drive the *camera* rather than the aim — so the virtual cursor
     // must not move, or the nose snaps when the button is released.
-    let free_look = mouse.pressed(MouseButton::Right) || keys.pressed(KeyCode::AltLeft);
+    //
+    // Right mouse *only*: `input.js:52` sets `rmb` on `button === 2` and
+    // nothing reads a modifier. Left-alt was an addition here and is gone.
+    let free_look = mouse.pressed(MouseButton::Right);
 
     // Half the window *height* on both axes, matching `input.js:66` — the
     // horizontal range is deliberately not half the width, so aim sensitivity
@@ -161,9 +202,14 @@ fn gather_input(
         // Q is fine-aim *and* the flare key, and in the JS it is genuinely
         // both at once rather than one winning: `main.js:1240` reads it held
         // for the slower arrow ramp, `:1108` reads its rising edge for the
-        // flare. Left-control is kept as a second fine-aim binding for anyone
-        // who would rather not slow their turn every time they pop a decoy.
-        arrow_fine: keys.pressed(KeyCode::KeyQ) || keys.pressed(KeyCode::ControlLeft),
+        // flare.
+        //
+        // Left-control used to be a second fine-aim binding here. The JS has no
+        // such key — `main.js` reads exactly `Arrow*`, `WASD`, `C`, `E`, `F`,
+        // `L`, `O`, `P`, `Q`, `V`, `Shift`, `Space`, `Tab`, and the two mouse
+        // buttons — and an extra binding is its own kind of wrong when the
+        // muscle memory being ported is the point.
+        arrow_fine: keys.pressed(KeyCode::KeyQ),
 
         // Roll. `main.js:1249`.
         // Sign matters and was inverted. `main.js:1255`-`:1256` is

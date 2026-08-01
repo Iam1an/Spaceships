@@ -495,6 +495,13 @@ struct HudModel {
 
     /// `#killfeed`, newest row first.
     kills: [KillRowModel; KILLFEED_ROWS],
+
+    /// Whether [`HudNodes::cockpit_hidden`] is hidden — true while seated.
+    ///
+    /// Phrased as *hidden* rather than *shown* so `Default` can stay derived:
+    /// `HudModel::default()` is the no-local-ship model, where the whole tree
+    /// is already hidden by `present`, and `false` there is the no-op.
+    bars_hidden: bool,
 }
 
 /// One `#killfeed` row, as the tree needs it.
@@ -637,13 +644,21 @@ const VIGNETTE_HEALTHY_GAIN: f32 = 0.45;
 /// player's aim is on someone is a question about *projection*, and only
 /// [`sync_world_markers`] can answer it.
 fn model(frame: &Frame, time: f32, seated: bool, locked: bool, feed: &KillFeed) -> HudModel {
-    // Seated in the cockpit, the 3D instrument panel *is* the HUD, so the flat
-    // overlay stands down entirely. `main.js:1` does the same with
-    // `document.body.classList.toggle('cockpit-view', fp)` — without it the
-    // bottom bars sit on top of the panel.
-    if seated {
-        return HudModel::default();
-    }
+    // Seated in the cockpit the 3D panel replaces the *bars*, and only the
+    // bars. This used to return `HudModel::default()` and stand the whole
+    // overlay down, which also took the reticle with it — so the cockpit had no
+    // crosshair and there was no way to tell where the guns pointed.
+    //
+    // `index.html:865`–`:870` is the authority, and it is a short list:
+    // `body.cockpit-view` hides `#healthbar`, `#chargebar`, `#boostbar`,
+    // `#heatbar`, `#missilehud` and `#flarehud`. The reticle, the target boxes,
+    // the lead marker, the missile-lock warning, the hit vignette, the kill
+    // feed, the match clock and the death banner are all absent from it and all
+    // stay up, because the instrument panel does not duplicate any of them.
+    //
+    // The values behind the hidden bars are zeroed rather than left live, which
+    // is this model's usual discipline: a field that cannot be seen must not
+    // vary, or the diff churns on invisible state.
     // `ShipFlags::LOCAL` is set by `sim_bridge::ship_view` for the ship whose
     // id matches `World::local_id`. Before the first tick there is no frame and
     // no ship, and the HUD stays hidden rather than drawing a dead one.
@@ -694,27 +709,44 @@ fn model(frame: &Frame, time: f32, seated: bool, locked: bool, feed: &KillFeed) 
         ChargeState::Idle
     };
 
-    let pulsing = overheated || charge == ChargeState::Overload;
+    // Both pulses live on bars the cockpit hides, so seated they must not run —
+    // an advancing phase behind a hidden node is exactly the churn the model
+    // exists to prevent.
+    let pulsing = !seated && (overheated || charge == ChargeState::Overload);
     let lock_warning = hud.missile_lock_warning && alive;
 
     HudModel {
         present: true,
         alive,
 
-        hp: hud.hp.max(0),
-        hp_mil: mil(hp01),
+        bars_hidden: seated,
+
+        hp: if seated { 0 } else { hud.hp.max(0) },
+        hp_mil: if seated { 0 } else { mil(hp01) },
         // `Math.round(pct * 120)`: pure green at full, pure red at zero.
-        hp_hue: (hp01 * 120.0).round() as u16,
+        hp_hue: if seated {
+            0
+        } else {
+            (hp01 * 120.0).round() as u16
+        },
 
-        boost_mil: mil(hud.boost01.clamp(0.0, 1.0)),
-        heat_mil: mil(hud.ammo01.clamp(0.0, 1.0)),
-        overheated,
+        boost_mil: if seated {
+            0
+        } else {
+            mil(hud.boost01.clamp(0.0, 1.0))
+        },
+        heat_mil: if seated {
+            0
+        } else {
+            mil(hud.ammo01.clamp(0.0, 1.0))
+        },
+        overheated: overheated && !seated,
 
-        charge_mil: mil(charge01),
-        charge,
+        charge_mil: if seated { 0 } else { mil(charge01) },
+        charge: if seated { ChargeState::Idle } else { charge },
 
-        missiles: hud.missiles,
-        flares: hud.flares,
+        missiles: if seated { 0 } else { hud.missiles },
+        flares: if seated { 0 } else { hud.flares },
 
         // `main.js:1929` — `anyVisible && bestAlignment < 22`, which is a
         // question about where things land on screen and so is answered by
@@ -801,6 +833,16 @@ fn fmt_clock(secs: u32) -> String {
 #[derive(Resource)]
 struct HudNodes {
     root: Entity,
+
+    /// The six elements `body.cockpit-view` hides, in the order
+    /// `index.html:865`–`:870` lists them: `#healthbar`, `#chargebar`,
+    /// `#boostbar`, `#heatbar`, `#missilehud`, `#flarehud`.
+    ///
+    /// Held as their outer rows rather than as fills, because hiding is a
+    /// property of the whole element. Everything *not* in this array — the
+    /// reticle above all — stays up in the cockpit, which is what the JS does
+    /// and what this port originally got wrong.
+    cockpit_hidden: [Entity; 6],
 
     health_fill: Entity,
     health_text: Entity,
@@ -913,6 +955,9 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
     // targeting the primary window — `camera.rs`'s `Camera3d`. Adding a
     // `Camera2d` would give the window a second camera and make that choice
     // ambiguous.
+    // `[health, charge, boost, heat, missile, flare]`, filled below in spawn
+    // order rather than in that order; see `HudNodes::cockpit_hidden`.
+    let mut cockpit_hidden = [Entity::PLACEHOLDER; 6];
     let mut health_fill = Entity::PLACEHOLDER;
     let mut health_text = Entity::PLACEHOLDER;
     let mut boost_fill = Entity::PLACEHOLDER;
@@ -951,165 +996,181 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
         ))
         .with_children(|hud| {
             // -- #healthbar -------------------------------------------------
-            hud.spawn(centred_row(HEALTH_BOTTOM)).with_children(|row| {
-                row.spawn((
-                    bar_frame(HEALTH_HEIGHT, HEALTH_WELL, HEALTH_BORDER, 2.0),
-                    // `box-shadow: 0 8px 24px rgba(0,0,0,0.6)`.
-                    BoxShadow::new(rgba(0, 0, 0, 0.6), px(0), px(8), px(0), px(24)),
-                ))
-                .with_children(|bar| {
-                    health_fill = bar
-                        .spawn((
-                            fill_node(),
-                            // The CSS declares a static green gradient which
-                            // `main.js:1980` immediately overwrites with an
-                            // hsl one every frame. This is the one the player
-                            // actually sees; it is rebuilt here only when the
-                            // hue moves.
-                            health_gradient(120),
-                        ))
-                        .id();
-                    // `#healthbar-text`: `inset: 0`, flex-centred both ways.
-                    bar.spawn(Node {
-                        position_type: PositionType::Absolute,
-                        left: px(0),
-                        right: px(0),
-                        top: px(0),
-                        bottom: px(0),
-                        align_items: AlignItems::Center,
-                        justify_content: JustifyContent::Center,
-                        ..default()
-                    })
-                    .with_children(|slot| {
-                        health_text = slot
+            cockpit_hidden[0] = hud
+                .spawn(centred_row(HEALTH_BOTTOM))
+                .with_children(|row| {
+                    row.spawn((
+                        bar_frame(HEALTH_HEIGHT, HEALTH_WELL, HEALTH_BORDER, 2.0),
+                        // `box-shadow: 0 8px 24px rgba(0,0,0,0.6)`.
+                        BoxShadow::new(rgba(0, 0, 0, 0.6), px(0), px(8), px(0), px(24)),
+                    ))
+                    .with_children(|bar| {
+                        health_fill = bar
                             .spawn((
-                                Text::new(format!("{MAX_HP} / {MAX_HP}")),
-                                hud_font(&font, 14.0, 800),
-                                TextColor(Color::WHITE),
-                                LetterSpacing::Px(4.0),
-                                // `text-shadow: 0 2px 4px rgba(0,0,0,0.9)`.
-                                // Bevy's shadow has an offset but no blur.
-                                TextShadow {
-                                    offset: Vec2::new(0.0, 2.0),
-                                    color: rgba(0, 0, 0, 0.9),
-                                },
+                                fill_node(),
+                                // The CSS declares a static green gradient which
+                                // `main.js:1980` immediately overwrites with an
+                                // hsl one every frame. This is the one the player
+                                // actually sees; it is rebuilt here only when the
+                                // hue moves.
+                                health_gradient(120),
                             ))
                             .id();
+                        // `#healthbar-text`: `inset: 0`, flex-centred both ways.
+                        bar.spawn(Node {
+                            position_type: PositionType::Absolute,
+                            left: px(0),
+                            right: px(0),
+                            top: px(0),
+                            bottom: px(0),
+                            align_items: AlignItems::Center,
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        })
+                        .with_children(|slot| {
+                            health_text = slot
+                                .spawn((
+                                    Text::new(format!("{MAX_HP} / {MAX_HP}")),
+                                    hud_font(&font, 14.0, 800),
+                                    TextColor(Color::WHITE),
+                                    LetterSpacing::Px(4.0),
+                                    // `text-shadow: 0 2px 4px rgba(0,0,0,0.9)`.
+                                    // Bevy's shadow has an offset but no blur.
+                                    TextShadow {
+                                        offset: Vec2::new(0.0, 2.0),
+                                        color: rgba(0, 0, 0, 0.9),
+                                    },
+                                ))
+                                .id();
+                        });
                     });
-                });
-            });
+                })
+                .id();
 
             // -- #boostbar --------------------------------------------------
-            hud.spawn(centred_row(BOOST_BOTTOM)).with_children(|row| {
-                row.spawn((
-                    bar_frame(METER_HEIGHT, METER_WELL, BOOST_BORDER, 1.0),
-                    meter_shadow(),
-                ))
-                .with_children(|bar| {
-                    boost_fill = bar
-                        .spawn((
-                            fill_node(),
-                            // `linear-gradient(90deg, #2980b9 0%, #3498db 100%)`.
-                            gradient_90(rgb(0x29, 0x80, 0xb9), rgb(0x34, 0x98, 0xdb)),
-                        ))
-                        .id();
-                    bar.spawn(meter_label_slot()).with_children(|slot| {
-                        slot.spawn(meter_label(&font, "BOOST"));
-                    });
-                });
-            });
-
-            // -- #heatbar ---------------------------------------------------
-            hud.spawn(centred_row(HEAT_BOTTOM)).with_children(|row| {
-                heat_frame = row
-                    .spawn((
-                        bar_frame(METER_HEIGHT, METER_WELL, HEAT_BORDER, 1.0),
-                        // `.overheated` swaps this drop shadow for a red glow.
-                        // Spawned present so the swap is a value change.
+            cockpit_hidden[2] = hud
+                .spawn(centred_row(BOOST_BOTTOM))
+                .with_children(|row| {
+                    row.spawn((
+                        bar_frame(METER_HEIGHT, METER_WELL, BOOST_BORDER, 1.0),
                         meter_shadow(),
                     ))
                     .with_children(|bar| {
-                        heat_fill = bar
+                        boost_fill = bar
                             .spawn((
                                 fill_node(),
-                                // `linear-gradient(90deg, #d35400 0%, #e67e22 100%)`.
-                                gradient_90(rgb(0xd3, 0x54, 0x00), rgb(0xe6, 0x7e, 0x22)),
+                                // `linear-gradient(90deg, #2980b9 0%, #3498db 100%)`.
+                                gradient_90(rgb(0x29, 0x80, 0xb9), rgb(0x34, 0x98, 0xdb)),
                             ))
                             .id();
                         bar.spawn(meter_label_slot()).with_children(|slot| {
-                            slot.spawn(meter_label(&font, "GUN"));
+                            slot.spawn(meter_label(&font, "BOOST"));
                         });
-                    })
-                    .id();
-            });
+                    });
+                })
+                .id();
+
+            // -- #heatbar ---------------------------------------------------
+            cockpit_hidden[3] = hud
+                .spawn(centred_row(HEAT_BOTTOM))
+                .with_children(|row| {
+                    heat_frame = row
+                        .spawn((
+                            bar_frame(METER_HEIGHT, METER_WELL, HEAT_BORDER, 1.0),
+                            // `.overheated` swaps this drop shadow for a red glow.
+                            // Spawned present so the swap is a value change.
+                            meter_shadow(),
+                        ))
+                        .with_children(|bar| {
+                            heat_fill = bar
+                                .spawn((
+                                    fill_node(),
+                                    // `linear-gradient(90deg, #d35400 0%, #e67e22 100%)`.
+                                    gradient_90(rgb(0xd3, 0x54, 0x00), rgb(0xe6, 0x7e, 0x22)),
+                                ))
+                                .id();
+                            bar.spawn(meter_label_slot()).with_children(|slot| {
+                                slot.spawn(meter_label(&font, "GUN"));
+                            });
+                        })
+                        .id();
+                })
+                .id();
 
             // -- #chargebar -------------------------------------------------
-            hud.spawn(centred_row(CHARGE_BOTTOM)).with_children(|row| {
-                charge_frame = row
-                    .spawn((
-                        bar_frame(CHARGE_HEIGHT, METER_WELL, METER_BORDER, 1.0),
-                        meter_shadow(),
-                        // `opacity: 0` until `.active`. `Visibility` rather
-                        // than `Display::None`: hiding by display would drop
-                        // the node out of layout and force a relayout on every
-                        // brake, which is the cost this port exists to avoid.
-                        Visibility::Hidden,
-                    ))
-                    .with_children(|bar| {
-                        charge_fill = bar
-                            .spawn((
-                                Node {
-                                    // `#chargebar-fill { width: 0% }` — the one
-                                    // bar that starts empty rather than full.
-                                    width: percent(0),
-                                    height: percent(100),
-                                    ..default()
-                                },
-                                charge_gradient(false),
-                            ))
-                            .id();
-                    })
-                    .id();
-            });
+            cockpit_hidden[1] = hud
+                .spawn(centred_row(CHARGE_BOTTOM))
+                .with_children(|row| {
+                    charge_frame = row
+                        .spawn((
+                            bar_frame(CHARGE_HEIGHT, METER_WELL, METER_BORDER, 1.0),
+                            meter_shadow(),
+                            // `opacity: 0` until `.active`. `Visibility` rather
+                            // than `Display::None`: hiding by display would drop
+                            // the node out of layout and force a relayout on every
+                            // brake, which is the cost this port exists to avoid.
+                            Visibility::Hidden,
+                        ))
+                        .with_children(|bar| {
+                            charge_fill = bar
+                                .spawn((
+                                    Node {
+                                        // `#chargebar-fill { width: 0% }` — the one
+                                        // bar that starts empty rather than full.
+                                        width: percent(0),
+                                        height: percent(100),
+                                        ..default()
+                                    },
+                                    charge_gradient(false),
+                                ))
+                                .id();
+                        })
+                        .id();
+                })
+                .id();
 
             // -- #missilehud ------------------------------------------------
             // `transform: translateX(calc(-100% - 16px))` off `left: 50%`,
             // which is "right edge 16px left of centre" — expressed here as
             // `right: 50%` plus a 16px right margin, no transform needed.
-            hud.spawn(Node {
-                position_type: PositionType::Absolute,
-                right: percent(50),
-                bottom: px(PIP_ROW_BOTTOM),
-                margin: UiRect::right(px(16)),
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: px(8),
-                ..default()
-            })
-            .with_children(|row| {
-                row.spawn(pip_label(&font, "MSL"));
-                for slot in &mut missile_pips {
-                    *slot = row.spawn(pip(MSL_PIP)).id();
-                }
-            });
+            cockpit_hidden[4] = hud
+                .spawn(Node {
+                    position_type: PositionType::Absolute,
+                    right: percent(50),
+                    bottom: px(PIP_ROW_BOTTOM),
+                    margin: UiRect::right(px(16)),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px(8),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn(pip_label(&font, "MSL"));
+                    for slot in &mut missile_pips {
+                        *slot = row.spawn(pip(MSL_PIP)).id();
+                    }
+                })
+                .id();
 
             // -- #flarehud --------------------------------------------------
-            hud.spawn(Node {
-                position_type: PositionType::Absolute,
-                left: percent(50),
-                bottom: px(PIP_ROW_BOTTOM),
-                margin: UiRect::left(px(16)),
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: px(8),
-                ..default()
-            })
-            .with_children(|row| {
-                row.spawn(pip_label(&font, "FLR"));
-                for slot in &mut flare_pips {
-                    *slot = row.spawn(pip(FLA_PIP)).id();
-                }
-            });
+            cockpit_hidden[5] = hud
+                .spawn(Node {
+                    position_type: PositionType::Absolute,
+                    left: percent(50),
+                    bottom: px(PIP_ROW_BOTTOM),
+                    margin: UiRect::left(px(16)),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px(8),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn(pip_label(&font, "FLR"));
+                    for slot in &mut flare_pips {
+                        *slot = row.spawn(pip(FLA_PIP)).id();
+                    }
+                })
+                .id();
 
             // -- .target-box / .target-label / .lead-marker ------------------
             // The pool. Built once, hidden, and thereafter only ever moved and
@@ -1345,6 +1406,7 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
 
     commands.insert_resource(HudNodes {
         root,
+        cockpit_hidden,
         health_fill,
         health_text,
         boost_fill,
@@ -1940,6 +2002,16 @@ fn sync_hud(
         // Nothing below is meaningful without a ship, and leaving the tree
         // untouched means a HUD that is off costs one comparison a frame.
         return;
+    }
+
+    // -- body.cockpit-view --------------------------------------------------
+    // Six writes on the frame `V` is pressed and none after it. The bars' own
+    // values are zeroed while hidden (see `model`), so the guards below are
+    // all comparing an unchanging zero and none of them fire either.
+    if moved!(bars_hidden) {
+        for node in nodes.cockpit_hidden {
+            set_visible(&mut w.vis, node, !next.bars_hidden);
+        }
     }
 
     // -- #healthbar ---------------------------------------------------------
@@ -2982,15 +3054,61 @@ mod tests {
         assert!(model(&f, 0.0, false).match_on, "a live match must");
     }
 
-    /// Seated in the cockpit, the flat overlay stands down entirely — the 3D
-    /// instrument panel is the HUD. Without this the bottom bars draw on top of
-    /// the panel, which is what `main.js`'s `cockpit-view` body class prevents.
+    /// Seated in the cockpit the **bars** stand down and nothing else does.
+    ///
+    /// `index.html:865`–`:870` is the whole of `body.cockpit-view`: six
+    /// elements, all of them duplicated by the 3D instrument panel. This test
+    /// exists because the port originally hid the entire overlay, which took
+    /// the reticle with it and left the cockpit with no crosshair.
     #[test]
-    fn the_overlay_stands_down_in_the_cockpit() {
+    fn only_the_bars_stand_down_in_the_cockpit() {
         let mut f = frame(healthy());
         f.ships[0].flags = ShipFlags::LOCAL.with(ShipFlags::ALIVE);
-        assert!(model(&f, 0.0, false).present, "third person draws the HUD");
-        assert!(!model(&f, 0.0, true).present, "seated hides it");
+
+        let out = model(&f, 0.0, false);
+        let seated = model(&f, 0.0, true);
+
+        assert!(out.present && seated.present, "the tree stays up in both");
+        assert!(!out.bars_hidden, "third person shows the bars");
+        assert!(seated.bars_hidden, "the cockpit hides them");
+
+        // Every value behind a hidden bar is pinned to a constant, so the diff
+        // cannot churn on state no one can see.
+        assert_eq!(
+            (
+                seated.hp,
+                seated.hp_mil,
+                seated.hp_hue,
+                seated.boost_mil,
+                seated.heat_mil,
+                seated.charge_mil,
+                seated.missiles,
+                seated.flares,
+                seated.pulse
+            ),
+            (0, 0, 0, 0, 0, 0, 0, 0, 0),
+        );
+        assert!(!seated.overheated);
+        assert_eq!(seated.charge, ChargeState::Idle);
+
+        // And everything the JS keeps, this keeps. The match clock is the
+        // readable proxy: it is driven from the same model and is not on the
+        // hidden list.
+        assert_eq!(seated.match_on, out.match_on);
+        assert_eq!(seated.clock, out.clock);
+        assert_eq!(seated.alive, out.alive);
+    }
+
+    /// The reticle in particular, since losing it is the reported bug.
+    #[test]
+    fn the_cockpit_keeps_the_reticle() {
+        let mut f = frame(healthy());
+        f.ships[0].flags = ShipFlags::LOCAL.with(ShipFlags::ALIVE);
+
+        // `locked` is the third argument to the real `model`; the wrapper
+        // passes `false`, so this asserts the reticle's *presence* rather than
+        // its lock state — `present` is what gates the node's visibility.
+        assert!(model(&f, 0.0, true).present);
     }
 
     /// A dead ship shows the banner; a frame with no local ship shows nothing.
