@@ -140,6 +140,26 @@ fn main() {
                         bevy::window::PresentMode::AutoVsync
                     },
                     resolution: window_resolution(),
+
+                    // A grey title bar over a space game looks like a document
+                    // window. These three make it disappear into the scene:
+                    // `fullsize_content_view` extends the render target up
+                    // under the bar so there is something behind it,
+                    // `titlebar_transparent` stops it painting grey, and the
+                    // title text goes since it would sit over the sky.
+                    //
+                    // The traffic lights stay — without them the window cannot
+                    // be closed or minimised by mouse, and they float over the
+                    // scene, which is the intended look. Note this means the
+                    // top-left ~80x30 px of the viewport sits under them, so
+                    // nothing important should be drawn there.
+                    //
+                    // macOS-only in effect; the fields exist on every platform
+                    // and are ignored elsewhere, so no `cfg` is needed.
+                    fullsize_content_view: true,
+                    titlebar_transparent: true,
+                    titlebar_show_title: false,
+
                     ..default()
                 }),
                 ..default()
