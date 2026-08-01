@@ -300,7 +300,70 @@ alternate dogfight arena; here the ground is the point.
 
 ---
 
-## 6. Falls out of the replay system nearly free
+## 6. Rebuild the terrain map
+
+Sierras needs a full redo. The problem is the generation approach, not the
+tuning — no choice of coefficients fixes it.
+
+### Diagnosis
+
+`terrain.js:22` is seven summed `sin`/`cos` terms. Three specific consequences:
+
+1. **Sine waves are smooth and periodic**, so every feature is a rolling blob.
+   No ridgelines, no cliffs, no canyons, no flat valley floors. Terrain reads as
+   real when it has *sharp* features and drainage; this has neither.
+2. **The multiplicative pairs** — `(sin(wx)*0.5+0.5) * (sin(wz)*0.5+0.5)` —
+   produce a grid-aligned lattice. Hills repeat on axis, which is the specific
+   thing that makes it look generated.
+3. **`TERRAIN_SEGS = 96` over `TERRAIN_SIZE = 3600` is 37.5 units per vertex**,
+   against a 3.3-unit ship. Every triangle is 11x the aircraft. No feature
+   smaller than 37.5 units can exist at all — a canyon you could fly through is
+   not merely absent, it is unrepresentable.
+
+Colour (`terrain.js:55`) is a pure function of altitude, so a cliff and a
+meadow at the same height shade identically.
+
+### The fix
+
+- **Ridged multifractal noise** instead of summed sines. `1 - |noise|` is the
+  standard technique for mountain ridgelines and canyon walls, and it is the
+  single change that most transforms how terrain reads. Layer it with ordinary
+  fBm for the base.
+- **Far more resolution**, with chunked LOD so it stays affordable. Bevy wants
+  chunked terrain regardless.
+- **Slope-based shading** — rock on steep faces, grass on shallow, snow by
+  altitude *and* exposure. Cheap, and it does most of the visual work.
+- **Optional: hydraulic erosion passes.** Drainage patterns are what push
+  terrain from "procedural" to "real". A few iterations go a long way.
+
+### Two problems, one fix
+
+The heightfield is also a **determinism hazard** in the Rust port. `sin`/`cos`
+from libm are not bit-identical across glibc, musl, Apple and WASM, so a
+sin-based heightfield can put a client and the server at different ground
+levels — and ground contact is instant death. Value or simplex noise built from
+integer hashing and plain arithmetic is deterministic *by construction*.
+
+So the rebuild fixes the map and removes a desync risk in the same pass.
+
+It also closes the largest gap flagged during the port: the octave table has no
+home in `rules.rs` and is currently written literally inside `ship.rs`'s
+`raw_terrain_height`. A rebuilt heightfield belongs in `WorldRules` so maps can
+differ.
+
+### Sequencing
+
+Do it **in Rust**, not in `terrain.js` — the JS is being deleted. The
+heightfield goes in `sim` (it is gameplay: ground contact kills), the rendering
+in the Bevy client. Blocked until `tick()` lands, since that agent owns the
+files `raw_terrain_height` currently lives in.
+
+Worth doing before the bombing missions in section 5, which assume a map worth
+flying over.
+
+---
+
+## 7. Falls out of the replay system nearly free
 
 - **Killcam.** A replay bounded to the 5 seconds before your death, from the
   killer's view.
@@ -313,7 +376,7 @@ alternate dogfight arena; here the ground is the point.
 
 ---
 
-## 7. Netcode: rollback
+## 8. Netcode: rollback
 
 A deterministic simulation is the hard prerequisite for rollback netcode — the
 thing that makes fighting games feel lagless online. The client predicts
@@ -325,7 +388,7 @@ foundation is already in place.
 
 ---
 
-## 8. Known gameplay issues found during the port
+## 9. Known gameplay issues found during the port
 
 Real behaviors in the current game, each verified against the source. Some are
 bugs, some are probably-unintended design. Decide individually.
@@ -346,7 +409,7 @@ bugs, some are probably-unintended design. Decide individually.
 
 ---
 
-## 9. Other ideas
+## 10. Other ideas
 
 - **Replace the pixel filter with a real post chain.** `PIXEL_SCALE = 3` renders
   to a third-res target and upscales. In Bevy this is a post-processing pass,
