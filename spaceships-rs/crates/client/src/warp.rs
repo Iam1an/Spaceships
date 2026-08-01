@@ -109,6 +109,15 @@ const _: () = assert!((DURATION as f64) <= RULES.combat.spawn_invuln);
 /// `starCount`.
 const STAR_COUNT: u32 = 3000;
 
+/// Fixed vertex and index budget for the warp mesh.
+///
+/// Rebuilt every frame, and it **must not change size** doing so — see the
+/// padding in the rebuild. One local tunnel plus a flash quad is the worst
+/// case; remote tunnels are far smaller and share the budget.
+const MESH_QUAD_CAPACITY: usize = STAR_COUNT as usize + 64;
+const MESH_VERTEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 4;
+const MESH_INDEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 6;
+
 /// `radius = 10 + Math.random() * 200`: the annulus the tunnel's stars sit in.
 const RADIUS_MIN: f32 = 10.0;
 /// The width of that annulus.
@@ -914,8 +923,23 @@ fn build_surface(
         draw_flash(&mut build, arrival, cam);
     }
 
-    // An empty attribute list is a valid zero-triangle draw, so an idle frame
-    // costs one empty submission rather than a branch here.
+    // Pad to a fixed size rather than submitting a shorter list on a quiet
+    // frame. A mesh that changes vertex count between frames makes Bevy's slab
+    // allocator free and reallocate its GPU entry, and the render world's copy
+    // step then references the key that just went away:
+    //
+    //     ERROR bevy_render::slab_allocator: Use-after-free: attempted to copy
+    //     element data for an unallocated key
+    //
+    // With this module idle and `weapons.rs` doing the same thing, that fired
+    // twice a frame for an entire session. The padding is degenerate triangles:
+    // zero-area, so the rasteriser discards them, and zero-alpha, so the
+    // additive blend would contribute nothing even if one survived.
+    build.pos.resize(MESH_VERTEX_CAPACITY, [0.0; 3]);
+    build.uv.resize(MESH_VERTEX_CAPACITY, [0.0; 2]);
+    build.color.resize(MESH_VERTEX_CAPACITY, [0.0; 4]);
+    build.idx.resize(MESH_INDEX_CAPACITY, 0);
+
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, std::mem::take(&mut build.pos));
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, std::mem::take(&mut build.uv));
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, std::mem::take(&mut build.color));

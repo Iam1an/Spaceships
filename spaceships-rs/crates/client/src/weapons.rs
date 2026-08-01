@@ -160,6 +160,15 @@ const FLARE_GLOW_R: f32 = 1.10;
 /// bounds the vertex rebuild — see [`Effects::motes`].
 const MAX_MOTES: usize = 320;
 
+/// Fixed vertex and index budget for the effects mesh.
+///
+/// The mesh is rebuilt every frame, and it **must not change size** doing so --
+/// see the padding in `rebuild`. Sized for the worst case the caps above allow,
+/// with headroom: every quad is 4 vertices and 6 indices.
+const MESH_QUAD_CAPACITY: usize = 4096;
+const MESH_VERTEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 4;
+const MESH_INDEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 6;
+
 /// `main.js` `TRAIL_OFFSETS`: the two engine nozzles, in ship-local space.
 ///
 /// These are the *old* model's, and they sit at x = ±2.2 on a hull about 8
@@ -1122,15 +1131,29 @@ fn build_surface(
     }
 
     // An empty vertex buffer is a zero-byte allocation, which wgpu rejects.
-    // One degenerate triangle at the origin costs nothing and keeps the
-    // "quiet scene" path off a special case.
-    if build.pos.is_empty() {
-        build.pos.extend_from_slice(&[[0.0; 3]; 3]);
-        build.normal.extend_from_slice(&[[0.0, 0.0, 1.0]; 3]);
-        build.uv.extend_from_slice(&[[0.0; 2]; 3]);
-        build.color.extend_from_slice(&[[0.0; 4]; 3]);
-        build.index.extend_from_slice(&[0, 1, 2]);
-    }
+    // Pad to a fixed size. This is not tidiness -- a mesh whose vertex count
+    // changes between frames makes Bevy's slab allocator free and reallocate
+    // its GPU entry, and the render world's copy step then references the key
+    // that just went away:
+    //
+    //     ERROR bevy_render::slab_allocator: Use-after-free: attempted to copy
+    //     element data for an unallocated key
+    //
+    // That fired twice a frame -- once here, once in `warp.rs` -- roughly 166
+    // times a second, for the whole session.
+    //
+    // Padding with degenerate triangles keeps the allocation stable: they are
+    // zero-area so the rasteriser discards them, and zero-alpha so an additive
+    // blend contributes nothing even if one survived.
+    let cap_verts = MESH_VERTEX_CAPACITY;
+    let cap_indices = MESH_INDEX_CAPACITY;
+    debug_assert!(build.pos.len() <= cap_verts, "vertex budget exceeded");
+    debug_assert!(build.index.len() <= cap_indices, "index budget exceeded");
+    build.pos.resize(cap_verts, [0.0; 3]);
+    build.normal.resize(cap_verts, [0.0, 0.0, 1.0]);
+    build.uv.resize(cap_verts, [0.0; 2]);
+    build.color.resize(cap_verts, [0.0; 4]);
+    build.index.resize(cap_indices, 0);
 
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, build.pos.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, build.normal.clone());
