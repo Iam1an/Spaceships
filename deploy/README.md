@@ -24,32 +24,27 @@ to account for that asymmetry.
 
 **Anything serving this game must bind `127.0.0.1:4000`.**
 
-## Install the service
+## Process management: pm2, not systemd
 
-The server has been running as a bare `node server/index.js` — no unit, so a
-crash or a reboot took the game down until someone noticed. `spaceships.service`
-fixes that, following the same pattern as `paintballer.service`.
-
-Needs sudo on the host:
+The server runs under **pm2** as `spaceships` (id 0), and `pm2-root.service` is
+enabled, so it restarts on crash *and* resurrects on boot. There is deliberately
+no systemd unit for it — one was written and installed here, then removed, on
+finding pm2 already owned the job: both would have raced to bind `:4000` at
+boot.
 
 ```bash
-scp deploy/spaceships.service gheat@100.81.137.100:/tmp/
-ssh gheat@100.81.137.100
-sudo install -m 644 /tmp/spaceships.service /etc/systemd/system/
-sudo systemctl daemon-reload
-
-# The manual process is holding :4000, so stop it before starting the unit or
-# the unit will fail to bind. Find it with:
-ss -lptn 'sport = :4000'
-kill <pid>
-
-sudo systemctl enable --now spaceships
-systemctl status spaceships
-journalctl -u spaceships -n 50 --no-pager
+pm2 list
+pm2 logs spaceships --lines 50
+pm2 restart spaceships
+pm2 describe spaceships
 ```
 
-Expect a few seconds of downtime between the `kill` and `systemctl enable
---now`. There is no way to avoid it while a single port is involved.
+Other pm2 apps on the same host: `gheat-net`, `gheat-next`, `gianniandson-api`.
+
+Historical note: `~/.pm2/logs/spaceships-error.log` carries 32
+`Cannot find module '/var/www/Gheat.net/spaceships'` crashes — a pm2 entry that
+pointed at the directory instead of a script. Last written 27 June; the entry
+has been correct since, and the restart counter is not reset by fixing it.
 
 ## Deploying a change
 
@@ -59,11 +54,11 @@ cd /var/www/Gheat.net/spaceships
 git pull
 npm ci                      # three and vite are runtime deps, not dev deps
 npm run build               # writes dist/; the server prefers it over public/
-sudo systemctl restart spaceships
+pm2 restart spaceships
 ```
 
-`npm start` also runs the build via `prestart`, but under systemd the unit
-invokes `node` directly, so the build has to be an explicit deploy step.
+pm2 runs `server/index.js` directly, so `prestart` never fires — the build has
+to be an explicit deploy step.
 
 ## Cutting over to the Rust server
 
@@ -81,14 +76,18 @@ formatting, trial bests and achievement metadata all come back correct.
    sqlite3 "file:pilots.db?mode=ro" ".backup pilots-$(date +%F).db"
    ```
 2. Build the binary for the host (Arch, x86_64) and copy it over.
-3. Point `ExecStart=` at the binary and drop the `node` dependency:
+3. Point pm2 at the binary instead of the script:
+   ```bash
+   pm2 delete spaceships
+   PILOTS_DB=/var/www/Gheat.net/spaceships/pilots.db PORT=4000 \
+     pm2 start ./spaceships-server --name spaceships
+   pm2 save
    ```
-   ExecStart=/var/www/Gheat.net/spaceships/spaceships-server
-   Environment=PILOTS_DB=/var/www/Gheat.net/spaceships/pilots.db
-   ```
-4. `sudo systemctl daemon-reload && sudo systemctl restart spaceships`
+   `pm2 save` matters — without it the change is lost on the next resurrect.
+4. `pm2 logs spaceships` to confirm it bound `:4000` and opened the database.
 
-Rolling back is putting the old `ExecStart=` back and restarting. Both servers
+Rolling back is `pm2 delete spaceships && pm2 start server/index.js --name
+spaceships && pm2 save`. Both servers
 read the same database file, so no migration is involved in either direction.
 
 ## Notes
