@@ -13,22 +13,24 @@ What it does
     2. Finds the landing gear as connected components hanging below the
        airframe and deletes those faces (the download has the gear DOWN, and
        everything is one mesh so there is no node to remove).
-    3. Samples the source baseColor bake once, per face, at barycentric points
-       inside the triangle, to learn which faces are dark (canopy glass,
-       intake/exhaust cavities, gun port) and which are light (airframe skin).
-       The bake itself is a photogrammetry-style auto-bake -- smeared islands,
-       bleeding edges, grey mush -- so it is used ONLY as a classifier and is
-       then thrown away. The output has no texture at all.
-    4. Emits exactly two flat PBR materials: `hull` (luminance > 0.35) and
+    3. Cuts the nose-gear well, which is welded into the belly rather than
+       being a separate shell, and seals the hole with a lid that follows the
+       surrounding belly (see find_gear_well / cap_openings).
+    4. Selects the canopy GEOMETRICALLY -- a lofted footprint on the upper
+       centreline, reduced to one connected patch -- and paints it accent.
+       Everything else is hull. See select_canopy for why the source's baked
+       texture cannot do this job.
+    5. Emits exactly two flat PBR materials: `hull` (luminance > 0.35) and
        `accent` (luminance < 0.35), which is what public/src/customization.js
-       and public/src/ship.js split on.
-    5. Orients nose to +X (public/src/ship.js applies rotation.y = -PI/2, which
+       and public/src/ship.js split on. The output has no texture at all.
+    6. Orients nose to +X (public/src/ship.js applies rotation.y = -PI/2, which
        maps model +X to world +Z = flight-forward), recentres on the origin and
        scales to the envelope of the ship it replaces.
 
-Dependencies: Python standard library only, plus macOS `sips` (used once to
-decode the source JPEG into a PNG that stdlib zlib can read). Pass
---no-texture-classify to skip the texture step entirely.
+Dependencies: Python standard library only. The default path never opens the
+source texture; --legacy-texture-accent (which does, via macOS `sips`) is kept
+only so the abandoned occlusion-based split can still be rendered for
+comparison.
 
 Usage
     python3 spaceships-rs/tools/make_jet_glb.py \
@@ -71,12 +73,21 @@ ACCENT_METALLIC = 0.45
 ACCENT_ROUGHNESS = 0.30
 
 # Nose-gear well: the lengthwise station to search, as (from_nose, to_nose)
-# fractions of the aircraft's length, and the height below which anything found
-# there is gear structure, as a fraction of its height above the lowest point.
+# fractions of the aircraft's length. The floor is NOT a fixed fraction any
+# more -- find_gear_well measures it from the well cluster itself.
 NOSE_WELL_STATION = (0.20, 0.38)
-NOSE_WELL_FLOOR = 0.072
+NOSE_WELL_FLOOR_MAX = 0.12   # only ever search this far up the airframe's height
+NOSE_WELL_FLOOR_STEP = 0.002  # sweep resolution, as a fraction of height
 
-# Face classification from the source bake.
+# Canopy footprint, all in fractions of the airframe's length, measured off the
+# source's upper-surface cross-sections (see select_canopy).
+CANOPY_STATION = (0.150, 0.360)   # aft of the nose tip: front point, rear point
+CANOPY_HALF_WIDTH = 0.048         # widest half-width
+CANOPY_FRONT_POWER = 0.65         # loft shape: w = s^FRONT * (1-s)^REAR, so the
+CANOPY_REAR_POWER = 0.35          # widest point sits at FRONT/(FRONT+REAR) = 65%
+CANOPY_FLOOR = 0.35               # ignore anything below this fraction of height
+
+# Legacy occlusion-based classification (--legacy-texture-accent only).
 TEX_MAX_SIDE = 1024        # the bake is 4096^2 of noise; 1024 is plenty
 SMOOTH_ITERS = 6           # diffusion passes over the face-adjacency graph
 DARK_PERCENTILE = 14.0     # darkest N% of airframe faces seed the accent set
@@ -254,55 +265,103 @@ def face_centroid(tris, pos, ti):
             (a[2] + b[2] + c[2]) / 3.0)
 
 
+def _well_cluster(tris, pos, faces, wmap, cent, x_lo, x_hi, y_cut):
+    """Faces under the chin below y_cut, flood-filled from the lowest one."""
+    cand = {ti for ti in faces
+            if x_lo <= cent[ti][0] <= x_hi and cent[ti][1] < y_cut}
+    if not cand:
+        return []
+    adj, _ = face_adjacency(tris, wmap, cand)
+    seed = min(cand, key=lambda ti: cent[ti][1])
+    seen, grp, stack = set(), [], [seed]
+    while stack:
+        v = stack.pop()
+        if v in seen:
+            continue
+        seen.add(v)
+        grp.append(v)
+        for w in adj.get(v, ()):
+            if w in cand and w not in seen:
+                stack.append(w)
+    return grp
+
+
 def find_gear_well(tris, pos, faces, wmap, station=NOSE_WELL_STATION,
-                   floor=NOSE_WELL_FLOOR, min_group=20):
+                   min_group=20):
     """The nose-gear well and drag brace, which are welded into the belly.
 
     The three bogies were separate shells and are gone with them, but the nose
-    well is part of the airframe and stays behind as a black boss hanging under
-    the chin. This is a deliberately narrow, hand-identified cut rather than a
-    clever general rule: a generic "anything below the belly line" test needs a
-    smoothed belly profile, and the belly climbs steadily toward the tail, so
-    every smoothing window wide enough to ignore a narrow boss also lags that
-    climb and condemns large patches of good rear underside. Measured instead:
-    the well is the only structure on the whole airframe below 7.2% of the
-    aircraft's height, between 20% and 38% of its length aft of the nose. The
-    next-lowest structure sits 0.008 (0.8% of length) higher, so the cut has
-    real clearance. Bounds are fractions of the airframe box, so a re-export at
-    a different scale still lands in the same place.
+    well is part of the airframe and stays behind as a boss hanging under the
+    chin. The x window is hand-identified and deliberately narrow: a generic
+    "anything below the belly line" test needs a smoothed belly profile, and
+    the belly climbs steadily toward the tail, so every smoothing window wide
+    enough to ignore a narrow boss also lags that climb and condemns large
+    patches of good rear underside.
+
+    The FLOOR, though, is measured rather than guessed. An earlier pass used a
+    fixed 7.2% of the airframe's height. That number has no relationship to
+    where the well actually stops: it happened to land 0.001 low, which left
+    the topmost ring of the well's wall behind as an 18-face collar and gave
+    the cap a rim that alternated between -0.0920 and -0.0940 -- the serrated
+    lip. Nudge the model and the same number starts eating radome instead.
+
+    Measured instead. Sweep the floor upward from the lowest point under the
+    chin, flood-filling the well from that lowest face at each step, and watch
+    the cluster's FOOTPRINT (its x and z extent, not its face count). Climbing
+    through the boss, the footprint grows step by step. Between the top of the
+    boss and the belly it hangs from there is nothing to add, so the footprint
+    stops changing; that plateau is the well's actual boundary. Once the floor
+    clears the belly the flood escapes sideways into the skin and the footprint
+    jumps by 3x and then by 10x. Cut at the top of the longest plateau. On this
+    model that is a 0.0041-tall band (1.6% of the airframe's height) over which
+    the answer does not move at all, which is the margin the old fixed fraction
+    only claimed to have.
     """
     lo, hi = bbox(tris, pos, faces)
     length, height = hi[0] - lo[0], hi[1] - lo[1]
     x_lo = hi[0] - station[1] * length
     x_hi = hi[0] - station[0] * length
-    y_cut = lo[1] + floor * height
     cent = {ti: face_centroid(tris, pos, ti) for ti in faces}
-    cand = {ti for ti in faces
-            if x_lo <= cent[ti][0] <= x_hi and cent[ti][1] < y_cut}
-    print('  nose-well cut: x %.4f..%.4f, below y %.4f -> %d candidate faces'
-          % (x_lo, x_hi, y_cut, len(cand)))
-    adj, _ = face_adjacency(tris, wmap, cand)
-    seen, out = set(), []
-    for s in cand:
-        if s in seen:
-            continue
-        stack, grp = [s], []
-        while stack:
-            v = stack.pop()
-            if v in seen:
-                continue
-            seen.add(v)
-            grp.append(v)
-            for w in adj.get(v, ()):
-                if w in cand and w not in seen:
-                    stack.append(w)
-        glo, ghi = bbox(tris, pos, grp)
-        verdict = 'removed' if len(grp) >= min_group else 'too small, kept'
-        print('    cluster %4d tris  x[%7.4f %7.4f] y[%7.4f %7.4f] z[%7.4f %7.4f]  %s'
-              % (len(grp), glo[0], ghi[0], glo[1], ghi[1], glo[2], ghi[2], verdict))
-        if len(grp) >= min_group:
-            out.extend(grp)
-    return out
+    under = [ti for ti in faces if x_lo <= cent[ti][0] <= x_hi]
+    if not under:
+        return []
+
+    step = NOSE_WELL_FLOOR_STEP * height
+    sweep = []
+    y_cut = min(cent[ti][1] for ti in under) + step
+    while y_cut <= lo[1] + NOSE_WELL_FLOOR_MAX * height:
+        grp = _well_cluster(tris, pos, faces, wmap, cent, x_lo, x_hi, y_cut)
+        if grp:
+            glo, ghi = bbox(tris, pos, grp)
+            sweep.append((y_cut, grp, round(ghi[0] - glo[0], 6),
+                          round(ghi[2] - glo[2], 6)))
+        y_cut += step
+    if not sweep:
+        return []
+
+    runs, i = [], 0
+    while i < len(sweep):
+        j = i
+        while (j + 1 < len(sweep) and sweep[j + 1][2] == sweep[i][2]
+               and sweep[j + 1][3] == sweep[i][3]):
+            j += 1
+        runs.append((j - i + 1, sweep[i], sweep[j]))
+        i = j + 1
+    usable = [r for r in runs if len(r[2][1]) >= min_group]
+    if not usable:
+        return []
+    n, first, last = max(usable, key=lambda r: (r[0], r[2][0]))
+    y_cut, grp = last[0], last[1]
+    glo, ghi = bbox(tris, pos, grp)
+    print('  nose-well cut: x %.4f..%.4f, floor measured at y %.4f (%.2f%% of'
+          ' height) -- footprint %.4f x %.4f held over %.4f of sweep (%.2f%% of'
+          ' height) before the flood escaped into the belly'
+          % (x_lo, x_hi, y_cut, 100.0 * (y_cut - lo[1]) / height,
+             last[2], last[3], y_cut - first[0] + step,
+             100.0 * (y_cut - first[0] + step) / height))
+    print('    cluster %4d tris  x[%7.4f %7.4f] y[%7.4f %7.4f] z[%7.4f %7.4f]  removed'
+          % (len(grp), glo[0], ghi[0], glo[1], ghi[1], glo[2], ghi[2]))
+    return grp
 
 
 def _boundary(tris, wmap, faces):
@@ -314,14 +373,54 @@ def _boundary(tris, wmap, faces):
     return {e for e, n in ec.items() if n == 1}
 
 
-def cap_openings(tris, pos, wmap, faces_before, faces_after):
-    """Seal every opening that the deletion just created.
+def _fit_plane(points):
+    """Least-squares y = a*x + b*z + c through a handful of points."""
+    n = len(points)
+    sx = sz = sy = sxx = szz = sxz = sxy = szy = 0.0
+    for x, y, z in points:
+        sx += x; sz += z; sy += y
+        sxx += x * x; szz += z * z; sxz += x * z
+        sxy += x * y; szy += z * y
+    m = [[sxx, sxz, sx], [sxz, szz, sz], [sx, sz, float(n)]]
+    v = [sxy, szy, sy]
+    # 3x3 Gaussian elimination with partial pivoting
+    for i in range(3):
+        p = max(range(i, 3), key=lambda r: abs(m[r][i]))
+        if abs(m[p][i]) < 1e-14:
+            return None
+        m[i], m[p] = m[p], m[i]
+        v[i], v[p] = v[p], v[i]
+        for r in range(i + 1, 3):
+            f = m[r][i] / m[i][i]
+            for c in range(i, 3):
+                m[r][c] -= f * m[i][c]
+            v[r] -= f * v[i]
+    out = [0.0] * 3
+    for i in (2, 1, 0):
+        out[i] = (v[i] - sum(m[i][c] * out[c] for c in range(i + 1, 3))) / m[i][i]
+    return out
 
-    Each connected group of fresh boundary edges gets a cone: one triangle per
-    boundary edge, apex at the group's centroid. Winding comes from the
-    surviving face on the far side of each edge, so the lid always faces the
-    same way as the skin it closes -- which also copes with ragged fringes that
-    are not simple loops.
+
+def cap_openings(tris, pos, nor, wmap, faces_before, faces_after):
+    """Seal every opening that the deletion just created, flush with the skin.
+
+    Each connected group of fresh boundary edges gets a fan: one triangle per
+    boundary edge, apex in the middle. Winding comes from the surviving face on
+    the far side of each edge, so the lid always faces the same way as the skin
+    it closes -- which also copes with ragged fringes that are not simple loops.
+
+    Two things make the lid disappear rather than read as a patch:
+
+    * The apex is placed ON the surrounding skin, not at the rim's own centroid.
+      The rim of a cut bay sits slightly below the belly around it (here the rim
+      alternates between -0.0920 and -0.0940 while the skin one ring out
+      averages -0.0897), so a fan to the rim centroid dishes inward and leaves a
+      step. A plane fitted to that one-ring of surviving skin, evaluated at the
+      rim's centre, continues the belly instead.
+    * The lid carries smooth PER-VERTEX normals lifted from the skin that
+      surrounds it, not one flat facet normal. A flat facet catches the light as
+      a distinct panel; borrowed normals shade continuously with the belly, so
+      the seam is invisible even though the lid is geometrically flat.
     """
     fresh = _boundary(tris, wmap, faces_after) - _boundary(tris, wmap, faces_before)
     if not fresh:
@@ -329,19 +428,28 @@ def cap_openings(tris, pos, wmap, faces_before, faces_after):
     wpos = {}
     for i, p in enumerate(pos):
         wpos[wmap[i]] = p
-    # directed edges of the surviving skin, so the lid can oppose them
+    # directed edges of the surviving skin, so the lid can oppose them, plus a
+    # per-welded-vertex average of the surviving skin's shading normals
     directed = {}
+    skin_n = defaultdict(lambda: [0.0, 0.0, 0.0])
     for ti in faces_after:
-        a, b, c = wmap[tris[ti][0]], wmap[tris[ti][1]], wmap[tris[ti][2]]
-        for e in ((a, b), (b, c), (c, a)):
+        w = [wmap[v] for v in tris[ti]]
+        for e in ((w[0], w[1]), (w[1], w[2]), (w[2], w[0])):
             directed[e] = ti
+        for v in tris[ti]:
+            acc = skin_n[wmap[v]]
+            for k in range(3):
+                acc[k] += nor[v][k]
+
+    def unit(n):
+        l = math.sqrt(n[0] ** 2 + n[1] ** 2 + n[2] ** 2)
+        return (n[0] / l, n[1] / l, n[2] / l) if l > 1e-14 else (0.0, -1.0, 0.0)
+
     dsu_index = {}
-    verts = set()
     for a, b in fresh:
-        verts.add(a)
-        verts.add(b)
-    for v in verts:
-        dsu_index[v] = len(dsu_index)
+        for v in (a, b):
+            if v not in dsu_index:
+                dsu_index[v] = len(dsu_index)
     dsu = DSU(len(dsu_index))
     for a, b in fresh:
         dsu.union(dsu_index[a], dsu_index[b])
@@ -350,41 +458,52 @@ def cap_openings(tris, pos, wmap, faces_before, faces_after):
         groups[dsu.find(dsu_index[e[0]])].append(e)
 
     out = []
-    for gid, edges in groups.items():
+    for _gid, edges in groups.items():
         gverts = {v for e in edges for v in e}
         cx = sum(wpos[v][0] for v in gverts) / len(gverts)
-        cy = sum(wpos[v][1] for v in gverts) / len(gverts)
         cz = sum(wpos[v][2] for v in gverts) / len(gverts)
+        rim_y = [wpos[v][1] for v in gverts]
+
+        # the one-ring of surviving skin just outside the rim
+        ring = set()
+        for ti in faces_after:
+            w = [wmap[v] for v in tris[ti]]
+            if any(v in gverts for v in w):
+                ring.update(v for v in w if v not in gverts)
+        plane = _fit_plane([wpos[v] for v in ring]) if len(ring) >= 3 else None
+        if plane is not None:
+            cy = plane[0] * cx + plane[1] * cz + plane[2]
+            # never let the fit push the lid outside the skin it is joining
+            ring_y = [wpos[v][1] for v in ring]
+            cy = max(min(cy, max(ring_y)), min(rim_y))
+        else:
+            cy = sum(rim_y) / len(rim_y)
         apex = (cx, cy, cz)
+        apex_n = unit([sum(skin_n[v][k] for v in ring) for k in range(3)]) \
+            if ring else (0.0, -1.0, 0.0)
+
         made = 0
-        fan = []
         for a, b in edges:
             # the skin uses this edge in one direction; the lid uses the other
             if (a, b) in directed:
-                p1, p2 = wpos[b], wpos[a]
+                v1, v2 = b, a
             elif (b, a) in directed:
-                p1, p2 = wpos[a], wpos[b]
+                v1, v2 = a, b
             else:
                 continue
+            p1, p2 = wpos[v1], wpos[v2]
             ux, uy, uz = p1[0] - cx, p1[1] - cy, p1[2] - cz
             vx, vy, vz = p2[0] - cx, p2[1] - cy, p2[2] - cz
-            nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
-            ln = math.sqrt(nx * nx + ny * ny + nz * nz)
-            if ln < 1e-14:
+            cr = (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
+            if math.sqrt(sum(c * c for c in cr)) < 1e-14:
                 continue
-            fan.append((apex, p1, p2, (nx, ny, nz)))
+            out.append(((apex, apex_n),
+                        (p1, unit(skin_n[v1])),
+                        (p2, unit(skin_n[v2]))))
             made += 1
-        # One shared normal for the whole lid. Per-facet normals on a cone over
-        # a non-planar loop shade as a bright pinwheel; a single averaged normal
-        # makes it read as one flat panel, which is what a closed bay looks like.
-        ax = sum(t[3][0] for t in fan)
-        ay = sum(t[3][1] for t in fan)
-        az = sum(t[3][2] for t in fan)
-        al = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
-        shared = (ax / al, ay / al, az / al)
-        out.extend((t[0], t[1], t[2], shared) for t in fan)
         print('  sealed a %d-edge opening at (%.4f, %.4f, %.4f) with %d triangles'
-              % (len(edges), cx, cy, cz, made))
+              ' (rim y %.4f..%.4f, lid apex on the skin at y %.4f)'
+              % (len(edges), cx, cy, cz, made, min(rim_y), max(rim_y), cy))
     return out
 
 
@@ -426,6 +545,195 @@ def mirror_pairs(tris, pos, faces, tol=0.004):
         if best is not None:
             out[ti] = best
     return out
+
+
+def face_normals(tris, nor, faces):
+    """Per-face shading normal: the mean of the source's three vertex normals."""
+    out = {}
+    for ti in faces:
+        n = [0.0, 0.0, 0.0]
+        for v in tris[ti]:
+            for k in range(3):
+                n[k] += nor[v][k]
+        l = math.sqrt(n[0] ** 2 + n[1] ** 2 + n[2] ** 2) or 1.0
+        out[ti] = (n[0] / l, n[1] / l, n[2] / l)
+    return out
+
+
+def _lerp(p0, p1, t):
+    return tuple(p0[k] + (p1[k] - p0[k]) * t for k in range(3))
+
+
+def _split_triangle(vp, vn, vg):
+    """Marching-triangles cut of one face along the g = 0 isoline.
+
+    vp/vn/vg are the three vertices' positions, normals and field values.
+    Returns (positive_side_triangles, negative_side_triangles), each triangle a
+    tuple of ((position, normal), ...) with the source winding preserved. The
+    cut point on an edge depends only on that edge's two endpoint values, so
+    the face on the other side of the edge lands on exactly the same point and
+    the surface stays watertight.
+    """
+    sign = [g > 0.0 for g in vg]
+    tri = tuple(zip(vp, vn))
+    if all(sign):
+        return [tri], []
+    if not any(sign):
+        return [], [tri]
+    # rotate so index 0 is the lone vertex on its own side
+    lone = next(i for i in range(3) if sign[i] != sign[(i + 1) % 3]
+                and sign[i] != sign[(i + 2) % 3])
+    i, j, k = lone, (lone + 1) % 3, (lone + 2) % 3
+    tij = vg[i] / (vg[i] - vg[j])
+    tik = vg[i] / (vg[i] - vg[k])
+    xij = (_lerp(vp[i], vp[j], tij), _lerp(vn[i], vn[j], tij))
+    xik = (_lerp(vp[k], vp[i], 1.0 - tik), _lerp(vn[k], vn[i], 1.0 - tik))
+    corner = [((vp[i], vn[i]), xij, xik)]
+    quad = [(xij, (vp[j], vn[j]), (vp[k], vn[k])),
+            (xij, (vp[k], vn[k]), xik)]
+    return (corner, quad) if sign[i] else (quad, corner)
+
+
+def select_canopy(tris, pos, nor, wmap, faces, station=CANOPY_STATION,
+                  half_width=CANOPY_HALF_WIDTH, shape=None):
+    """The canopy, chosen from where it is rather than from how dark it baked.
+
+    An earlier pass derived the hull/accent split from the source's baked
+    baseColor, treating it as an ambient-occlusion map. That does not work and
+    cannot be made to work:
+
+      * the bake carries no albedo signal -- the canopy samples 0.217 against
+        the airframe's 0.231, i.e. the artist never painted a canopy;
+      * so the split was really being driven by occlusion, which on this model
+        varies wildly across the cockpit's interior walls. The canopy came out
+        in three pieces with a light wedge through the middle, and unrelated
+        recesses (wing root, spine, tail) came out dark as well.
+
+    The canopy is instead a well-defined place on the aircraft, so select it as
+    one. Measured off the source's upper-surface cross-sections, the bubble
+    starts about 15% of the length aft of the nose tip, has merged back into
+    the spine by about 36%, and reaches a half-width near 4.8% of the length
+    about two thirds of the way along -- a teardrop, blunter at the back than
+    the front. That footprint becomes a signed field g on the surface, positive
+    inside the canopy:
+
+        g = half-width(x) - |z|      inside the station
+        g = -(|z| + distance past the station)   outside it
+
+    pinned hard negative on anything that is not upper skin, so the canopy can
+    never reach the belly directly underneath it.
+
+    The faces are then cut along g = 0 rather than merely sorted by it. Sorting
+    whole faces is what the previous attempts did and it cannot work here: the
+    canopy's rear boundary runs nearly parallel to the long thin triangles of
+    the spine, so whichever way each of those triangles falls it leaves a tooth
+    or a notch several triangles long -- a comb. Diffusing the field first files
+    the comb down but does not remove it, because the paint boundary still has
+    to land on a triangle edge. Cutting the triangles puts the boundary exactly
+    on the isoline instead, which is a smooth curve, so there is no comb, no
+    notch, and nothing light left inside the dark region.
+
+    g is a function of position alone and is symmetric about the aircraft's own
+    plane of symmetry, so the two halves come out identical for free.
+
+    Returns (accent_faces, straddling_faces, accent_extra, hull_extra): source
+    faces wholly inside, source faces that were cut (and so must be dropped),
+    and the two lists of explicit replacement triangles.
+    """
+    lo, hi = bbox(tris, pos, faces)
+    length, height = hi[0] - lo[0], hi[1] - lo[1]
+    u0, u1 = station
+    span = u1 - u0
+    a, b = shape or (CANOPY_FRONT_POWER, CANOPY_REAR_POWER)
+    peak = a / (a + b)                       # where s^a (1-s)^b is largest
+    fmax = (peak ** a) * ((1.0 - peak) ** b)
+    y_gate = lo[1] + CANOPY_FLOOR * height
+    z_mid = 0.5 * (lo[2] + hi[2])
+    OUTSIDE = -length
+
+    # A vertex counts as upper skin when it is above the gate AND every face
+    # meeting it there faces up. The gate alone would be enough on this model
+    # (the belly under the canopy sits 0.05 lower than the canopy's lowest
+    # point) but the normal test keeps the rule honest if the model changes.
+    fn = face_normals(tris, nor, faces)
+    downward = set()
+    for ti in faces:
+        if fn[ti][1] <= 0.0:
+            downward.update(wmap[v] for v in tris[ti])
+
+    def g_at(v):
+        p = pos[v]
+        w = wmap[v]
+        if p[1] < y_gate or w in downward:
+            return OUTSIDE
+        s = ((hi[0] - p[0]) / length - u0) / span
+        dz = abs(p[2] - z_mid)
+        if 0.0 < s < 1.0:
+            val = half_width * length * ((s ** a) * ((1.0 - s) ** b)) / fmax - dz
+        else:
+            # outside the station the width is zero, and the margin keeps
+            # falling with distance so the isoline closes to a point rather
+            # than running off along the centreline
+            val = -(dz + (-s if s <= 0.0 else s - 1.0) * span * length)
+        # never let a vertex sit exactly on the isoline; a zero would make the
+        # cut produce a degenerate sliver instead of a clean edge
+        return val if abs(val) > 1e-9 else -1e-9
+
+    gv = {}
+    for ti in faces:
+        for v in tris[ti]:
+            if v not in gv:
+                gv[v] = g_at(v)
+
+    touched = [ti for ti in faces if any(gv[v] > 0.0 for v in tris[ti])]
+    print('  canopy loft: station %.3f..%.3f aft, half-width <= %.4f,'
+          ' %d faces touch the footprint' % (u0, u1, half_width * length, len(touched)))
+    if not touched:
+        return set(), set(), [], []
+
+    # Safety net: keep only the patch connected to the highest touched face, so
+    # a stray upward-facing scrap somewhere else inside the loft cannot join in.
+    cent = {ti: face_centroid(tris, pos, ti) for ti in faces}
+    adj, _ = face_adjacency(tris, wmap, touched)
+    seed = max(touched, key=lambda ti: cent[ti][1])
+    tset, seen, stack = set(touched), set(), [seed]
+    while stack:
+        v = stack.pop()
+        if v in seen:
+            continue
+        seen.add(v)
+        for w in adj.get(v, ()):
+            if w in tset and w not in seen:
+                stack.append(w)
+    if len(seen) != len(tset):
+        print('    dropped %d face(s) not connected to the canopy patch'
+              % (len(tset) - len(seen)))
+
+    accent, straddle, acc_extra, hull_extra = set(), set(), [], []
+    for ti in seen:
+        vg = [gv[v] for v in tris[ti]]
+        if all(v > 0.0 for v in vg):
+            accent.add(ti)
+        elif any(v > 0.0 for v in vg):
+            straddle.add(ti)
+            vp = [pos[v] for v in tris[ti]]
+            vn = [nor[v] for v in tris[ti]]
+            plus, minus = _split_triangle(vp, vn, vg)
+            acc_extra.extend(plus)
+            hull_extra.extend(minus)
+    print('    %d faces wholly inside, %d cut along the outline'
+          ' (-> %d accent + %d hull pieces)'
+          % (len(accent), len(straddle), len(acc_extra), len(hull_extra)))
+    if accent or acc_extra:
+        clo, chi = bbox(tris, pos, accent) if accent else ([0] * 3, [0] * 3)
+        for tri in acc_extra:
+            for p, _n in tri:
+                for k in range(3):
+                    clo[k] = min(clo[k], p[k])
+                    chi[k] = max(chi[k], p[k])
+        print('  canopy patch x[%7.4f %7.4f] y[%7.4f %7.4f] z[%7.4f %7.4f]'
+              % (clo[0], chi[0], clo[1], chi[1], clo[2], chi[2]))
+    return accent, straddle, acc_extra, hull_extra
 
 
 def bbox(tris, pos, faces):
@@ -540,6 +848,105 @@ def face_luminance(tris, uv, tex):
 
 
 # ---------------------------------------------------------------------------
+# Legacy classifier (comparison only)
+# ---------------------------------------------------------------------------
+
+def legacy_texture_accent(tris, pos, uv, wmap, faces, src, cache, dark_percentile):
+    """The abandoned occlusion-derived accent mask, kept for comparison only.
+
+    This is what --legacy-texture-accent restores, and what select_canopy
+    replaced: it treats the source's baked baseColor as an ambient-occlusion
+    map, symmetrises it, diffuses it over the face graph, thresholds the
+    darkest N%, then spends three more passes trying to tidy up the result.
+    The mask it produces breaks the canopy into pieces and paints unrelated
+    recesses on the wing root, spine and tail. Nothing calls this by default.
+    """
+    tex = decode_basecolor(src, cache)
+    print('baseColor bake decoded at %dx%d; sampling %d faces'
+          % (tex[0], tex[1], len(faces)))
+    raw = face_luminance(tris, uv, tex)
+    # The airframe is exactly mirror-symmetric but its auto-unwrap is not:
+    # mirrored charts land on unrelated parts of the atlas and come back
+    # with luminances that differ by 40%+ (chart 9 vs its twin: 0.158 vs
+    # 0.224). Averaging each face with its mirror twin removes that, so the
+    # jet does not end up with a dark patch on one wing only.
+    pair, paired = mirror_pairs(tris, pos, faces), 0
+    sym = dict.fromkeys(faces, 0.0)
+    for ti in faces:
+        mi = pair.get(ti)
+        if mi is None:
+            sym[ti] = raw[ti]
+        else:
+            sym[ti] = 0.5 * (raw[ti] + raw[mi])
+            paired += 1
+    print('  mirror-symmetrised %d/%d faces (%.1f%%)'
+          % (paired, len(faces), 100.0 * paired / len(faces)))
+    raw = sym
+    # The bake has baked-in AO and heavy island bleed, so a per-face
+    # threshold on its own is salt-and-pepper noise. Diffuse the signal
+    # across the face graph first, which keeps coherent dark regions (the
+    # canopy, the nozzle cans, the intake lips) and erases the speckle.
+    adj, _ = face_adjacency(tris, wmap, faces)
+    cur = {ti: raw[ti] for ti in faces}
+    for _ in range(SMOOTH_ITERS):
+        nxt = {}
+        for ti in faces:
+            nb = adj.get(ti)
+            nxt[ti] = ((cur[ti] + sum(cur[j] for j in nb)) / (1 + len(nb))) if nb else cur[ti]
+        cur = nxt
+    srt = sorted(cur.values())
+    thr = srt[min(len(srt) - 1, int(dark_percentile / 100.0 * len(srt)))]
+    dark = {ti for ti in faces if cur[ti] < thr}
+    # Erase islands: isolated dark specks are bleed, real accents are patches.
+    seen, keep_dark = set(), set()
+    for s in dark:
+        if s in seen:
+            continue
+        stack, grp = [s], []
+        while stack:
+            v = stack.pop()
+            if v in seen:
+                continue
+            seen.add(v)
+            grp.append(v)
+            for w in adj.get(v, ()):
+                if w in dark and w not in seen:
+                    stack.append(w)
+        if len(grp) >= MIN_ACCENT_PATCH:
+            keep_dark.update(grp)
+    # ...and plug pinholes: a light face ringed by accent is accent.
+    for ti in faces:
+        if ti in keep_dark:
+            continue
+        nb = adj.get(ti, ())
+        if nb and all(j in keep_dark for j in nb):
+            keep_dark.add(ti)
+    # Regularise the border. Straight off the threshold it zigzags along
+    # triangle edges, which at this triangle density is plainly visible as
+    # a torn edge on the flank. A couple of majority votes over the face
+    # graph pull it back to something that looks drawn rather than diced.
+    for _ in range(MASK_SMOOTH_ROUNDS):
+        flip_on, flip_off = set(), set()
+        for ti in faces:
+            nb = adj.get(ti)
+            if not nb:
+                continue
+            dark_n = sum(1 for j in nb if j in keep_dark)
+            if ti in keep_dark:
+                if dark_n * 3 < len(nb):
+                    flip_off.add(ti)
+            elif dark_n * 3 >= len(nb) * 2:
+                flip_on.add(ti)
+        if not flip_on and not flip_off:
+            break
+        keep_dark |= flip_on
+        keep_dark -= flip_off
+    accent = keep_dark
+    print('  legacy accent faces %d / %d (%.1f%%)'
+          % (len(accent), len(faces), 100.0 * len(accent) / len(faces)))
+    return accent
+
+
 # GLB writing
 # ---------------------------------------------------------------------------
 
@@ -636,8 +1043,24 @@ def main():
     ap.add_argument('--out', default='public/jet.glb')
     ap.add_argument('--keep-gear', action='store_true',
                     help='skip landing-gear removal (for before/after renders)')
+    ap.add_argument('--keep-nose-well', action='store_true',
+                    help='leave the welded nose-gear well in place (see find_gear_well)')
     ap.add_argument('--no-texture-classify', action='store_true',
-                    help='skip the baseColor sampling; split hull/accent geometrically')
+                    help='accepted for compatibility; the default path already '
+                         'never reads the texture, so this is now a no-op')
+    ap.add_argument('--legacy-texture-accent', action='store_true',
+                    help='restore the abandoned occlusion-derived accent mask '
+                         '(fragments the canopy; kept only for comparison)')
+    ap.add_argument('--no-canopy', action='store_true',
+                    help='emit hull only, no accent group (diagnostic)')
+    ap.add_argument('--canopy-station', type=float, nargs=2, default=CANOPY_STATION,
+                    metavar=('FRONT', 'REAR'),
+                    help='canopy extent, as fractions of length aft of the nose')
+    ap.add_argument('--canopy-width', type=float, default=CANOPY_HALF_WIDTH,
+                    help='canopy half-width, as a fraction of length')
+    ap.add_argument('--canopy-shape', type=float, nargs=2, metavar=('FRONT', 'REAR'),
+                    default=(CANOPY_FRONT_POWER, CANOPY_REAR_POWER),
+                    help='loft exponents; the widest point sits at FRONT/(FRONT+REAR)')
     ap.add_argument('--debug-colors', action='store_true',
                     help='emit garish hull/accent colours to eyeball the split')
     ap.add_argument('--dark-percentile', type=float, default=DARK_PERCENTILE)
@@ -692,13 +1115,13 @@ def main():
     # chin. Find anything that dips below the smoothed belly line, cut it out,
     # and cap the hole flush -- "fold in the pads".
     caps = []
-    if not args.keep_gear:
+    if not args.keep_gear and not args.keep_nose_well:
         prot = find_gear_well(tris, pos, faces, wmap)
         if prot:
             pf = set(prot)
             before = faces
             faces = [f for f in faces if f not in pf]
-            caps = cap_openings(tris, pos, wmap, before, faces)
+            caps = cap_openings(tris, pos, nor, wmap, before, faces)
             print('removed %d protruding gear-well faces; %d remain (+%d cap triangles)'
                   % (len(prot), len(faces), len(caps)))
 
@@ -713,13 +1136,41 @@ def main():
     if degen:
         print('dropping %d degenerate source faces' % len(degen))
         faces = [ti for ti in faces if ti not in set(degen)]
-    caps = [c for c in caps if area3(c[0], c[1], c[2]) >= 1e-12]
+    caps = [c for c in caps if area3(c[0][0], c[1][0], c[2][0]) >= 1e-12]
+
+    # --- 2/3. hull vs accent ------------------------------------------------
+    # The canopy is picked out geometrically; nothing else on the aircraft is
+    # accent. --legacy-texture-accent restores the abandoned occlusion split.
+    accent = set()
+    acc_extra, hull_extra = [], []
+    if args.no_texture_classify and not args.legacy_texture_accent:
+        print('note: --no-texture-classify is a no-op; the default accent split'
+              ' is geometric and never opens the texture')
+    if args.no_canopy:
+        print('canopy selection skipped (--no-canopy)')
+    elif not args.legacy_texture_accent:
+        accent, straddle, acc_extra, hull_extra = select_canopy(
+            tris, pos, nor, wmap, faces,
+            station=tuple(args.canopy_station), half_width=args.canopy_width,
+            shape=tuple(args.canopy_shape))
+        if straddle:
+            faces = [f for f in faces if f not in straddle]
+        acc_extra = [t for t in acc_extra if area3(t[0][0], t[1][0], t[2][0]) >= 1e-12]
+        hull_extra = [t for t in hull_extra if area3(t[0][0], t[1][0], t[2][0]) >= 1e-12]
+        n_acc = len(accent) + len(acc_extra)
+        n_all = len(faces) + len(acc_extra) + len(hull_extra) + len(caps)
+        print('  accent %d / %d triangles (%.1f%%)'
+              % (n_acc, n_all, 100.0 * n_acc / n_all))
+    else:
+        accent = legacy_texture_accent(tris, pos, uv, wmap, faces, src, cache,
+                                       args.dark_percentile)
 
     # End-to-end integrity check on exactly what will be written out: skin
-    # faces plus caps, welded together, counting edges used by a single face.
+    # faces plus caps and canopy-cut pieces, welded together, counting edges
+    # used by a single face.
     def integrity(fs, cs):
         soup = [tuple(pos[v] for v in tris[ti]) for ti in fs]
-        soup += [(c[0], c[1], c[2]) for c in cs]
+        soup += [(c[0][0], c[1][0], c[2][0]) for c in cs]
         vids, table = [], {}
         q = 1e6
         for tri in soup:
@@ -739,104 +1190,11 @@ def main():
                 sum(1 for v in ec.values() if v > 2))
 
     n_src, b_src, nm_src = integrity(range(len(tris)), [])
-    n_out, b_out, nm_out = integrity(faces, caps)
+    n_out, b_out, nm_out = integrity(faces, caps + acc_extra + hull_extra)
     print('integrity: source %d tris, %d open edges, %d non-manifold edges'
           % (n_src, b_src, nm_src))
     print('           output %d tris, %d open edges, %d non-manifold edges'
           % (n_out, b_out, nm_out))
-
-    # --- 2/3. hull vs accent, driven by the source bake ---------------------
-    accent = set()
-    lum_stats = None
-    if not args.no_texture_classify:
-        tex = decode_basecolor(src, cache)
-        print('baseColor bake decoded at %dx%d; sampling %d faces'
-              % (tex[0], tex[1], len(faces)))
-        raw = face_luminance(tris, uv, tex)
-        # The airframe is exactly mirror-symmetric but its auto-unwrap is not:
-        # mirrored charts land on unrelated parts of the atlas and come back
-        # with luminances that differ by 40%+ (chart 9 vs its twin: 0.158 vs
-        # 0.224). Averaging each face with its mirror twin removes that, so the
-        # jet does not end up with a dark patch on one wing only.
-        pair, paired = mirror_pairs(tris, pos, faces), 0
-        sym = dict.fromkeys(faces, 0.0)
-        for ti in faces:
-            mi = pair.get(ti)
-            if mi is None:
-                sym[ti] = raw[ti]
-            else:
-                sym[ti] = 0.5 * (raw[ti] + raw[mi])
-                paired += 1
-        print('  mirror-symmetrised %d/%d faces (%.1f%%)'
-              % (paired, len(faces), 100.0 * paired / len(faces)))
-        raw = sym
-        # The bake has baked-in AO and heavy island bleed, so a per-face
-        # threshold on its own is salt-and-pepper noise. Diffuse the signal
-        # across the face graph first, which keeps coherent dark regions (the
-        # canopy, the nozzle cans, the intake lips) and erases the speckle.
-        adj, _ = face_adjacency(tris, wmap, faces)
-        cur = {ti: raw[ti] for ti in faces}
-        for _ in range(SMOOTH_ITERS):
-            nxt = {}
-            for ti in faces:
-                nb = adj.get(ti)
-                nxt[ti] = ((cur[ti] + sum(cur[j] for j in nb)) / (1 + len(nb))) if nb else cur[ti]
-            cur = nxt
-        srt = sorted(cur.values())
-        thr = srt[min(len(srt) - 1, int(args.dark_percentile / 100.0 * len(srt)))]
-        dark = {ti for ti in faces if cur[ti] < thr}
-        # Erase islands: isolated dark specks are bleed, real accents are patches.
-        seen, keep_dark = set(), set()
-        for s in dark:
-            if s in seen:
-                continue
-            stack, grp = [s], []
-            while stack:
-                v = stack.pop()
-                if v in seen:
-                    continue
-                seen.add(v)
-                grp.append(v)
-                for w in adj.get(v, ()):
-                    if w in dark and w not in seen:
-                        stack.append(w)
-            if len(grp) >= MIN_ACCENT_PATCH:
-                keep_dark.update(grp)
-        # ...and plug pinholes: a light face ringed by accent is accent.
-        for ti in faces:
-            if ti in keep_dark:
-                continue
-            nb = adj.get(ti, ())
-            if nb and all(j in keep_dark for j in nb):
-                keep_dark.add(ti)
-        # Regularise the border. Straight off the threshold it zigzags along
-        # triangle edges, which at this triangle density is plainly visible as
-        # a torn edge on the flank. A couple of majority votes over the face
-        # graph pull it back to something that looks drawn rather than diced.
-        for _ in range(MASK_SMOOTH_ROUNDS):
-            flip_on, flip_off = set(), set()
-            for ti in faces:
-                nb = adj.get(ti)
-                if not nb:
-                    continue
-                dark_n = sum(1 for j in nb if j in keep_dark)
-                if ti in keep_dark:
-                    if dark_n * 3 < len(nb):
-                        flip_off.add(ti)
-                elif dark_n * 3 >= len(nb) * 2:
-                    flip_on.add(ti)
-            if not flip_on and not flip_off:
-                break
-            keep_dark |= flip_on
-            keep_dark -= flip_off
-        accent = keep_dark
-        lum_stats = (min(srt), thr, max(srt))
-        print('  smoothed bake luminance min %.4f, threshold %.4f (p%.1f), max %.4f'
-              % (lum_stats[0], thr, args.dark_percentile, lum_stats[2]))
-        print('  accent faces %d / %d (%.1f%%)'
-              % (len(accent), len(faces), 100.0 * len(accent) / len(faces)))
-    else:
-        print('texture classification skipped')
 
     # --- 4. orient, recentre, scale -----------------------------------------
     lo, hi = bbox(tris, pos, faces)
@@ -878,8 +1236,9 @@ def main():
 
     # --- build the two groups ------------------------------------------------
     out_groups = []
-    for gname, gfaces, matidx in (('Hull', [f for f in faces if f not in accent], 0),
-                                  ('Accent_Cockpit', [f for f in faces if f in accent], 1)):
+    for gname, gfaces, gextra, matidx in (
+            ('Hull', [f for f in faces if f not in accent], caps + hull_extra, 0),
+            ('Accent_Cockpit', [f for f in faces if f in accent], acc_extra, 1)):
         remap, verts, out_tris = {}, [], []
         for ti in gfaces:
             tri = []
@@ -890,16 +1249,18 @@ def main():
                     verts.append((xf_p(pos[v]), xf_n(nor[v])))
                 tri.append(j)
             out_tris.append(tuple(tri))
-        if gname == 'Hull' and caps:
-            # the flush lids over the gear wells; new geometry, so new verts
-            for p0, p1, p2, nrm in caps:
-                base = len(verts)
-                for p in (p0, p1, p2):
-                    verts.append((xf_p(p), xf_n(nrm)))
-                out_tris.append((base, base + 1, base + 2))
+        # Geometry this tool made rather than kept: the lids over the gear
+        # wells, and the pieces of the faces the canopy outline cut through.
+        # Both carry their own per-vertex normals, so they shade continuously
+        # with the skin they sit in.
+        for tri3 in gextra:
+            base = len(verts)
+            for p, nrm in tri3:
+                verts.append((xf_p(p), xf_n(nrm)))
+            out_tris.append((base, base + 1, base + 2))
         if not out_tris:
-            # --no-texture-classify leaves nothing in the accent bucket; an
-            # empty primitive is not valid glTF, so drop the node entirely.
+            # --no-canopy leaves nothing in the accent bucket; an empty
+            # primitive is not valid glTF, so drop the node entirely.
             print('  %-15s empty, not emitted' % gname)
             continue
         out_groups.append((gname, matidx, verts, out_tris))

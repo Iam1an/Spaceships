@@ -38,6 +38,14 @@ const HEIGHT: f32 = 5.6;
 /// ship" the view direction sits. `camera.js:53` (`lerp(dirToShip, 0.25)`).
 const VIEW_BLEND: f32 = 0.25;
 
+/// The chase camera's resting vertical field of view, in radians.
+///
+/// Public because [`crate::warp`]'s FOV punch decelerates *into* it and needs a
+/// fallback for a camera it cannot read one from. The punch normally captures
+/// whatever the projection actually holds when it starts, because `cockpit.rs`
+/// swaps this out for the seated profile on `V`.
+pub const BASE_FOV: f32 = std::f32::consts::FRAC_PI_4;
+
 /// The camera's smoothed up vector. In Three.js this is `camera.up`, a mutable
 /// field on the camera object; Bevy's `Transform::look_at` takes up as an
 /// argument, so it has to be stored.
@@ -74,7 +82,9 @@ pub fn spawn_camera(mut commands: Commands) {
         // Bevy's `intensity` is not on the same scale as three's `strength`,
         // so this is tuned by eye from `NATURAL`; the threshold is the part
         // that has to be faithful, because Ultra's bright star cores and
-        // additive glow idiom are authored to sit just above it.
+        // additive glow idiom are authored to sit just above it — including
+        // `warp.rs`'s streaks, which are the same `0xccffff` additive material
+        // `warp.js` uses.
         Bloom {
             intensity: 0.22,
             low_frequency_boost: 0.7,
@@ -103,6 +113,15 @@ pub fn spawn_camera(mut commands: Commands) {
         // post-process node — one fullscreen shader — and are the only part of
         // the Ultra stack that does not map onto something built in.
         //
+        // Still open, deliberately. `bevy::core_pipeline::fullscreen_material`
+        // has the whole node in 0.19 — a `FullscreenMaterial` impl scheduled
+        // `after(tonemapping)`, which is where `GradeShader` grades — so this
+        // is perhaps eighty lines whenever someone wants it. It is not being
+        // built *here* because nothing else needs it: `warp.rs` is world-space
+        // geometry and a projection change, and standing up a fullscreen pass
+        // that only carries a grain and a colour trim is infrastructure the
+        // effect does not use.
+        //
         // `PCFSoftShadowMap`.
         ShadowFilteringMethod::Gaussian,
         // Ultra sets `antialias: false` on purpose and leans on a high pixel
@@ -113,7 +132,7 @@ pub fn spawn_camera(mut commands: Commands) {
         // The moon is 160 units across and the field reaches 400; the default
         // far plane of 1000 clips the far half of the map.
         Projection::Perspective(PerspectiveProjection {
-            fov: std::f32::consts::FRAC_PI_4,
+            fov: BASE_FOV,
             near: 0.5,
             far: 20_000.0,
             ..default()
