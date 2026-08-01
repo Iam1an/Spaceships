@@ -16,6 +16,14 @@ dist/
 build/
 *.log
 
+# Vite
+.vite/
+node_modules/.vite/
+node_modules/.vite-temp/
+*.local
+vite.config.js.timestamp-*
+vite.config.mjs.timestamp-*
+
 # Env / secrets (none today, but be safe)
 .env
 .env.local
