@@ -586,6 +586,11 @@
     </label>
     <div class="hint">Bots fire as fast as you do.</div>
     <label style="margin-top:10px;">
+      <input type="checkbox" id="cockpitViewInput" />
+      <span>Start in Cockpit</span>
+    </label>
+    <div class="hint">First-person view with a live instrument panel. Press V in flight to switch.</div>
+    <label style="margin-top:10px;">
       <input type="checkbox" id="pixelFilterInput" />
       <span>Retro Pixel Filter</span>
     </label>
@@ -846,6 +851,15 @@
   </div>
 
   <!-- In-game HUD (hidden until game starts) -->
+  <style>
+    /* First person: the 3D instrument panel replaces these DOM meters. */
+    body.cockpit-view #healthbar,
+    body.cockpit-view #chargebar,
+    body.cockpit-view #boostbar,
+    body.cockpit-view #heatbar,
+    body.cockpit-view #missilehud,
+    body.cockpit-view #flarehud { display: none !important; }
+  </style>
   <div id="hud-stats" style="display:none"></div>
   <div id="killfeed"></div>
   <div id="reticle" style="display:none"></div>

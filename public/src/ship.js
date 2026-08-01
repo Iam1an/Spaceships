@@ -21,6 +21,9 @@ export function isModelCached(url) {
 export function applyColorsToShip(ship, hullColor, accentColor) {
   ship.traverse((o) => {
     if (!o.isMesh || !o.material?.color) return;
+    // Cockpit interior keeps its own palette. isAccentMesh would otherwise claim every dark
+    // panel (luma < 0.35) and anything named cockpit/glass, repainting the whole interior.
+    if (o.userData?.isInterior) return;
     if (isAccentMesh(o)) {
       if (accentColor !== undefined) o.material.color.setHex(accentColor);
     } else {
