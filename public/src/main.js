@@ -386,6 +386,11 @@ export async function startGame(opts = {}) {
   scene.add(missileSystem.group);
   const trails = createTrails();
   scene.add(trails.group);
+  // Declared here rather than with the other player state further down: inCockpit()
+  // reads it during camera setup below, and a `let` declared later sits in the temporal
+  // dead zone. With viewMode 'third' the && short-circuits and hides the problem, so this
+  // only threw for players who had already switched to the cockpit view.
+  let myAlive = true;
   const tpCam = new ThirdPersonCamera(camera, ship);
   const cockpitProfile = getCockpitProfile(isLocalAdmin);
   const fpCam = new FirstPersonCamera(camera, ship, cockpitProfile);
@@ -520,7 +525,6 @@ export async function startGame(opts = {}) {
   const RESPAWN_DELAY = 2.5;
   const SPAWN_INVULN_DURATION = 2.0;
   let myHp = SHIP_MAX_HP;
-  let myAlive = true;
   let myRespawnTimer = 0;
   let myInvulnTimer = SPAWN_INVULN_DURATION;
   const scores = new Map();
