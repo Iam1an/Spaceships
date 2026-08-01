@@ -470,7 +470,89 @@ Bevy loads glTF natively, so the format does not need to change.
 
 ---
 
-## 8. Falls out of the replay system nearly free
+## 8. UI redesign — the menu is the aircraft
+
+The lobby, shop, profile and settings all get redone as **avionics**, not as a
+game menu. This is the last major client surface and it has **not** been ported
+to Bevy yet — which is the point of deciding now. Porting the current design
+faithfully and then redesigning it is the one clearly wasted path.
+
+### Why avionics
+
+The game has already become a fighter sim: voice warnings, chaff and flares,
+Over-G, a cockpit with annunciators and a radar, Kvochur's Bell, F-22 airframes.
+The menu is the last surface that still looks like a generic space game — dark
+blue glassmorphism, `blur(16px)`, cyan accents, the default.
+
+Framing the menu as the aircraft's multi-function display makes the HUD, the
+cockpit and the menu **one system instead of three**, and it reuses the visual
+language `cockpit.rs` is building anyway.
+
+| Screen | Becomes |
+|---|---|
+| Home | Systems boot / mission select, annunciators, radar sweep |
+| Shop | **Armory / requisition** |
+| Profile | Pilot service record — flight hours, kill marks, a dossier |
+| Leaderboard | Squadron standings |
+| Room browser | Available sorties / tasking orders |
+| Settings | Systems configuration |
+
+Visual language: phosphor green and amber, hard-edged panels, thin technical
+rules, monospace readouts, scanlines. **Not** soft blur — glassmorphism is the
+thing being replaced. Orbitron is already vendored at `public/fonts/`.
+
+Do this **after** `cockpit.rs` lands, so the menu inherits an established look
+rather than inventing a second one.
+
+### The shop is a structural problem, not a styling one
+
+Current prices:
+
+| Item | Cost |
+|---|---|
+| Save colours | 50 |
+| Trail shape | 200 |
+| Hull colour | 250 |
+| Accent colour | 400 |
+| Trail | 500 |
+| **Admin ship** | **125,000** |
+
+Everything except the admin ship totals 1,400. Completing the campaign alone
+pays 3,500. So a player buys the entire shop in their first evening and then
+faces a **250x gap** with nothing in between. There is no ladder — that is why
+it feels bad, and restyling cannot fix it.
+
+**The fix the rest of the roadmap already supplies: multiple airframes.** Section
+7 replaces the models with fighter jets. Several jets, unlocked in sequence, is a
+progression ladder that costs no new systems — `ship-model` is already a protocol
+message, `unlock_admin_ship` is already a database column, and the customization
+UI already gates on ownership.
+
+Suggested rungs (numbers to playtest, shape to keep):
+
+| Tier | Item | Cost |
+|---|---|---|
+| Entry | colours, trail shape | 50–500 (unchanged) |
+| Early | second airframe | ~2,000 |
+| Mid | third airframe, cockpit variant | ~8,000 |
+| Late | fourth airframe, nose art / decals | ~25,000 |
+| Chase | fifth airframe | ~60,000 |
+| Prestige | admin ship | 125,000 (unchanged) |
+
+Keep the admin ship where it is — a genuine flex should stay out of reach. The
+problem was never its price, it was the emptiness beneath it.
+
+Other rungs that need no new systems: tracer and beam colours, callsign styling,
+and cockpit instrument themes once `cockpit.rs` exists.
+
+### Out of scope here
+
+Balance of credit *earning* rates. Adding rungs changes what players chase; how
+fast they get there is a separate tuning pass with real play data.
+
+---
+
+## 9. Falls out of the replay system nearly free
 
 - **Killcam.** A replay bounded to the 5 seconds before your death, from the
   killer's view.
@@ -483,7 +565,7 @@ Bevy loads glTF natively, so the format does not need to change.
 
 ---
 
-## 9. Netcode: rollback
+## 10. Netcode: rollback
 
 A deterministic simulation is the hard prerequisite for rollback netcode — the
 thing that makes fighting games feel lagless online. The client predicts
@@ -495,7 +577,7 @@ foundation is already in place.
 
 ---
 
-## 10. Known gameplay issues found during the port
+## 11. Known gameplay issues found during the port
 
 Real behaviors in the current game, each verified against the source. Some are
 bugs, some are probably-unintended design. Decide individually.
@@ -516,7 +598,7 @@ bugs, some are probably-unintended design. Decide individually.
 
 ---
 
-## 11. Other ideas
+## 12. Other ideas
 
 - **Replace the pixel filter with a real post chain.** `PIXEL_SCALE = 3` renders
   to a third-res target and upscales. In Bevy this is a post-processing pass,
