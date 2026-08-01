@@ -69,8 +69,20 @@ struct VirtualCursor {
 fn grab_cursor(
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
+    lobby: Option<Res<crate::ui::LobbyOpen>>,
     mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
+    // The lobby navigates by pointer, so it needs a real cursor. Taking the
+    // lock on the first click there would hide it and pin it to the centre,
+    // which is the opposite of what a menu wants.
+    if lobby.is_some_and(|l| l.0) {
+        if cursor.grab_mode != CursorGrabMode::None {
+            cursor.grab_mode = CursorGrabMode::None;
+            cursor.visible = true;
+        }
+        return;
+    }
+
     if mouse.just_pressed(MouseButton::Left) && cursor.grab_mode == CursorGrabMode::None {
         // `Locked` is the pointer-lock equivalent. macOS supports it; where it
         // is unavailable winit falls back and the cursor stays confined, which
@@ -89,6 +101,7 @@ fn gather_input(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     window: Single<&Window, With<PrimaryWindow>>,
+    lobby: Option<Res<crate::ui::LobbyOpen>>,
     mut virt: ResMut<VirtualCursor>,
     mut out: ResMut<PlayerInput>,
 ) {
@@ -107,6 +120,17 @@ fn gather_input(
     // horizontal range is deliberately not half the width, so aim sensitivity
     // does not change with aspect ratio.
     let half_h = (window.height() * 0.5).max(1.0);
+
+    // While the lobby is up the pointer is navigating menus, not aiming. The
+    // virtual cursor is a *position*, so integrating menu movement into it
+    // leaves it pegged at the clamp, and the first frame after launch hands
+    // `ship::integrate` a full-deflection stick — the ship snapped into a turn
+    // the moment a match started. Recentred rather than merely paused, so a
+    // match always begins with the stick neutral.
+    if lobby.is_some_and(|l| l.0) {
+        virt.x = 0.0;
+        virt.y = 0.0;
+    }
 
     // The delta has to be brought into the same units as that clamp, and it is
     // not already there. `AccumulatedMouseMotion` is winit's raw

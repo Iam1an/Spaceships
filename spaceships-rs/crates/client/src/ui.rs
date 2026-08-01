@@ -73,6 +73,29 @@
 //! must measure on every dirty pass cost far more than the single relayout a
 //! page change causes, and a page change is an event, not a frame.
 //!
+//! # The pointer has to be resolved by hand
+//!
+//! `bevy_ui`'s [`ui_focus_system`] only resolves a cursor for cameras whose
+//! render target is a **window**, and this menu's camera targets an *image* so
+//! the tube can warp it. So [`Interaction`] never fires on anything in this
+//! tree, and a hover path built on it is dead code — which is what it was.
+//!
+//! Giving up the render target was not on the table: the tube is the design.
+//! Instead [`through_the_glass`] runs the shader's own three lines of
+//! projection on the CPU, in the one direction a cursor needs — from the tube
+//! node's UV out to the menu image's UV — reading the curvature and the face
+//! inset back out of the live material so the two can never disagree, not even
+//! under `SPACESHIPS_UI_CRT=0`. [`control_at`] then hit-tests the page's own
+//! controls at that point, and what comes out drives exactly what the keyboard
+//! drives: [`Menu::focus`], and on a click the same [`Action`] through the same
+//! [`apply`]. There is one arming path, not two.
+//!
+//! It obeys the rule above as well: a mouse that has not moved and a button
+//! that has not gone down do not reach the hit test at all, so a still pointer
+//! costs one `Option<Vec2>` comparison a frame.
+//!
+//! [`ui_focus_system`]: bevy::ui::ui_focus_system
+//!
 //! # Where the data comes from, and where it does not
 //!
 //! Auth, the room list, matchmaking, credits and the leaderboard are all server
@@ -99,6 +122,7 @@ use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::asset::{uuid_handle, AssetId, RenderAssetUsages};
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::RenderTarget;
+use bevy::ecs::system::SystemParam;
 use bevy::image::Image;
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
@@ -108,6 +132,7 @@ use bevy::render::render_resource::{
 use bevy::shader::{Shader, ShaderRef};
 use bevy::text::{FontWeight, LetterSpacing, LineHeight};
 use bevy::ui_render::prelude::{MaterialNode, UiMaterial, UiMaterialPlugin};
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use bevy::world_serialization::{WorldAsset, WorldAssetRoot, WorldInstanceReady};
 
 use spaceships_sim as sim;
@@ -161,7 +186,8 @@ impl Plugin for UiPlugin {
             // own: `PreUpdate` finishes before `RunFixedMainLoop` starts.
             .add_systems(
                 RunFixedMainLoop,
-                hold_the_stick.before(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+                (hold_the_stick, release_the_pointer)
+                    .before(RunFixedMainLoopSystems::BeforeFixedMainLoop),
             );
     }
 }
@@ -499,6 +525,17 @@ impl Crt {
             housing: Vec4::new(INSET, BEZEL, SPILL_REACH, if on { SPILL_GAIN } else { 0.0 }),
             source,
         }
+    }
+
+    /// The two terms the pointer has to reproduce: curvature and face inset.
+    ///
+    /// Read back out of the uniforms rather than from [`CURVATURE`] and
+    /// [`INSET`] directly, because `Crt::new` zeroes the curvature under
+    /// `SPACESHIPS_UI_CRT=0` — and a cursor mapped through a curve the shader
+    /// is not drawing lands next to the row it is over. This is one number with
+    /// one home.
+    fn glass(&self) -> (f32, f32) {
+        (self.geometry.z, self.housing.x)
     }
 }
 
@@ -1852,10 +1889,6 @@ struct ControlDef {
     value: Entity,
 }
 
-/// Marker carrying an index into [`MenuNodes::controls`].
-#[derive(Component, Clone, Copy)]
-struct Control(u16);
-
 const ST_FOCUS: u8 = 1;
 const ST_SELECTED: u8 = 2;
 const ST_DISABLED: u8 = 4;
@@ -2088,11 +2121,8 @@ struct Ui<'a> {
 }
 
 impl Ui<'_> {
-    fn control(&mut self, def: ControlDef) -> u16 {
-        #[allow(clippy::cast_possible_truncation)]
-        let id = self.controls.len() as u16;
+    fn control(&mut self, def: ControlDef) {
         self.controls.push(def);
-        id
     }
 }
 
@@ -2207,6 +2237,15 @@ fn wordmark(f: &Fonts, text: &str, size: f32, colour: Color, track: f32) -> impl
 
 /// A section heading: one small caption with air under it, and no rule. The gap
 /// is the grouping.
+/// What a tasking page's rows do, said once, in the dimmest thing on the page.
+///
+/// The same words on all three, because they are the same promise: the row
+/// under the cursor is the match that starts. Deliberately a bundle rather than
+/// a control — see the call sites.
+fn hint(f: &Fonts) -> impl Bundle {
+    tracked(f, "SELECT TO LAUNCH", 8.0, dim(0.35), 2.4)
+}
+
 fn section(parent: &mut ChildSpawnerCommands, f: &Fonts, text: &str) {
     parent.spawn((
         caption(f, text, 9.0, dim(0.7)),
@@ -2218,6 +2257,13 @@ fn section(parent: &mut ChildSpawnerCommands, f: &Fonts, text: &str) {
 }
 
 /// A selectable row.
+///
+/// Not a [`Button`], and carries no marker component tying the entity back to
+/// its [`ControlDef`]. Both were there to be picked up by `Interaction`, which
+/// cannot fire in a tree rendered to an image — see the module docs. The row is
+/// found the other way round now: [`MenuNodes::controls`] already holds the
+/// root entity, so [`Pointer::rect`] asks for the rect it wants rather than
+/// waiting to be told about a hover that never comes.
 #[allow(clippy::too_many_arguments)]
 fn control_row(
     parent: &mut ChildSpawnerCommands,
@@ -2235,7 +2281,6 @@ fn control_row(
 
     let root = parent
         .spawn((
-            Button,
             Node {
                 width: percent(100),
                 min_height: px(size * 1.9),
@@ -2273,7 +2318,7 @@ fn control_row(
         })
         .id();
 
-    let id = ui.control(ControlDef {
+    ui.control(ControlDef {
         screen,
         action,
         root,
@@ -2281,7 +2326,6 @@ fn control_row(
         label: label_e,
         value: value_e,
     });
-    parent.commands().entity(root).insert(Control(id));
 }
 
 /// A label/value line. No box, no rule — two columns and a gap.
@@ -3062,6 +3106,13 @@ fn build_pages(
                         18.0,
                     );
                 }
+                // Not a control: a caption, so it costs no cursor stop. It is
+                // here because the three rows above it no longer arm a
+                // preference for a separate `EXECUTE` to consume — they launch
+                // — and a row that flies the aircraft should say so before it
+                // is pressed rather than after.
+                c.spawn(gap(10.0));
+                c.spawn(hint(f));
                 c.spawn(gap(32.0));
                 for (screen, label) in [
                     (Screen::Trials, "TIME TRIAL CIRCUITS"),
@@ -3069,8 +3120,6 @@ fn build_pages(
                 ] {
                     control_row(c, ui, Screen::Solo, Action::Go(screen), label, None, 18.0);
                 }
-                c.spawn(gap(44.0));
-                control_row(c, ui, Screen::Solo, Action::Execute, "EXECUTE", None, 15.0);
             });
             p.spawn(page_col(38.0)).with_children(|c| {
                 for (i, k) in ["OBJECTIVE", "ADVERSARY", "DURATION"]
@@ -3108,16 +3157,8 @@ fn build_pages(
                         18.0,
                     );
                 }
-                c.spawn(gap(44.0));
-                control_row(
-                    c,
-                    ui,
-                    Screen::Trials,
-                    Action::Execute,
-                    "EXECUTE",
-                    None,
-                    15.0,
-                );
+                c.spawn(gap(10.0));
+                c.spawn(hint(f));
             });
         })
         .id();
@@ -3146,16 +3187,8 @@ fn build_pages(
                         18.0,
                     );
                 }
-                c.spawn(gap(44.0));
-                control_row(
-                    c,
-                    ui,
-                    Screen::Campaign,
-                    Action::Execute,
-                    "EXECUTE",
-                    None,
-                    15.0,
-                );
+                c.spawn(gap(10.0));
+                c.spawn(hint(f));
             });
         })
         .id();
@@ -3717,6 +3750,159 @@ fn page_controls(nodes: &MenuNodes, screen: Screen) -> Vec<u16> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// The pointer
+// ---------------------------------------------------------------------------
+
+/// [`CRT_WGSL`]'s `warp`, on the CPU.
+///
+/// Deliberately the same three tokens as the shader's body, because the two
+/// have to agree to the pixel and the cheapest way to keep them agreeing is for
+/// a reviewer to be able to read them side by side.
+fn warp(p: Vec2, k: f32) -> Vec2 {
+    p * (1.0 + k * p.dot(p))
+}
+
+/// Where a point on the tube lands on the menu image, or `None` if it landed
+/// off the glass.
+///
+/// This is the fragment shader's projection, forward, on one point:
+///
+/// ```wgsl
+/// let c = (in.uv * 2.0 - 1.0) * inset / (1.0 + k);
+/// let w = warp(c, k);
+/// let uv = clamp(w * 0.5 + 0.5, 0.0, 1.0);
+/// ```
+///
+/// The shader runs it per fragment to ask "what part of the page is under this
+/// pixel of glass", which is the same question a cursor asks — so nothing has
+/// to be inverted. `cursor` and `tube` are in the window's physical pixels
+/// (what `bevy_ui` measures the tube node in); `image` is the off-screen
+/// target's size, and the result is in its pixels, which is the space the menu
+/// tree is laid out in.
+///
+/// The rejection is the shader's `edge`: `max(abs(w))` is the tube's
+/// rectangular boundary in warped space, 1.0 is the edge of the glass, and
+/// anything larger is on the moulding or the room beyond it. The shader clamps
+/// there because it still has a pixel to shade; a pointer has nothing to point
+/// at, so it says so.
+fn through_the_glass(cursor: Vec2, tube: Rect, image: Vec2, k: f32, inset: f32) -> Option<Vec2> {
+    let size = tube.size();
+    if size.x <= 0.0 || size.y <= 0.0 || image.x <= 0.0 || image.y <= 0.0 {
+        return None;
+    }
+    let uv = (cursor - tube.min) / size;
+    let c = (uv * 2.0 - Vec2::ONE) * inset / (1.0 + k);
+    let w = warp(c, k);
+    if w.x.abs().max(w.y.abs()) > 1.0 {
+        return None;
+    }
+    Some((w * 0.5 + Vec2::splat(0.5)) * image)
+}
+
+/// The first of `rows` containing `point`, as `(slot, control)`.
+///
+/// A linear scan, and it stays one: `rows` is the page's own cursor order,
+/// which is under twenty entries on the widest page, and it only runs on a
+/// frame the pointer actually moved. The rows do not overlap — they are
+/// siblings in a column — so "first" and "topmost" are the same answer.
+fn control_at(point: Vec2, rows: &[(u16, Rect)]) -> Option<(u8, u16)> {
+    #[allow(clippy::cast_possible_truncation)]
+    rows.iter()
+        .position(|(_, r)| r.contains(point))
+        .map(|slot| (slot as u8, rows[slot].0))
+}
+
+/// Everything resolving the pointer needs, as one system parameter.
+///
+/// Grouped rather than spread over [`read_input`]'s signature because the four
+/// of them are one concern, and because the alternative is a nine-line
+/// parameter list in which the keyboard and the mouse are indistinguishable.
+#[derive(SystemParam)]
+struct Pointer<'w, 's> {
+    windows: Query<'w, 's, &'static Window>,
+    buttons: Res<'w, ButtonInput<MouseButton>>,
+    /// The tube's material, for the curve the cursor has to be mapped through.
+    /// See [`Crt::glass`].
+    materials: Res<'w, Assets<Crt>>,
+    /// Every laid-out node's rect. One query serves the tube and the controls
+    /// because both are `bevy_ui` nodes; they are simply measured against
+    /// different targets, which is the whole problem this module is solving.
+    ///
+    /// Read one frame late — layout runs in `PostUpdate` — exactly as
+    /// `bevy_ui`'s own `ui_focus_system` reads it.
+    rects: Query<'w, 's, (&'static ComputedNode, &'static UiGlobalTransform)>,
+    /// Where the cursor was the last time it was resolved.
+    was: Local<'s, Option<Vec2>>,
+    /// And which page it was resolved against.
+    page: Local<'s, u8>,
+}
+
+/// What the pointer is on: a slot in the page's cursor order, the control that
+/// slot names, and whether the left button went down on it this frame.
+struct Aim {
+    slot: u8,
+    control: u16,
+    clicked: bool,
+}
+
+impl Pointer<'_, '_> {
+    /// A laid-out node's rect, in its own tree's pixels.
+    ///
+    /// `None` for a node with no extent, which is what a page that is
+    /// `Display::None` and everything under it measures as — so an off-page
+    /// control cannot be clicked even if one reached this far.
+    fn rect(&self, entity: Entity) -> Option<Rect> {
+        let (node, transform) = self.rects.get(entity).ok()?;
+        (node.size.x > 0.0 && node.size.y > 0.0)
+            .then(|| Rect::from_center_size(transform.translation, node.size))
+    }
+
+    /// Resolves the cursor onto one of `list`'s controls.
+    ///
+    /// Returns `None` when nothing can have changed — no window, no cursor, the
+    /// pointer off the glass, or, first of all, a pointer that has not moved
+    /// and a button that has not gone down. That last case is the one the
+    /// module's no-per-frame-writes rule cares about: it costs an `Option<Vec2>`
+    /// comparison and touches nothing.
+    ///
+    /// A page change counts as movement even though the mouse did not move,
+    /// because every row moved out from under it — click a door and the row now
+    /// under the pointer should light immediately rather than after a jiggle.
+    /// That is an event, not a frame, and it costs one byte compared.
+    fn resolve(&mut self, nodes: &MenuNodes, screen: Screen, list: &[u16]) -> Option<Aim> {
+        let clicked = self.buttons.just_pressed(MouseButton::Left);
+        let turned = *self.page != screen as u8;
+        *self.page = screen as u8;
+        let at = self
+            .windows
+            .single()
+            .ok()
+            .and_then(Window::physical_cursor_position);
+        if at == *self.was && !clicked && !turned {
+            return None;
+        }
+        *self.was = at;
+
+        let cursor = at?;
+        let (k, inset) = self.materials.get(&nodes.material)?.glass();
+        let tube = self.rect(nodes.tube)?;
+        let image = self.rect(nodes.root)?.size();
+        let point = through_the_glass(cursor, tube, image, k, inset)?;
+
+        let rows: Vec<(u16, Rect)> = list
+            .iter()
+            .filter_map(|&i| Some((i, self.rect(nodes.controls[i as usize].root)?)))
+            .collect();
+        let (slot, control) = control_at(point, &rows)?;
+        Some(Aim {
+            slot,
+            control,
+            clicked,
+        })
+    }
+}
+
 /// Keyboard and pointer. Moves the cursor, fires actions, nothing else.
 fn read_input(
     keys: Res<ButtonInput<KeyCode>>,
@@ -3726,7 +3912,7 @@ fn read_input(
     mut data: ResMut<LobbyData>,
     mut setup: ResMut<MatchSetup>,
     mut launch: MessageWriter<LaunchRequest>,
-    hovered: Query<(&Control, &Interaction), Changed<Interaction>>,
+    mut pointer: Pointer,
     mut audio: ResMut<crate::audio::AudioCommands>,
 ) {
     let Some(nodes) = nodes else { return };
@@ -3763,23 +3949,21 @@ fn read_input(
     // Hover moves the cursor rather than lighting a second highlight. One
     // highlighted line at a time is how a page-key display behaves, and it
     // halves the state the model has to carry.
+    //
+    // It writes `menu.focus[page]` and nothing else. The keyboard block below
+    // reads that back as its own starting cursor and previews whatever it ends
+    // on, so hovering a row arms it through the *same* call to `preview` that
+    // arrowing onto it uses — there is no second arming path to keep in step.
+    // A click fires the same `Action` through the same `apply`.
     let mut fire: Option<Action> = None;
-    for (ctl, interaction) in &hovered {
-        let Some(slot) = list.iter().position(|&i| i == ctl.0) else {
-            continue;
-        };
-        #[allow(clippy::cast_possible_truncation)]
-        let slot = slot as u8;
-        match interaction {
-            Interaction::Hovered => {
-                menu.focus[page] = slot;
-                preview(nodes.controls[ctl.0 as usize].action, &mut menu);
-            }
-            Interaction::Pressed => {
-                menu.focus[page] = slot;
-                fire = Some(nodes.controls[ctl.0 as usize].action);
-            }
-            Interaction::None => {}
+    if let Some(aim) = pointer.resolve(&nodes, menu.screen, &list) {
+        if menu.focus[page] != aim.slot {
+            menu.focus[page] = aim.slot;
+            audio.play(crate::audio::Sfx::UiMove);
+        }
+        if aim.clicked {
+            audio.play(crate::audio::Sfx::UiSelect);
+            fire = Some(nodes.controls[aim.control as usize].action);
         }
     }
 
@@ -3863,17 +4047,31 @@ fn apply(
             None => menu.say("NO PAGE BELOW"),
         },
         Action::Inert(msg) => menu.say(msg),
+        // The three tasking rows *are* the launch. Choosing a mode used to arm
+        // a preference and leave the pilot to find `EXECUTE` on another page,
+        // which is the complaint this shape answers: a row that names a match
+        // starts that match. Arrowing or hovering over one still only arms it —
+        // that is `preview`, and it is what keeps the brief beside the list
+        // describing the row under the cursor.
         Action::SetSolo(p) => {
             menu.solo = p;
-            menu.say("TASKING ARMED");
+            execute(menu, data, setup, launch);
         }
         Action::SetTrial(t) => {
+            if trial_locked(t) {
+                menu.say("CIRCUIT NOT CLEARED");
+                return;
+            }
             menu.trial = t;
-            menu.say("CIRCUIT ARMED");
+            execute(menu, data, setup, launch);
         }
         Action::SetMission(m) => {
+            if mission_locked(m) {
+                menu.say("OPERATION NOT CLEARED");
+                return;
+            }
             menu.mission = m;
-            menu.say("OPERATION ARMED");
+            execute(menu, data, setup, launch);
         }
         Action::SetMap(m) => {
             menu.map = m;
@@ -3944,21 +4142,47 @@ fn apply(
                 Stock::Locked => menu.say("TIER NOT CLEARED"),
             }
         }
-        Action::Execute => {
-            let next = menu.setup(data);
-            let online = !next.mode.is_solo();
-            // `MatchSetup` is `sim_bridge`'s input and is written exactly here:
-            // toying with the theatre selector must not touch the simulation's
-            // configuration.
-            *setup = next.clone();
-            launch.write(LaunchRequest {
-                setup: next,
-                online,
-            });
-            menu.open = false;
-            menu.say("EXECUTING");
-        }
+        Action::Execute => execute(menu, data, setup, launch),
     }
+}
+
+/// Leaves the display and flies the armed selection.
+///
+/// The one place [`MatchSetup`] and [`LaunchRequest`] are written, reached from
+/// [`Action::Execute`] on the mission board and from the tasking rows that name
+/// a match directly. `sim_bridge.rs` consumes the message and rebuilds the
+/// world; nothing else here has to know that.
+fn execute(
+    menu: &mut Menu,
+    data: &LobbyData,
+    setup: &mut MatchSetup,
+    launch: &mut MessageWriter<LaunchRequest>,
+) {
+    let next = menu.setup(data);
+    let online = !next.mode.is_solo();
+    // `MatchSetup` is `sim_bridge`'s input and is written exactly here: toying
+    // with the theatre selector must not touch the simulation's configuration.
+    *setup = next.clone();
+    launch.write(LaunchRequest {
+        setup: next,
+        online,
+    });
+    menu.open = false;
+    menu.say("EXECUTING");
+}
+
+/// Circuits 3 and 4, and operation 3, are not flown yet.
+///
+/// One definition each, because [`control_state`] paints from them and [`apply`]
+/// refuses from them — and a row that reads as locked and launches anyway is
+/// worse than either behaviour on its own. They became load-bearing the moment
+/// a tasking row started launching on activation rather than arming.
+fn trial_locked(t: u8) -> bool {
+    t >= 2
+}
+
+fn mission_locked(m: u8) -> bool {
+    m >= 2
 }
 
 /// Advances the self test, and steps off it when it finishes.
@@ -3992,6 +4216,40 @@ fn hold_the_stick(menu: Res<Menu>, mut input: ResMut<PlayerInput>) {
         id,
         ..Default::default()
     };
+}
+
+/// ...and while the display is up the pointer belongs to the pilot, not to the
+/// aim.
+///
+/// `input.rs::grab_cursor` takes pointer lock on the first left click and hides
+/// the cursor, which is exactly right for flying and fatal for a menu: a locked
+/// pointer stops reporting a position, and an invisible one cannot be aimed at
+/// a row. That module has no reason to know a lobby exists — [`LobbyOpen`] is
+/// this module's export, not its import — so the arbitration belongs here,
+/// beside [`hold_the_stick`], which stands the stick down for the same reason.
+///
+/// The scheduling does the rest. The grab is taken in `PreUpdate`, this runs in
+/// `RunFixedMainLoop` just after it, [`read_input`] reads the cursor in
+/// `Update` after that, and `bevy_winit` only applies [`CursorOptions`] in
+/// `Last` — so the lock is undone before the window manager ever sees it, and
+/// the pointer keeps moving. Both writes are guarded, so an open display costs
+/// two comparisons a frame and marks nothing changed.
+fn release_the_pointer(
+    menu: Res<Menu>,
+    mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
+) {
+    if !menu.open {
+        return;
+    }
+    let Ok(mut cursor) = cursors.single_mut() else {
+        return;
+    };
+    if cursor.grab_mode != CursorGrabMode::None {
+        cursor.grab_mode = CursorGrabMode::None;
+    }
+    if !cursor.visible {
+        cursor.visible = true;
+    }
 }
 
 /// Keeps the off-screen target the size of the window.
@@ -4330,8 +4588,8 @@ fn control_state(def: &ControlDef, menu: &Menu, data: &LobbyData) -> (bool, bool
             false,
         ),
         Action::SetSolo(p) => (menu.solo == p, false, false),
-        Action::SetTrial(t) => (menu.trial == t, t >= 2, false),
-        Action::SetMission(m) => (menu.mission == m, m >= 2, false),
+        Action::SetTrial(t) => (menu.trial == t, trial_locked(t), false),
+        Action::SetMission(m) => (menu.mission == m, mission_locked(m), false),
         Action::SetMap(m) => (menu.map == m, false, false),
         Action::SetPrivate(v) => (menu.private == v, false, false),
         Action::SetAutoBot(v) => (menu.auto_bot == v, false, false),
@@ -5053,5 +5311,312 @@ mod tests {
     fn the_tube_never_reports_a_zero_size() {
         let c = Crt::new(Handle::default(), Vec2::ZERO, true);
         assert!(c.geometry.x >= 1.0 && c.geometry.y >= 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // The pointer
+    // -----------------------------------------------------------------------
+    //
+    // A screenshot cannot prove a hit test: the highlight it shows is the one
+    // the *keyboard* left. So the mapping is proved here, at known cursor
+    // positions, against rows placed where `build_pages` puts them.
+
+    /// A 1280x720 window with the tube filling it, and the off-screen target at
+    /// the same size — which is what it is, since `fit_tube` matches the two.
+    const TUBE: Rect = Rect {
+        min: Vec2::ZERO,
+        max: Vec2::new(1280.0, 720.0),
+    };
+    const IMAGE: Vec2 = Vec2::new(1280.0, 720.0);
+
+    /// `through_the_glass`, backwards, written from the equation rather than
+    /// from the code it checks.
+    ///
+    /// `warp` is `c -> c * (1 + k|c|²)`, so `c = w / (1 + k|c|²)` is a
+    /// contraction for the small `k` a tube uses and converges in a handful of
+    /// steps. Used to ask the honest question: *where does the mouse have to
+    /// be* for a given part of the page to be under it.
+    fn cursor_for(menu_point: Vec2, k: f32, inset: f32) -> Vec2 {
+        let w = (menu_point / IMAGE) * 2.0 - Vec2::ONE;
+        let mut c = w;
+        for _ in 0..64 {
+            c = w / (1.0 + k * c.dot(c));
+        }
+        let uv = ((c * (1.0 + k) / inset) + Vec2::ONE) * 0.5;
+        TUBE.min + uv * TUBE.size()
+    }
+
+    /// Three rows down the left column, at the pitch `control_row` gives an
+    /// 18px row: `min_height` is `size * 1.9`, so 34 pixels tall.
+    fn solo_rows() -> Vec<(u16, Rect)> {
+        (0..3u16)
+            .map(|i| {
+                (
+                    i,
+                    Rect::from_center_size(
+                        Vec2::new(300.0, 300.0 + f32::from(i) * 34.0),
+                        Vec2::new(430.0, 34.0),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// The centre of the tube is the centre of the page. `warp(0) == 0`, so
+    /// this is the one point the curve cannot move — and if it ever does, the
+    /// inset or the pre-divide has been mis-transcribed.
+    #[test]
+    fn the_middle_of_the_glass_is_the_middle_of_the_page() {
+        let hit = through_the_glass(TUBE.size() * 0.5, TUBE, IMAGE, CURVATURE, INSET)
+            .expect("the centre of the tube is on the tube");
+        assert!(
+            (hit - IMAGE * 0.5).length() < 0.01,
+            "the centre mapped to {hit}, not {}",
+            IMAGE * 0.5
+        );
+    }
+
+    /// Every row is under the cursor that the mapping says it is under.
+    ///
+    /// The positions come from the inverse above, so this is a round trip
+    /// through the real constants: a page pixel, out to where the mouse must
+    /// be on the physical screen, and back through the shader's projection to
+    /// the row that owns it.
+    #[test]
+    fn the_pointer_lands_on_the_row_it_is_over() {
+        let rows = solo_rows();
+        for (i, rect) in &rows {
+            let cursor = cursor_for(rect.center(), CURVATURE, INSET);
+            let hit = through_the_glass(cursor, TUBE, IMAGE, CURVATURE, INSET)
+                .expect("a row in the middle of the page is on the glass");
+            assert_eq!(
+                control_at(hit, &rows),
+                Some((u8::try_from(*i).expect("three rows"), *i)),
+                "the cursor at {cursor} did not land on row {i}",
+            );
+        }
+        // ...and the gaps between the columns belong to nobody, rather than to
+        // whichever row happens to share a y with them.
+        let outside = cursor_for(Vec2::new(900.0, 300.0), CURVATURE, INSET);
+        let hit = through_the_glass(outside, TUBE, IMAGE, CURVATURE, INSET).expect("on the glass");
+        assert_eq!(control_at(hit, &rows), None);
+    }
+
+    /// Near a corner the curve moves the answer by more than a row is tall, so
+    /// a linear map is not merely imprecise there — it is wrong.
+    ///
+    /// Two rows: one where the warp says the page is, one where a naive
+    /// `uv * size` would say it is. The pointer has to choose the first.
+    #[test]
+    fn the_warp_is_what_decides_it_near_a_corner() {
+        // Up in the top-right quarter, well out along both axes.
+        let uv = Vec2::new(0.90, 0.10);
+        let cursor = TUBE.min + uv * TUBE.size();
+        let warped = through_the_glass(cursor, TUBE, IMAGE, CURVATURE, INSET)
+            .expect("nine tenths of the way out is still on the glass");
+        let naive = uv * IMAGE;
+
+        let apart = (warped - naive).length();
+        assert!(
+            apart > 34.0,
+            "the corner displaces by {apart}px, which a 34px row would swallow \
+             — pick a point further out"
+        );
+
+        let rows = vec![
+            (7u16, Rect::from_center_size(warped, Vec2::new(200.0, 34.0))),
+            (8u16, Rect::from_center_size(naive, Vec2::new(200.0, 34.0))),
+        ];
+        assert_eq!(control_at(warped, &rows), Some((0, 7)));
+    }
+
+    /// Off the glass is not "the nearest row": it is nothing.
+    ///
+    /// `INSET` pulls the face in and the curve rounds the corners off, so the
+    /// last few percent of the window is moulding and room. A cursor there has
+    /// nothing under it, and clamping — which is right for a fragment, since it
+    /// still has to be shaded — would silently arm the row nearest the edge.
+    #[test]
+    fn a_cursor_off_the_glass_hits_nothing() {
+        let w = TUBE.size();
+        for uv in [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(0.0, 1.0),
+            Vec2::new(1.0, 1.0),
+            // The edge midpoints: `1 + k` puts these *just* off, which is the
+            // pre-divide doing its job — the bowed sides reach the bezel.
+            Vec2::new(0.5, 0.0),
+            Vec2::new(1.0, 0.5),
+            // And the rounded corner, which cuts in further than the sides do.
+            Vec2::new(0.965, 0.035),
+        ] {
+            assert_eq!(
+                through_the_glass(TUBE.min + uv * w, TUBE, IMAGE, CURVATURE, INSET),
+                None,
+                "uv {uv} should be off the glass",
+            );
+        }
+        // ...but the same distance out along a side still is on it, so the
+        // rejection is the tube's shape and not a blanket margin.
+        assert!(
+            through_the_glass(
+                TUBE.min + Vec2::new(0.965, 0.5) * w,
+                TUBE,
+                IMAGE,
+                CURVATURE,
+                INSET
+            )
+            .is_some(),
+            "the middle of the right-hand edge is glass, not moulding",
+        );
+        // A cursor outside the node entirely — the window is bigger than the
+        // tube on a frame `fit_tube` has not caught up with — is off it too.
+        assert_eq!(
+            through_the_glass(Vec2::new(-40.0, 300.0), TUBE, IMAGE, CURVATURE, INSET),
+            None
+        );
+    }
+
+    /// `SPACESHIPS_UI_CRT=0` draws a flat blit, and the pointer has to go flat
+    /// with it. This is why `Crt::glass` reads the uniforms back rather than
+    /// naming the constants.
+    #[test]
+    fn a_flat_tube_maps_flat() {
+        let (k, inset) = Crt::new(Handle::default(), IMAGE, false).glass();
+        assert_eq!(k, 0.0);
+        let uv = Vec2::new(0.25, 0.75);
+        let hit = through_the_glass(TUBE.min + uv * TUBE.size(), TUBE, IMAGE, k, inset)
+            .expect("a quarter of the way in is on the glass");
+        // Still not `uv * IMAGE`: the face inset survives, because the housing
+        // is geometry rather than an effect.
+        let expected = ((uv * 2.0 - Vec2::ONE) * inset * 0.5 + Vec2::splat(0.5)) * IMAGE;
+        assert!((hit - expected).length() < 0.01, "{hit} vs {expected}");
+        assert_eq!(
+            Crt::new(Handle::default(), IMAGE, true).glass().0,
+            CURVATURE
+        );
+    }
+
+    /// A tube that has not been laid out yet must not divide by zero or pick a
+    /// row at random.
+    #[test]
+    fn a_tube_with_no_extent_resolves_nothing() {
+        let empty = Rect::from_corners(Vec2::ZERO, Vec2::ZERO);
+        assert_eq!(
+            through_the_glass(Vec2::ZERO, empty, IMAGE, CURVATURE, INSET),
+            None
+        );
+        assert_eq!(
+            through_the_glass(Vec2::new(10.0, 10.0), TUBE, Vec2::ZERO, CURVATURE, INSET),
+            None
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The launch flow
+    // -----------------------------------------------------------------------
+
+    /// Runs one activation against a real `MessageWriter`, and reports what
+    /// `sim_bridge.rs` would have been handed.
+    fn activate(action: Action, menu: &mut Menu) -> (MatchSetup, Vec<LaunchRequest>) {
+        use bevy::ecs::message::Messages;
+        use bevy::ecs::system::SystemState;
+
+        let mut world = World::new();
+        world.init_resource::<Messages<LaunchRequest>>();
+        let mut state: SystemState<MessageWriter<LaunchRequest>> = SystemState::new(&mut world);
+        let mut data = LobbyData::placeholder();
+        let mut setup = MatchSetup::default();
+        {
+            let mut launch = state.get_mut(&mut world).expect("the writer validates");
+            apply(action, menu, &mut data, &mut setup, &mut launch);
+        }
+        state.apply(&mut world);
+        let sent = world
+            .resource_mut::<Messages<LaunchRequest>>()
+            .drain()
+            .collect();
+        (setup, sent)
+    }
+
+    /// The complaint, as a test: choosing a mode has to *be* the launch.
+    ///
+    /// Before this, activating a row armed a preference and left the pilot to
+    /// find `EXECUTE` on another page — with the match already running.
+    #[test]
+    fn choosing_a_mode_flies_it() {
+        for (action, screen, mode) in [
+            (
+                Action::SetSolo(SoloPick::Skirmish),
+                Screen::Solo,
+                Mode::Skirmish,
+            ),
+            (
+                Action::SetSolo(SoloPick::Tutorial),
+                Screen::Solo,
+                Mode::Tutorial,
+            ),
+            (Action::SetTrial(1), Screen::Trials, Mode::Trials(2)),
+            (Action::SetMission(0), Screen::Campaign, Mode::Campaign(1)),
+        ] {
+            let mut menu = Menu {
+                open: true,
+                screen,
+                ..Menu::default()
+            };
+            let (setup, sent) = activate(action, &mut menu);
+            assert!(!menu.open, "{action:?} left the display up");
+            assert_eq!(sent.len(), 1, "{action:?} did not launch");
+            assert_eq!(setup.mode, mode, "{action:?}");
+            assert_eq!(sent[0].setup.mode, mode);
+            assert!(sent[0].setup.mode.is_solo() && !sent[0].online);
+        }
+    }
+
+    /// ...and the mission board's `EXECUTE` still launches what is armed, which
+    /// is the one page with no row that names a match.
+    #[test]
+    fn the_board_still_executes_what_is_armed() {
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Main,
+            solo: SoloPick::Train,
+            ..Menu::default()
+        };
+        let (setup, sent) = activate(Action::Execute, &mut menu);
+        assert!(!menu.open);
+        assert_eq!(setup.mode, Mode::Training);
+        assert_eq!(sent.len(), 1);
+    }
+
+    /// A row painted as locked must not fly when it is pressed.
+    ///
+    /// It never could before either — but it armed itself and `EXECUTE` then
+    /// flew it, which was a slower way to reach the same wrong place. Now that
+    /// the row *is* the launch, the paint and the behaviour have to agree.
+    #[test]
+    fn a_locked_row_refuses_rather_than_launches() {
+        for (action, screen) in [
+            (Action::SetTrial(2), Screen::Trials),
+            (Action::SetTrial(3), Screen::Trials),
+            (Action::SetMission(2), Screen::Campaign),
+        ] {
+            let mut menu = Menu {
+                open: true,
+                screen,
+                ..Menu::default()
+            };
+            let (_, sent) = activate(action, &mut menu);
+            assert!(menu.open, "{action:?} left the display");
+            assert!(sent.is_empty(), "{action:?} launched a locked tasking");
+            assert!(menu.notice.contains("NOT CLEARED"), "{}", menu.notice);
+        }
+        // The rows that *are* open still are, so the gate is the ladder rather
+        // than a blanket refusal.
+        for t in 0..2u8 {
+            assert!(!trial_locked(t));
+        }
+        assert!(!mission_locked(0) && !mission_locked(1));
     }
 }

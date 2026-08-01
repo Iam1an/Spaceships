@@ -65,20 +65,60 @@
 //! a phase that ticked unconditionally would make the model differ every frame
 //! and quietly reintroduce exactly the bug above.
 //!
+//! # The world-space layer
+//!
+//! `.target-box`, `.target-label`, `.lead-marker` and the reticle itself are
+//! not screen furniture: they sit over a point in the 3D scene and therefore
+//! move every frame by nature. [`sync_world_markers`] draws them, and it is the
+//! one place in this module where a per-frame write is legitimate — so it is
+//! also the place where the discipline above matters most:
+//!
+//! - **The pool is fixed.** [`TARGET_POOL`] slots are built in [`spawn_hud`]
+//!   and are never spawned, despawned or re-parented again. A slot is a box, a
+//!   label and a lead ring; a frame with three targets leaves five slots
+//!   untouched, and a frame with none touches nothing at all.
+//! - **Only the position is written per frame**, and it is written as a
+//!   [`UiTransform`] rather than as `Node::left`/`top`. That distinction is the
+//!   whole point: `Node` is synced into taffy and dirties the layout subtree,
+//!   whereas `UiTransform` is consumed by the geometry pass that
+//!   `ui_layout_system` runs regardless. Moving a marker therefore costs no
+//!   relayout — the direct answer to the forced synchronous layout above.
+//! - **Everything else goes through the same diff as the flat HUD.** Each slot
+//!   has its own `Copy + Eq` [`MarkerModel`] holding the target's id, hit
+//!   points and ring state; the label string, the ring's solid/scattered
+//!   swap, the box colour and the visibility flag are written only when that
+//!   model moves. A target that is merely *moving* rewrites one `UiTransform`
+//!   and nothing else.
+//! - **Screen positions are quantised to whole pixels**, so a target that is
+//!   holding still on screen — which is what a co-operating wingman or a
+//!   parked bot does — produces no write at all.
+//! - **An off-screen target costs one hidden flag.** A slot that was already
+//!   hidden is not touched, and a contact too far away to engage does not have
+//!   its bracket moved at all — only its ring.
+//!
+//! The one thing that is *not* free is the occlusion sweep that stops a bracket
+//! drawing through the moon; [`sync_world_markers`] says what it costs and why
+//! it runs last.
+//!
 //! # What it is not
 //!
 //! `bevy_ui` has no CSS transitions, no `backdrop-filter`, and no
 //! `mix-blend-mode`; where the CSS relies on those the port lands on the end
 //! state rather than the animation, and the deviations are noted at each site.
+//! It also has no *dashed* border, which is what `.lead-marker` uses to say
+//! "the assist has this target but your nose is not on it" — see
+//! [`lead_marker`] for how that state is drawn instead.
 
+use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::text::{FontSource, FontWeight, Justify, LetterSpacing};
 
 use sim::rules::Rules;
-use sim::world::{Frame, GunMode, HudState, ShipFlags};
+use sim::world::{is_boss_hitbox, EntityId, Frame, GunMode, HudState, ShipFlags, SimEvent};
 use spaceships_sim as sim;
 
-use crate::sim_bridge::{SimFrame, SimSet};
+use crate::scene::ShipRoot;
+use crate::sim_bridge::{Roster, SimFrame, SimSet, LOCAL_ID};
 
 /// Wires the HUD in: one tree at startup, one diffing system per frame.
 pub struct HudPlugin;
@@ -86,12 +126,28 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AppliedHud>()
+            .init_resource::<AppliedMarkers>()
+            .init_resource::<KillFeed>()
+            .init_resource::<TargetLock>()
             .add_systems(Startup, spawn_hud)
             // `SimSet` lives in `FixedUpdate` and this is `Update`, so the
             // ordering is nominal — the point is documentary, matching
             // `scene.rs`: the HUD reads whatever `SimFrame` the most recent
             // fixed tick left behind, and never runs before one exists.
-            .add_systems(Update, sync_hud.after(SimSet));
+            .add_systems(Update, sync_hud.after(SimSet))
+            // The killfeed is the one part of the HUD driven by *events*
+            // rather than by state, and an event lives for exactly one tick.
+            // Read in `Update` it would double-count a kill whenever the
+            // display beats the tick rate and miss one whenever it does not,
+            // so it is read where it is published: once per tick.
+            .add_systems(FixedUpdate, collect_kills.after(SimSet))
+            // The world-space markers need the *interpolated* ship poses and
+            // the chase camera's settled transform, neither of which exists
+            // before transform propagation — see [`sync_world_markers`].
+            .add_systems(
+                PostUpdate,
+                sync_world_markers.after(TransformSystems::Propagate),
+            );
     }
 }
 
@@ -236,6 +292,118 @@ const Z_OVERLAY: i32 = 4;
 /// `z-index: 5` — `#missile-lock-warning`.
 const Z_WARNING: i32 = 5;
 
+// --- the world-space layer -------------------------------------------------
+
+/// Target slots built at startup.
+///
+/// Eight, because eight is the number the module header names as the profiling
+/// case that motivated this whole port — "eight style writes per remote player
+/// per frame", at eight players. A ninth simultaneously-visible enemy simply
+/// does not get a box; it does not get a *slower frame*, which is the property
+/// worth having. Boss hitboxes are excluded from targeting outright (there are
+/// twenty of them and they are one ship), so the campaign cannot exhaust it.
+const TARGET_POOL: usize = 8;
+
+/// `.target-box`, tightened.
+///
+/// The CSS is 64px square with 14px arms. At 64 the bracket is wider than the
+/// ship inside it at any range worth shooting at, and two enemies flying
+/// together put their brackets through each other — which is what a skirmish
+/// spawn looks like the moment it starts. 44 is the same drawing at the size
+/// the thing it is bracketing actually occupies.
+const BOX_SIZE: f32 = 44.0;
+/// The length of one corner bracket arm — the `14px` colour stop in each of
+/// `.target-box`'s eight gradients, scaled with the box.
+const BOX_CORNER: f32 = 10.0;
+/// Bracket thickness — the `2px` in `background-size: 100% 2px`.
+const BOX_STROKE: f32 = 2.0;
+/// `.target-label { left: 70px }`, moved in with the box's edge.
+const LABEL_LEFT: f32 = 50.0;
+
+/// `.lead-marker { width: 16px; height: 16px }`.
+const LEAD_SIZE: f32 = 16.0;
+/// Dashes in the scattered ring. See [`lead_marker`].
+const LEAD_DASHES: usize = 8;
+/// Diameter of one scattered-ring dash, in pixels.
+const LEAD_DASH: f32 = 3.5;
+
+/// How near the aim point a target has to project before the lead ring snaps
+/// solid and the reticle locks, in pixels.
+///
+/// `main.js:1928` — `r.lead.classList.toggle('aligned', screenDist < 22)`, and
+/// `main.js:1929` reuses the same number for `#reticle.locked`. It is a screen
+/// distance rather than an angle in the JS and stays one here, so the feel does
+/// not change with the field of view.
+const ALIGN_PX: f32 = 22.0;
+
+/// How far outside the viewport a marker may sit before it is hidden.
+///
+/// `main.js:1913` — `sx < -32 || sx > W + 32 || ...`, i.e. half a target box,
+/// so a box does not pop as its centre crosses the edge.
+const OFFSCREEN_MARGIN: f32 = BOX_SIZE / 2.0;
+
+/// Beyond this, a ship gets no HUD marker at all. `MARKER_VISIBLE_DIST`,
+/// `main.js:1003`.
+const MARKER_VISIBLE_DIST: f32 = 1500.0;
+
+/// Beyond this a contact keeps its ring but loses its bracket and its name.
+///
+/// The JS draws the full box out to [`MARKER_VISIBLE_DIST`], which puts a
+/// 44-pixel bracket and a callsign on a ship half a kilometre past the range
+/// anything you own can reach it at — clutter that says nothing actionable.
+/// Inside this range the target is one the aim assist will work on and the guns
+/// will reach; outside it, the ring alone says "someone is over there".
+///
+/// It is [`sim::rules::AimAssistRules::range`] rather than a number invented
+/// here, so "the bracket means you can engage" cannot drift away from what
+/// engaging actually costs.
+const ENGAGE_DIST: f32 = Rules::DEFAULT.aim_assist.range as f32;
+
+/// How far down the gun line the reticle sits when there is nothing to shoot.
+///
+/// `BEAM_RANGE`, `main.js:1045`. The JS raycasts along the aim vector and puts
+/// the reticle on whatever it *hits* (`main.js:1832`), and that detail turns
+/// out to be load-bearing rather than cosmetic. **The gun line does not project
+/// to a single screen point.** The camera sits eleven units behind the muzzle
+/// and five above it, so it is not on the line; a target 250 units down it and
+/// one 1000 units down it land about a degree — twenty-odd pixels — apart.
+///
+/// Two consequences, handled separately:
+///
+/// - **The alignment test cannot use one fixed point.** Measured against a
+///   reticle pinned at 1000, a close target you are aimed squarely at reads as
+///   twenty pixels off and the ring never fills in — which is exactly the "the
+///   aimlock doesnt work" report. So each contact is compared against the point
+///   on the gun line *at its own range*, which is parallax-free by
+///   construction. See [`sync_world_markers`].
+/// - **The reticle still has to be drawn somewhere**, and with no scene raycast
+///   the honest answer is "at the range of whatever you are most nearly aimed
+///   at". This constant is the empty-sky fallback.
+const AIM_RANGE: f32 = 1000.0;
+
+/// Closest the aim point may be placed, so a target you are inside of cannot
+/// put the reticle behind the camera.
+const AIM_RANGE_MIN: f32 = 20.0;
+
+/// Rows in the killfeed. `main.js:2039` trims to five.
+const KILLFEED_ROWS: usize = 5;
+/// How long a killfeed row stays up.
+///
+/// `main.js:2040` starts a fade at 3.6 s and removes the row 0.42 s later.
+/// `bevy_ui` has no CSS animations, so the row is drawn and then dropped at the
+/// moment the JS finishes fading it.
+const KILL_TTL: f64 = 4.0;
+
+/// `.kf-entry` background, `rgba(6,12,24,0.7)`.
+const KF_BG: Color = rgba(6, 12, 24, 0.7);
+/// `.kf-victim` colour, `#8fb6d6`.
+const KF_VICTIM: Color = rgb(0x8f, 0xb6, 0xd6);
+/// `.kf-icon` colour, `rgba(255,255,255,0.5)`.
+const KF_ICON: Color = rgba(255, 255, 255, 0.5);
+/// `.kf-icon`'s `→`. The `default_font` fallback is ASCII-only (see
+/// [`LOCK_WARNING_TEXT`]), and Orbitron has no U+2192 either.
+const KF_ARROW: &str = ">>";
+
 // ---------------------------------------------------------------------------
 // The model
 // ---------------------------------------------------------------------------
@@ -324,12 +492,114 @@ struct HudModel {
     team1: u32,
     /// Whole seconds on the clock, `Math.ceil` as `fmtTime` does.
     clock: u32,
+
+    /// `#killfeed`, newest row first.
+    kills: [KillRowModel; KILLFEED_ROWS],
+}
+
+/// One `#killfeed` row, as the tree needs it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct KillRowModel {
+    /// Whether the row is up at all — false once [`KILL_TTL`] has passed.
+    shown: bool,
+    /// Which kill this is. Monotonic, so a row that scrolled down one place
+    /// still compares equal to itself and is not rewritten.
+    serial: u32,
+    /// Who scored it.
+    killer: EntityId,
+    /// Who died.
+    victim: EntityId,
 }
 
 /// The model [`sync_hud`] last wrote to the tree. `None` until the first frame,
 /// which is what makes that frame write everything.
 #[derive(Resource, Default)]
 struct AppliedHud(Option<HudModel>);
+
+/// One world-space target slot, as the tree needs it.
+///
+/// Deliberately **not** carrying the screen position. Position is the one thing
+/// that genuinely changes every frame, and folding it in here would make every
+/// field's comparison fire whenever a target so much as drifted a pixel. It is
+/// written separately, straight onto a [`UiTransform`], where `set_if_neq`
+/// catches the stationary case on its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct MarkerModel {
+    /// Whether this slot is drawing at all. False leaves every other field
+    /// stale, and nothing reads them.
+    shown: bool,
+    /// Whether the bracket and the callsign are drawn as well as the ring —
+    /// that is, whether the contact is inside [`ENGAGE_DIST`].
+    boxed: bool,
+    /// Which ship the slot is tracking. Zero is no ship: ids start at
+    /// [`LOCAL_ID`], which is 1.
+    id: EntityId,
+    /// The target's hit points, for the label.
+    hp: i32,
+    /// `.lead-marker.aligned` — the ring is solid rather than scattered. At
+    /// most one slot has this set: it is *the* lock, not a threshold several
+    /// targets can pass at once.
+    aligned: bool,
+    /// Whether aim assist is currently holding *this* target
+    /// ([`HudState::assist_target`]), which brightens the bracket.
+    assisted: bool,
+}
+
+/// What [`sync_world_markers`] last wrote to each slot.
+#[derive(Resource, Default)]
+struct AppliedMarkers([MarkerModel; TARGET_POOL]);
+
+/// Whether the player's aim is on a target this frame.
+///
+/// Written by [`sync_world_markers`], which is the only system that knows where
+/// anything projects to, and read by [`sync_hud`] for `#reticle.locked`. A
+/// resource rather than a return value because the two run in different
+/// schedules; the lock therefore lights one frame after the alignment, which no
+/// one can see and which is the same latency the marker itself has.
+#[derive(Resource, Default)]
+struct TargetLock(bool);
+
+/// The killfeed's backing store: five rows, newest first.
+///
+/// Filled by [`collect_kills`] from [`SimEvent::ShipDestroyed`] and read by
+/// [`model`]. Nothing here is per-frame — a row is written when someone dies
+/// and read until it expires.
+#[derive(Resource, Default)]
+struct KillFeed {
+    /// The rows themselves, index 0 newest.
+    rows: [KillRowModel; KILLFEED_ROWS],
+    /// Simulation time each row was pushed at, in [`Frame::time`]'s clock.
+    at: [f64; KILLFEED_ROWS],
+    /// Kills seen so far, which is where [`KillRowModel::serial`] comes from.
+    serial: u32,
+}
+
+impl KillFeed {
+    /// Pushes a row on top, scrolling the rest down and dropping the oldest.
+    fn push(&mut self, killer: EntityId, victim: EntityId, now: f64) {
+        self.rows.rotate_right(1);
+        self.at.rotate_right(1);
+        self.serial += 1;
+        self.rows[0] = KillRowModel {
+            shown: true,
+            serial: self.serial,
+            killer,
+            victim,
+        };
+        self.at[0] = now;
+    }
+
+    /// The rows as of `now`, with expired ones marked hidden.
+    fn model(&self, now: f64) -> [KillRowModel; KILLFEED_ROWS] {
+        let mut out = self.rows;
+        for (row, at) in out.iter_mut().zip(self.at) {
+            // `serial == 0` is a row that has never held a kill. Both tests are
+            // needed: the array starts zeroed and `now` starts at zero too.
+            row.shown = row.serial != 0 && now - at < KILL_TTL;
+        }
+        out
+    }
+}
 
 /// Steps in one half of the overload pulse.
 ///
@@ -351,7 +621,11 @@ const VIGNETTE_STEPS: f32 = 64.0;
 ///
 /// Pure, and deliberately free of Bevy — which is what lets the tests below
 /// assert the no-change property directly.
-fn model(frame: &Frame, time: f32, seated: bool) -> HudModel {
+///
+/// `locked` comes from [`TargetLock`] rather than from the frame: whether the
+/// player's aim is on someone is a question about *projection*, and only
+/// [`sync_world_markers`] can answer it.
+fn model(frame: &Frame, time: f32, seated: bool, locked: bool, feed: &KillFeed) -> HudModel {
     // Seated in the cockpit, the 3D instrument panel *is* the HUD, so the flat
     // overlay stands down entirely. `main.js:1` does the same with
     // `document.body.classList.toggle('cockpit-view', fp)` — without it the
@@ -431,7 +705,14 @@ fn model(frame: &Frame, time: f32, seated: bool) -> HudModel {
         missiles: hud.missiles,
         flares: hud.flares,
 
-        reticle_locked: hud.assist_target >= 0,
+        // `main.js:1929` — `anyVisible && bestAlignment < 22`, which is a
+        // question about where things land on screen and so is answered by
+        // `sync_world_markers`. This deliberately does *not* read
+        // `HudState::assist_target`: the assist holds anything inside a 53
+        // degree cone, which would leave the reticle red almost permanently.
+        // `assist_target` earns its keep on the target bracket instead — see
+        // `MarkerModel::assisted`.
+        reticle_locked: locked && alive,
         lock_warning,
         // Both of these are zero unless their effect is running. That is not a
         // micro-optimisation: a phase that advanced unconditionally would make
@@ -456,6 +737,11 @@ fn model(frame: &Frame, time: f32, seated: bool) -> HudModel {
         team0: hud.team_kills[0],
         team1: hud.team_kills[1],
         clock: hud.match_timer.max(0.0).ceil() as u32,
+
+        // On the simulation's clock, not the render clock: the rows are pushed
+        // from a tick and this is what keeps the two agreeing about "4 seconds
+        // ago" across a hitch.
+        kills: feed.model(frame.time),
     }
 }
 
@@ -515,6 +801,12 @@ struct HudNodes {
     missile_pips: [Entity; MISSILE_PIPS],
     flare_pips: [Entity; FLARE_PIPS],
 
+    /// The node that carries the reticle's *position*. Split from the ring
+    /// below because `sync_hud` owns the ring's `.locked` scale and
+    /// `sync_world_markers` owns the position, and a `UiTransform` holds both
+    /// scale and translation — one component, two writers, one clobbering the
+    /// other. Two nodes, one writer each.
+    reticle_anchor: Entity,
     reticle: Entity,
     reticle_ticks: [Entity; 2],
 
@@ -526,6 +818,64 @@ struct HudNodes {
     team0: Entity,
     team1: Entity,
     clock: Entity,
+
+    markers: [MarkerNodes; TARGET_POOL],
+    killfeed: [KillRowNodes; KILLFEED_ROWS],
+}
+
+/// One world-space target slot's entities.
+#[derive(Clone, Copy)]
+struct MarkerNodes {
+    /// `.target-box`. Carries the slot's position and its visibility; the
+    /// label rides along as a child, which is what `main.js:679`
+    /// (`box.appendChild(label)`) does and what keeps the label to one write.
+    boxes: Entity,
+    /// The four corner brackets, whose colour says whether aim assist has
+    /// picked this target.
+    corners: [Entity; 4],
+    /// `.target-label`.
+    label: Entity,
+    /// `.lead-marker`, positioned separately because it is 16px where the box
+    /// is 64 and the two therefore need different offsets from the same point.
+    lead: Entity,
+    /// The `.aligned` ring: solid, filled.
+    lead_solid: Entity,
+    /// The scattered ring that stands in for `border-style: dashed`.
+    lead_dashed: Entity,
+}
+
+impl Default for MarkerNodes {
+    fn default() -> Self {
+        MarkerNodes {
+            boxes: Entity::PLACEHOLDER,
+            corners: [Entity::PLACEHOLDER; 4],
+            label: Entity::PLACEHOLDER,
+            lead: Entity::PLACEHOLDER,
+            lead_solid: Entity::PLACEHOLDER,
+            lead_dashed: Entity::PLACEHOLDER,
+        }
+    }
+}
+
+/// One `.kf-entry`'s entities.
+#[derive(Clone, Copy)]
+struct KillRowNodes {
+    /// The row itself, hidden when the entry has expired.
+    row: Entity,
+    /// `.kf-killer`.
+    killer: Entity,
+    /// `.kf-victim`.
+    victim: Entity,
+}
+
+impl Default for KillRowNodes {
+    fn default() -> Self {
+        KillRowNodes {
+            row: Entity::PLACEHOLDER,
+            killer: Entity::PLACEHOLDER,
+            victim: Entity::PLACEHOLDER,
+        }
+    }
 }
 
 /// Builds the HUD. Runs once.
@@ -557,8 +907,11 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
     let mut charge_fill = Entity::PLACEHOLDER;
     let mut missile_pips = [Entity::PLACEHOLDER; MISSILE_PIPS];
     let mut flare_pips = [Entity::PLACEHOLDER; FLARE_PIPS];
+    let mut reticle_anchor = Entity::PLACEHOLDER;
     let mut reticle = Entity::PLACEHOLDER;
     let mut reticle_ticks = [Entity::PLACEHOLDER; 2];
+    let mut markers = [MarkerNodes::default(); TARGET_POOL];
+    let mut killfeed = [KillRowNodes::default(); KILLFEED_ROWS];
     let mut lock_warning = Entity::PLACEHOLDER;
     let mut vignette = Entity::PLACEHOLDER;
     let mut death_banner = Entity::PLACEHOLDER;
@@ -743,13 +1096,21 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
                 }
             });
 
+            // -- .target-box / .target-label / .lead-marker ------------------
+            // The pool. Built once, hidden, and thereafter only ever moved and
+            // shown — never spawned, never despawned, never re-parented. Boxes
+            // first so the lead rings and the reticle draw over them.
+            for slot in &mut markers {
+                *slot = spawn_marker(hud, &font);
+            }
+
             // -- #reticle ---------------------------------------------------
-            // Screen-centred, unlike the JS, which projects the aim ray's
-            // impact point and writes `style.left`/`style.top` every frame
-            // (`main.js:1839`). Reproducing that needs a world-space aim point,
-            // which `HudState` does not carry — see the gap note at the end of
-            // this file.
-            reticle = hud
+            // Two nodes: an anchor that `sync_world_markers` slides onto the
+            // projected aim point, and the ring itself, whose `.locked`
+            // transform `sync_hud` owns. The anchor starts screen-centred, so
+            // a frame before the first projection — or a frame with no local
+            // ship — draws the reticle exactly where it used to be.
+            reticle_anchor = hud
                 .spawn((
                     Node {
                         position_type: PositionType::Absolute,
@@ -759,50 +1120,85 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
                         height: px(16),
                         // `margin: -8px 0 0 -8px`.
                         margin: UiRect::new(px(-8), px(0), px(-8), px(0)),
-                        border: UiRect::all(px(1)),
-                        border_radius: BorderRadius::all(percent(50)),
                         ..default()
                     },
-                    BorderColor::all(RETICLE_CYAN),
-                    BoxShadow::new(rgba(102, 221, 255, 0.4), px(0), px(0), px(0), px(8)),
-                    // `.locked` scales to 1.2. A `UiTransform` is applied after
-                    // layout, so the lock state costs no relayout — where
-                    // animating `width`/`height` would.
                     UiTransform::IDENTITY,
                 ))
-                .with_children(|r| {
-                    // `#reticle::before` — a 1x6 tick above the ring.
-                    reticle_ticks[0] = r
+                .with_children(|anchor| {
+                    reticle = anchor
                         .spawn((
                             Node {
                                 position_type: PositionType::Absolute,
-                                left: percent(50),
-                                top: px(-8),
-                                width: px(1),
-                                height: px(6),
+                                left: px(0),
+                                top: px(0),
+                                width: percent(100),
+                                height: percent(100),
+                                border: UiRect::all(px(1)),
+                                border_radius: BorderRadius::all(percent(50)),
                                 ..default()
                             },
-                            BackgroundColor(RETICLE_CYAN),
+                            BorderColor::all(RETICLE_CYAN),
+                            BoxShadow::new(rgba(102, 221, 255, 0.4), px(0), px(0), px(0), px(8)),
+                            // `.locked` scales to 1.2. A `UiTransform` is
+                            // applied after layout, so the lock state costs no
+                            // relayout — where animating `width`/`height`
+                            // would.
+                            UiTransform::IDENTITY,
                         ))
-                        .id();
-                    // `#reticle::after` — a 6x1 tick to the left of it. The
-                    // crosshair really is asymmetric in the CSS; this is not a
-                    // porting slip.
-                    reticle_ticks[1] = r
-                        .spawn((
-                            Node {
-                                position_type: PositionType::Absolute,
-                                top: percent(50),
-                                left: px(-8),
-                                width: px(6),
-                                height: px(1),
-                                ..default()
-                            },
-                            BackgroundColor(RETICLE_CYAN),
-                        ))
+                        .with_children(|r| {
+                            // `#reticle::before` — a 1x6 tick above the ring.
+                            reticle_ticks[0] = r
+                                .spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        left: percent(50),
+                                        top: px(-8),
+                                        width: px(1),
+                                        height: px(6),
+                                        ..default()
+                                    },
+                                    BackgroundColor(RETICLE_CYAN),
+                                ))
+                                .id();
+                            // `#reticle::after` — a 6x1 tick to the left of it.
+                            // The crosshair really is asymmetric in the CSS;
+                            // this is not a porting slip.
+                            reticle_ticks[1] = r
+                                .spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        top: percent(50),
+                                        left: px(-8),
+                                        width: px(6),
+                                        height: px(1),
+                                        ..default()
+                                    },
+                                    BackgroundColor(RETICLE_CYAN),
+                                ))
+                                .id();
+                        })
                         .id();
                 })
                 .id();
+
+            // -- #killfeed --------------------------------------------------
+            hud.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(44),
+                    left: px(16),
+                    max_width: vw(70),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(8),
+                    ..default()
+                },
+                ZIndex(Z_OVERLAY),
+            ))
+            .with_children(|feed| {
+                for slot in &mut killfeed {
+                    *slot = spawn_kill_row(feed, &font);
+                }
+            });
 
             // -- #deathbanner -----------------------------------------------
             hud.spawn(Node {
@@ -929,27 +1325,6 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
                     ))
                     .id();
             });
-
-            // TODO(hud): the floating, world-space part of the HUD —
-            // `.target-box`, `.target-label`, `.lead-marker` and `#killfeed` —
-            // is not here.
-            //
-            // Not because projection is hard: `Camera::world_to_viewport` plus
-            // an absolutely positioned node per target is a dozen lines, and
-            // those nodes moving every frame would be legitimate, because
-            // their value genuinely changes every frame. It is missing because
-            // `Frame` carries no *identity*: `ShipView` has an `id`, a `team`
-            // and flags, but no callsign, and `Frame` has no roster, so
-            // `.target-label` and every killfeed row would read `"1"`. The
-            // killfeed also needs the killer's and victim's names, and
-            // `SimEvent::ShipDestroyed` carries `EntityId`s only.
-            //
-            // What unblocks all four at once is a name source on the frame —
-            // `MatchState::scores` already holds `Score` rows and is simply not
-            // copied into `Frame`. See the gap note at the end of this file.
-            // `.lead-marker` additionally needs the aim-assist intercept point,
-            // which `sim::world::AimAssistState` computes and `HudState`
-            // reduces to a bare `assist_target: i32`.
         })
         .id();
 
@@ -964,6 +1339,7 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
         charge_fill,
         missile_pips,
         flare_pips,
+        reticle_anchor,
         reticle,
         reticle_ticks,
         lock_warning,
@@ -973,7 +1349,268 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
         team0,
         team1,
         clock,
+        markers,
+        killfeed,
     });
+}
+
+/// Builds one target slot: a bracketed box with a label, and a lead ring.
+///
+/// Both start hidden and at the tree's origin. Neither is ever rebuilt; the
+/// only thing that happens to them afterwards is a translation, a visibility
+/// flag, and — when the target itself changes — a string and four colours.
+fn spawn_marker(hud: &mut ChildSpawnerCommands, font: &HudFont) -> MarkerNodes {
+    let mut corners = [Entity::PLACEHOLDER; 4];
+    let mut label = Entity::PLACEHOLDER;
+
+    // `.target-box`'s eight stacked linear gradients draw a 2px, 14px-long arm
+    // along each end of each edge — which is four L-shaped corner brackets.
+    // `bevy_ui` has no multi-stop background layers, so the brackets are four
+    // 14x14 nodes wearing two borders each. Same pixels, and it means the
+    // "which target is the assist on" state is four colour writes rather than
+    // an eight-layer gradient string.
+    let boxes = hud
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                top: px(0),
+                width: px(BOX_SIZE),
+                height: px(BOX_SIZE),
+                ..default()
+            },
+            // `margin: -32px 0 0 -32px` is folded into the translation
+            // `sync_world_markers` writes, so there is one source of position.
+            UiTransform::IDENTITY,
+            Visibility::Hidden,
+        ))
+        .with_children(|b| {
+            // (left, right, top, bottom) insets and which two borders to draw,
+            // going top-left, top-right, bottom-left, bottom-right.
+            let arms = [
+                (true, false, true, false),
+                (false, true, true, false),
+                (true, false, false, true),
+                (false, true, false, true),
+            ];
+            for (slot, (l, r, t, bot)) in corners.iter_mut().zip(arms) {
+                let inset = |on: bool| if on { px(0) } else { Val::Auto };
+                let stroke = |on: bool| if on { px(BOX_STROKE) } else { px(0) };
+                *slot = b
+                    .spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: inset(l),
+                            right: inset(r),
+                            top: inset(t),
+                            bottom: inset(bot),
+                            width: px(BOX_CORNER),
+                            height: px(BOX_CORNER),
+                            border: UiRect {
+                                left: stroke(l),
+                                right: stroke(r),
+                                top: stroke(t),
+                                bottom: stroke(bot),
+                            },
+                            ..default()
+                        },
+                        BorderColor::all(RED),
+                        // `filter: drop-shadow(0 0 6px rgba(255,85,102,0.6))`.
+                        BoxShadow::new(rgba(255, 85, 102, 0.6), px(0), px(0), px(0), px(6)),
+                    ))
+                    .id();
+            }
+
+            label = b
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(LABEL_LEFT),
+                        top: px(0),
+                        ..default()
+                    },
+                    Text::new(String::new()),
+                    hud_font(font, 11.0, 600),
+                    TextColor(RED),
+                    LetterSpacing::Px(1.0),
+                    TextLayout::new(Justify::Left, LineBreak::NoWrap),
+                    TextShadow {
+                        offset: Vec2::new(0.0, 1.0),
+                        color: rgba(0, 0, 0, 0.9),
+                    },
+                ))
+                .id();
+        })
+        .id();
+
+    let (lead, lead_solid, lead_dashed) = lead_marker(hud);
+
+    MarkerNodes {
+        boxes,
+        corners,
+        label,
+        lead,
+        lead_solid,
+        lead_dashed,
+    }
+}
+
+/// `.lead-marker`, in both of its states.
+///
+/// The CSS is a 16px circle with a **dashed** 2px border that goes **solid and
+/// filled** when the shot is lined up:
+///
+/// ```text
+/// .lead-marker         { border: 2px dashed var(--color-red); border-radius: 50% }
+/// .lead-marker.aligned { background: rgba(255,85,102,0.4); border-style: solid }
+/// ```
+///
+/// `bevy_ui` has one border style and it is solid, so the scattered state is
+/// drawn rather than styled: eight dots on the same 16px circle, which is what
+/// a 2px dash pattern resolves to at that diameter anyway. Both rings are built
+/// here and the swap is two `Visibility` writes — no archetype move, no
+/// relayout, and no per-frame cost, since it only happens when the shot goes
+/// from lined up to not.
+///
+/// Returns `(root, solid, scattered)`.
+fn lead_marker(hud: &mut ChildSpawnerCommands) -> (Entity, Entity, Entity) {
+    let mut solid = Entity::PLACEHOLDER;
+    let mut dashed = Entity::PLACEHOLDER;
+
+    let root = hud
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                top: px(0),
+                width: px(LEAD_SIZE),
+                height: px(LEAD_SIZE),
+                ..default()
+            },
+            UiTransform::IDENTITY,
+            Visibility::Hidden,
+        ))
+        .with_children(|m| {
+            solid = m
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0),
+                        top: px(0),
+                        width: percent(100),
+                        height: percent(100),
+                        border: UiRect::all(px(2)),
+                        border_radius: BorderRadius::all(percent(50)),
+                        ..default()
+                    },
+                    BorderColor::all(RED),
+                    BackgroundColor(rgba(255, 85, 102, 0.4)),
+                    BoxShadow::new(rgba(255, 85, 102, 0.5), px(0), px(0), px(0), px(10)),
+                    Visibility::Hidden,
+                ))
+                .id();
+
+            dashed = m
+                .spawn(Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0),
+                    top: px(0),
+                    width: percent(100),
+                    height: percent(100),
+                    ..default()
+                })
+                .with_children(|ring| {
+                    let r = LEAD_SIZE / 2.0 - 1.0;
+                    for i in 0..LEAD_DASHES {
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "eight, as a float, is eight"
+                        )]
+                        let a = std::f32::consts::TAU * i as f32 / LEAD_DASHES as f32;
+                        ring.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(LEAD_SIZE / 2.0 + r * a.cos() - LEAD_DASH / 2.0),
+                                top: px(LEAD_SIZE / 2.0 + r * a.sin() - LEAD_DASH / 2.0),
+                                width: px(LEAD_DASH),
+                                height: px(LEAD_DASH),
+                                border_radius: BorderRadius::all(percent(50)),
+                                ..default()
+                            },
+                            BackgroundColor(RED),
+                        ));
+                    }
+                })
+                .id();
+        })
+        .id();
+
+    (root, solid, dashed)
+}
+
+/// One `.kf-entry`: killer, arrow, victim, on a glass slab with a blue spine.
+fn spawn_kill_row(feed: &mut ChildSpawnerCommands, font: &HudFont) -> KillRowNodes {
+    let mut killer = Entity::PLACEHOLDER;
+    let mut victim = Entity::PLACEHOLDER;
+
+    let row = feed
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(10),
+                padding: UiRect::axes(px(16), px(8)),
+                // `border: 1px solid ...; border-left: 4px solid --color-blue`.
+                border: UiRect {
+                    left: px(4),
+                    right: px(1),
+                    top: px(1),
+                    bottom: px(1),
+                },
+                border_radius: BorderRadius::all(px(8)),
+                ..default()
+            },
+            BackgroundColor(KF_BG),
+            BorderColor {
+                left: BLUE,
+                right: GLASS_BORDER,
+                top: GLASS_BORDER,
+                bottom: GLASS_BORDER,
+            },
+            BoxShadow::new(rgba(0, 0, 0, 0.5), px(0), px(8), px(0), px(24)),
+            // `animation: kf-in` has no `bevy_ui` equivalent; the row lands on
+            // its end state, which is the same rule the rest of this module
+            // follows for CSS animations.
+            Visibility::Hidden,
+        ))
+        .with_children(|r| {
+            killer = r.spawn(kill_text(font, BLUE)).id();
+            r.spawn((
+                Text::new(KF_ARROW.to_owned()),
+                hud_font(font, 10.0, 600),
+                TextColor(KF_ICON),
+            ));
+            victim = r.spawn(kill_text(font, KF_VICTIM)).id();
+        })
+        .id();
+
+    KillRowNodes {
+        row,
+        killer,
+        victim,
+    }
+}
+
+/// A `.kf-killer` / `.kf-victim` cell. `text-transform: uppercase` is applied
+/// when the string is written, since `bevy_text` has no such property.
+fn kill_text(font: &HudFont, colour: Color) -> impl Bundle {
+    (
+        Text::new(String::new()),
+        hud_font(font, 11.0, 600),
+        TextColor(colour),
+        LetterSpacing::Px(1.0),
+        TextLayout::new(Justify::Left, LineBreak::NoWrap),
+    )
 }
 
 // --- tree helpers ----------------------------------------------------------
@@ -1199,33 +1836,43 @@ fn vignette_gradient(alpha: f32) -> BackgroundGradient {
 // The diff
 // ---------------------------------------------------------------------------
 
+/// Every component type [`sync_hud`] writes, in one system parameter.
+///
+/// Bevy caps a system at sixteen parameters, and one query per writable
+/// component plus the resources the diff reads is past it. Grouping the writes
+/// is also the honest description of what they are: the tree, handed to the
+/// diff — and because they are separate fields, two of them can still be
+/// borrowed at once, which [`sync_pips`] needs.
+#[derive(bevy::ecs::system::SystemParam)]
+struct HudWrite<'w, 's> {
+    node: Query<'w, 's, &'static mut Node>,
+    vis: Query<'w, 's, &'static mut Visibility>,
+    bg: Query<'w, 's, &'static mut BackgroundColor>,
+    border: Query<'w, 's, &'static mut BorderColor>,
+    grad: Query<'w, 's, &'static mut BackgroundGradient>,
+    shadow: Query<'w, 's, &'static mut BoxShadow>,
+    text: Query<'w, 's, &'static mut Text>,
+    text_colour: Query<'w, 's, &'static mut TextColor>,
+    xform: Query<'w, 's, &'static mut UiTransform>,
+}
+
 /// Writes the frame's HUD, and nothing that did not change.
 ///
 /// The shape to keep: build the model, compare it whole, and return before
 /// acquiring a single `Mut` if it matches. Everything after the early-out is
 /// guarded by its own field comparison, so the cost of a frame is proportional
 /// to what moved rather than to how many nodes exist.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one query per component type written; splitting the system would \
-              only split the single comparison that makes it cheap"
-)]
 fn sync_hud(
     frame: Res<SimFrame>,
     time: Res<Time>,
     view: Res<crate::cockpit::ViewMode>,
     lobby: Option<Res<crate::ui::LobbyOpen>>,
     nodes: Option<Res<HudNodes>>,
+    roster: Res<Roster>,
+    feed: Res<KillFeed>,
+    lock: Res<TargetLock>,
     mut applied: ResMut<AppliedHud>,
-    mut q_node: Query<&mut Node>,
-    mut q_vis: Query<&mut Visibility>,
-    mut q_bg: Query<&mut BackgroundColor>,
-    mut q_border: Query<&mut BorderColor>,
-    mut q_grad: Query<&mut BackgroundGradient>,
-    mut q_shadow: Query<&mut BoxShadow>,
-    mut q_text: Query<&mut Text>,
-    mut q_text_colour: Query<&mut TextColor>,
-    mut q_xform: Query<&mut UiTransform>,
+    mut w: HudWrite,
 ) {
     let Some(nodes) = nodes else { return };
 
@@ -1233,7 +1880,7 @@ fn sync_hud(
     // for the same reason it stands down in the cockpit: something else is
     // already the interface.
     let hidden = view.seated || lobby.is_some_and(|l| l.0);
-    let next = model(&frame.0, time.elapsed_secs(), hidden);
+    let next = model(&frame.0, time.elapsed_secs(), hidden, lock.0, &feed);
     let prev = applied.0;
 
     // The early-out. On a frame where nothing the player can see has changed —
@@ -1255,7 +1902,7 @@ fn sync_hud(
 
     // -- master visibility --------------------------------------------------
     if moved!(present) {
-        set_visible(&mut q_vis, nodes.root, next.present);
+        set_visible(&mut w.vis, nodes.root, next.present);
     }
     if !next.present {
         // Nothing below is meaningful without a ship, and leaving the tree
@@ -1265,29 +1912,29 @@ fn sync_hud(
 
     // -- #healthbar ---------------------------------------------------------
     if moved!(hp_mil) {
-        set_width(&mut q_node, nodes.health_fill, next.hp_mil);
+        set_width(&mut w.node, nodes.health_fill, next.hp_mil);
     }
     if moved!(hp_hue) {
-        set(&mut q_grad, nodes.health_fill, health_gradient(next.hp_hue));
+        set(&mut w.grad, nodes.health_fill, health_gradient(next.hp_hue));
     }
     if moved!(hp) {
-        set_text(&mut q_text, nodes.health_text, || {
+        set_text(&mut w.text, nodes.health_text, || {
             format!("{} / {MAX_HP}", next.hp)
         });
     }
 
     // -- #boostbar ----------------------------------------------------------
     if moved!(boost_mil) {
-        set_width(&mut q_node, nodes.boost_fill, next.boost_mil);
+        set_width(&mut w.node, nodes.boost_fill, next.boost_mil);
     }
 
     // -- #heatbar -----------------------------------------------------------
     if moved!(heat_mil) {
-        set_width(&mut q_node, nodes.heat_fill, next.heat_mil);
+        set_width(&mut w.node, nodes.heat_fill, next.heat_mil);
     }
     if moved!(overheated) {
         set(
-            &mut q_border,
+            &mut w.border,
             nodes.heat_frame,
             BorderColor::all(if next.overheated {
                 ALERT_BORDER
@@ -1298,7 +1945,7 @@ fn sync_hud(
     }
     if moved!(overheated, pulse) {
         set(
-            &mut q_shadow,
+            &mut w.shadow,
             nodes.heat_frame,
             if next.overheated {
                 alert_glow(next.pulse)
@@ -1310,17 +1957,17 @@ fn sync_hud(
 
     // -- #chargebar ---------------------------------------------------------
     if moved!(charge_mil) {
-        set_width(&mut q_node, nodes.charge_fill, next.charge_mil);
+        set_width(&mut w.node, nodes.charge_fill, next.charge_mil);
     }
     if moved!(charge) {
         let overload = next.charge == ChargeState::Overload;
         set_visible(
-            &mut q_vis,
+            &mut w.vis,
             nodes.charge_frame,
             next.charge != ChargeState::Idle,
         );
         set(
-            &mut q_border,
+            &mut w.border,
             nodes.charge_frame,
             BorderColor::all(match next.charge {
                 ChargeState::Overload => ALERT_BORDER,
@@ -1328,11 +1975,11 @@ fn sync_hud(
                 _ => METER_BORDER,
             }),
         );
-        set(&mut q_grad, nodes.charge_fill, charge_gradient(overload));
+        set(&mut w.grad, nodes.charge_fill, charge_gradient(overload));
     }
     if moved!(charge, pulse) {
         set(
-            &mut q_shadow,
+            &mut w.shadow,
             nodes.charge_frame,
             match next.charge {
                 ChargeState::Overload => alert_glow(next.pulse),
@@ -1353,9 +2000,9 @@ fn sync_hud(
     // is that the shape does not degrade as the row gets longer, which is
     // exactly how "8 writes per player" became 64.
     sync_pips(
-        &mut q_bg,
-        &mut q_border,
-        &mut q_shadow,
+        &mut w.bg,
+        &mut w.border,
+        &mut w.shadow,
         &nodes.missile_pips,
         prev.map(|p| p.missiles),
         next.missiles,
@@ -1364,9 +2011,9 @@ fn sync_hud(
         MSL_PIP_EMPTY_BORDER,
     );
     sync_pips(
-        &mut q_bg,
-        &mut q_border,
-        &mut q_shadow,
+        &mut w.bg,
+        &mut w.border,
+        &mut w.shadow,
         &nodes.flare_pips,
         prev.map(|p| p.flares),
         next.flares,
@@ -1382,12 +2029,12 @@ fn sync_hud(
         } else {
             RETICLE_CYAN
         };
-        set(&mut q_border, nodes.reticle, BorderColor::all(colour));
+        set(&mut w.border, nodes.reticle, BorderColor::all(colour));
         for tick in nodes.reticle_ticks {
-            set(&mut q_bg, tick, BackgroundColor(colour));
+            set(&mut w.bg, tick, BackgroundColor(colour));
         }
         set(
-            &mut q_shadow,
+            &mut w.shadow,
             nodes.reticle,
             if next.reticle_locked {
                 BoxShadow::new(RED_BRIGHT, px(0), px(0), px(0), px(12))
@@ -1396,7 +2043,7 @@ fn sync_hud(
             },
         );
         set(
-            &mut q_xform,
+            &mut w.xform,
             nodes.reticle,
             if next.reticle_locked {
                 UiTransform::from_scale(Vec2::splat(1.2))
@@ -1408,14 +2055,14 @@ fn sync_hud(
 
     // -- #missile-lock-warning ----------------------------------------------
     if moved!(lock_warning) {
-        set_visible(&mut q_vis, nodes.lock_warning, next.lock_warning);
+        set_visible(&mut w.vis, nodes.lock_warning, next.lock_warning);
     }
     if moved!(lock_blink) {
         // `@keyframes msl-lock-blink { 0%,49% { opacity: 1 } 50%,100% { 0.1 } }`
         // — a square wave, so two writes per 250 ms rather than sixty, and none
         // at all when nothing has a lock on you.
         set(
-            &mut q_text_colour,
+            &mut w.text_colour,
             nodes.lock_warning,
             TextColor(RED_BRIGHT.with_alpha(if next.lock_blink { 1.0 } else { 0.1 })),
         );
@@ -1423,10 +2070,10 @@ fn sync_hud(
 
     // -- #hit-vignette ------------------------------------------------------
     if moved!(vignette) {
-        set_visible(&mut q_vis, nodes.vignette, next.vignette > 0);
+        set_visible(&mut w.vis, nodes.vignette, next.vignette > 0);
         if next.vignette > 0 {
             set(
-                &mut q_grad,
+                &mut w.grad,
                 nodes.vignette,
                 vignette_gradient(f32::from(next.vignette) / VIGNETTE_STEPS),
             );
@@ -1435,22 +2082,490 @@ fn sync_hud(
 
     // -- #deathbanner -------------------------------------------------------
     if moved!(alive) {
-        set_visible(&mut q_vis, nodes.death_banner, !next.alive);
+        set_visible(&mut w.vis, nodes.death_banner, !next.alive);
     }
 
     // -- #matchhud ----------------------------------------------------------
     if moved!(match_on) {
-        set_visible(&mut q_vis, nodes.match_panel, next.match_on);
+        set_visible(&mut w.vis, nodes.match_panel, next.match_on);
     }
     if next.match_on {
         if moved!(team0) {
-            set_text(&mut q_text, nodes.team0, || next.team0.to_string());
+            set_text(&mut w.text, nodes.team0, || next.team0.to_string());
         }
         if moved!(team1) {
-            set_text(&mut q_text, nodes.team1, || next.team1.to_string());
+            set_text(&mut w.text, nodes.team1, || next.team1.to_string());
         }
         if moved!(clock) {
-            set_text(&mut q_text, nodes.clock, || fmt_clock(next.clock));
+            set_text(&mut w.text, nodes.clock, || fmt_clock(next.clock));
+        }
+    }
+
+    // -- #killfeed ----------------------------------------------------------
+    //
+    // Per row, not per feed: a kill scrolls every row down one place, but a row
+    // whose `serial` did not change is the same row and keeps its strings. The
+    // only rows rewritten are the new one at the top and whichever one fell off
+    // the bottom.
+    for (i, slot) in nodes.killfeed.iter().enumerate() {
+        let row = next.kills[i];
+        if prev.is_some_and(|p| p.kills[i] == row) {
+            continue;
+        }
+        set_visible(&mut w.vis, slot.row, row.shown);
+        if !row.shown {
+            continue;
+        }
+        // `text-transform: uppercase`, which `bevy_text` has no property for.
+        set_text(&mut w.text, slot.killer, || {
+            roster.callsign(row.killer).to_uppercase()
+        });
+        set_text(&mut w.text, slot.victim, || {
+            roster.callsign(row.victim).to_uppercase()
+        });
+        // `.kf-you` — the row is about you, on one side or the other.
+        set(
+            &mut w.text_colour,
+            slot.killer,
+            TextColor(if row.killer == LOCAL_ID { GOLD } else { BLUE }),
+        );
+        set(
+            &mut w.text_colour,
+            slot.victim,
+            TextColor(if row.victim == LOCAL_ID {
+                RED
+            } else {
+                KF_VICTIM
+            }),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The world-space layer
+// ---------------------------------------------------------------------------
+
+/// Records a kill for the feed. One tick's events, once.
+///
+/// `main.js:3252` and `:3305` both skip the entry when there is no killer —
+/// flying into a rock is not a frag — and so does this. Boss hitboxes are
+/// skipped as victims for the same reason they are skipped as targets: the
+/// capital ship is twenty ships and destroying it would print twenty rows.
+fn collect_kills(frame: Res<SimFrame>, mut feed: ResMut<KillFeed>) {
+    for event in &frame.0.events {
+        if let SimEvent::ShipDestroyed {
+            id,
+            killer: Some(killer),
+            ..
+        } = *event
+        {
+            if is_boss_hitbox(id) {
+                continue;
+            }
+            feed.push(killer, id, frame.0.time);
+        }
+    }
+}
+
+/// One eligible target: who it is, and where it landed on screen.
+#[derive(Clone, Copy)]
+struct Contact {
+    id: EntityId,
+    hp: i32,
+    /// Viewport position, in logical pixels, rounded to the pixel it will be
+    /// drawn on. Rounding here is what makes a target that is holding still on
+    /// screen cost zero writes.
+    at: Vec2,
+    /// How far away it is, in world units. Both the bracket cutoff and the
+    /// reticle's own depth read this.
+    range: f32,
+    /// Pixels between [`Contact::at`] and the gun line at [`Contact::range`].
+    /// [`f32::INFINITY`] for a contact too far away to engage, which is what
+    /// keeps it out of the lock without a second test.
+    align: f32,
+    /// Inside [`ENGAGE_DIST`]: draws a bracket and a name, not just a ring.
+    boxed: bool,
+}
+
+/// Whether a sphere blocks the view from `from` to `to`.
+///
+/// `raySphereDist` (`main.js:1080`) solved for the near root of the ray-sphere
+/// quadratic and compared it against the target's distance. This asks the same
+/// question as a point-segment distance, which needs no square root and no
+/// discriminant: the segment is clipped to `0..=1` first, so a sphere behind
+/// the viewer or beyond the target cannot block, and a target *inside* a rock
+/// reads as blocked — the same resolution `aim_assist.rs` documents for the
+/// identical case.
+fn occluded_by(from: Vec3, to: Vec3, centre: Vec3, radius: f32) -> bool {
+    let seg = to - from;
+    let len_sq = seg.length_squared();
+    if len_sq <= f32::EPSILON {
+        return false;
+    }
+    let t = ((centre - from).dot(seg) / len_sq).clamp(0.0, 1.0);
+    from.lerp(to, t).distance_squared(centre) < radius * radius
+}
+
+/// Draws the floating part of the HUD: the target brackets, their labels, the
+/// lead rings, and the reticle's position.
+///
+/// # Where the numbers come from
+///
+/// Every rule here is `main.js:1843`–`:1931`, in order: skip the dead, skip
+/// teammates, skip anything past [`MARKER_VISIBLE_DIST`], project, skip
+/// anything behind the camera or off the edge, drop anything with a rock or the
+/// moon in the way, then draw.
+///
+/// # Three deliberate differences from the JS
+///
+/// 1. **Occlusion is tested from the camera, not from the ship.**
+///    `main.js:1876` casts from `ship.position`, because it is asking a
+///    targeting question. The complaint this answers is a *visual* one —
+///    brackets drawn over the front of the moon with the ship they belong to
+///    behind it — and the camera is the only viewpoint that defines "in front
+///    of". They are eleven units apart, so the two answers differ only for a
+///    rock close enough to fill the screen anyway.
+/// 2. **A contact past [`ENGAGE_DIST`] keeps its ring and loses its bracket.**
+///    See that constant. The JS draws the full box out to 1500.
+/// 3. **Exactly one ring is ever solid.** `main.js:1928` sets `.aligned` on
+///    every target inside 22 pixels, so a pair flying in formation both fill
+///    in and neither is "the" target. The solid ring is the lock, so it goes to
+///    the single best-aligned contact and to nothing else.
+///
+/// # Cost
+///
+/// The occlusion test is the one piece of real per-frame arithmetic in this
+/// module, and it is deliberately last: it runs only for contacts that already
+/// survived the flag, team, range, projection and off-screen tests, so it is a
+/// handful of targets against sixty rocks — a few hundred multiply-adds, no
+/// allocation, no square roots, and nothing that touches the ECS. That is a
+/// different order of thing from the forced layout this module exists to
+/// delete, but it is not free, and it is the first thing to move behind a
+/// `ShipFlags` bit if `sim` ever offers one.
+///
+/// # Poses
+///
+/// Both the ships and the camera are read from [`GlobalTransform`], never from
+/// [`Frame`]: `SimFrame`'s own documentation is explicit that anything a marker
+/// positions itself from wants the interpolated pose `scene.rs` writes, not the
+/// last tick's `ShipView::pos`, or the marker judders at the tick rate while
+/// the ship it is on does not. The frame is still read for identity, hit points
+/// and flags, which are discrete and have no in-between value.
+///
+/// # Ordering, and the frame it costs
+///
+/// This has to run after `scene.rs` has interpolated the ships and after
+/// `camera.rs` has settled the chase camera — which means after
+/// `TransformSystems::Propagate`, and `bevy_ui`'s layout runs *before* that. So
+/// a `UiTransform` written here is consumed by the next frame's layout, and the
+/// markers trail the scene by one frame — a few pixels in a hard turn. Removing
+/// it means running between the camera and `UiSystems::Layout`, which needs an
+/// ordering handle on `camera.rs`'s `follow`; that system is private and
+/// `camera.rs` is not this module's file.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one query per component type written, plus the two transform \
+              sources; splitting it would split the per-slot diff that makes \
+              it cheap"
+)]
+fn sync_world_markers(
+    frame: Res<SimFrame>,
+    roster: Res<Roster>,
+    setup: Res<crate::sim_bridge::MatchSetup>,
+    nodes: Option<Res<HudNodes>>,
+    mut applied: ResMut<AppliedMarkers>,
+    mut lock: ResMut<TargetLock>,
+    cameras: Query<(&Camera, &GlobalTransform, Option<&RenderLayers>), With<Camera3d>>,
+    ships: Query<(&ShipRoot, &GlobalTransform)>,
+    mut q_vis: Query<&mut Visibility>,
+    mut q_xform: Query<&mut UiTransform>,
+    mut q_text: Query<&mut Text>,
+    mut q_border: Query<&mut BorderColor>,
+) {
+    let Some(nodes) = nodes else { return };
+
+    // `ui.rs` puts a second `Camera3d` in the world for the menu's ship
+    // preview. It renders to an image and is confined to its own layer, so the
+    // camera that can see the match is the one that draws layer 0 — which is
+    // also the exact question being asked, and survives `ui.rs` changing its
+    // order or its target.
+    let scene_layer = RenderLayers::layer(0);
+    let camera = cameras
+        .iter()
+        .find(|(_, _, layers)| layers.is_none_or(|l: &RenderLayers| l.intersects(&scene_layer)));
+    let Some((camera, cam_tf, _)) = camera else {
+        hide_all(&mut applied, &mut q_vis, &nodes);
+        lock.0 = false;
+        return;
+    };
+    let Some(viewport) = camera.logical_viewport_size() else {
+        hide_all(&mut applied, &mut q_vis, &nodes);
+        lock.0 = false;
+        return;
+    };
+
+    // The local ship, from the interpolated transform rather than the frame.
+    let Some((_, me)) = ships.iter().find(|(root, _)| root.0 == LOCAL_ID) else {
+        hide_all(&mut applied, &mut q_vis, &nodes);
+        lock.0 = false;
+        return;
+    };
+
+    // The gun line: `main.js:1830`'s muzzle and nose. The nose is local +Z,
+    // which is `camera.rs`'s convention and `sim`'s. Where a point on it lands
+    // on screen depends on how far down it sits — see [`AIM_RANGE`] — so the
+    // line is carried around and sampled per target rather than reduced to one
+    // point here.
+    let muzzle = me.translation();
+    let aim_fwd = me.rotation() * Vec3::Z;
+    let centre = viewport / 2.0;
+    let aim_at = |range: f32| {
+        camera
+            .world_to_viewport(cam_tf, muzzle + aim_fwd * range.max(AIM_RANGE_MIN))
+            .ok()
+    };
+
+    // -- eligible targets ---------------------------------------------------
+    //
+    // Walked in `Frame::ships` order, which is `World::ships` order and is
+    // stable across ticks — so a target keeps the same slot, and its label is
+    // written once rather than every time the set changes shape.
+    let my_team = frame
+        .0
+        .ships
+        .iter()
+        .find(|s| s.flags.contains(ShipFlags::LOCAL))
+        .map_or(-1, |s| s.team);
+    let assist = frame.0.hud.assist_target;
+
+    // The occluders, straight off the frame plus the one piece of fixed world
+    // geometry. `Frame` carries the asteroids' *mesh* size; the collision
+    // radius is that scaled by `collision_radius_scale`, which is the same
+    // conversion `sim::asteroids` does when it builds a rock, read from
+    // `rules.rs` rather than written down twice.
+    let rock_scale = Rules::DEFAULT.world.asteroid_field.collision_radius_scale as f32;
+    // The moon is an obstacle on the space map and does not exist on terrain.
+    // `World::obstacles` holds it, but that lives on `SimWorld`, which
+    // `sim_bridge` documents as never read by a rendering system — so it comes
+    // from the rules and the map, exactly as `scene.rs` builds its mesh.
+    let moon = (setup.map == sim::world::MapKind::Space).then(|| {
+        let p = Rules::DEFAULT.world.moon_pos;
+        (
+            Vec3::new(p.x as f32, p.y as f32, p.z as f32),
+            Rules::DEFAULT.world.moon_radius as f32,
+        )
+    });
+    let eye = cam_tf.translation();
+
+    let mut contacts = [None; TARGET_POOL];
+    let mut found = 0;
+    for view in &frame.0.ships {
+        if found == TARGET_POOL {
+            break;
+        }
+        if view.flags.contains(ShipFlags::LOCAL)
+            || !view.flags.contains(ShipFlags::ALIVE)
+            || view.flags.contains(ShipFlags::BOSS_HITBOX)
+        {
+            continue;
+        }
+        // `main.js:1864`. `team` is `-1` for unassigned, and two unassigned
+        // ships in a free-for-all are not on a team together — which is why
+        // this is not a bare equality test.
+        if my_team >= 0 && view.team == my_team {
+            continue;
+        }
+        let Some((_, tf)) = ships.iter().find(|(root, _)| root.0 == view.id) else {
+            continue;
+        };
+        let pos = tf.translation();
+        let range = me.translation().distance(pos);
+        if range > MARKER_VISIBLE_DIST {
+            continue;
+        }
+        // Anything behind the camera fails here rather than projecting to a
+        // mirrored point in front of it: `world_to_viewport` rejects an NDC z
+        // outside the frustum, which is exactly the `projTmp.z > 1 || < -1`
+        // test at `main.js:1910`.
+        let Ok(at) = camera.world_to_viewport(cam_tf, pos) else {
+            continue;
+        };
+        if at.x < -OFFSCREEN_MARGIN
+            || at.y < -OFFSCREEN_MARGIN
+            || at.x > viewport.x + OFFSCREEN_MARGIN
+            || at.y > viewport.y + OFFSCREEN_MARGIN
+        {
+            continue;
+        }
+        // Last, because it is the only expensive test and everything above has
+        // already thrown most candidates away. `main.js:1876`: asteroids first,
+        // then the moon, and the first hit ends it.
+        let blocked = frame
+            .0
+            .asteroids
+            .iter()
+            .any(|r| occluded_by(eye, pos, Vec3::from(r.pos), r.size * rock_scale))
+            || moon.is_some_and(|(c, r)| occluded_by(eye, pos, c, r));
+        if blocked {
+            continue;
+        }
+
+        let at = at.round();
+        let boxed = range <= ENGAGE_DIST;
+        contacts[found] = Some(Contact {
+            id: view.id,
+            hp: view.hp,
+            at,
+            range,
+            // Against the gun line sampled at *this* target's range, so the
+            // test is the same whether the target is at 200 units or 900. Out
+            // of engagement range there is no lock to be had, so the ring can
+            // never fill in and the contact cannot hold the reticle.
+            align: match aim_at(range) {
+                Some(aim) if boxed => at.distance(aim),
+                _ => f32::INFINITY,
+            },
+            boxed,
+        });
+        found += 1;
+    }
+
+    // `main.js:1927` — the *best* alignment among the targets actually on
+    // screen, so one enemy behind you cannot hold the lock open for another.
+    // Unlike the JS this also picks a single winner: the solid ring is the
+    // lock, and two targets cannot both be it. Ties go to the earlier slot,
+    // which is `Frame::ships` order — the same insertion-order tie-break
+    // `aim_assist.rs` and `bot.rs` document.
+    let best = contacts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.map(|c| (i, c)))
+        .min_by(|a, b| a.1.align.total_cmp(&b.1.align));
+    let locked_on = best.filter(|(_, c)| c.align < ALIGN_PX).map(|(i, _)| i);
+    lock.0 = locked_on.is_some();
+
+    // -- the reticle --------------------------------------------------------
+    //
+    // Drawn at the range of whatever the nose is nearest to, which is the
+    // closest thing available to `main.js:1832`'s raycast: as you swing onto a
+    // target the reticle settles onto *it* rather than onto a point a kilometre
+    // past it. With nothing in front of you it falls back to [`AIM_RANGE`], and
+    // if even that fails to project the anchor is left where it was — which is
+    // screen centre, the position it is laid out at.
+    let aim = best
+        .and_then(|(_, c)| aim_at(c.range))
+        .or_else(|| aim_at(AIM_RANGE));
+    if let Some(aim) = aim {
+        let aim = aim.round();
+        // The anchor is laid out screen-centred, so the translation is the
+        // offset from centre.
+        set(
+            &mut q_xform,
+            nodes.reticle_anchor,
+            UiTransform::from_translation(Val2::px(aim.x - centre.x, aim.y - centre.y)),
+        );
+    }
+
+    // -- the slots ----------------------------------------------------------
+    for (i, ((slot, contact), was_slot)) in nodes
+        .markers
+        .iter()
+        .zip(contacts)
+        .zip(&mut applied.0)
+        .enumerate()
+    {
+        let was = *was_slot;
+        let Some(c) = contact else {
+            // Nothing to track. An already-hidden slot is left completely
+            // alone — no transform, no text, no visibility write.
+            if was.shown {
+                set_visible(&mut q_vis, slot.boxes, false);
+                set_visible(&mut q_vis, slot.lead, false);
+                *was_slot = MarkerModel::default();
+            }
+            continue;
+        };
+
+        // The position, and only the position, every frame. `.target-box` has
+        // `margin: -32px 0 0 -32px` and `.lead-marker` `-8px 0 0 -8px`; both
+        // are folded in here so the node's *centre* lands on the target. The
+        // box is written only while it is up — a distant contact is a ring and
+        // nothing else, and its bracket does not need moving.
+        if c.boxed {
+            set(
+                &mut q_xform,
+                slot.boxes,
+                UiTransform::from_translation(Val2::px(
+                    c.at.x - BOX_SIZE / 2.0,
+                    c.at.y - BOX_SIZE / 2.0,
+                )),
+            );
+        }
+        set(
+            &mut q_xform,
+            slot.lead,
+            UiTransform::from_translation(Val2::px(
+                c.at.x - LEAD_SIZE / 2.0,
+                c.at.y - LEAD_SIZE / 2.0,
+            )),
+        );
+
+        let now = MarkerModel {
+            shown: true,
+            boxed: c.boxed,
+            id: c.id,
+            hp: c.hp,
+            // The lock, not a threshold: exactly one slot can carry it.
+            aligned: locked_on == Some(i),
+            assisted: assist >= 0 && assist == c.id,
+        };
+        if was == now {
+            continue;
+        }
+        *was_slot = now;
+
+        // A slot that was hidden has stale everything, so a first frame writes
+        // the lot; after that each of these is its own comparison.
+        let fresh = !was.shown;
+        if fresh {
+            set_visible(&mut q_vis, slot.lead, true);
+        }
+        if fresh || was.boxed != now.boxed {
+            set_visible(&mut q_vis, slot.boxes, now.boxed);
+        }
+        if now.boxed && (fresh || !was.boxed || was.id != now.id || was.hp != now.hp) {
+            // `main.js:1921` — `${targetName}  HP ${r.hp}`, two spaces.
+            set_text(&mut q_text, slot.label, || {
+                format!("{}  HP {}", roster.callsign(c.id), c.hp)
+            });
+        }
+        if fresh || was.aligned != now.aligned {
+            set_visible(&mut q_vis, slot.lead_solid, now.aligned);
+            set_visible(&mut q_vis, slot.lead_dashed, !now.aligned);
+        }
+        if now.boxed && (fresh || !was.boxed || was.assisted != now.assisted) {
+            // The one thing `HudState::assist_target` is the right source for.
+            // The 22-pixel test above says "your nose is on them"; this says
+            // "the assist has picked them", which is a different fact and the
+            // one that tells a player why their aim is being helped.
+            let colour = if now.assisted { RED_BRIGHT } else { RED };
+            for corner in slot.corners {
+                set(&mut q_border, corner, BorderColor::all(colour));
+            }
+        }
+    }
+}
+
+/// Hides every marker that is currently up, and nothing else.
+///
+/// The frames with no camera, no viewport or no local ship — the first few, and
+/// every frame in the lobby. A slot that is already down costs one comparison.
+fn hide_all(applied: &mut AppliedMarkers, q_vis: &mut Query<&mut Visibility>, nodes: &HudNodes) {
+    for (slot, was) in nodes.markers.iter().zip(&mut applied.0) {
+        if was.shown {
+            set_visible(q_vis, slot.boxes, false);
+            set_visible(q_vis, slot.lead, false);
+            *was = MarkerModel::default();
         }
     }
 }
@@ -1592,25 +2707,43 @@ fn set_text(q: &mut Query<&mut Text>, entity: Entity, value: impl FnOnce() -> St
 // - **No braking flag.** `main.js:1336` shows `#chargebar` while `braking ||
 //   brakeCharge > 0`. `HudState` has `charge01` but not the brake input, so the
 //   bar appears a frame late, on the first non-zero charge.
-// - **No roster.** `Frame` has no player names. `MatchState::scores` already
-//   holds them; copying that into `Frame` (or adding a name to `ShipView`) is
-//   what unblocks `.target-label`, `#killfeed` and `#scoreboard` at once.
+// - **No line-of-sight query, and no world geometry.** A marker must not draw
+//   through the moon, so [`sync_world_markers`] runs its own ray-sphere sweep
+//   per target per frame. The asteroids come off `Frame`, but their *collision*
+//   radius does not — `RockView` carries the mesh size and the scale factor has
+//   to be reapplied from `rules.rs` — and the moon is not on `Frame` at all, so
+//   it is rebuilt from `WorldRules` plus `MatchSetup::map`, which is a second
+//   copy of a fact `World::obstacles` already holds. Either an occluded bit on
+//   `ShipView`, set once per tick where `aim_assist::line_of_sight_blocked` is
+//   already sweeping, or `World::obstacles` on the frame, removes both the
+//   duplication and the per-frame arithmetic.
 // - **`assist_target` is only an id.** `AimAssistState` computes an intercept
-//   point that `.lead-marker` needs, and `HudState` keeps only the target id.
-//   The same reduction means the reticle cannot follow the aim ray's impact
-//   point the way `main.js:1839` does, and is drawn at screen centre.
+//   point — where a bullet fired now would actually meet the target — and
+//   `HudState` keeps only the target's id. `.lead-marker` is therefore drawn on
+//   the target rather than on the lead point, which is what `main.js:1922`
+//   does too (`lx = sx, ly = sy`), so nothing is lost against the JS; but the
+//   intercept point is strictly better information and it already exists.
+// - **No scene raycast.** `main.js:1832` puts the reticle on whatever the gun
+//   line actually hits. [`AIM_RANGE`] pins it at maximum range instead, which
+//   differs by about a degree of parallax. A hit distance on `HudState`, or a
+//   ray query on `sim`, would remove the approximation.
 //
 // Separately, and not a `HudState` problem: `sim_bridge::tick` does not yet
-// populate `overcharge01`, `missile_lock_warning` or `assist_target` — the
-// projectile, missile and aim-assist systems it calls out as missing are what
-// would fill them. The fields exist and are read here, so `.overload`, the lock
-// warning and the locked reticle light up the moment that lands, with no change
-// to this file.
+// populate `overcharge01` or `missile_lock_warning` — the projectile and
+// missile systems it calls out as missing are what would fill them. The fields
+// exist and are read here, so `.overload` and the lock warning light up the
+// moment that lands, with no change to this file.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sim::world::ShipView;
+
+    /// [`model`] with the two out-of-frame inputs at rest — no target lock, no
+    /// killfeed. The cases that care about either pass their own.
+    fn model(frame: &Frame, time: f32, seated: bool) -> HudModel {
+        super::model(frame, time, seated, false, &KillFeed::default())
+    }
 
     /// A frame with one live local ship and a given HUD state.
     fn frame(hud: HudState) -> Frame {
@@ -1880,5 +3013,216 @@ mod tests {
         assert_eq!(MISSILE_PIPS, 4);
         assert_eq!(FLARE_PIPS, 3);
         assert_eq!(MAX_HP, 100);
+    }
+
+    // --- the world-space layer ---------------------------------------------
+
+    /// The reticle's lock comes from where things land on screen, not from the
+    /// aim assist's 53-degree cone — which is wide enough that reading it would
+    /// leave the reticle red for most of a match.
+    #[test]
+    fn the_reticle_locks_on_alignment_and_not_on_the_assist_cone() {
+        let held = frame(HudState {
+            assist_target: 7,
+            ..healthy()
+        });
+        assert!(
+            !super::model(&held, 0.0, false, false, &KillFeed::default()).reticle_locked,
+            "the assist holding a target is not a lock"
+        );
+        assert!(
+            super::model(&held, 0.0, false, true, &KillFeed::default()).reticle_locked,
+            "being lined up on one is"
+        );
+
+        // And a corpse never locks, however well aimed.
+        let mut dead = frame(healthy());
+        dead.ships[0].flags = ShipFlags::LOCAL;
+        assert!(!super::model(&dead, 0.0, false, true, &KillFeed::default()).reticle_locked);
+    }
+
+    /// A kill lands on top and scrolls the rest down, and the ones that did not
+    /// move keep their serial — which is what stops `sync_hud` rewriting four
+    /// rows of text every time someone dies.
+    #[test]
+    fn the_killfeed_scrolls_and_leaves_settled_rows_alone() {
+        let mut feed = KillFeed::default();
+        feed.push(2, 3, 0.0);
+        feed.push(4, 5, 1.0);
+
+        let rows = feed.model(1.0);
+        assert_eq!((rows[0].killer, rows[0].victim), (4, 5), "newest on top");
+        assert_eq!((rows[1].killer, rows[1].victim), (2, 3));
+        assert!(rows[0].shown && rows[1].shown);
+        assert!(!rows[2].shown, "a row that never held a kill is not drawn");
+
+        // The older row kept its identity as it scrolled, so its text is not
+        // rewritten.
+        assert_eq!(rows[1].serial, 1);
+        assert_eq!(rows[0].serial, 2);
+    }
+
+    /// Rows expire on the simulation's clock, and expiring is the only thing
+    /// about a settled feed that ever changes.
+    #[test]
+    fn killfeed_rows_expire() {
+        let mut feed = KillFeed::default();
+        feed.push(2, 3, 10.0);
+
+        assert!(feed.model(10.0)[0].shown);
+        assert!(feed.model(10.0 + KILL_TTL - 0.01)[0].shown);
+        assert!(!feed.model(10.0 + KILL_TTL)[0].shown);
+
+        // Between pushes and expiry the model is constant, so the HUD's
+        // early-out still holds with a feed on screen.
+        assert_eq!(feed.model(11.0), feed.model(12.0));
+    }
+
+    /// Only the oldest row falls off when a sixth kill arrives.
+    #[test]
+    fn the_killfeed_holds_five() {
+        let mut feed = KillFeed::default();
+        for i in 0..7 {
+            feed.push(2, 3 + i, f64::from(i));
+        }
+        let rows = feed.model(6.0);
+        assert_eq!(rows.len(), KILLFEED_ROWS);
+        assert_eq!(rows[0].victim, 9, "the last kill is on top");
+        assert_eq!(rows[4].victim, 5, "and the sixth-oldest has gone");
+    }
+
+    /// The killfeed is part of the one model the HUD compares, so a kill is a
+    /// change and a quiet feed is not.
+    #[test]
+    fn a_kill_moves_the_model_and_nothing_else_does() {
+        let f = frame(healthy());
+        let mut feed = KillFeed::default();
+
+        let quiet = super::model(&f, 0.0, false, false, &feed);
+        assert_eq!(quiet, super::model(&f, 5.0, false, false, &feed));
+
+        feed.push(2, 3, 0.0);
+        let loud = super::model(&f, 0.0, false, false, &feed);
+        assert_ne!(quiet, loud);
+        assert_eq!(
+            HudModel {
+                kills: quiet.kills,
+                ..loud
+            },
+            quiet,
+            "a killfeed row should not disturb anything else"
+        );
+    }
+
+    /// A hidden slot is `Default`, and `Default` is not `shown` — which is what
+    /// every "leave it alone" branch in `sync_world_markers` tests.
+    #[test]
+    fn a_marker_slot_starts_hidden() {
+        let m = MarkerModel::default();
+        assert!(!m.shown);
+        assert_eq!(m.id, 0, "no ship has id 0; LOCAL_ID is 1");
+        assert_ne!(m.id, LOCAL_ID);
+    }
+
+    /// The alignment threshold is the JS's, and it is the same number for the
+    /// lead ring and for the reticle — `main.js:1928` and `:1929`.
+    #[test]
+    fn the_alignment_threshold_is_the_one_from_the_js() {
+        assert_eq!(ALIGN_PX, 22.0);
+        assert_eq!(OFFSCREEN_MARGIN, BOX_SIZE / 2.0);
+        assert_eq!(MARKER_VISIBLE_DIST, 1500.0);
+        assert_eq!(KILLFEED_ROWS, 5);
+    }
+
+    /// The bracket range is the aim assist's, read from the rules rather than
+    /// typed here, and it is inside the range a marker appears at at all — so
+    /// there is a band where a contact is a ring and nothing more.
+    #[test]
+    fn the_bracket_range_comes_from_the_rules() {
+        assert_eq!(ENGAGE_DIST, Rules::DEFAULT.aim_assist.range as f32);
+        // Otherwise nothing is ever ring-only and the band does not exist.
+        const { assert!(ENGAGE_DIST < MARKER_VISIBLE_DIST) };
+    }
+
+    /// A sphere blocks only when it is genuinely between the two points.
+    #[test]
+    fn occlusion_only_counts_what_is_in_the_way() {
+        let eye = Vec3::ZERO;
+        let target = Vec3::new(0.0, 0.0, 400.0);
+
+        assert!(
+            occluded_by(eye, target, Vec3::new(0.0, 0.0, 200.0), 80.0),
+            "a rock on the line blocks"
+        );
+        assert!(
+            !occluded_by(eye, target, Vec3::new(0.0, 200.0, 200.0), 80.0),
+            "one beside the line does not"
+        );
+        assert!(
+            !occluded_by(eye, target, Vec3::new(0.0, 0.0, 600.0), 80.0),
+            "one behind the target does not"
+        );
+        assert!(
+            !occluded_by(eye, target, Vec3::new(0.0, 0.0, -200.0), 80.0),
+            "and one behind the camera does not"
+        );
+        assert!(
+            occluded_by(eye, target, target, 20.0),
+            "a target inside a rock reads as blocked, as aim_assist resolves it"
+        );
+    }
+
+    /// The moon really is big enough to matter: a target directly behind it is
+    /// hidden, which is the report this rule exists for.
+    #[test]
+    fn the_moon_hides_what_is_behind_it() {
+        let moon = Rules::DEFAULT.world.moon_pos;
+        let moon = Vec3::new(moon.x as f32, moon.y as f32, moon.z as f32);
+        let r = Rules::DEFAULT.world.moon_radius as f32;
+        assert!(r > 0.0);
+
+        // Camera one side, target the other, moon in the middle.
+        let eye = moon - Vec3::Z * 500.0;
+        let behind = moon + Vec3::Z * 300.0;
+        assert!(occluded_by(eye, behind, moon, r));
+
+        // Slid clear of the line, it is visible again.
+        let beside = moon + Vec3::Z * 300.0 + Vec3::X * (r * 4.0);
+        assert!(!occluded_by(eye, beside, moon, r));
+    }
+
+    /// A rock's collision radius is its mesh size scaled, and the scale is the
+    /// one `sim::asteroids` used when it built the rock.
+    #[test]
+    fn rock_radii_come_back_off_the_rules() {
+        let scale = Rules::DEFAULT.world.asteroid_field.collision_radius_scale;
+        assert!(scale > 0.0 && scale <= 1.0, "a sanity range, not a guess");
+        // A 20-unit rock occludes at its collision radius, not at zero and not
+        // at some radius invented here.
+        let r = 20.0 * scale as f32;
+        let eye = Vec3::ZERO;
+        let target = Vec3::new(0.0, 0.0, 400.0);
+        let just_inside = Vec3::new(r * 0.9, 0.0, 200.0);
+        let just_outside = Vec3::new(r * 1.1, 0.0, 200.0);
+        assert!(occluded_by(eye, target, just_inside, r));
+        assert!(!occluded_by(eye, target, just_outside, r));
+    }
+
+    /// The scattered ring's dashes sit on the circle the solid ring's border
+    /// traces, so the two states are the same size and the swap does not jump.
+    #[test]
+    fn the_scattered_ring_matches_the_solid_one() {
+        let r = LEAD_SIZE / 2.0 - 1.0;
+        for i in 0..LEAD_DASHES {
+            let a = std::f32::consts::TAU * i as f32 / LEAD_DASHES as f32;
+            let x = LEAD_SIZE / 2.0 + r * a.cos();
+            let y = LEAD_SIZE / 2.0 + r * a.sin();
+            let from_centre =
+                ((x - LEAD_SIZE / 2.0).powi(2) + (y - LEAD_SIZE / 2.0).powi(2)).sqrt();
+            assert!(
+                (from_centre - r).abs() < 1e-4,
+                "dash {i} is off the ring at {from_centre}"
+            );
+        }
     }
 }
