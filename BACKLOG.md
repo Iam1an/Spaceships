@@ -552,7 +552,65 @@ fast they get there is a separate tuning pass with real play data.
 
 ---
 
-## 9. Falls out of the replay system nearly free
+## 9. Warp-in on spawn
+
+Spawning currently just places you somewhere, which is the least interesting
+moment in a game that does it constantly — every respawn, every match start.
+Replace it with an arrival: space bends around you and you fall out of it.
+
+### What exists
+
+`public/src/warp.js` is a warp **tunnel** — 3,000 instanced streaking boxes and
+an FOV punch from 175 degrees down to 75 over 1.5 s. It fires only on campaign
+respawn.
+
+The FOV punch is the good part and should survive the port: decelerating out of
+175 degrees is what sells the arrival. What is missing is the *bend*.
+
+### The bend
+
+The distinctive part is a **screen-space radial distortion** — UVs displaced
+toward or away from centre, strongest at the arrival instant and relaxing on an
+ease-out over roughly 0.6 s. That is the thing that reads as space folding
+rather than as stars going past.
+
+It composes with what the client already has:
+
+- The camera runs an HDR post chain (`Bloom`, `ChromaticAberration`, `Vignette`)
+  and `camera.rs` already carries a `TODO(grade)` for a custom fullscreen post
+  node. The warp distortion belongs in that same node rather than a second pass.
+- `ChromaticAberration` is already there — **animate its intensity** on the same
+  curve. Real lensing splits colour; a static value cannot.
+- A bright flash and an expanding shockwave ring at t=0, with the ring itself
+  distorting what it passes over.
+- The existing streaks, but collapsing **inward to a point** rather than
+  streaming past. Arriving, not travelling.
+
+### Details worth getting right
+
+- **Others should see it too.** A remote ship arriving should warp in visibly at
+  its own position — world-space, not screen-space. Watching an enemy fold into
+  existence is better than having them appear.
+- **It covers the invulnerability window.** Spawn protection is 2 s and the
+  respawn delay is 2 s; an arrival of about 1.2 s sits inside that. That is a
+  feature — the effect *communicates* why you cannot be hit yet, which nothing
+  currently does.
+- **Every spawn, not just campaign.** Match start, respawn, and joining in
+  progress should all use it.
+- **Audio.** A rising whoosh that cuts hard at arrival. The synthesised
+  `missile_whoosh` is close in character; reversed and pitched down it is a
+  starting point.
+
+### Where it goes
+
+A `warp.rs` module in the Bevy client, sharing the custom post node with the
+Ultra grade pass. Not in `sim` — it changes nothing about the simulation, and
+`SimEvent::ShipRespawned` already exists to trigger it (`scene.rs` consumes it
+today to snap interpolation).
+
+---
+
+## 10. Falls out of the replay system nearly free
 
 - **Killcam.** A replay bounded to the 5 seconds before your death, from the
   killer's view.
@@ -565,7 +623,7 @@ fast they get there is a separate tuning pass with real play data.
 
 ---
 
-## 10. Netcode: rollback
+## 11. Netcode: rollback
 
 A deterministic simulation is the hard prerequisite for rollback netcode — the
 thing that makes fighting games feel lagless online. The client predicts
@@ -577,7 +635,7 @@ foundation is already in place.
 
 ---
 
-## 11. Known gameplay issues found during the port
+## 12. Known gameplay issues found during the port
 
 Real behaviors in the current game, each verified against the source. Some are
 bugs, some are probably-unintended design. Decide individually.
@@ -598,7 +656,7 @@ bugs, some are probably-unintended design. Decide individually.
 
 ---
 
-## 12. Other ideas
+## 13. Other ideas
 
 - **Replace the pixel filter with a real post chain.** `PIXEL_SCALE = 3` renders
   to a third-res target and upscales. In Bevy this is a post-processing pass,
