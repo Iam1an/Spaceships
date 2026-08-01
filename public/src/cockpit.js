@@ -21,32 +21,35 @@ import { createDash } from './dash.js';
 export const COCKPIT_PROFILES = {
   default: {
     id: 'default',
-    // Seated forward in the blister (which spans ship-local z 0.1..2.6) and above the
-    // fuselage spine, so the view is over the nose rather than into it.
-    eye: new THREE.Vector3(0, 1.02, 1.80),
+    // Seated above the fuselage spine but well back in the blister (ship-local z 0.1..2.6),
+    // so the nose runs out ahead of the panel and the wing roots sit in peripheral view.
+    // The rail is dropped further below the eye than the panel top, to open the sides up.
+    eye: new THREE.Vector3(0, 1.26, 0.40),
     fov: 84,
     tub: {
-      halfWidth: 0.66,
-      floorY: 0.40,
-      railY: 0.80,   // canopy rail: top of the solid tub sides
-      ceilY: 1.30,   // apex of the canopy hoops
-      backZ: 0.70,
-      dashZ: 2.80,
+      halfWidth: 0.60,
+      floorY: 0.64,
+      railY: 0.92,   // canopy rail: top of the solid tub sides
+      ceilY: 1.56,   // apex of the canopy hoops
+      backZ: -0.70,
+      dashZ: 1.50,
     },
     accent: 0x5fd8ff,
     lampColor: 0x9fd0ff,
   },
   admin: {
     id: 'admin',
-    eye: new THREE.Vector3(0, 1.16, 4.15),
+    // Admin hull: the Cylinder spine runs to ship-local z 6.9 and the wing planes sit at
+    // z -1.2..2.1, so the seat goes well back to put nose ahead and wing roots in view.
+    eye: new THREE.Vector3(0, 1.30, 2.95),
     fov: 86,
     tub: {
-      halfWidth: 0.74,
-      floorY: 0.54,
-      railY: 0.94,
-      ceilY: 1.58,
-      backZ: 3.05,
-      dashZ: 5.15,
+      halfWidth: 0.68,
+      floorY: 0.68,
+      railY: 0.96,
+      ceilY: 1.62,
+      backZ: 1.85,
+      dashZ: 4.05,
     },
     accent: 0xffc451,
     lampColor: 0xffd39a,
