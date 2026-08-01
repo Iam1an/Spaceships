@@ -473,10 +473,16 @@ fn team_spawn(world: &mut World, index: usize) -> (Vec3, Quat) {
             rules.spawn.terrain_jitter,
         ),
     };
+    // `*_jitter` is documented as the **full width** of the scatter box, so a
+    // signed draw over [-1, 1) has to be halved. Without the halving this
+    // scattered twice as wide as `rules.rs` says and as the JS does
+    // (`(rand - 0.5) * range`), which matters: the tight box was tuned against
+    // the mothership hangar mouth, and the doc records that a wider one drops
+    // players outside it and sometimes clips the hull on frame one.
     let rng = &mut world.rng.spawn;
-    let jx = rng.next_f64_signed() * jitter.x;
-    let jy = rng.next_f64_signed() * jitter.y;
-    let jz = rng.next_f64_signed() * jitter.z;
+    let jx = rng.next_f64_signed() * jitter.x * 0.5;
+    let jy = rng.next_f64_signed() * jitter.y * 0.5;
+    let jz = rng.next_f64_signed() * jitter.z * 0.5;
     let (sign, quat) = match team {
         Team::Zero => (-1.0, Quat::IDENTITY),
         Team::One => (1.0, Quat::FLIP_Y),
