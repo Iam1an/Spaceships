@@ -80,10 +80,9 @@ export function createAudio() {
     const dur = buf.duration;
     const xfade = Math.min(0.08, dur * 0.1);
     const cycle = dur - xfade;
-    const state = { gain: masterGain, alive: true };
+    const state = { gain: masterGain };
     let nextStart = ctx.currentTime + 0.05;
     function scheduleCycle(startTime) {
-      if (!state.alive) return;
       const src = ctx.createBufferSource();
       const fade = ctx.createGain();
       src.buffer = buf;
@@ -95,7 +94,6 @@ export function createAudio() {
       src.start(startTime);
       src.stop(startTime + dur + 0.01);
       src.onended = () => {
-        if (!state.alive) return;
         scheduleCycle(nextStart);
         nextStart += cycle;
       };

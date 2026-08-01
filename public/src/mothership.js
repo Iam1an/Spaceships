@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-export const HANGAR_OFFSET = 40;
 export function createMothership() {
   const group = new THREE.Group();
   group.name = 'Mothership';

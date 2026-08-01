@@ -49,7 +49,6 @@ export class FirstPersonCamera {
   }
 
   setProfile(profile) {
-    this.profile = profile;
     this.eyeLocal = profile.eye.clone();
     this.fov = profile.fov ?? 82;
   }

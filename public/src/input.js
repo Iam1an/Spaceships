@@ -20,7 +20,6 @@ export class Input {
     this.stickKnobY = 0;
     this._stickId = null;
     this._stickRadius = 80;
-    this.gpConnected = false;
     this.gp = {
       steerX: 0,
       steerY: 0,
@@ -158,7 +157,6 @@ export class Input {
       return a < DEAD ? 0 : Math.sign(v) * (a - DEAD) / (1 - DEAD);
     };
     const gamepad = [...(navigator.getGamepads?.() ?? [])].find(g => g?.connected);
-    this.gpConnected = !!gamepad;
     if (!gamepad) {
       this.gp.steerX = 0;
       this.gp.steerY = 0;

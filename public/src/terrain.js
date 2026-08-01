@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 export const TERRAIN_SIZE = 3600;
-export const TERRAIN_SEGS = 96;
+const TERRAIN_SEGS = 96;
 export const TERRAIN_KILL_CLEARANCE = 5;
 const AIRFIELDS = [
   { cx: 0, cz: -1500, hw: 280, hd: 190 },  // team 0

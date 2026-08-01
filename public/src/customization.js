@@ -84,7 +84,6 @@ export function initCustomizationScene(canvasEl) {
   const hullMeshes = [];
   const accentMeshes = [];
   const currentColor = new THREE.Color(getSavedShipColor());
-  const currentAccentColor = new THREE.Color(getSavedAccentColor());
   let running = false;
   let raf = null;
   let angle = 0;
@@ -114,7 +113,6 @@ export function initCustomizationScene(canvasEl) {
     }
   }
   function setAccentColor(hex) {
-    currentAccentColor.set(hex);
     const n = parseInt(hex.replace('#', ''), 16);
     for (const m of accentMeshes) {
       if (m.material?.color) m.material.color.setHex(n);

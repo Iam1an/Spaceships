@@ -176,12 +176,10 @@ export function createTouchHud({ input, scheme }) {
   slider.appendChild(sliderThumb);
   slider.appendChild(sliderLabel);
   root.appendChild(slider);
-  let throttleFrac = 0;
   function setThrottleFromTouchY(clientY) {
     const rect = slider.getBoundingClientRect();
     const y = clientY - rect.top;
     const f = Math.max(0, Math.min(1, 1 - y / rect.height));
-    throttleFrac = f;
     input.throttleOverride = f;
     const pct = (f * 100).toFixed(0);
     sliderFill.style.height = pct + '%';

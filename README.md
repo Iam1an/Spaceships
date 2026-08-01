@@ -198,11 +198,9 @@ graph TD
 │       ├── mothership.js     # Static mothership object
 │       ├── warp.js           # Warp jump visual effect
 │       │
-│       ├── carrier.js        # Aircraft carrier (team base)
 │       ├── terrain.js        # Ground terrain + airfields
 │       ├── airfield.js       # Landing and spawn zones
 │       ├── trees.js          # Environmental foliage
-│       ├── water.js          # Water surface rendering
 │       └── clouds.js         # Volumetric cloud layer
 │
 ├── server/

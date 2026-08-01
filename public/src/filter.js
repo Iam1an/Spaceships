@@ -1,12 +1,12 @@
 const BLOCKED = [
-  'nigger', 'nigga', 'nigg3r', 'n1gger', 'n1gga', 'niggah',
+  'nigger', 'nigga', 'niggah',
   'chink', 'spic', 'spick', 'kike', 'gook', 'wetback', 'beaner',
   'towelhead', 'raghead', 'sandnigger', 'coon', 'jigaboo', 'sambo',
   'zipperhead', 'slope', 'nip', 'wog', 'paki', 'cracker',
   'faggot', 'fagot', 'fag', 'dyke', 'tranny',
   'retard', 'retarded', 'spaz',
   'whore', 'cunt', 'slut', 'twat',
-  'chigger', 'groid', 'zipperhead',
+  'chigger', 'groid',
 ];
 function normalise(text) {
   return text.toLowerCase()
