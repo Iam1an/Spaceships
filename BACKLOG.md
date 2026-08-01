@@ -226,7 +226,81 @@ that out before building a cinematic around it.
 
 ---
 
-## 5. Falls out of the replay system nearly free
+## 5. Co-op bombing missions
+
+An open-map strike mission. A bomber run against a defended ground target, with
+escorts and interceptors, and every role fillable by a player *or* an AI.
+
+### The shape
+
+**Strike side.** One or two bombers fly to a target and put ordnance on it.
+Two-crew is the interesting version: one player flies, the other takes the
+bombardier seat, looks down, finds the aim point and releases. Escorts — human
+or AI — keep the interceptors off them.
+
+**Defence side.** Patrol fighters scramble to intercept. Also human or AI.
+
+**Any seat can be a bot.** This is the feature that makes the mode work at all,
+because the game usually has one or two people in it. Two players plus AI in
+every other role should play as a complete mission, and the same mission should
+scale up to a full lobby without changing.
+
+### What already exists
+
+| Piece | Status |
+|---|---|
+| Open map with terrain, trees, cloud layer, airfields at Z=+/-1500 | **exists** (Sierras) |
+| Ground contact is instant death — the low run is genuinely dangerous | **exists** |
+| Terrain proximity voice warnings on the bomb run | **exists** |
+| Bombardier view: cockpit + free-look pointed down | **exists** (`fpcamera.js`, `cockpit.js`) |
+| AI that seeks, attacks and evades | **exists** (`bot.js`) |
+| Filling empty slots with bots | **exists** (`allowBot` on `create`) |
+| Two teams with separate spawns | **exists** |
+| A defended target with aiming turrets | **exists** (the capital ship) |
+
+### What is genuinely new
+
+- **Bombs.** An unguided, gravity-affected weapon. Different enough from every
+  existing weapon to be interesting: no lock, no homing, and the skill is the
+  release solution rather than the aim.
+- **Ground targets** with damage state and a destruction condition.
+- **Two players in one aircraft.** This is the real engineering cost. `sim`
+  currently takes one `Input` per ship; a crewed aircraft needs pilot input and
+  bombardier input against the same entity, which is a `World`/`Input` change,
+  not a client feature.
+- Mission flow: objectives, success and failure conditions, scoring.
+
+### Design tensions worth deciding early
+
+- **The passenger problem.** Sitting in a seat you cannot fly is boring unless
+  the role has real agency. The instinct to let one player do both is the safer
+  default — so make the second seat a **buff, not a requirement**: solo you can
+  bomb, but the release solution is harder and less accurate; crewed, the
+  bombardier gets a proper sight and a better drop. Nobody is ever stuck being
+  cargo, and two-up is genuinely better.
+- **Interceptors need a real window.** If bombers just fly to a coordinate, the
+  defenders have nothing to do. The tension comes from the bomber being slow,
+  low and committed during the run — that is the interceptors' moment, and the
+  escorts' job is to make it survivable.
+- **Bombing has to be a skill.** If it is "fly over, press key", it is a chore.
+  Altitude, speed and a lead solution should all matter, so getting good at it
+  is visible.
+- **AI has to be adequate, not equal.** A bot escort that cannot hold its own
+  makes the mode feel empty. `bot.js` currently only knows seek/attack/evade —
+  escorting, patrolling a route, and defending a point are new behaviours.
+
+### Why it fits this game
+
+Every other mode is a dogfight. This is the first one where the objective is
+somewhere else and the fighting is *in the way of it* — which is what makes
+combined-arms missions read as a real combat situation rather than a scoreboard.
+
+It also gives the terrain map a reason to exist. Right now Sierras is an
+alternate dogfight arena; here the ground is the point.
+
+---
+
+## 6. Falls out of the replay system nearly free
 
 - **Killcam.** A replay bounded to the 5 seconds before your death, from the
   killer's view.
@@ -239,7 +313,7 @@ that out before building a cinematic around it.
 
 ---
 
-## 6. Netcode: rollback
+## 7. Netcode: rollback
 
 A deterministic simulation is the hard prerequisite for rollback netcode — the
 thing that makes fighting games feel lagless online. The client predicts
@@ -251,7 +325,7 @@ foundation is already in place.
 
 ---
 
-## 7. Known gameplay issues found during the port
+## 8. Known gameplay issues found during the port
 
 Real behaviors in the current game, each verified against the source. Some are
 bugs, some are probably-unintended design. Decide individually.
@@ -272,7 +346,7 @@ bugs, some are probably-unintended design. Decide individually.
 
 ---
 
-## 8. Other ideas
+## 9. Other ideas
 
 - **Replace the pixel filter with a real post chain.** `PIXEL_SCALE = 3` renders
   to a third-res target and upscales. In Bevy this is a post-processing pass,
