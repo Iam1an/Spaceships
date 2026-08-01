@@ -123,7 +123,11 @@ fn model_fit(model: &str) -> (f32, Vec3) {
     if model.contains("jet") {
         // span 4.17 -> 5.43 to match the ship it replaces, then the origin
         // moved to the same fraction along the hull the old model used.
-        (5.43 / 4.17, Vec3::new(1.98, 0.22, 0.0))
+        // Span alone (5.43 / 4.17) matched the old ship's width but still read
+        // small, because the jet is also a third flatter -- 1.34 against 1.97 --
+        // so it presents much less area from behind. Scaled past parity until it
+        // has the same presence in the chase view.
+        (1.62, Vec3::new(1.98, 0.20, 0.0))
     } else {
         (1.0, Vec3::ZERO)
     }

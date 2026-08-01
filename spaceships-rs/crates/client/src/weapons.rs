@@ -171,11 +171,15 @@ const TRAIL_OFFSETS_LEGACY: [Vec3; 2] = [Vec3::new(-2.2, -0.05, -1.8), Vec3::new
 
 /// Nozzle positions for the F-22 airframe (`jet.glb`).
 ///
-/// Twin nozzles inboard at the tail: x = ±0.62, slightly below the centreline,
-/// and further aft than the old model's because the hull actually extends
-/// there. Derived from the converted mesh's own rear extent rather than
-/// guessed.
-const TRAIL_OFFSETS_JET: [Vec3; 2] = [Vec3::new(-0.62, -0.08, -3.5), Vec3::new(0.62, -0.08, -3.5)];
+/// Twin nozzles inboard at the tail, in **ship** space — so they have to follow
+/// `scene::model_fit`, which scales the jet up and shifts it nose-ward so it
+/// frames like the model it replaces. The first values here were derived
+/// against the unfitted mesh and left the plumes too wide, too high and hanging
+/// well behind the aircraft.
+const TRAIL_OFFSETS_JET: [Vec3; 2] = [
+    Vec3::new(-0.45, -0.06, -1.45),
+    Vec3::new(0.45, -0.06, -1.45),
+];
 
 /// Exhaust origins for whichever hull is flying.
 ///
