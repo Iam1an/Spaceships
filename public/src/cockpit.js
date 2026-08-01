@@ -39,17 +39,18 @@ export const COCKPIT_PROFILES = {
   },
   admin: {
     id: 'admin',
-    // Admin hull: the Cylinder spine runs to ship-local z 6.9 and the wing planes sit at
-    // z -1.2..2.1, so the seat goes well back to put nose ahead and wing roots in view.
-    eye: new THREE.Vector3(0, 1.30, 2.95),
+    // Seat position reverted after moving it back put the footwell below the hull's spine
+    // cylinder (ship-local z -1.9..6.9, top y 0.9), which then punched up through the floor
+    // between the pilot's legs. Only the rail is lowered, to open the outboard view.
+    eye: new THREE.Vector3(0, 1.16, 4.15),
     fov: 86,
     tub: {
-      halfWidth: 0.68,
-      floorY: 0.68,
-      railY: 0.96,
-      ceilY: 1.62,
-      backZ: 1.85,
-      dashZ: 4.05,
+      halfWidth: 0.74,
+      floorY: 0.54,
+      railY: 0.86,
+      ceilY: 1.58,
+      backZ: 3.05,
+      dashZ: 5.15,
     },
     accent: 0xffc451,
     lampColor: 0xffd39a,
