@@ -744,6 +744,7 @@ fn park_bullet(world: &mut World, pos: Vec3) {
         owner: 1,
         owner_team: Some(Team::Zero),
         owner_coarse_aim: false,
+        owner_is_bot: false,
         damage: rules.weapons.gun_damage,
     });
 }
@@ -1026,9 +1027,16 @@ fn aim_assist_turns_the_nose_and_lights_the_hud_through_the_tick() {
     // reaches both the ship's pose and `HudState`.
     let want = Vec3::new(120.0, 0.0, 300.0).normalize();
 
+    // Switched off by hand: assist now *defaults* on
+    // (`AimAssistState::default`), so this half of the test has to ask for the
+    // disabled case rather than assume it.
     let mut off = assisted_duel();
+    off.aim_assist.enabled = false;
     let frame = tick(&mut off, &[idle(1)], &[], TICK_DT);
-    assert_eq!(frame.hud.assist_target, -1, "assist is off by default");
+    assert_eq!(
+        frame.hud.assist_target, -1,
+        "a disabled assist draws no lock"
+    );
     assert_eq!(off.ship(1).expect("pilot").quat, Quat::IDENTITY);
 
     let mut on = assisted_duel();
@@ -1051,11 +1059,32 @@ fn aim_assist_turns_the_nose_and_lights_the_hud_through_the_tick() {
 }
 
 #[test]
+fn the_assist_defaults_on_for_a_mouse_pilot() {
+    // The JS reads a persisted `localStorage` flag (`main.js:996`) that a
+    // returning pilot has almost always set. With no settings store here, a
+    // faithful `false` means assist is off at every launch and `C` is the only
+    // way to it — which is how "there is no aim assist" gets reported. It
+    // engages without anyone having to know the binding.
+    let mut world = assisted_duel();
+    assert!(world.aim_assist.enabled, "a fresh world has assist on");
+    assert!(
+        !world.ship(1).expect("pilot").coarse_aim,
+        "and this pilot is on the precise profile, not force-enabled",
+    );
+
+    let frame = tick(&mut world, &[idle(1)], &[], TICK_DT);
+    assert_eq!(frame.hud.assist_target, 2, "it locks with no key pressed");
+}
+
+#[test]
 fn the_c_key_toggles_aim_assist_through_the_tick() {
     // Phase 5 owns the toggle and phase 4 owns the pull, so `C` lands on the
     // step *after* the one it is pressed on — the same order `main.js` has, where
     // `applyAimAssist` runs at `:1256` and the key edge is read at `:1385`.
     let mut world = assisted_duel();
+    // From off, so the sequence below reads on-then-off. The default is on; see
+    // `the_assist_defaults_on_for_a_mouse_pilot`.
+    world.aim_assist.enabled = false;
     let press = Input {
         id: 1,
         toggle_aim_assist: true,

@@ -195,12 +195,18 @@ const TRAIL_OFFSETS_JET: [Vec3; 2] = [
 /// Keyed off the same `SPACESHIPS_SHIP_MODEL` switch `scene.rs` reads, so the
 /// trails follow the model rather than needing a second decision. When the jet
 /// becomes the default this collapses to one constant.
+/// Multiplied by [`crate::scene::SHIP_SCALE`] because these are consumed in
+/// **world** space — `emit` computes `ship.pos + quat * offset` rather than
+/// parenting the motes to the hull — so unlike the mesh they do not inherit the
+/// ship's scale and have to be given it. Both constants are authored in the
+/// same pre-scale space the JS authors `TRAIL_OFFSETS` in, where they are
+/// children of a group `main.js:219` scales.
 fn trail_offsets() -> [Vec3; 2] {
     #[cfg(not(target_arch = "wasm32"))]
     if std::env::var("SPACESHIPS_SHIP_MODEL").is_ok_and(|m| m.contains("jet")) {
-        return TRAIL_OFFSETS_JET;
+        return TRAIL_OFFSETS_JET.map(|o| o * crate::scene::SHIP_SCALE);
     }
-    TRAIL_OFFSETS_LEGACY
+    TRAIL_OFFSETS_LEGACY.map(|o| o * crate::scene::SHIP_SCALE)
 }
 
 /// One row of `main.js`'s `EMIT_CONFIG`.

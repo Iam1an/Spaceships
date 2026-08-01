@@ -879,7 +879,7 @@ fn rotate_toward(q: Quat, from: Vec3, to: Vec3, max_angle: f64) -> Quat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::{Asteroid, AsteroidTier, Flare, MapKind, Mode};
+    use crate::world::{Asteroid, AsteroidTier, Flare, MapKind, Mode, ShooterAim};
 
     const SEED: u64 = 0x5EED_5EED;
     const DT: f64 = 1.0 / 60.0;
@@ -1179,16 +1179,22 @@ mod tests {
     // --- defect 2: the shared hit radius ---------------------------------
 
     #[test]
-    fn bot_bullets_resolve_against_the_unified_ship_radius() {
+    fn bot_bullets_resolve_against_the_narrower_bot_radius() {
         let mut w = duel(200.0);
         tick(&mut w, 30);
         let b = *w.bullets.first().expect("no bullet");
         // The bullet carries no radius of its own: the target's radius plus the
-        // bullet's is what a hit test uses, and it is the same 6.0 the player's
-        // shots get. The bot-only 4.0 is gone.
+        // bullet's is what a hit test uses. A bot's shot sees 4.0 —
+        // `bot.js:31`+`:52` — where a player's sees 6.0, and that difference is
+        // the difficulty setting. Losing it is what made the ported bots play
+        // as far deadlier than the originals.
         let target = w.ship(2).unwrap();
         assert!(!b.owner_coarse_aim);
-        assert_eq!(target.hit_radius(&w.rules, b.owner_coarse_aim), 6.0);
+        assert!(b.owner_is_bot, "a bot's bullet must be marked as one");
+        assert_eq!(
+            target.hit_radius(&w.rules, ShooterAim::of(w.ship(1).unwrap())),
+            4.0
+        );
         assert_eq!(w.rules.weapons.bullet_radius, 0.5);
     }
 

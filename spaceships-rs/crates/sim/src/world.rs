@@ -291,6 +291,35 @@ pub enum ShipKind {
     BossHitbox,
 }
 
+/// What a shot knows about whoever fired it, for [`Ship::hit_radius`].
+///
+/// Both fields widen or narrow *every* target the shot can reach, so they are
+/// properties of the shooter and are captured when the shot is created rather
+/// than looked up on impact — a projectile routinely outlives its owner.
+///
+/// [`ShooterAim::default`] is a precise-aim player, which is the conservative
+/// answer for any weapon that has no opinion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShooterAim {
+    /// Shooter was on [`crate::rules::AimProfile::Coarse`]:
+    /// [`crate::rules::ShipRules::hit_radius_coarse_aim_bonus`].
+    pub coarse: bool,
+    /// Shooter was a bot:
+    /// [`crate::rules::ShipRules::hit_radius_bot_penalty`].
+    pub bot: bool,
+}
+
+impl ShooterAim {
+    /// What a given ship's shots carry.
+    #[must_use]
+    pub fn of(ship: &Ship) -> ShooterAim {
+        ShooterAim {
+            coarse: ship.coarse_aim,
+            bot: ship.kind == ShipKind::Bot,
+        }
+    }
+}
+
 /// State for interpolating a networked ship between `state` messages.
 ///
 /// `main.js:827`–`:853` (ingest) and `main.js:1721`–`:1726` (interpolation).
@@ -548,19 +577,22 @@ impl Ship {
 
     /// The radius a weapon must reach to hit this ship.
     ///
-    /// One function, so no weapon can invent its own answer. `shooter_coarse`
-    /// is the *shooter's* control scheme; see
-    /// [`crate::rules::ShipRules::hit_radius_coarse_aim_bonus`].
+    /// One function, so no weapon can invent its own answer. Every adjustment
+    /// keys off [`ShooterAim`] — the *shooter*, never the target — so none of
+    /// them can be farmed by changing something about yourself.
     #[must_use]
-    pub fn hit_radius(&self, rules: &Rules, shooter_coarse: bool) -> f64 {
+    pub fn hit_radius(&self, rules: &Rules, shooter: ShooterAim) -> f64 {
         if let Some(r) = self.hit_radius_override {
             return r;
         }
-        if shooter_coarse {
-            rules.ship.hit_radius + rules.ship.hit_radius_coarse_aim_bonus
-        } else {
-            rules.ship.hit_radius
+        let mut r = rules.ship.hit_radius;
+        if shooter.coarse {
+            r += rules.ship.hit_radius_coarse_aim_bonus;
         }
+        if shooter.bot {
+            r -= rules.ship.hit_radius_bot_penalty;
+        }
+        r
     }
 
     /// Whether this ship can currently be damaged at all.
@@ -626,6 +658,13 @@ pub struct Bullet {
     /// Whether the owner had coarse aim, so the hit radius follows the shot
     /// rather than being re-derived at impact.
     pub owner_coarse_aim: bool,
+    /// Whether the owner was a bot, for
+    /// [`crate::rules::ShipRules::hit_radius_bot_penalty`].
+    ///
+    /// Snapshotted at launch for the same reason [`Self::owner_team`] is: a
+    /// bullet outlives its shooter, and looking the owner up at impact would
+    /// make a round fired by a bot that has since died behave as a player's.
+    pub owner_is_bot: bool,
     /// Damage on hit. Carried per bullet so the boss's turret rounds
     /// ([`crate::rules::WeaponRules::boss_bullet_damage`]) share this list
     /// instead of needing the separate `bossBullets` array at `main.js:2327`.
@@ -811,7 +850,7 @@ pub struct BoxVolume {
 /// One instance, on [`World`], for the local player: assist is a client-side
 /// aiming aid, and a headless server with no [`World::local_id`] never runs it.
 /// See [`crate::aim_assist`].
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AimAssistState {
     /// Whether assist is switched on. Forced on for coarse-aim pilots
     /// (`main.js:996`); see [`crate::aim_assist::update`], which rewrites this
@@ -834,6 +873,33 @@ pub struct AimAssistState {
     pub has_target: bool,
     /// Unit direction toward the intercept point of the held target.
     pub target_dir: Vec3,
+}
+
+impl Default for AimAssistState {
+    /// **Divergence, deliberate.** `main.js:996` starts a precise-aim pilot at
+    /// `localStorage.getItem('spaceships:aimAssist') === '1'` — off on a fresh
+    /// browser, and thereafter whatever they last chose. That default only
+    /// works because the setting *persists*: you turn it on once and the
+    /// browser remembers forever.
+    ///
+    /// This client has no settings store, so a faithful `false` means assist is
+    /// off at every single launch, `C` is the only way to it, and — since the
+    /// port never carried `showAimAssistToast` (`main.js:2004`) — pressing `C`
+    /// gives no sign anything happened. That reads as "the game has no aim
+    /// assist", which is exactly how it was reported.
+    ///
+    /// On is also the better default on its own merits: it is what the coarse
+    /// profiles get unconditionally, and `C` still turns it off for anyone who
+    /// wants the raw stick.
+    fn default() -> Self {
+        AimAssistState {
+            enabled: true,
+            strength_smoothed: 0.0,
+            target: None,
+            has_target: false,
+            target_dir: Vec3::ZERO,
+        }
+    }
 }
 
 impl AimAssistState {
@@ -2145,14 +2211,38 @@ mod tests {
     fn hit_radius_is_one_number_unless_overridden() {
         let rules = Rules::DEFAULT;
         let mut s = Ship::spawn(1, ShipKind::Bot, Vec3::ZERO, Quat::IDENTITY, &rules);
-        assert_eq!(s.hit_radius(&rules, false), 6.0);
-        assert_eq!(s.hit_radius(&rules, true), 7.0, "coarse aim widens by 1.0");
+        let player = ShooterAim::default();
+        let coarse = ShooterAim {
+            coarse: true,
+            bot: false,
+        };
+        let bot = ShooterAim {
+            coarse: false,
+            bot: true,
+        };
+        assert_eq!(s.hit_radius(&rules, player), 6.0);
+        assert_eq!(
+            s.hit_radius(&rules, coarse),
+            7.0,
+            "coarse aim widens by 1.0"
+        );
+        assert_eq!(
+            s.hit_radius(&rules, bot),
+            4.0,
+            "a bot's shot sees the JS's 4.0, not a player's 6.0"
+        );
+
+        // The radius follows the *shooter*: this is the target's own kind, and
+        // it must not matter. `s` is a bot and is still 6.0 to a player.
+        assert_eq!(s.kind, ShipKind::Bot);
+        assert_eq!(s.hit_radius(&rules, player), 6.0);
 
         // A boss hitbox is the one legitimate override, and it ignores the
         // shooter's aim profile — the sphere is 28 either way.
         s.hit_radius_override = Some(rules.weapons.boss_hitbox_radius);
-        assert_eq!(s.hit_radius(&rules, false), 28.0);
-        assert_eq!(s.hit_radius(&rules, true), 28.0);
+        assert_eq!(s.hit_radius(&rules, player), 28.0);
+        assert_eq!(s.hit_radius(&rules, coarse), 28.0);
+        assert_eq!(s.hit_radius(&rules, bot), 28.0);
     }
 
     #[test]

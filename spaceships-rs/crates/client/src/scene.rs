@@ -118,8 +118,33 @@ pub(crate) fn ship_model() -> String {
 /// camera reads as "how big is my ship", so it is scaled to match.
 ///
 /// Numbers are model space, before `ship.js`'s -90 degree yaw and before
-/// `SHIP_SCALE`. Nose is +x.
+/// [`SHIP_SCALE`], which the returned scale folds in. Nose is +x.
 fn model_fit(model: &str) -> (f32, Vec3) {
+    let (fit, offset) = model_fit_unscaled(model);
+    (fit * SHIP_SCALE, offset)
+}
+
+/// `main.js:188`. Every ship in the JS is drawn at `1.5`: the local one at
+/// `main.js:219` and every remote one at `:667`.
+///
+/// **This was missing, and it is why ships looked tiny.** The comment above
+/// already said these numbers were "before `SHIP_SCALE`" — nothing ever applied
+/// it, so hulls rendered at two thirds the size the game is designed around.
+///
+/// It is not only a look. `main.js:980` derives the collision radius as
+/// `2.2 * SHIP_SCALE`, and [`spaceships_sim::rules::ShipRules::collide_radius`]
+/// is that 3.3 with the 1.5 already inside it. Drawing at 1.0 therefore put a
+/// hitbox around a ship half again bigger than the mesh, so shots that visibly
+/// missed still landed. Restoring the scale is what makes the two agree.
+///
+/// Anything anchored to the hull in world space has to carry it too — see
+/// `weapons.rs`'s nozzles.
+pub(crate) const SHIP_SCALE: f32 = 1.5;
+
+/// [`model_fit`] before [`SHIP_SCALE`], which is the space the fit was measured
+/// in: both entries below compare one model against the other, and neither
+/// changes when the shared scale does.
+fn model_fit_unscaled(model: &str) -> (f32, Vec3) {
     if model.contains("jet") {
         // span 4.17 -> 5.43 to match the ship it replaces, then the origin
         // moved to the same fraction along the hull the old model used.

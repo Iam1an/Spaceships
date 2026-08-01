@@ -105,7 +105,7 @@ use crate::math::Vec3;
 use crate::rng::Rng;
 use crate::world::{
     is_boss_hitbox, EntityId, ExplosionKind, Flare, Missile, MissileTarget, Ship, ShipKind,
-    SimEvent, Team, World,
+    ShooterAim, SimEvent, Team, World,
 };
 
 // ---------------------------------------------------------------------------
@@ -1000,7 +1000,10 @@ fn first_contact(
         // (`main.js:406` passes it into `createBullets` and nowhere else).
         // `missiles.js` never saw it, so a missile gets the plain radius — or
         // the campaign's override, which is the fix this port exists for.
-        let sphere = Sphere::new(s.pos, s.hit_radius(&world.rules, false));
+        // A missile carries no shooter traits: `missiles.js:5` gives every
+        // missile one `HIT_RADIUS` whoever launched it, and the counter to a
+        // bot's missile is a flare rather than a smaller target.
+        let sphere = Sphere::new(s.pos, s.hit_radius(&world.rules, ShooterAim::default()));
         // Ships move during the step too. `update` runs before the movers, so
         // `Ship::pos` is the start-of-step pose and `vel * dt` is the
         // displacement over the same interval the missile covers — the identical

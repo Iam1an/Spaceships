@@ -313,6 +313,10 @@ pub struct Sweep {
     /// [`crate::rules::ShipRules::hit_radius_coarse_aim_bonus`]. A property of
     /// the shooter, never of the target.
     pub owner_coarse_aim: bool,
+    /// Whether the owner was a bot, which narrows every target ship by
+    /// [`crate::rules::ShipRules::hit_radius_bot_penalty`]. Also a property of
+    /// the shooter.
+    pub owner_is_bot: bool,
 }
 
 impl Sweep {
@@ -327,6 +331,7 @@ impl Sweep {
             owner: bullet.owner,
             owner_team: bullet.owner_team,
             owner_coarse_aim: bullet.owner_coarse_aim,
+            owner_is_bot: bullet.owner_is_bot,
         }
     }
 
@@ -345,6 +350,7 @@ impl Sweep {
             owner: shooter.id,
             owner_team: shooter.team,
             owner_coarse_aim: shooter.coarse_aim,
+            owner_is_bot: shooter.kind == crate::world::ShipKind::Bot,
         }
     }
 }
@@ -529,7 +535,13 @@ pub fn resolve_impact(world: &World, sweep: &Sweep, hulls: HullVolumes<'_>) -> O
                 continue;
             }
         }
-        let hit_radius = s.hit_radius(&world.rules, sweep.owner_coarse_aim);
+        let hit_radius = s.hit_radius(
+            &world.rules,
+            crate::world::ShooterAim {
+                coarse: sweep.owner_coarse_aim,
+                bot: sweep.owner_is_bot,
+            },
+        );
         let motion = s.vel * sweep.step_dt;
         // Widen the cull by the target's own displacement, so a ship crossing
         // the segment is not culled at its start position.
@@ -624,6 +636,8 @@ pub struct BulletSpawn {
     pub owner_team: Option<Team>,
     /// Whether the owner had coarse aim.
     pub owner_coarse_aim: bool,
+    /// Whether the owner was a bot.
+    pub owner_is_bot: bool,
     /// Damage on impact.
     pub damage: i32,
 }
@@ -646,6 +660,7 @@ impl BulletSpawn {
             owner: shooter.id,
             owner_team: shooter.team,
             owner_coarse_aim: shooter.coarse_aim,
+            owner_is_bot: shooter.kind == crate::world::ShipKind::Bot,
             damage: rules.weapons.gun_damage,
         }
     }
@@ -667,6 +682,11 @@ impl BulletSpawn {
             owner,
             owner_team,
             owner_coarse_aim: false,
+            // The boss is not a bot: `BotRules` never touches it, and its
+            // turrets are tuned by `WeaponRules::boss_bullet_*`. Taking the bot
+            // penalty here would nerf the campaign fight as a side effect of a
+            // deathmatch rebalance.
+            owner_is_bot: false,
             damage: rules.weapons.boss_bullet_damage,
         }
     }
@@ -688,6 +708,7 @@ pub fn spawn_bullet(world: &mut World, spawn: BulletSpawn) -> u64 {
         owner: spawn.owner,
         owner_team: spawn.owner_team,
         owner_coarse_aim: spawn.owner_coarse_aim,
+        owner_is_bot: spawn.owner_is_bot,
         damage: spawn.damage,
     });
     key
@@ -1265,8 +1286,12 @@ mod tests {
     }
 
     /// A ship at `pos`, on `team`, with spawn protection already expired.
+    // `Local`, not `Bot`: a bot's shots take
+    // `ShipRules::hit_radius_bot_penalty`, so a fixture that spawned bots would
+    // quietly narrow every target in every test that fires through this helper.
+    // The radii pinned below are the player's, which is what they claim to be.
     fn ship(w: &mut World, id: i32, team: Option<Team>, pos: Vec3) -> usize {
-        let mut s = Ship::spawn(id, ShipKind::Bot, pos, Quat::IDENTITY, &w.rules);
+        let mut s = Ship::spawn(id, ShipKind::Local, pos, Quat::IDENTITY, &w.rules);
         s.team = team;
         s.invuln_timer = 0.0;
         w.ships.push(s);
@@ -1377,6 +1402,7 @@ mod tests {
             owner: 1,
             owner_team: Some(Team::Zero),
             owner_coarse_aim: false,
+            owner_is_bot: false,
         };
         let impact = resolve_impact(&w, &sweep, HullVolumes::EMPTY).expect("hit");
         assert!(matches!(impact.target, Target::Ship { id: 2, .. }));
@@ -1401,6 +1427,7 @@ mod tests {
             owner: 1,
             owner_team: Some(Team::Zero),
             owner_coarse_aim: false,
+            owner_is_bot: false,
         };
         let near = resolve_impact(&w, &sweep, HullVolumes::EMPTY).expect("hit");
         assert!(matches!(near.target, Target::Asteroid { id: 10, .. }));
@@ -1546,6 +1573,7 @@ mod tests {
             owner: 1,
             owner_team: Some(Team::Zero),
             owner_coarse_aim: false,
+            owner_is_bot: false,
         };
         assert!(resolve_impact(&w, &base, HullVolumes::EMPTY).is_none());
         let coarse = Sweep {
@@ -1630,6 +1658,7 @@ mod tests {
             owner: 1,
             owner_team: Some(Team::Zero),
             owner_coarse_aim: false,
+            owner_is_bot: false,
         };
         assert!(resolve_impact(&w, &sweep, HullVolumes::EMPTY).is_some());
         // With the target frozen it is 30 units off the line and cannot be hit.
@@ -2203,7 +2232,11 @@ mod tests {
         let mut w = World::new(1, Rules::DEFAULT, Mode::Multiplayer, MapKind::Space);
         w.obstacles.clear();
         w.boxes.clear();
-        ship(&mut w, 5, Some(Team::Zero), Vec3::ZERO); // ShipKind::Bot by default
+        // Explicitly a bot: that is the whole subject of this test, and the
+        // fixture deliberately spawns players.
+        let shooter = ship(&mut w, 5, Some(Team::Zero), Vec3::ZERO);
+        w.ships[shooter].kind = ShipKind::Bot;
+        // Dead ahead, so the narrower bot radius still connects.
         ship(&mut w, 2, Some(Team::One), v(0.0, 0.0, 40.0));
         let mut out = BulletOutput::new();
         shoot(&mut w, 5, Vec3::ZERO, Vec3::Z);

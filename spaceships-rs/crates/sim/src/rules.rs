@@ -371,6 +371,27 @@ pub struct ShipRules {
     /// switching your own control scheme.
     pub hit_radius_coarse_aim_bonus: f64,
 
+    /// Hit radius *removed* when the shooter is a bot.
+    ///
+    /// **This reverses a decision made above.** [`Self::hit_radius`] unified
+    /// five JS radii on 6.0, and its comment argued that the bot's 4.0
+    /// (`bot.js:31`+`:52`, `SHIP_RADIUS + 0.5`) made bots "read as bad at
+    /// aiming when they are actually being cheated". That reading was wrong in
+    /// the way that matters: the 4.0 *was* the difficulty setting. A 6.0 sphere
+    /// against a 4.0 one is 2.25x the cross-section, so the port's bots landed
+    /// shots the JS's would have missed from identical geometry, and they
+    /// played as markedly harder than the game they are a port of.
+    ///
+    /// Restoring it as a shooter-keyed penalty rather than by lowering
+    /// [`Self::hit_radius`] keeps every player weapon at 6.0 and keeps the
+    /// "one function decides a hit radius" property — it is the same shape as
+    /// [`Self::hit_radius_coarse_aim_bonus`], applied at the same place, and
+    /// varying it is how a difficulty tier would be expressed.
+    ///
+    /// 2.0 puts a bot back on the JS's 4.0. Zero makes bots shoot exactly as
+    /// well as players.
+    pub hit_radius_bot_penalty: f64,
+
     /// Top speed at full throttle, before boost. `main.js:982`
     /// (`MAX_THROTTLE`).
     pub max_throttle: f64,
@@ -475,6 +496,7 @@ impl ShipRules {
         collide_radius: 3.3,
         hit_radius: 6.0,
         hit_radius_coarse_aim_bonus: 1.0,
+        hit_radius_bot_penalty: 2.0,
 
         max_throttle: 80.0,
         boost_factor: 1.7,
