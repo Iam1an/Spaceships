@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/sim", "crates/server"]
+members = ["crates/client", "crates/protocol", "crates/sim", "crates/server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,6 +18,51 @@ serde_json = "1"
 spaceships-protocol = { path = "crates/protocol" }
 spaceships-sim = { path = "crates/sim" }
 
+# ── Server-only dependencies ─────────────────────────────────────────────────
+# Exact-pinned: this is an application, not a library, and a silent minor bump
+# in the JWT or bcrypt layer would break every account in pilots.db. `sim` and
+# `protocol` must not use any of these.
+axum = { version = "=0.8.9", features = ["ws"] }
+tokio = { version = "=1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "signal",
+] }
+tokio-tungstenite = "=0.30.0"
+tower = { version = "=0.5.3", features = ["util"] }
+tower-http = { version = "=0.7.0", features = ["fs"] }
+rusqlite = { version = "=0.40.1", features = ["bundled"] }
+bcrypt = "=0.19.3"
+# `rust_crypto` selects the pure-Rust provider (jsonwebtoken 10 requires an
+# explicit one); `use_pem` is off because only HMAC secrets are ever loaded.
+jsonwebtoken = { version = "=10.3.0", default-features = false, features = [
+    "rust_crypto",
+] }
+futures-util = { version = "=0.3.33", default-features = false, features = [
+    "sink",
+    "std",
+] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Web builds only (`crates/client/build-wasm.sh`). Additive: it changes nothing
+# about how `sim`, `protocol`, or `server` build, and nothing uses it unless
+# `--profile wasm-release` is passed.
+#
+# A wasm payload is bandwidth-bound, not CPU-bound, so the trade `release`
+# makes is the wrong one here. `opt-level = "z"` and fat LTO are worth several
+# megabytes; `panic = "abort"` drops the unwinding tables, which nothing in the
+# browser can use anyway. This is the profile Bevy's own `build-wasm-example`
+# tool defines, for the same reasons.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

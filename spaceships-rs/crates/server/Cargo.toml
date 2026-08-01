@@ -1,17 +1,37 @@
 [package]
 name = "spaceships-server"
-description = "Placeholder binary for the Rust port of the Spaceships game server."
+description = "Rust port of the Spaceships game server (HTTP API, static files, WebSocket lobby, SQLite persistence)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[lib]
+name = "spaceships_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "spaceships-server"
 path = "src/main.rs"
 
-# Deliberately minimal. No axum, no tokio, no rusqlite yet — the HTTP/WebSocket
-# and persistence layers are not designed, and pulling in a runtime before that
-# decision is made would bias it. See the module docs in src/main.rs.
 [dependencies]
 spaceships-protocol = { workspace = true }
+spaceships-sim = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+futures-util = { workspace = true }
+
+rusqlite = { workspace = true }
+bcrypt = { workspace = true }
+jsonwebtoken = { workspace = true }
+
+[dev-dependencies]
+# The integration tests drive the running server with a real WebSocket client —
+# the other half of the handshake the JS server hand-rolled.
+tokio-tungstenite = { workspace = true }
