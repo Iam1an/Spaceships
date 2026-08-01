@@ -24,6 +24,7 @@
 - [Game Modes](#-game-modes)
 - [Controls](#-controls)
 - [Weapons](#%EF%B8%8F-weapons)
+- [Development & Testing](#-development--testing)
 - [Architecture](#-architecture)
 - [Project Structure](#-project-structure)
 - [Tech Stack](#-tech-stack)
