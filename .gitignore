@@ -35,5 +35,7 @@ pilots.db-shm
 pilots.db-wal
 
 # Claude
+# .claude holds agent worktrees and local settings -- not source.
+# CLAUDE.md IS tracked: it carries project context that agents need, and
+# untracked files do not propagate into git worktrees.
 .claude
-CLAUDE.md
