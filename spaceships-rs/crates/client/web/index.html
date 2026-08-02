@@ -3,44 +3,227 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
-    <title>Spaceships (wasm)</title>
+    <meta name="color-scheme" content="dark" />
+    <title>Spaceships (Rust)</title>
+    <link rel="icon" href="assets/favicon.png" />
     <style>
       html, body { margin: 0; height: 100%; background: #05050c; overflow: hidden; }
       /* Bevy's `fit_canvas_to_parent` sizes the canvas from its parent, so the
          parent is what needs the dimensions. */
       #wrap { width: 100vw; height: 100vh; }
-      canvas { display: block; outline: none; }
-      #status {
+      canvas { display: block; outline: none; touch-action: none; }
+
+      /* The boot screen. It covers the canvas until the wasm is running, and
+         is removed rather than hidden so it can never eat a click. */
+      #boot {
         position: fixed; inset: 0; display: grid; place-items: center;
-        color: #8ea8c8; font: 14px ui-monospace, monospace; pointer-events: none;
+        background: radial-gradient(ellipse at center, #1a2540 0%, #03050a 85%);
+        color: #8ea8c8; font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+        text-align: center; z-index: 10;
       }
+      #boot .inner { max-width: 34rem; padding: 0 1.5rem; }
+      #boot h1 {
+        margin: 0 0 1.6rem; font-size: 1.5rem; font-weight: 600; letter-spacing: .34em;
+        color: #66ddff; text-transform: uppercase;
+      }
+      #bar {
+        width: min(22rem, 70vw); height: 4px; margin: 1.4rem auto .8rem;
+        background: rgba(102,221,255,.14); border-radius: 2px; overflow: hidden;
+      }
+      #bar > i {
+        display: block; height: 100%; width: 0%;
+        background: linear-gradient(90deg, #4aa3ff, #66ddff);
+        transition: width .18s linear;
+      }
+      /* Before the payload size is known there is nothing honest to show as a
+         percentage, so the bar sweeps instead of lying about progress. */
+      #bar.indeterminate > i {
+        width: 34%; animation: sweep 1.1s ease-in-out infinite alternate;
+      }
+      @keyframes sweep { from { margin-left: -34%; } to { margin-left: 100%; } }
+      #boot .note { color: #62809c; font-size: 12px; }
+      #boot .err { color: #ff5566; white-space: pre-wrap; text-align: left; }
+      #boot a { color: #66ddff; }
+
+      /* A way back to the Three.js client, since this page is reached from the
+         same domain and there is otherwise no exit. Sits over the game, out of
+         the way; the HUD does not use this corner. */
+      #back {
+        position: fixed; right: 10px; bottom: 8px; z-index: 5;
+        font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: .1em; text-transform: uppercase;
+        color: #4d6b86; text-decoration: none; padding: 6px 9px;
+        border: 1px solid rgba(102,221,255,.14); border-radius: 4px;
+        background: rgba(6,12,24,.5); backdrop-filter: blur(8px);
+      }
+      #back:hover { color: #66ddff; border-color: rgba(102,221,255,.4); }
     </style>
   </head>
   <body>
-    <div id="wrap"><canvas id="game"></canvas></div>
-    <div id="status">loading…</div>
+    <!-- `tabindex` is what makes the canvas able to hold keyboard focus.
+         `main.rs` sets `prevent_default_event_handling: false` so the browser
+         keeps F5 and devtools, which means winit listens on the canvas rather
+         than the window and an unfocused canvas receives no key events at all —
+         a game that renders and ignores the keyboard. -->
+    <div id="wrap"><canvas id="game" tabindex="0"></canvas></div>
+    <a id="back" href="/spaceships/">Three.js version</a>
+
+    <div id="boot">
+      <div class="inner">
+        <h1>Spaceships</h1>
+        <div id="msg">loading…</div>
+        <div id="bar" class="indeterminate"><i></i></div>
+        <div class="note" id="sub">Rust · Bevy · WebGL2</div>
+      </div>
+    </div>
 
     <script type="module">
-      // wasm-bindgen's `--target web` output. The .wasm is fetched by the shim
-      // relative to its own URL, which is why vite.config.js's WASM-readiness
-      // note calls out `optimizeDeps.exclude` — esbuild rewrites that URL and
-      // the fetch 404s. This page loads the shim directly, so it does not
-      // apply here; it will when this is wired into the Vite build.
-      import init from './spaceships-client.js';
+      const boot = document.getElementById('boot');
+      const msg = document.getElementById('msg');
+      const sub = document.getElementById('sub');
+      const bar = document.getElementById('bar');
+      const fill = bar.firstElementChild;
 
-      const status = document.getElementById('status');
+      const fail = (title, detail) => {
+        bar.remove();
+        msg.textContent = title;
+        sub.className = 'err';
+        sub.textContent = detail;
+      };
+
+      // ── Audio ────────────────────────────────────────────────────────────
+      // Browsers start every AudioContext suspended until a user gesture, and
+      // bevy_audio constructs its one eagerly inside `AudioPlugin::build` —
+      // always before any gesture. cpal calls `resume()` and drops the
+      // returned promise un-awaited, so nothing errors and nothing plays; see
+      // the long trace in `audio.rs`'s module docs. There is no public handle
+      // on that context from Rust, so the page has to keep its own.
+      //
+      // This must run before the module is instantiated: cpal builds the
+      // context through the global constructor, so patching the global is what
+      // catches it.
+      {
+        const Ctor = window.AudioContext || window.webkitAudioContext;
+        if (Ctor) {
+          const live = [];
+          const patched = new Proxy(Ctor, {
+            construct: (target, args) => {
+              const ctx = new target(...args);
+              live.push(ctx);
+              return ctx;
+            },
+          });
+          window.AudioContext = patched;
+          window.webkitAudioContext = patched;
+          const resume = () => {
+            for (const ctx of live) {
+              if (ctx.state !== 'running') ctx.resume().catch(() => {});
+            }
+          };
+          for (const ev of ['pointerdown', 'keydown', 'touchstart']) {
+            addEventListener(ev, resume, { passive: true });
+          }
+        }
+      }
+
+      // ── WebGL2 ───────────────────────────────────────────────────────────
+      // The client is built with bevy's `webgl2` feature and no WebGPU
+      // fallback. Without this check the failure is a wgpu panic in the
+      // console and a black page.
+      if (!document.createElement('canvas').getContext('webgl2')) {
+        fail(
+          'This browser has no WebGL2.',
+          'Spaceships needs WebGL2. On Safari, enable it under\n' +
+            'Develop → Experimental Features. Otherwise try Chrome or Firefox.',
+        );
+        throw new Error('no webgl2');
+      }
+
+      // ── Payload ──────────────────────────────────────────────────────────
+      // Fetched by hand rather than letting the wasm-bindgen shim do it, for
+      // one reason: this is a ~15 MB download and a page that says nothing for
+      // twenty seconds looks broken. Streaming the body through a
+      // `TransformStream` back into a `Response` keeps
+      // `instantiateStreaming`'s compile-while-downloading — handing over an
+      // ArrayBuffer instead would serialise the two.
+      //
+      // `build.json` carries the *uncompressed* byte count, which is what the
+      // reader below counts. `Content-Length` cannot be used for it: the file
+      // is served brotli-precompressed, so the header is the compressed size
+      // and the bar would finish at 20%.
+      const wasmUrl = new URL('./spaceships-client_bg.wasm', import.meta.url);
+      const MB = 1048576;
+
+      let total = 0;
+      const sized = fetch(new URL('./build.json', import.meta.url), { cache: 'no-cache' })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((info) => {
+          if (info && info.wasm > 0) {
+            total = info.wasm;
+            bar.classList.remove('indeterminate');
+          }
+        })
+        .catch(() => {});
+
+      const progress = (res) => {
+        if (!res.body) return res;
+        let seen = 0;
+        const reader = res.body.getReader();
+        const stream = new ReadableStream({
+          async pull(controller) {
+            const { done, value } = await reader.read();
+            if (done) {
+              controller.close();
+              return;
+            }
+            seen += value.byteLength;
+            msg.textContent = `downloading… ${(seen / MB).toFixed(1)} MB`;
+            if (total) fill.style.width = `${Math.min(100, (seen / total) * 100).toFixed(1)}%`;
+            controller.enqueue(value);
+          },
+          cancel(reason) {
+            return reader.cancel(reason);
+          },
+        });
+        // The Content-Type has to be restated: `instantiateStreaming` rejects
+        // anything that is not exactly `application/wasm`, and a hand-built
+        // Response inherits no headers.
+        return new Response(stream, { headers: { 'Content-Type': 'application/wasm' } });
+      };
+
+      const canvas = document.getElementById('game');
       try {
-        await init();
-        status.remove();
+        const [{ default: init }, res] = await Promise.all([
+          import('./spaceships-client.js'),
+          fetch(wasmUrl).then((r) => {
+            if (!r.ok) throw new Error(`${r.status} fetching ${wasmUrl.pathname}`);
+            return sized.then(() => progress(r));
+          }),
+        ]);
+
+        msg.textContent = 'starting…';
+        fill.style.width = '100%';
+
+        await init({ module_or_path: res });
+        boot.remove();
       } catch (e) {
         // Bevy's winit loop reports its own shutdown by throwing. That is not
         // an error worth showing the player.
-        if (!String(e).includes('Using exceptions for control flow')) {
-          status.textContent = 'failed to start: ' + e;
+        if (String(e).includes('Using exceptions for control flow')) {
+          boot.remove();
+        } else {
+          fail('Failed to start.', String(e));
           throw e;
         }
-        status.remove();
       }
+
+      // Keyboard focus, again — see the `tabindex` note above. Bevy takes a
+      // frame or two to attach its listeners, and clicking the HUD or
+      // tabbing away otherwise leaves the ship unflyable with no clue why.
+      const grab = () => canvas.focus({ preventScroll: true });
+      grab();
+      addEventListener('pointerdown', grab);
+      addEventListener('focus', grab);
     </script>
   </body>
 </html>

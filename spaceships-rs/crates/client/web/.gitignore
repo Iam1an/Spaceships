@@ -1,6 +1,11 @@
 # Build output from build-wasm.sh. `index.html` is source; everything else in
 # here is generated and large (the .wasm alone is ~15 MB).
 /spaceships-client.js
+/spaceships-client.js.br
+/spaceships-client.js.gz
 /spaceships-client_bg.wasm
+/spaceships-client_bg.wasm.br
+/spaceships-client_bg.wasm.gz
 /spaceships-client.d.ts
+/build.json
 /assets/

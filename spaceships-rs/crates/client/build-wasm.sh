@@ -106,6 +106,10 @@ cp "$repo/public/jet.glb"             "$out/assets/"
 cp "$repo/public/moon Texture.jpg"    "$out/assets/"
 cp "$repo/public/sounds/asteroid.jpg" "$out/assets/sounds/"
 
+# The tab icon. Not loaded by the engine — `index.html` links it — but it
+# belongs with the rest of the copied payload rather than in a deploy step.
+cp "$repo/public/favicon.png"         "$out/assets/"
+
 # Audio. `audio.rs` loads every effect plus the fourteen voice warnings, and a
 # missing file is silent rather than an error, so an incomplete copy here shows
 # up as a game that simply has no sound.
@@ -116,15 +120,46 @@ cp "$repo/public/sounds/warnings/"*.mp3 "$out/assets/sounds/warnings/"
 # embedded FiraMono subset — no error, just the wrong typeface.
 cp "$repo/public/fonts/"*.ttf "$out/assets/fonts/"
 
-# ── Report ───────────────────────────────────────────────────────────────────
-gz=$(gzip -9 -c "$bg" | wc -c)
-br=$( (command -v brotli >/dev/null 2>&1 && brotli -q 11 -c "$bg" | wc -c) || echo 0)
+# ── Precompressed sidecars ───────────────────────────────────────────────────
+# Caddy's `file_server { precompressed br gzip }` serves `foo.wasm.br` in place
+# of `foo.wasm` when the client sends `Accept-Encoding: br`, and falls back to
+# the plain file otherwise. Compressing here rather than per-request matters at
+# this size: `encode` would spend ~a second of CPU on every cold load, and at
+# `-q 11` brotli takes roughly a quarter of what gzip leaves.
+#
+# These were already being computed and thrown away for the size report below;
+# now the report reads the files. Both are regenerated every build — a stale
+# `.br` beside a fresh `.wasm` is served in preference to it, which fails as a
+# wasm-bindgen schema mismatch and gives no hint that the cause is a file the
+# page never names.
+for f in "$bg" "$out/spaceships-client.js"; do
+  gzip -9 -c "$f" >"$f.gz"
+  if command -v brotli >/dev/null 2>&1; then
+    brotli -q 11 -f -c "$f" >"$f.br"
+  else
+    rm -f "$f.br"
+  fi
+done
 
+gz=$(wc -c <"$bg.gz")
+br=$( ( [ -f "$bg.br" ] && wc -c <"$bg.br" ) || echo 0)
+
+# ── Build stamp ──────────────────────────────────────────────────────────────
+# `index.html` needs the *uncompressed* size to draw a progress bar, and cannot
+# derive it: with the brotli sidecar in play `Content-Length` is the compressed
+# size, so a bar scaled to it finishes at ~20% and stops.
+cat >"$out/build.json" <<EOF
+{ "wasm": $after, "wasm_br": $br, "wasm_gz": $gz, "profile": "$profile" }
+EOF
+
+# ── Report ───────────────────────────────────────────────────────────────────
 fmt() { awk -v b="$1" 'BEGIN{ printf "%.1f MB (%d bytes)", b/1048576, b }'; }
 echo
 echo "wasm    before wasm-opt : $(fmt "$before")"
 echo "        after  wasm-opt : $(fmt "$after")"
 echo "        gzip -9          : $(fmt "$gz")"
 [ "$br" -gt 0 ] && echo "        brotli -q 11     : $(fmt "$br")"
+echo "assets                   : $(fmt "$(find "$out/assets" -type f -exec wc -c {} + | tail -1 | awk '{print $1}')")"
 echo
-echo "serve: python3 -m http.server -d $out 8080"
+echo "serve:  python3 -m http.server -d $out 8080"
+echo "deploy: $repo/deploy/deploy-rs-web.sh"
