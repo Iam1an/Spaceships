@@ -174,6 +174,7 @@ impl Plugin for UiPlugin {
                     read_input,
                     advance_boot,
                     publish_lobby_open,
+                    publish_volume,
                     drive_menu,
                     paint_preview,
                     spin_preview,
@@ -1849,6 +1850,26 @@ pub struct LobbyOpen(pub bool);
 fn publish_lobby_open(menu: Res<Menu>, mut out: ResMut<LobbyOpen>) {
     if out.0 != menu.open {
         out.0 = menu.open;
+    }
+}
+
+/// Sends the two faders to the mixer.
+///
+/// [`audio::MixerLevels`] says "write these from wherever the settings UI ends
+/// up living" — and nothing ever did. It was `init_resource`'d from its
+/// `Default` and read by two systems, so both sliders moved a number in
+/// [`Menu::volume`], redrew themselves, and changed nothing you could hear.
+///
+/// `Menu::volume` is 0..=10 per `Action::Volume`; the mixer wants 0.0..=1.0.
+/// Guarded so an unchanged mix is not written every frame, which is the same
+/// discipline `hud.rs` keeps for `bevy_ui` and this module keeps for
+/// [`LobbyOpen`].
+fn publish_volume(menu: Res<Menu>, mut levels: ResMut<crate::audio::MixerLevels>) {
+    let music = f32::from(menu.volume[0]) / 10.0;
+    let sfx = f32::from(menu.volume[1]) / 10.0;
+    if levels.music != music || levels.sfx != sfx {
+        levels.music = music;
+        levels.sfx = sfx;
     }
 }
 
