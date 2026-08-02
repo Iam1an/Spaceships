@@ -206,7 +206,12 @@ impl Plugin for UiPlugin {
 /// the menu and the panel are meant to be the same aircraft, and a colour
 /// re-picked by eye is how two surfaces drift apart.
 /// `the_palette_is_the_instrument_panels` pins them.
-mod palette {
+///
+/// `pub(crate)` because `hud.rs` is the third surface of the same aircraft and
+/// draws from exactly this list — see that module's header. Nothing else in
+/// this file opens up: [`Menu`] and every page type stay private, so the menu's
+/// *state* is still this module's alone and only its *colours* are shared.
+pub(crate) mod palette {
     use bevy::prelude::Color;
 
     /// `#rrggbb`, as `cockpit.rs::srgb` spells it.
@@ -1166,6 +1171,19 @@ struct Menu {
     /// `SPACESHIPS_UI` pinned this page; do not auto-advance or accept `ESC`.
     pinned: bool,
     opened_at: f32,
+    /// There is a match behind this menu to go back to.
+    ///
+    /// `ESC` in flight pauses — `sim_bridge::fixed_tick` freezes the world
+    /// while the menu is up — and `ESC` again is meant to resume. It could not:
+    /// the second press ran `Screen::back()`, which walks *down* the page tree,
+    /// and from the main page there is nothing below, so it printed
+    /// `NO PAGE BELOW` and left the pilot in a menu with no way out of it while
+    /// their match sat frozen behind it.
+    ///
+    /// Set only by the pause path. A menu reopened because the match *ended*
+    /// (`ReturnToLobby`) clears it, so `ESC` there cannot resume a match that
+    /// is over.
+    resumable: bool,
 
     solo: SoloPick,
     trial: u8,
@@ -1205,6 +1223,8 @@ impl Default for Menu {
             focus: [0; Screen::ALL.len()],
             pinned: forced.is_some(),
             opened_at: 0.0,
+            // Nothing to go back to before a match has ever been launched.
+            resumable: false,
             solo: SoloPick::Skirmish,
             trial: 0,
             mission: 0,
@@ -1904,6 +1924,9 @@ fn reopen_menu(mut requests: MessageReader<ReturnToLobby>, mut menu: ResMut<Menu
     if !menu.open {
         menu.open = true;
     }
+    // The match this menu came back from is over, so `ESC` must not offer to
+    // return to it.
+    menu.resumable = false;
 }
 
 #[derive(Message, Debug, Clone)]
@@ -3999,7 +4022,11 @@ fn read_input(
             menu.open = true;
             menu.screen = Screen::Main;
             menu.opened_at = time.elapsed_secs();
-            menu.say("READY");
+            // Paused rather than abandoned: `fixed_tick` freezes the world
+            // while this is up, and the second `ESC` below puts the pilot back
+            // where they left off.
+            menu.resumable = true;
+            menu.say("PAUSED");
         }
         return;
     }
@@ -4075,6 +4102,9 @@ fn read_input(
         audio.play(crate::audio::Sfx::UiBack);
         match menu.screen.back() {
             Some(s) => menu.go(s),
+            // Nothing below the main page. If a match is paused behind this
+            // menu, that is what `ESC` means here — resume it.
+            None if menu.resumable => menu.open = false,
             None => menu.say("NO PAGE BELOW"),
         }
         return;
