@@ -665,6 +665,13 @@ fn log_match(setup: &MatchSetup, world: &SimWorldState) {
 
 /// Runs one fixed simulation step and republishes [`SimFrame`] and [`Roster`].
 #[allow(clippy::too_many_arguments)]
+/// Whether an open menu stops the simulation.
+///
+/// Solo only. See [`fixed_tick`] for what freezing a networked match did.
+fn freezes_the_world(menu_up: bool, authority: sim::world::Authority) -> bool {
+    menu_up && authority == sim::world::Authority::Local
+}
+
 fn fixed_tick(
     mut world: ResMut<SimWorld>,
     setup: Res<MatchSetup>,
@@ -675,21 +682,45 @@ fn fixed_tick(
     mut inbox: ResMut<crate::net::NetInbox>,
     lobby: Option<Res<crate::ui::LobbyOpen>>,
 ) {
-    // The lobby is not an overlay on a running game: while it is up, the match
-    // is frozen. Without this the world keeps ticking behind the menu, so bots
-    // hunt and kill a player who is reading a mission brief and cannot fly.
-    // The JS has the same property for a different reason -- there, no game
-    // exists until the lobby calls `startGame`.
+    // The lobby is not an overlay on a running game: while it is up, a *solo*
+    // match is frozen. Without this the world keeps ticking behind the menu, so
+    // bots hunt and kill a player who is reading a mission brief and cannot
+    // fly. The JS has the same property for a different reason -- there, no
+    // game exists until the lobby calls `startGame`.
+    //
+    // **Only solo.** Under `Authority::Server` there is nothing this client can
+    // pause: the server runs the match clock, the other pilots keep flying, and
+    // it goes on broadcasting whatever happens. Freezing here stopped the
+    // world, and — because the early return sat *above* the drain below — it
+    // also stopped the inbox being emptied, so every frame the server sent
+    // piled up unread. A player who opened the menu online therefore stopped
+    // moving, stopped seeing anyone else move, and, if they were dead at the
+    // time, never respawned: the `respawn` broadcast was sitting in a queue
+    // nobody drained. That was reported as being stuck on the destroyed screen
+    // forever.
     //
     // Input is still latched (above, in `PreUpdate`), so a key pressed on the
     // frame the menu closes is not swallowed; the latch simply drains into the
     // first tick that actually runs.
-    if lobby.is_some_and(|l| l.0) {
+    let menu_up = lobby.is_some_and(|l| l.0);
+    if freezes_the_world(menu_up, world.0.authority) {
         return;
     }
 
-    let mut player = input.0;
-    latch.drain_into(&mut player);
+    // Menu up in a networked match: the world still has to advance and the
+    // server's frames still have to be applied, but the pilot is reading a menu
+    // and is not flying. Neutral input rather than the last stick position, so
+    // a ship whose owner is in the settings page does not hold a turn.
+    let player = if menu_up {
+        sim::world::Input {
+            id: LOCAL_ID,
+            ..Default::default()
+        }
+    } else {
+        let mut p = input.0;
+        latch.drain_into(&mut p);
+        p
+    };
 
     // Solo is `Authority::Local` and resolves its own damage, so this is empty
     // and the call is exactly what it always was. In multiplayer `net.rs` fills
@@ -1300,6 +1331,29 @@ pub fn rot(q: [f32; 4]) -> Quat {
 
 #[cfg(test)]
 mod tests {
+    /// Pause is a solo affordance. Online there is nothing to pause.
+    ///
+    /// The bug: `fixed_tick` froze the world whenever the menu was up, and its
+    /// early return sat above the inbox drain — so a networked player who
+    /// opened the menu stopped ticking *and* stopped consuming the server's
+    /// frames, which piled up unread. Dead at the time, they never saw the
+    /// `respawn` broadcast and sat on the destroyed screen forever.
+    #[test]
+    fn only_a_solo_match_pauses() {
+        use sim::world::Authority;
+
+        assert!(
+            freezes_the_world(true, Authority::Local),
+            "solo with the menu up must freeze, or bots kill a player reading it",
+        );
+        assert!(
+            !freezes_the_world(true, Authority::Server),
+            "a networked match must keep ticking and keep draining the inbox",
+        );
+        assert!(!freezes_the_world(false, Authority::Local));
+        assert!(!freezes_the_world(false, Authority::Server));
+    }
+
     use super::*;
     use sim::campaign::{CHECKPOINT_BOSS, CHECKPOINT_START};
     use sim::rules::{campaign_waves, trial_checkpoints, BOSS_HITBOX_COUNT, BOSS_ID_BASE};
