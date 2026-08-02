@@ -16,6 +16,9 @@
 //!   transforms.
 //! - [`camera`] — the chase camera from `public/src/camera.js`.
 //! - [`skybox`] — the procedural starfield from `public/src/skybox.js`.
+//! - [`terrain`] — the Sierras map: ground, airfields, trees, clouds, and fog,
+//!   with the ground generated from `sim::ship::terrain_height` so what you see
+//!   is what kills you.
 //!
 //! The dependency direction is one-way: `scene`, `camera`, and `skybox` read
 //! `Frame` and never touch `World`.
@@ -73,6 +76,7 @@ mod net;
 mod scene;
 mod sim_bridge;
 mod skybox;
+mod terrain;
 mod ui;
 mod warp;
 mod weapons;
@@ -171,6 +175,7 @@ fn main() {
         scene::ScenePlugin,
         camera::FollowCameraPlugin,
         skybox::SkyboxPlugin,
+        terrain::TerrainPlugin,
         audio::AudioPlugin,
         hud::HudPlugin,
         net::NetPlugin,

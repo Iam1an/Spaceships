@@ -226,7 +226,7 @@ const ACCENT_LUMA: f32 = 0.35;
 /// JS or CSS it came from character for character, which is the only way a
 /// table copied out of another language stays honest. `Srgba::hex` does the
 /// same job at runtime and from a string; this is the same thing for a `const`.
-const fn hex(rgb: u32) -> Srgba {
+pub(crate) const fn hex(rgb: u32) -> Srgba {
     Srgba::rgb(
         ((rgb >> 16) & 0xff) as f32 / 255.0,
         ((rgb >> 8) & 0xff) as f32 / 255.0,
@@ -289,7 +289,7 @@ const ROCK_FLASH: LinearRgba = LinearRgba::rgb(2.4, 2.4 * 0.6, 2.4 * 0.3);
 
 /// Ultra's `glowBoost` (`graphics.js:379`), the one multiplier that turns an
 /// authored glow colour into one the bloom pass can see. See [`glow`].
-const GLOW_BOOST: f32 = 1.7;
+pub(crate) const GLOW_BOOST: f32 = 1.7;
 
 /// What a rock's albedo is multiplied by once its HP reaches zero — a scorched,
 /// slightly warm darkening, so a nearly-dead asteroid reads as chewed up before
@@ -310,6 +310,26 @@ const TELEPORT_DOT: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// HUD's lock-on marker — can still tell which ship it is looking at.
 #[derive(Component)]
 pub struct ShipRoot(pub sim::world::EntityId);
+
+/// A prop that only exists on the space map: the moon and the two motherships.
+///
+/// [`crate::terrain`] hides these rather than despawning them, because their
+/// meshes and materials are built once in [`setup`] and rebuilding them on
+/// every lobby round trip would be work for nothing. Everything marked here is
+/// a root with `Visibility`, so hiding the root hides its children too.
+#[derive(Component)]
+pub(crate) struct SpaceScenery;
+
+/// An entity the *current map* owns, and that is despawned wholesale when the
+/// map changes.
+///
+/// The lighting rig is the shared case — [`install_space_lights`] and the
+/// terrain sun are alternatives, not additions — and everything
+/// [`crate::terrain`] spawns carries it too. Kept here rather than in
+/// `terrain.rs` so the two rigs are marked by the same component in the module
+/// that defines one of them.
+#[derive(Component)]
+pub(crate) struct MapScenery;
 
 /// Marks an asteroid entity. Carries its id for the same reason.
 #[derive(Component)]
@@ -827,6 +847,10 @@ fn setup(
 ) {
     let rules = sim::rules::Rules::DEFAULT;
 
+    // The space rig, so the first frame is lit whatever the map turns out to
+    // be. [`crate::terrain::apply_map`] owns the rig from the first `Update`
+    // onward and swaps this out for the terrain sun when it has to — see
+    // [`MapScenery`].
     install_space_lights(&mut commands, &rules);
 
     // -- The moon -------------------------------------------------------------
@@ -848,6 +872,10 @@ fn setup(
         ),
         // `graphics.js`: "Big background props stay out of the shadow pass."
         NotShadowCaster,
+        // `main.js:182` — `isTerrainMap ? null : createMoon(..)`. The Sierras
+        // have no moon, and `sim::world::World::new` agrees: its obstacle list
+        // is empty on that map.
+        SpaceScenery,
     ));
 
     // -- Motherships ----------------------------------------------------------
@@ -991,6 +1019,11 @@ fn install_motherships(
                 // pass. A 90-unit box 600 units out contributes nothing a
                 // two-cascade map can resolve.
                 NotShadowCaster,
+                // `main.js:142` swaps these for `createAirfield` on the terrain
+                // map. The collision boxes swap with them in
+                // `sim::world::World::new`, so hiding the mesh is the whole of
+                // the renderer's half.
+                SpaceScenery,
             ))
             .with_children(|hull_of| {
                 hull_of.spawn((Mesh3d(hull_mesh.clone()), MeshMaterial3d(hull.clone())));
@@ -1085,7 +1118,7 @@ fn install_motherships(
 /// `m.color.multiplyScalar(glowBoost)` — on the linear colour, three.js having
 /// stored it that way since r152 — because "pushing the colour past 1.0 is what
 /// makes the bloom pass actually bite".
-fn glow(color: Srgba, scale: f32) -> StandardMaterial {
+pub(crate) fn glow(color: Srgba, scale: f32) -> StandardMaterial {
     let c = LinearRgba::from(color);
     StandardMaterial {
         base_color: LinearRgba::rgb(c.red * scale, c.green * scale, c.blue * scale).into(),
@@ -1130,7 +1163,12 @@ fn sharp_texture(assets: &AssetServer, path: &str) -> Handle<Image> {
 /// A Three.js light at position `P` shines from `P` toward the origin; a Bevy
 /// `DirectionalLight` shines along its transform's -Z. Hence
 /// `from_translation(P).looking_at(ZERO)`.
-fn install_space_lights(commands: &mut Commands, rules: &sim::rules::Rules) {
+///
+/// Every light here is tagged [`MapScenery`], and so is the terrain sun. The
+/// two rigs are mutually exclusive — `main.js:107` branches between them — so
+/// [`crate::terrain::apply_map`] can install one by despawning the other with
+/// no knowledge of what it is replacing.
+pub(crate) fn install_space_lights(commands: &mut Commands, rules: &sim::rules::Rules) {
     const KEY_LUX: f32 = 9_000.0;
 
     // Key: warm, high, from the front-right.
@@ -1167,6 +1205,7 @@ fn install_space_lights(commands: &mut Commands, rules: &sim::rules::Rules) {
             ..default()
         }
         .build(),
+        MapScenery,
     ));
 
     // Fill: cool bounce from the opposite side. "Kept gentle — a strong blue
@@ -1179,6 +1218,7 @@ fn install_space_lights(commands: &mut Commands, rules: &sim::rules::Rules) {
             ..default()
         },
         Transform::from_xyz(-260.0, -120.0, -180.0).looking_at(Vec3::ZERO, Vec3::Y),
+        MapScenery,
     ));
 
     // Rim: warm, from behind, for silhouette separation against the nebula.
@@ -1190,6 +1230,7 @@ fn install_space_lights(commands: &mut Commands, rules: &sim::rules::Rules) {
             ..default()
         },
         Transform::from_xyz(-80.0, 60.0, -320.0).looking_at(Vec3::ZERO, Vec3::Y),
+        MapScenery,
     ));
 
     // `HemisphereLight(0x9fb4d0, 0x2b2f3a, 0.55)`. Bevy has no hemisphere
