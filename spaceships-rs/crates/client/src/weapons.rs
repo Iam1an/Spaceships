@@ -7,13 +7,16 @@
 //!
 //! # The shape that does not
 //!
-//! There is exactly **one** rendered entity in this module — [`EffectSurface`]
-//! — carrying one [`Mesh`] and one [`StandardMaterial`]. Every frame,
-//! [`build_surface`] clears that mesh and rewrites it from the current
+//! There is exactly **one** rendered *effect* entity in this module —
+//! [`EffectSurface`] — carrying one [`Mesh`] and one [`StandardMaterial`]. Every
+//! frame, [`build_surface`] clears that mesh and rewrites it from the current
 //! [`SimFrame`] slices plus this module's own effect state. Bullets, bullet
-//! halos, missile bodies, missile exhaust, flare cores and glows, beams,
+//! halos, missile exhaust and nozzle glow, flare cores and glows, beams,
 //! explosion shells, muzzle flashes, and engine trails all land in the same
 //! vertex buffer.
+//!
+//! The one thing that is *not* an effect is the missile body, which is a solid
+//! object and is drawn as one — see [the section below](#the-missile-body).
 //!
 //! The cost is therefore **O(1) in draw calls and O(n) in vertices**, which is
 //! the trade the GPU wants. Six hundred live effects is one draw call and about
@@ -97,6 +100,40 @@
 //! fixed cap so it cannot evict the engine trails. See [`SMOKE_AT`] for why the
 //! smoke is a light haze rather than dark smoke — the answer is that this
 //! module has exactly one material and it is additive.
+//!
+//! # The missile body
+//!
+//! A missile is the one projectile here that is a *thing* rather than a light,
+//! and the additive surface above cannot draw a thing. It got a
+//! [`MeshBuild::streak`] like everything else — a camera-facing quad on the hard
+//! brush — and at range that reads as a glowing lozenge and close up as a flat
+//! white pill. `missiles.js:143` (`makeMissileMesh`) builds five solid parts in
+//! three flat colours, and losing them is what the report "rockets don't look
+//! like rockets" is about.
+//!
+//! So it is solid geometry, and it is the one place in this module that spawns
+//! entities. The shape that keeps that inside the budget:
+//!
+//! - **One mesh, built once.** [`missile_mesh`] is a static `Handle<Mesh>` built
+//!   at [`setup`] and never touched again. Nothing here rebuilds geometry per
+//!   frame, so the fixed-capacity padding [`build_surface`] needs does not apply
+//!   — a mesh that is never rewritten cannot make the slab allocator free and
+//!   reallocate under the render world.
+//! - **One material, and three colours anyway.** The body, the fins and the bell
+//!   are three hexes in the JS and three materials with them; here they are
+//!   [`Mesh::ATTRIBUTE_COLOR`] on one `StandardMaterial`, which the PBR shader
+//!   multiplies into `base_color` exactly as it does for the effect surface.
+//!   Bevy's batch key is `(mesh, material, pipeline)`, so every missile in the
+//!   air is one batch however many there are.
+//! - **A fixed pool, hidden and moved.** [`MISSILE_BODY_POOL`] entities are
+//!   spawned at startup and are never spawned or despawned again;
+//!   [`place_missile_bodies`] writes a `Transform` and a `Visibility` on the
+//!   ones in use and hides the rest. This is `hud.rs`'s target-marker pool, in
+//!   3D. Despawning and respawning per shot would churn the render world's
+//!   caches for no reason and is the habit this port exists to break.
+//!
+//! Cost, measured: a scene with forty missile bodies in it is **one** more draw
+//! call than the same scene with none.
 //!
 //! # What is missing from `Frame`
 //!
@@ -183,14 +220,68 @@ const BEAM_LIFE: f32 = 0.18;
 /// `beams.js`: base opacity, faded linearly over `BEAM_LIFE`.
 const BEAM_OPACITY: f32 = 0.9;
 
-/// `missiles.js`: `BODY_LEN`.
+/// `missiles.js:17`: `BODY_LEN`. The fuselage runs from `-BODY_LEN / 2` to
+/// `+BODY_LEN / 2` about the missile's own origin, and every other length below
+/// is measured off that.
 const MISSILE_BODY_LEN: f32 = 3.5;
-/// `missiles.js`: `BODY_RAD`, widened for the same billboard reason as the
-/// bolt core.
-const MISSILE_BODY_HALF_W: f32 = 0.34;
-/// `missiles.js`: `NOZZLE_Z`, the local-space exhaust origin.
-const MISSILE_NOZZLE_Z: f32 = -1.93;
-/// `missiles.js`: `TRAIL_INTERVAL`, the exhaust emission period.
+/// `missiles.js:18`: `BODY_RAD`, the fuselage radius at the nose end.
+const MISSILE_BODY_RAD: f32 = 0.28;
+/// `missiles.js:32`: the fuselage is `CylinderGeometry(BODY_RAD, BODY_RAD +
+/// 0.04, ..)`, so it is a hair fatter at the tail. Four hundredths of a unit is
+/// almost nothing and it is exactly what stops the barrel reading as a pipe.
+const MISSILE_BODY_RAD_AFT: f32 = MISSILE_BODY_RAD + 0.04;
+/// `missiles.js:19`: `NOSE_LEN`, ahead of the fuselage.
+const MISSILE_NOSE_LEN: f32 = 1.8;
+/// `missiles.js:20`, `:21`, `:22`: the fin box, span across, thickness through,
+/// depth along the body.
+const MISSILE_FIN_SPAN: f32 = 2.0;
+const MISSILE_FIN_THICK: f32 = 0.07;
+const MISSILE_FIN_DEPTH: f32 = 1.1;
+/// `missiles.js:23`: `FIN_Z`, which sets the fins a tenth of a unit forward of
+/// the fuselage's aft face rather than flush with it.
+const MISSILE_FIN_Z: f32 = -(MISSILE_BODY_LEN / 2.0 - MISSILE_FIN_DEPTH / 2.0 - 0.1);
+/// `missiles.js:47`: the nozzle bell, `ConeGeometry(0.38, 0.55)` — mouth radius
+/// and length.
+const MISSILE_BELL_R: f32 = 0.38;
+const MISSILE_BELL_LEN: f32 = 0.55;
+/// The bell's throat, where it meets the fuselage's aft face.
+///
+/// The one dimension with no JS to copy, because the JS bell is a *cone* and has
+/// no throat — see [`missile_geometry`] on why this is a frustum instead. Set
+/// below [`MISSILE_BODY_RAD_AFT`] so the tail visibly necks down and then flares,
+/// which is the silhouette that says "nozzle" rather than "the body stopped".
+const MISSILE_BELL_THROAT_R: f32 = 0.24;
+/// The bell's mouth plane: where the exhaust leaves and where the glow that
+/// stands in for the flame sits.
+///
+/// This is `missiles.js:24`'s `NOZZLE_Z = -(BODY_LEN / 2 + 0.18)` — that is
+/// -1.93 — pushed back to -2.30, and the reason is that the JS number is
+/// *inside* the body. Its bell spans z -1.755 to -2.305 and it hangs both the
+/// glow sphere and the exhaust emitter at -1.93, halfway up the inside of the
+/// cone; three.js depth-tests them against it and eats the first frames of the
+/// plume. A billboard quad centred there does worse, because it is flat and
+/// half of it is behind the bell wall at any angle.
+///
+/// Putting it on the mouth plane is what makes the plume come *out of the
+/// nozzle* rather than out of the middle of the tail, which is the whole reason
+/// the body and the exhaust have to agree about where the bell is.
+const MISSILE_FLAME_Z: f32 = -(MISSILE_BODY_LEN / 2.0 + MISSILE_BELL_LEN);
+/// `missiles.js:26`, `:32`, `:47`: every round part is 10 radial segments.
+const MISSILE_SEGMENTS: u32 = 10;
+/// `missiles.js:66`, `:67`, `:68`: fuselage and nose, fins, bell. Three flat
+/// `MeshBasicMaterial` colours there; three vertex colours on one lit material
+/// here.
+const MISSILE_HULL_HEX: u32 = 0xd4dce8;
+const MISSILE_FIN_HEX: u32 = 0x7a8fa8;
+const MISSILE_BELL_HEX: u32 = 0x445566;
+/// How many missile bodies can be on screen at once.
+///
+/// [`sim::rules::WeaponRules::missile_max`] per ship against a lobby that tops
+/// out around ten, plus the ones already in the air when a full salvo goes out.
+/// Overflow is missiles drawn without a body rather than a panic or a
+/// reallocation, and the pool is allocated once at startup either way.
+const MISSILE_BODY_POOL: usize = RULES.weapons.missile_max as usize * 12;
+/// `missiles.js:62`: `TRAIL_INTERVAL`, the exhaust emission period.
 const MISSILE_EXHAUST_INTERVAL: f32 = 0.028;
 
 /// `missiles.js`: flare core sphere radius.
@@ -237,9 +328,10 @@ const MAX_BEAMS: usize = 32;
 /// with headroom: every quad is 4 vertices and 6 indices.
 ///
 /// The worst case, counted: 900 motes + 320 damage + 128 shells + 32 beams,
-/// plus two quads each for the projectiles a ten-ship match can have in flight
-/// — 400 bolts (a 0.05 s gun cooldown against a 2 s bolt life), 40 missiles,
-/// 30 flares. That is 2 268 quads against 4 096.
+/// plus the projectiles a ten-ship match can have in flight — 400 bolts at two
+/// quads each (a 0.05 s gun cooldown against a 2 s bolt life), 30 flares at two,
+/// and 40 missiles at **one**, their bodies having moved off this mesh onto
+/// their own. That is 2 280 quads against 4 096.
 const MESH_QUAD_CAPACITY: usize = 4096;
 const MESH_VERTEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 4;
 const MESH_INDEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 6;
@@ -277,6 +369,33 @@ const TRAIL_OFFSETS_JET: [Vec3; 2] = [
 /// ship's scale and have to be given it. Both constants are authored in the
 /// same pre-scale space the JS authors `TRAIL_OFFSETS` in, where they are
 /// children of a group `main.js:219` scales.
+/// How much of a ship's velocity its exhaust keeps, split along the nozzle
+/// axis.
+///
+/// [`EmitMode::inherit`] exists so the plume *falls behind* the ship rather
+/// than travelling with it: a mote keeping 70% of the ship's velocity drifts
+/// aft at the remaining 30%, which is what puts a visible stream at the tail
+/// instead of a cloud around the hull.
+///
+/// Applied to the whole velocity vector, though, that residual points along the
+/// ship's **travel**, not along its nozzles. Fly straight and the two coincide,
+/// so it looks right; drift, strafe, or slide through a hard turn and 30% of a
+/// sideways velocity walks the plume off the side of the aircraft. That is the
+/// trails "not travelling the right way if you go sideways", and they were not.
+///
+/// Only the component along the exhaust axis may be shed. Everything lateral is
+/// inherited whole, so the plume stays on the nozzles however the airframe is
+/// moving, and the aft drift is exactly as tuned in the case it was tuned for —
+/// `back` parallel to `vel`, where this reduces to the old expression.
+///
+/// `back` must be a unit vector: the ship's -Z, which is where the nozzles
+/// point.
+fn carried_momentum(vel: Vec3, back: Vec3, inherit: f32) -> Vec3 {
+    let along = vel.dot(back);
+    let lateral = vel - back * along;
+    lateral + back * (along * inherit)
+}
+
 fn trail_offsets() -> [Vec3; 2] {
     if jet_hull() {
         return TRAIL_OFFSETS_JET.map(|o| o * crate::scene::SHIP_SCALE);
@@ -605,9 +724,14 @@ impl Plugin for WeaponsPlugin {
             )
             // Ageing and the rebuild are per *frame*: they are what makes the
             // effects smooth on a display that is not the tick rate.
-            // `stage_scene` runs last so the effect it holds still is the one
-            // the frame draws: ageing would move it, and the demo would bury it.
-            .add_systems(Update, (run_demo, age_effects, stage_scene).chain())
+            // `stage_scene` runs before `place_missile_bodies` and after the
+            // demo so the effect it holds still is the one the frame draws:
+            // ageing would move it, the demo would bury it, and the bodies have
+            // to see whatever it staged.
+            .add_systems(
+                Update,
+                (run_demo, age_effects, stage_scene, place_missile_bodies).chain(),
+            )
             // After transform propagation so the billboards face where the
             // camera actually ended up this frame rather than where it was
             // last frame. `camera::follow` writes the chase pose in
@@ -638,8 +762,8 @@ struct Brush {
 }
 
 impl Brush {
-    /// A near-solid disc with a soft rim: bolt cores, beams, missile bodies —
-    /// anything that should read as a hard object rather than a haze.
+    /// A near-solid disc with a soft rim: bolt cores, beams, explosion
+    /// fragments — anything that should read as a hard edge rather than a haze.
     const CORE: Brush = Brush { u0: 0.5, u1: 1.0 };
     /// A soft radial falloff: halos, puffs, explosion shells, trail motes.
     const GLOW: Brush = Brush { u0: 0.0, u1: 0.5 };
@@ -980,6 +1104,390 @@ fn setup(
     ));
 
     commands.insert_resource(EffectAssets { mesh });
+
+    // -- The missile bodies ---------------------------------------------------
+    //
+    // One mesh and one material, shared by the whole pool, so every missile in
+    // the air batches into a single draw call. Unlike the surface above, this
+    // mesh is built here and never written again.
+    let body_mesh = meshes.add(missile_mesh());
+    let body_material = materials.add(StandardMaterial {
+        // White, because the paint rides in `ATTRIBUTE_COLOR`: the PBR shader
+        // multiplies the vertex colour into `base_color`, which is what lets
+        // one material carry the JS's three.
+        base_color: Color::WHITE,
+        // **Lit, where `missiles.js:66` is `MeshBasicMaterial` and therefore
+        // is not.** Three flat greys read as a paper cutout in a scene where
+        // everything else — the hull, the rocks, the moon — is shaded, and a
+        // rocket that does not catch the key light is the same silhouette
+        // problem the billboard had, one step less bad. The hexes are the JS's
+        // exactly; only the shading model changed.
+        perceptual_roughness: 0.55,
+        metallic: 0.10,
+        ..default()
+    });
+    let slots: Vec<Entity> = (0..MISSILE_BODY_POOL)
+        .map(|_| {
+            commands
+                .spawn((
+                    MissileBody,
+                    Mesh3d(body_mesh.clone()),
+                    MeshMaterial3d(body_material.clone()),
+                    Transform::default(),
+                    // Nothing is in the air on frame one, and a slot that is
+                    // never used is never extracted.
+                    Visibility::Hidden,
+                    // `graphics.js`: small props stay out of the shadow pass. A
+                    // 3.5-unit body 600 units from the key light contributes a
+                    // shadow nobody can see, at the cost of a second batch.
+                    NotShadowCaster,
+                ))
+                .id()
+        })
+        .collect();
+    commands.insert_resource(MissileBodies { slots });
+}
+
+// ---------------------------------------------------------------------------
+// The missile body
+// ---------------------------------------------------------------------------
+
+/// One slot of the missile-body pool. Never spawned or despawned after
+/// [`setup`]; see the module docs.
+#[derive(Component)]
+struct MissileBody;
+
+/// The pool, in a stable order.
+///
+/// A `Vec<Entity>` rather than relying on query iteration order, for the same
+/// reason `scene.rs` keeps its own id-to-entity `Registry`: an archetype's
+/// iteration order is an implementation detail, and a slot has to be the *same*
+/// slot from one frame to the next or the pool is just a bag.
+#[derive(Resource)]
+struct MissileBodies {
+    slots: Vec<Entity>,
+}
+
+/// Positions, normals, vertex colours and indices for a solid mesh.
+///
+/// Deliberately not [`MeshBuild`]: that one is cleared and rewritten every
+/// frame, carries UVs for the brush atlas, and only ever emits camera-facing
+/// quads. This one is filled once, has no texture to address, and emits
+/// triangles whose winding matters.
+#[derive(Default)]
+struct SolidBuild {
+    pos: Vec<[f32; 3]>,
+    normal: Vec<[f32; 3]>,
+    color: Vec<[f32; 4]>,
+    index: Vec<u32>,
+}
+
+impl SolidBuild {
+    /// Pushes a vertex and hands back its index.
+    fn vertex(&mut self, p: Vec3, n: Vec3, c: LinearRgba) -> u32 {
+        let i = self.pos.len() as u32;
+        self.pos.push(p.to_array());
+        self.normal.push(n.to_array());
+        self.color.push([c.red, c.green, c.blue, 1.0]);
+        i
+    }
+
+    /// One triangle, wound **counter-clockwise seen from outside**.
+    ///
+    /// That is Bevy's convention (`FrontFace::Ccw` with back-face culling), and
+    /// it is equivalent to saying `(b - a) × (c - a)` points the same way as the
+    /// vertex normals — which is what `every_face_of_the_body_winds_outward`
+    /// asserts below, so a sign slip here fails a test rather than producing a
+    /// missile that is inside out on screen and nowhere else.
+    fn tri(&mut self, a: u32, b: u32, c: u32) {
+        self.index.extend_from_slice(&[a, b, c]);
+    }
+
+    /// A surface of revolution about the local Z axis: the ring of radius `r0`
+    /// at `z0` joined to the ring of radius `r1` at `z1`, with `z1 > z0`.
+    ///
+    /// Every round part of the missile is one of these. A cylinder is the case
+    /// where the radii match, a cone is the case where one of them is zero, and
+    /// the nozzle bell is neither.
+    ///
+    /// Normals are per-vertex and follow the slope, so the barrel shades
+    /// smoothly around its circumference rather than faceting — a ten-sided
+    /// prism with flat normals is what a low-poly missile looks like, and it is
+    /// not what this is meant to look like.
+    fn frustum(&mut self, z0: f32, r0: f32, z1: f32, r1: f32, seg: u32, c: LinearRgba) {
+        let dz = z1 - z0;
+        for i in 0..seg {
+            let (t0, t1) = (
+                i as f32 / seg as f32 * std::f32::consts::TAU,
+                (i + 1) as f32 / seg as f32 * std::f32::consts::TAU,
+            );
+            let (da, db) = (
+                Vec3::new(t0.cos(), t0.sin(), 0.0),
+                Vec3::new(t1.cos(), t1.sin(), 0.0),
+            );
+            // The outward normal of a cone's flank: radial, tilted along the
+            // axis by the taper. Reduces to purely radial when `r0 == r1`.
+            let (na, nb) = (
+                (da * dz + Vec3::Z * (r0 - r1)).normalize(),
+                (db * dz + Vec3::Z * (r0 - r1)).normalize(),
+            );
+            let a0 = self.vertex(da * r0 + Vec3::Z * z0, na, c);
+            let b0 = self.vertex(db * r0 + Vec3::Z * z0, nb, c);
+            let a1 = self.vertex(da * r1 + Vec3::Z * z1, na, c);
+            let b1 = self.vertex(db * r1 + Vec3::Z * z1, nb, c);
+            // A ring of radius zero collapses to a point, and the triangle that
+            // touches it twice is degenerate. Skipping it is cheaper than
+            // rasterising nothing, and it keeps the winding test honest — a
+            // zero-area triangle has no winding to check.
+            if r0 > 0.0 {
+                self.tri(a0, b0, b1);
+            }
+            if r1 > 0.0 {
+                self.tri(a0, b1, a1);
+            }
+        }
+    }
+
+    /// A flat disc in the plane `z`, facing `+Z` when `facing` is positive and
+    /// `-Z` when it is negative. What closes a frustum off.
+    fn disc(&mut self, z: f32, r: f32, facing: f32, seg: u32, c: LinearRgba) {
+        let n = Vec3::Z * facing.signum();
+        for i in 0..seg {
+            let (t0, t1) = (
+                i as f32 / seg as f32 * std::f32::consts::TAU,
+                (i + 1) as f32 / seg as f32 * std::f32::consts::TAU,
+            );
+            let centre = self.vertex(Vec3::Z * z, n, c);
+            let a = self.vertex(Vec3::new(t0.cos() * r, t0.sin() * r, z), n, c);
+            let b = self.vertex(Vec3::new(t1.cos() * r, t1.sin() * r, z), n, c);
+            if facing >= 0.0 {
+                self.tri(centre, a, b);
+            } else {
+                self.tri(centre, b, a);
+            }
+        }
+    }
+
+    /// One flat face, as two triangles. Corners counter-clockwise seen from
+    /// outside.
+    fn face(&mut self, corners: [Vec3; 4], n: Vec3, c: LinearRgba) {
+        let [a, b, cc, d] = corners.map(|p| self.vertex(p, n, c));
+        self.tri(a, b, cc);
+        self.tri(a, cc, d);
+    }
+
+    /// An axis-aligned box. `missiles.js` builds both fins out of one of these.
+    fn slab(&mut self, centre: Vec3, half: Vec3, c: LinearRgba) {
+        let (x, y, z) = (half.x, half.y, half.z);
+        let p = |sx: f32, sy: f32, sz: f32| centre + Vec3::new(x * sx, y * sy, z * sz);
+        for (corners, n) in [
+            (
+                [
+                    p(-1.0, -1.0, 1.0),
+                    p(1.0, -1.0, 1.0),
+                    p(1.0, 1.0, 1.0),
+                    p(-1.0, 1.0, 1.0),
+                ],
+                Vec3::Z,
+            ),
+            (
+                [
+                    p(1.0, -1.0, -1.0),
+                    p(-1.0, -1.0, -1.0),
+                    p(-1.0, 1.0, -1.0),
+                    p(1.0, 1.0, -1.0),
+                ],
+                Vec3::NEG_Z,
+            ),
+            (
+                [
+                    p(1.0, -1.0, 1.0),
+                    p(1.0, -1.0, -1.0),
+                    p(1.0, 1.0, -1.0),
+                    p(1.0, 1.0, 1.0),
+                ],
+                Vec3::X,
+            ),
+            (
+                [
+                    p(-1.0, -1.0, -1.0),
+                    p(-1.0, -1.0, 1.0),
+                    p(-1.0, 1.0, 1.0),
+                    p(-1.0, 1.0, -1.0),
+                ],
+                Vec3::NEG_X,
+            ),
+            (
+                [
+                    p(1.0, 1.0, -1.0),
+                    p(-1.0, 1.0, -1.0),
+                    p(-1.0, 1.0, 1.0),
+                    p(1.0, 1.0, 1.0),
+                ],
+                Vec3::Y,
+            ),
+            (
+                [
+                    p(-1.0, -1.0, -1.0),
+                    p(1.0, -1.0, -1.0),
+                    p(1.0, -1.0, 1.0),
+                    p(-1.0, -1.0, 1.0),
+                ],
+                Vec3::NEG_Y,
+            ),
+        ] {
+            self.face(corners, n, c);
+        }
+    }
+}
+
+/// `makeMissileMesh` (`missiles.js:143`), as vertices.
+///
+/// Five parts, three colours, nose along local `+Z` — the same axis
+/// `missiles.js:291` points its root down with
+/// `setFromUnitVectors((0, 0, 1), dir)`, which is why
+/// [`place_missile_bodies`] can rotate `Vec3::Z` onto `ProjView::dir` and be
+/// done.
+///
+/// # Where this deliberately departs from the JS
+///
+/// **Both of the JS's cones point the wrong way, and the nose is the one that
+/// shows.** `missiles.js:27` builds `ConeGeometry(BODY_RAD, NOSE_LEN)` — apex at
+/// `+y` — and then rotates it with `rotateX(-PI/2)`, which sends `+y` to `-z`.
+/// Evaluated, the nose spans z 1.75 to 3.55 with **radius 0 at the back and 0.28
+/// at the front**: a funnel that flares forward into a flat disc, not a nose
+/// cone. `missiles.js:48` does the same thing to the nozzle with
+/// `rotateX(PI/2)` followed by `rotateX(PI)`, and the tail comes to a spike.
+///
+/// Reproducing that faithfully would be reproducing a sign error, and it is
+/// precisely the part a player looks at. So the nose tapers to a point at the
+/// front, and the bell flares aft from a throat ([`MISSILE_BELL_THROAT_R`]) to
+/// the JS's own mouth radius over the JS's own length. Every *proportion* —
+/// `BODY_LEN`, `BODY_RAD`, `NOSE_LEN`, the fin box, `NOZZLE_Z` — is the JS's
+/// unchanged, and so are all three colours.
+fn missile_geometry() -> SolidBuild {
+    let hull = hex(MISSILE_HULL_HEX);
+    let fin = hex(MISSILE_FIN_HEX);
+    let bell = hex(MISSILE_BELL_HEX);
+    let seg = MISSILE_SEGMENTS;
+    let (aft, fore) = (-MISSILE_BODY_LEN / 2.0, MISSILE_BODY_LEN / 2.0);
+
+    let mut b = SolidBuild::default();
+
+    // Fuselage: fatter at the tail, tapering forward. `missiles.js:32`.
+    b.frustum(aft, MISSILE_BODY_RAD_AFT, fore, MISSILE_BODY_RAD, seg, hull);
+    // Nose: the fuselage's forward radius drawn to a point `NOSE_LEN` ahead. No
+    // cap between them — the two rings coincide, so the surface is continuous.
+    b.frustum(
+        fore,
+        MISSILE_BODY_RAD,
+        fore + MISSILE_NOSE_LEN,
+        0.0,
+        seg,
+        hull,
+    );
+    // The aft face, as a base plate. Only its outer annulus is ever visible,
+    // around the bell throat, and it is what a missile's tail actually looks
+    // like from behind.
+    b.disc(aft, MISSILE_BODY_RAD_AFT, -1.0, seg, hull);
+    // The bell: necked down at the fuselage and flared to the mouth.
+    b.frustum(
+        aft - MISSILE_BELL_LEN,
+        MISSILE_BELL_R,
+        aft,
+        MISSILE_BELL_THROAT_R,
+        seg,
+        bell,
+    );
+    // Closed at the mouth, in the bell's own dark grey. An open cone would show
+    // the skybox through the back of the missile, since back faces are culled
+    // and there is no interior.
+    b.disc(aft - MISSILE_BELL_LEN, MISSILE_BELL_R, -1.0, seg, bell);
+
+    // The two fins. `missiles.js:37` and `:42` are the same box turned ninety
+    // degrees, which is what makes the cross.
+    let depth = MISSILE_FIN_DEPTH / 2.0;
+    let (span, thick) = (MISSILE_FIN_SPAN / 2.0, MISSILE_FIN_THICK / 2.0);
+    let at = Vec3::new(0.0, 0.0, MISSILE_FIN_Z);
+    b.slab(at, Vec3::new(span, thick, depth), fin);
+    b.slab(at, Vec3::new(thick, span, depth), fin);
+
+    b
+}
+
+/// [`missile_geometry`] as a [`Mesh`].
+///
+/// No UVs: the material has no texture, so `pbr.wgsl`'s `VERTEX_UVS` block is
+/// not compiled in and an attribute nothing samples would be bytes uploaded for
+/// nothing.
+fn missile_mesh() -> Mesh {
+    let b = missile_geometry();
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        // Both worlds, and not because anything here rewrites it: Bevy's
+        // `calculate_bounds` reads the **main**-world copy to fit the entity's
+        // `Aabb`, and a mesh dropped after upload gets no bounds and therefore
+        // no frustum culling. Two hundred vertices held once is not a memory
+        // decision worth making.
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, b.pos)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, b.normal)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, b.color)
+    .with_inserted_indices(Indices::U32(b.index))
+}
+
+/// Points every live missile's body where it is going, and hides the rest of the
+/// pool.
+///
+/// The whole per-frame cost of the body: one `Transform` and one `Visibility`
+/// per missile in the air. Nothing is spawned, despawned, re-parented, or
+/// rebuilt.
+///
+/// The extrapolation is [`build_surface`]'s, for the same reason — [`SimFrame`]
+/// is the last completed *tick* and a missile covers 2.7 units in one, so
+/// drawing it at the tick pose would staircase against the exhaust, which is
+/// emitted on a finer interval and is therefore already smooth.
+fn place_missile_bodies(
+    frame: Res<SimFrame>,
+    fx: Res<Effects>,
+    fixed: Res<Time<Fixed>>,
+    bodies: Res<MissileBodies>,
+    mut q: Query<(&mut Transform, &mut Visibility), With<MissileBody>>,
+) {
+    let lead =
+        RULES.weapons.missile_speed as f32 * sim::world::TICK_DT as f32 * fixed.overstep_fraction();
+
+    let mut slots = bodies.slots.iter();
+    for m in frame.0.missiles.iter().chain(fx.demo.missiles.iter()) {
+        // Overflow drops the *body*, not the missile: the nozzle glow and the
+        // exhaust still draw, so a shot beyond the pool is dimmer rather than
+        // invisible. See `MISSILE_BODY_POOL` on how far off that is.
+        let Some(&slot) = slots.next() else {
+            break;
+        };
+        let Ok((mut tf, mut vis)) = q.get_mut(slot) else {
+            continue;
+        };
+        // `try_normalize` and not `normalize`: a zero direction would give NaNs,
+        // and a NaN transform takes the entity's bounding sphere with it.
+        let dir = to_vec3(m.dir).try_normalize().unwrap_or(Vec3::Z);
+        tf.translation = to_vec3(m.pos) + dir * lead;
+        // The mesh is built nose-along-`+Z`, so this is the whole of the
+        // orientation. `from_rotation_arc` handles the antiparallel case by
+        // picking an arbitrary perpendicular axis, which is correct here: a body
+        // of revolution has no roll to get wrong.
+        tf.rotation = Quat::from_rotation_arc(Vec3::Z, dir);
+        vis.set_if_neq(Visibility::Inherited);
+    }
+
+    // Everything the frame did not need. `set_if_neq` so a pool that is mostly
+    // idle — which it is, most of the time — writes nothing at all.
+    for &slot in slots {
+        if let Ok((_, mut vis)) = q.get_mut(slot) {
+            vis.set_if_neq(Visibility::Hidden);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,6 +1949,8 @@ fn emit_trails(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
         let right = quat * Vec3::X;
         let up = quat * Vec3::Y;
 
+        let carried = carried_momentum(vel, back, mode.inherit);
+
         let hot = glow(mode.hot.0, mode.hot.1);
         let cool = glow(mode.cool.0, mode.cool.1);
 
@@ -1486,7 +1996,7 @@ fn emit_trails(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                         color: hot,
                         cool,
                         opacity: mode.alpha,
-                        vel: vel * mode.inherit + back * mode.eject + spread,
+                        vel: carried + back * mode.eject + spread,
                         drag: mode.drag,
                         smear: MOTE_SMEAR,
                         ..default()
@@ -1778,7 +2288,7 @@ fn age_effects(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
         };
         for i in 0..puffs {
             let dir = to_vec3(m.dir);
-            let nozzle = to_vec3(m.pos) + dir * MISSILE_NOZZLE_Z;
+            let nozzle = to_vec3(m.pos) + dir * MISSILE_FLAME_Z;
             // Same sub-frame spread the engine trails use: a missile at
             // `missile_speed` covers a couple of units between puffs, and
             // stamping every puff a frame owes on one point beads the exhaust.
@@ -1908,8 +2418,8 @@ impl MeshBuild {
     }
 
     /// A quad aligned to a world-space segment and rolled to face the camera —
-    /// the billboard a cylinder degrades to. Bolts, beams, missile bodies, and
-    /// trail ribbons are all this.
+    /// the billboard a cylinder degrades to. Bolts, beams, and trail ribbons
+    /// are all this. The missile body was, and is now real geometry instead.
     #[allow(clippy::too_many_arguments)]
     fn streak(
         &mut self,
@@ -2013,29 +2523,19 @@ fn build_surface(
 
     // ── missiles ─────────────────────────────────────────────────────────
     //
-    // The JS body is six opaque parts; at the distance a missile is ever seen
-    // that is a grey streak with a pulsing orange nozzle, which is what these
-    // two quads are. The exhaust is emitted as motes in `age_effects`.
+    // Only the flame. The body is solid geometry on its own pooled entities —
+    // see the module docs — and `place_missile_bodies` puts it here, using the
+    // same `missile_lead` extrapolation so the two cannot separate.
     let t = frame.0.time as f32;
     for m in frame.0.missiles.iter().chain(fx.demo.missiles.iter()) {
         let dir = to_vec3(m.dir);
         let center = to_vec3(m.pos) + dir * missile_lead;
-        build.streak(
-            center,
-            dir,
-            MISSILE_BODY_LEN * 0.5,
-            MISSILE_BODY_HALF_W,
-            cam_fwd,
-            Brush::CORE,
-            MISSILE_BODY,
-            1.0,
-        );
         // `missiles.js`: `pulse = 0.75 + 0.45 * |sin(age * 19)|`. Phase is
         // offset per missile off the key so a salvo does not throb in unison.
         let phase = (m.key % 997) as f32 * 0.0063;
         let pulse = 0.75 + 0.45 * (t * 19.0 + phase).sin().abs();
         build.puff(
-            center + dir * MISSILE_NOZZLE_Z,
+            center + dir * MISSILE_FLAME_Z,
             0.55 * pulse,
             cam_right,
             cam_up,
@@ -2233,9 +2733,6 @@ fn build_surface(
 static BOLT_CORE: LinearRgba = LinearRgba::rgb(6.16, 7.49, 5.92);
 /// `bullets.js` `self.haloColor`.
 static BOLT_HALO: LinearRgba = LinearRgba::rgb(0.14, 2.55, 1.11);
-/// `missiles.js` fuselage `0xd4dce8`, kept near 1.0 so the body reads as a
-/// lit object rather than a light source.
-static MISSILE_BODY: LinearRgba = LinearRgba::rgb(1.09, 1.20, 1.36);
 /// `missiles.js` nozzle glow `0xff9900`.
 static MISSILE_NOZZLE: LinearRgba = LinearRgba::rgb(5.10, 1.30, 0.0);
 /// `missiles.js` flare core `0xffffff`.
@@ -2433,9 +2930,9 @@ fn run_demo(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
 /// what a screenshot wants.
 ///
 /// Names are [`ExplosionKind`]'s, plus `muzzle` and `beam` for the two effects
-/// that are not explosions. `@t` sets the life fraction and defaults to 0.35 —
-/// far enough in for a shell to have expanded, early enough that it has not
-/// faded out.
+/// that are not explosions, and `rocket` for the missile body. `@t` sets the
+/// life fraction and defaults to 0.35 — far enough in for a shell to have
+/// expanded, early enough that it has not faded out.
 #[derive(Clone, Copy)]
 struct Scene {
     what: SceneKind,
@@ -2447,6 +2944,8 @@ enum SceneKind {
     Explosion(ExplosionKind),
     Muzzle,
     Beam,
+    /// A flight of missile bodies, held still. See [`stage_rockets`].
+    Rocket,
 }
 
 fn fx_scene() -> Option<Scene> {
@@ -2458,9 +2957,9 @@ fn fx_scene() -> Option<Scene> {
         static SCENE: std::sync::OnceLock<Option<Scene>> = std::sync::OnceLock::new();
         *SCENE.get_or_init(|| {
             let raw = std::env::var("SPACESHIPS_FX_SCENE").ok()?;
-            let (name, at) = match raw.split_once('@') {
-                Some((n, t)) => (n, t.trim().parse::<f32>().unwrap_or(0.35)),
-                None => (raw.as_str(), 0.35),
+            let (name, arg) = match raw.split_once('@') {
+                Some((n, t)) => (n, t.trim().parse::<f32>().ok()),
+                None => (raw.as_str(), None),
             };
             let what = match name.trim().to_ascii_lowercase().as_str() {
                 "impact" => SceneKind::Explosion(ExplosionKind::Impact),
@@ -2470,15 +2969,22 @@ fn fx_scene() -> Option<Scene> {
                 "flare" => SceneKind::Explosion(ExplosionKind::FlareBurst),
                 "muzzle" => SceneKind::Muzzle,
                 "beam" => SceneKind::Beam,
+                "rocket" | "body" => SceneKind::Rocket,
                 other => {
                     warn!("SPACESHIPS_FX_SCENE={other} is not an effect this module draws");
                     return None;
                 }
             };
-            Some(Scene {
-                what,
-                at: at.clamp(0.0, 0.99),
-            })
+            let at = match what {
+                // For a rocket the argument is a **distance in units**, not a
+                // life fraction: a missile body does not age, and the question a
+                // still of one has to answer is how it reads close up against
+                // how it reads at the range it is actually seen from. Floored
+                // clear of the camera's own near plane and of the hull.
+                SceneKind::Rocket => arg.unwrap_or(SCENE_AHEAD).max(6.0),
+                _ => arg.unwrap_or(0.35).clamp(0.0, 0.99),
+            };
+            Some(Scene { what, at })
         })
     }
 }
@@ -2501,7 +3007,13 @@ fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
 
     let quat = rot(ship.quat);
     let fwd = quat * Vec3::Z;
-    let at = to_vec3(ship.pos) + fwd * SCENE_AHEAD + quat * Vec3::Y * SCENE_LIFT;
+    // `Rocket` spends its argument on range rather than on age, so it is also
+    // the one scene that decides how far out it is staged.
+    let ahead = match scene.what {
+        SceneKind::Rocket => scene.at,
+        _ => SCENE_AHEAD,
+    };
+    let at = to_vec3(ship.pos) + fwd * ahead + quat * Vec3::Y * SCENE_LIFT;
 
     // Every pool the staged effect writes into, including the shared mote pool
     // the sparks come out of. Without the last one a scene restaged 100 times a
@@ -2526,6 +3038,7 @@ fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
             age: BEAM_LIFE * scene.at,
             color: glow(0x88ffd6, 1.6),
         }),
+        SceneKind::Rocket => stage_rockets(&mut fx, at, quat, scene.at),
     }
 
     // Hold everything the stage just pushed at one moment of its life, so the
@@ -2548,6 +3061,66 @@ fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
 /// How finely the harness integrates a staged particle to its held age. Sixty
 /// is a frame-rate's worth, which is the accuracy the live effect gets.
 const SCENE_SUBSTEPS: u32 = 60;
+
+/// `SPACESHIPS_FX_SCENE=rocket@12`: three missile bodies parked in front of the
+/// camera.
+///
+/// The body is the one thing in this module that a *live* frame is bad at
+/// showing. A missile is in the air for [`sim::rules::WeaponRules::missile_life`]
+/// seconds at 160 units a second, it is fired away from the camera, and it is
+/// gone before the screenshot timer in `main.rs` reaches three seconds. So it
+/// gets the same treatment every other effect here already has: held still, at a
+/// chosen range, so a before-and-after pair is a pair of the same thing.
+///
+/// Six of them, not one, in two ranks at three attitudes each.
+///
+/// The attitudes are because a body only ever photographed abeam says nothing
+/// about the angles a player actually sees it from, which are all of them:
+/// broadside for the silhouette, quartering away for the nose, quartering back
+/// and pitched up for the fin cross. The second rank is because "does it read as
+/// a rocket" and "does it still read at the range it is normally seen" are two
+/// questions and a still that answers only the first is the one that gets
+/// shipped. Six also puts a squadron's worth of bodies on screen at once, which
+/// is the case the shared mesh exists for.
+///
+/// They are pushed into [`Demo`]'s missile list rather than into the frame,
+/// because that list is already chained onto `Frame::missiles` at every read
+/// site — the body placement, the nozzle glow, and the exhaust emitter all pick
+/// them up with no knowledge that a harness exists. Offsets are in **ship**
+/// space and scale with the rank's own range, so the flight fills the same part
+/// of the frame at 12 units as at 90.
+fn stage_rockets(fx: &mut Effects, at: Vec3, quat: Quat, dist: f32) {
+    let right = quat * Vec3::X;
+    let up = quat * Vec3::Y;
+    let fwd = quat * Vec3::Z;
+    let ship_space = |v: Vec3| right * v.x + up * v.y + fwd * v.z;
+
+    /// `(offset, facing)`, both in ship space, the offset in units of range.
+    const ATTITUDES: [(Vec3, Vec3); 3] = [
+        // Dead abeam: the full silhouette, nose to nozzle.
+        (Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
+        // Above and outboard, quartering away from the camera.
+        (Vec3::new(0.42, 0.20, -0.15), Vec3::new(0.50, 0.0, 0.87)),
+        // Below and inboard, quartering back toward it and pitched up.
+        (Vec3::new(-0.40, -0.16, 0.08), Vec3::new(0.55, 0.42, -0.72)),
+    ];
+    /// The two ranks, as multiples of the staged range.
+    const RANKS: [f32; 2] = [1.0, 2.6];
+
+    fx.demo.missiles.clear();
+    for (r, rank) in RANKS.into_iter().enumerate() {
+        // `at` is already one range ahead, so the far rank only adds the
+        // difference.
+        let anchor = at + fwd * dist * (rank - 1.0);
+        for (i, (offset, facing)) in ATTITUDES.into_iter().enumerate() {
+            fx.demo.missiles.push(ProjView {
+                key: 3_000_000 + (r * ATTITUDES.len() + i) as u64,
+                pos: (anchor + ship_space(offset) * dist * rank).to_array(),
+                dir: ship_space(facing).normalize().to_array(),
+            });
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Draw-call probe
@@ -2681,6 +3254,47 @@ fn binned_draw_calls(
 
 #[cfg(test)]
 mod tests {
+    /// The exhaust may only fall behind *along its own axis*.
+    ///
+    /// The bug this pins: `vel * inherit` shed 30% of whatever direction the
+    /// ship happened to be travelling, so a strafing or drifting aircraft left
+    /// its plume sliding off to one side instead of streaming from the nozzles.
+    #[test]
+    fn exhaust_sheds_speed_only_along_the_nozzle_axis() {
+        let back = Vec3::NEG_Z;
+        let inherit = 0.70;
+
+        // Straight ahead: unchanged from the expression this replaced, which is
+        // the case the emitter was tuned against.
+        let ahead = Vec3::new(0.0, 0.0, 80.0);
+        assert!(carried_momentum(ahead, back, inherit).abs_diff_eq(ahead * inherit, 1e-5));
+
+        // Pure sideways: nothing is shed, so the plume cannot walk off the
+        // side of the aircraft.
+        let sideways = Vec3::new(80.0, 0.0, 0.0);
+        assert!(carried_momentum(sideways, back, inherit).abs_diff_eq(sideways, 1e-5));
+
+        // A drifting ship: the lateral component survives whole and only the
+        // axial one is reduced.
+        let drift = Vec3::new(60.0, 12.0, 45.0);
+        let got = carried_momentum(drift, back, inherit);
+        assert!((got.x - drift.x).abs() < 1e-4, "x moved: {got:?}");
+        assert!((got.y - drift.y).abs() < 1e-4, "y moved: {got:?}");
+        assert!(
+            (got.z - drift.z * inherit).abs() < 1e-4,
+            "z should shed 30%: {got:?}"
+        );
+
+        // And the residual — what the plume drifts at relative to the ship — is
+        // parallel to the exhaust axis, whatever the ship is doing.
+        let residual = drift - got;
+        assert!(
+            residual.normalize().abs_diff_eq(back, 1e-4)
+                || residual.normalize().abs_diff_eq(-back, 1e-4),
+            "residual {residual:?} is not along the nozzles"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -2761,6 +3375,118 @@ mod tests {
         // Every index addresses a real vertex.
         let max = *build.index.iter().max().unwrap() as usize;
         assert_eq!(max, build.pos.len() - 1);
+    }
+
+    // --- the missile body ---------------------------------------------------
+
+    /// Every triangle in the body faces outward.
+    ///
+    /// Back faces are culled, so a triangle wound the wrong way is not a
+    /// slightly wrong missile — it is a hole through it, and the only place that
+    /// shows is on screen. `(b - a) × (c - a)` agreeing with the vertex normals
+    /// is exactly Bevy's `FrontFace::Ccw`, so this is that convention checked
+    /// without a render device.
+    #[test]
+    fn every_face_of_the_body_winds_outward() {
+        let b = missile_geometry();
+        assert_eq!(b.index.len() % 3, 0, "triangles come in threes");
+        assert_eq!(b.normal.len(), b.pos.len());
+        assert_eq!(b.color.len(), b.pos.len());
+
+        for tri in b.index.chunks(3) {
+            let p = |i: u32| Vec3::from_array(b.pos[i as usize]);
+            let (a, bb, c) = (p(tri[0]), p(tri[1]), p(tri[2]));
+            let geo = (bb - a).cross(c - a);
+            assert!(
+                geo.length_squared() > 1e-12,
+                "degenerate triangle {tri:?} at {a:?}"
+            );
+            let n = Vec3::from_array(b.normal[tri[0] as usize]);
+            assert!(
+                geo.normalize().dot(n) > 0.0,
+                "triangle {tri:?} winds inward: face {:?} against normal {n:?}",
+                geo.normalize()
+            );
+        }
+    }
+
+    /// The proportions are `missiles.js`'s, and the nose points **forward**.
+    ///
+    /// The second half is the deliberate departure: evaluated, the JS's
+    /// `rotateX(-PI / 2)` leaves its cone with radius 0 at the *back* and full
+    /// radius at the front — a funnel. This pins the fix so nobody restores the
+    /// bug in the name of fidelity.
+    #[test]
+    fn the_body_is_the_js_missile_pointing_the_right_way() {
+        let b = missile_geometry();
+        let zs: Vec<f32> = b.pos.iter().map(|p| p[2]).collect();
+        let front = zs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let back = zs.iter().copied().fold(f32::INFINITY, f32::min);
+
+        // Nose tip at `BODY_LEN / 2 + NOSE_LEN`, bell mouth at the flame plane.
+        assert!((front - (MISSILE_BODY_LEN / 2.0 + MISSILE_NOSE_LEN)).abs() < 1e-4);
+        assert!((back - MISSILE_FLAME_Z).abs() < 1e-4);
+
+        // The widest thing on the missile is the fin span, and it is centred.
+        let half_span = b.pos.iter().map(|p| p[0].abs()).fold(0.0f32, f32::max);
+        assert!((half_span - MISSILE_FIN_SPAN / 2.0).abs() < 1e-4);
+
+        // The nose is a *point*: everything within a whisker of the tip is on
+        // the axis. Under the JS's sign it would be a full-radius disc, which
+        // is the whole bug.
+        let at_tip = b.pos.iter().filter(|p| p[2] > front - 1e-4);
+        let mut counted = 0;
+        for p in at_tip {
+            counted += 1;
+            assert!(
+                p[0].hypot(p[1]) < 1e-5,
+                "the nose is blunt: {p:?} is off the axis at the tip"
+            );
+        }
+        assert_eq!(
+            counted,
+            MISSILE_SEGMENTS as usize * 2,
+            "one tip per segment"
+        );
+
+        // And the bell flares: it is wider at the mouth than at its throat.
+        let radius_at = |z: f32| {
+            b.pos
+                .iter()
+                .filter(|p| (p[2] - z).abs() < 1e-4)
+                .map(|p| p[0].hypot(p[1]))
+                .fold(0.0f32, f32::max)
+        };
+        assert!(
+            radius_at(MISSILE_FLAME_Z) > MISSILE_BELL_THROAT_R,
+            "the nozzle converges instead of flaring"
+        );
+    }
+
+    /// The plume leaves the bell, not the middle of the tail.
+    ///
+    /// The body and the exhaust emitter are written in two different places and
+    /// there is nothing but this holding them to the same nozzle — which is
+    /// exactly how the JS ended up emitting from inside its own cone.
+    #[test]
+    fn the_exhaust_leaves_the_bell_mouth() {
+        let b = missile_geometry();
+        let back = b.pos.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+        assert!(
+            (MISSILE_FLAME_Z - back).abs() < 1e-4,
+            "the emitter at {MISSILE_FLAME_Z} is not on the aft face at {back}"
+        );
+    }
+
+    /// The pool is fixed and holds a full lobby's salvo.
+    #[test]
+    fn the_body_pool_covers_a_full_lobby() {
+        // Ten ships emptying their tubes, with headroom for the ones already in
+        // the air.
+        assert!(MISSILE_BODY_POOL >= RULES.weapons.missile_max as usize * 10);
+        // And a body is cheap enough that the pool is not a mesh budget:
+        // one shared mesh, whatever the count.
+        assert!(missile_geometry().pos.len() < 400);
     }
 
     /// A bolt flying straight at the camera degenerates the side vector. It

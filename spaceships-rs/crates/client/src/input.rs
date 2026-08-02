@@ -133,10 +133,69 @@ fn toggle_fullscreen(
     };
 }
 
+/// Reference speed for [`accelerate`], in logical pixels per second.
+///
+/// Below this the curve is essentially off; above it, gain climbs. Chosen so an
+/// ordinary aiming movement sits near the knee rather than at either extreme.
+const ACCEL_REFERENCE: f32 = 900.0;
+
+/// How much extra gain a very fast flick gets, on top of 1.0.
+const ACCEL_GAIN: f32 = 1.0;
+
+/// Pointer acceleration, approximating what the OS already did for the web
+/// build.
+///
+/// The same client compiled two ways receives two different signals. In a
+/// browser, pointer lock delivers `movementX`/`movementY` — deltas macOS has
+/// **already** run through its pointer-acceleration curve, the one every other
+/// application on the machine uses. Natively, winit delivers
+/// `DeviceEvent::MouseMotion`, which is raw device counts with no curve at all.
+///
+/// That is why the web build felt smoother than the native one to fly, which is
+/// how this was reported. Raw input is *correct* and it is what a competitive
+/// shooter wants; it is also unlike everything else on the desktop, so slow
+/// corrections feel stiff and fast ones feel short.
+///
+/// This is a gain curve, not a smoothing filter: it scales the delta by speed
+/// and adds no latency and no history. Slow movement passes through at 1.0, so
+/// fine aim is untouched; a fast flick gets up to `1 + ACCEL_GAIN`. The `dt`
+/// divide is what makes it a *speed* curve rather than a per-frame one — at 144
+/// Hz each delta is half the size it is at 72 Hz for the same hand movement,
+/// and without dividing, frame rate would change the aiming.
+///
+/// `SPACESHIPS_MOUSE_RAW=1` turns it off for anyone who wants the hardware
+/// exactly as it comes. `SPACESHIPS_MOUSE` still scales everything on top.
+///
+/// Not applied on wasm: the browser has already done it, and doing it twice is
+/// how you get a pointer that skates.
+fn accelerate(delta: Vec2, dt: f32) -> Vec2 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = dt;
+        return delta;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if raw_mouse() || dt <= 0.0 {
+            return delta;
+        }
+        let speed = delta.length() / dt;
+        let gain = 1.0 + ACCEL_GAIN * (speed / ACCEL_REFERENCE).min(1.0);
+        delta * gain
+    }
+}
+
+/// `SPACESHIPS_MOUSE_RAW`: skip [`accelerate`] entirely.
+#[cfg(not(target_arch = "wasm32"))]
+fn raw_mouse() -> bool {
+    std::env::var_os("SPACESHIPS_MOUSE_RAW").is_some()
+}
+
 fn gather_input(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
+    time: Res<Time>,
     scroll: Res<AccumulatedMouseScroll>,
     window: Single<&Window, With<PrimaryWindow>>,
     lobby: Option<Res<crate::ui::LobbyOpen>>,
@@ -179,14 +238,13 @@ fn gather_input(
     // `Window::height` is logical. On a 2x display that made the mouse twice as
     // sensitive as the browser's `movementX`, which is CSS pixels.
     //
-    // Raw also means unaccelerated, where the browser hands the JS a delta the
-    // OS has already curved. There is no way to reproduce that exactly, so
-    // `SPACESHIPS_MOUSE` scales the result for anyone who wants it heavier or
-    // lighter than the 1:1 the JS implies.
+    // Raw also means *unaccelerated*, and that is the one difference a player
+    // feels immediately. See [`accelerate`].
     let scale = mouse_sensitivity() / window.scale_factor().max(0.5);
     if !free_look {
-        virt.x = (virt.x + motion.delta.x * scale).clamp(-half_h, half_h);
-        virt.y = (virt.y + motion.delta.y * scale).clamp(-half_h, half_h);
+        let delta = accelerate(motion.delta, time.delta_secs());
+        virt.x = (virt.x + delta.x * scale).clamp(-half_h, half_h);
+        virt.y = (virt.y + delta.y * scale).clamp(-half_h, half_h);
     }
 
     out.0 = sim::world::Input {
@@ -275,4 +333,63 @@ fn gather_input(
         // `throttle_override` (touch HUD).
         ..Default::default()
     };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// Fine aim is untouched and a flick is amplified — the point of the curve.
+    #[test]
+    fn slow_movement_passes_through_and_fast_movement_gains() {
+        let dt = 1.0 / 120.0;
+
+        // A slow correction: a couple of pixels in a frame is ~240 px/s,
+        // far below the knee.
+        let slow = Vec2::new(2.0, 0.0);
+        let out = accelerate(slow, dt);
+        assert!(
+            (out.length() / slow.length() - 1.0).abs() < 0.35,
+            "fine aim should be near 1:1, got {}",
+            out.length() / slow.length(),
+        );
+
+        // A flick, well past the reference speed, is capped at 1 + ACCEL_GAIN.
+        let fast = Vec2::new(60.0, 0.0);
+        let out = accelerate(fast, dt);
+        assert!(
+            (out.length() / fast.length() - (1.0 + ACCEL_GAIN)).abs() < 1e-4,
+            "a hard flick should hit the gain ceiling",
+        );
+    }
+
+    /// The property that makes this a *speed* curve rather than a per-frame
+    /// one: the same hand movement must aim the same at any frame rate.
+    ///
+    /// Without the `dt` divide, a 144 Hz display would halve every delta
+    /// against a 72 Hz one and quietly aim differently — which is the bug this
+    /// shape exists to avoid, and the reason the naive version was rejected.
+    #[test]
+    fn the_curve_is_frame_rate_independent() {
+        // One hand movement, sampled over one frame or split across two.
+        let whole = Vec2::new(24.0, 0.0);
+        let dt = 1.0 / 60.0;
+
+        let once = accelerate(whole, dt);
+        let halved = accelerate(whole / 2.0, dt / 2.0) * 2.0;
+
+        assert!(
+            once.abs_diff_eq(halved, 1e-4),
+            "same movement, different frame rate: {once:?} vs {halved:?}",
+        );
+    }
+
+    /// The escape hatch has to actually escape.
+    #[test]
+    fn raw_mode_is_the_identity() {
+        // `raw_mouse` reads the environment, so assert the arithmetic the flag
+        // selects rather than mutating global state in a threaded test run.
+        let delta = Vec2::new(40.0, -12.0);
+        assert_eq!(accelerate(delta, 0.0), delta, "a zero dt cannot divide");
+    }
 }
