@@ -1066,21 +1066,21 @@ impl Screen {
 
     fn title(self) -> &'static str {
         match self {
-            Screen::Boot => "SELF TEST",
-            Screen::Main => "MISSION BOARD",
-            Screen::Solo => "SOLO TASKING",
-            Screen::Trials => "TIME TRIAL CIRCUITS",
-            Screen::Campaign => "CAMPAIGN OPERATIONS",
-            Screen::Net => "NETWORK",
-            Screen::Create => "CREATE SORTIE",
-            Screen::Browser => "TASKING ORDERS",
-            Screen::Waiting => "CREW ROOM",
-            Screen::Armory => "ARMORY",
-            Screen::Livery => "LIVERY",
-            Screen::Record => "SERVICE RECORD",
-            Screen::Standings => "SQUADRON STANDINGS",
-            Screen::Auth => "PILOT AUTHENTICATION",
-            Screen::Config => "SYSTEMS",
+            Screen::Boot => "STARTING UP",
+            Screen::Main => "MAIN MENU",
+            Screen::Solo => "SINGLE PLAYER",
+            Screen::Trials => "TIME TRIALS",
+            Screen::Campaign => "CAMPAIGN",
+            Screen::Net => "MULTIPLAYER",
+            Screen::Create => "CREATE GAME",
+            Screen::Browser => "FIND GAME",
+            Screen::Waiting => "WAITING ROOM",
+            Screen::Armory => "CUSTOMISE",
+            Screen::Livery => "COLOURS",
+            Screen::Record => "YOUR STATS",
+            Screen::Standings => "LEADERBOARD",
+            Screen::Auth => "LOG IN",
+            Screen::Config => "SETTINGS",
         }
     }
 
@@ -1325,7 +1325,7 @@ impl AuthForm {
         if self.callsign.chars().count() < CALLSIGN_MIN {
             Some("CALLSIGN IS 3-20 LETTERS AND DIGITS")
         } else if self.secret.chars().count() < PASSWORD_MIN {
-            Some("PASSPHRASE IS 6 CHARACTERS OR MORE")
+            Some("PASSWORD IS 6 CHARACTERS OR MORE")
         } else {
             None
         }
@@ -1534,8 +1534,8 @@ impl Menu {
         self.screen = screen;
         self.say(match screen {
             Screen::Standings => "CACHED - NO DATA LINK",
-            Screen::Browser => "REQUESTING ORDERS",
-            Screen::Waiting => "AWAITING FLIGHT LEAD",
+            Screen::Browser => "LOOKING FOR GAMES",
+            Screen::Waiting => "WAITING FOR HOST",
             _ => "READY",
         });
     }
@@ -1601,9 +1601,9 @@ impl Flag {
             Flag::Retro => "RETRO PIXEL FILTER",
             Flag::Ultra => "ULTRA GRAPHICS",
             Flag::Stats => "TELEMETRY READOUT",
-            Flag::Trails => "ADVERSARY TRAILS",
+            Flag::Trails => "ENEMY TRAILS",
             Flag::Cockpit => "COCKPIT VIEW",
-            Flag::Hard => "HARD ADVERSARY",
+            Flag::Hard => "HARD ENEMIES",
         }
     }
 }
@@ -1642,8 +1642,8 @@ struct Rung {
 /// The tier headings.
 const TIERS: [&str; 7] = [
     "T0  ISSUED",
-    "T1  LIVERY",
-    "T2  SECOND AIRFRAME",
+    "T1  COLOURS",
+    "T2  SECOND SHIP",
     "T3  MID",
     "T4  LATE",
     "T5  CHASE",
@@ -1676,49 +1676,49 @@ const ARMORY: [Rung; 16] = [
     Rung {
         tier: 0,
         name: "MK.I  LANCER",
-        class: "AIRFRAME",
+        class: "SHIP",
         cost: 0,
         blurb: "Issued on enlistment. The hull every pilot learns on.",
     },
     Rung {
         tier: 1,
-        name: "COLOUR LOCK",
-        class: "LIVERY",
+        name: "SAVE COLOURS",
+        class: "COLOURS",
         cost: 50,
         blurb: "Persist a scheme across sorties instead of re-picking it.",
     },
     Rung {
         tier: 1,
         name: "TRAIL PROFILE",
-        class: "LIVERY",
+        class: "COLOURS",
         cost: 200,
         blurb: "Five exhaust shapes, visible to every other pilot.",
     },
     Rung {
         tier: 1,
         name: "HULL COLOUR",
-        class: "LIVERY",
+        class: "COLOURS",
         cost: 250,
         blurb: "Free choice of hull finish.",
     },
     Rung {
         tier: 1,
         name: "ACCENT COLOUR",
-        class: "LIVERY",
+        class: "COLOURS",
         cost: 400,
         blurb: "Free choice of accent, below the luminance split.",
     },
     Rung {
         tier: 1,
-        name: "ENGINE TRAIL",
-        class: "LIVERY",
+        name: "TRAIL COLOUR",
+        class: "COLOURS",
         cost: 500,
         blurb: "Free choice of trail colour.",
     },
     Rung {
         tier: 2,
         name: "MK.II  HALBERD",
-        class: "AIRFRAME",
+        class: "SHIP",
         cost: 2_000,
         blurb: "Second hull. Heavier nose, the same flight model.",
     },
@@ -1732,28 +1732,28 @@ const ARMORY: [Rung; 16] = [
     Rung {
         tier: 3,
         name: "MK.III  SABRE",
-        class: "AIRFRAME",
+        class: "SHIP",
         cost: 8_000,
         blurb: "Third hull. Long canopy, the best forward view of the five.",
     },
     Rung {
         tier: 3,
         name: "COCKPIT: NIGHT",
-        class: "AVIONICS",
+        class: "DISPLAY",
         cost: 4_500,
         blurb: "Dark interior, red strip lighting. Cockpit view only.",
     },
     Rung {
         tier: 3,
         name: "PANEL: AMBER",
-        class: "AVIONICS",
+        class: "DISPLAY",
         cost: 3_000,
         blurb: "Amber instrument theme in place of the standard cyan.",
     },
     Rung {
         tier: 4,
         name: "MK.IV  WARDEN",
-        class: "AIRFRAME",
+        class: "SHIP",
         cost: 25_000,
         blurb: "Fourth hull. Twin tails, the widest wing of the line.",
     },
@@ -1766,7 +1766,7 @@ const ARMORY: [Rung; 16] = [
     },
     Rung {
         tier: 4,
-        name: "CALLSIGN PLATE",
+        name: "CALLSIGN",
         class: "MARKINGS",
         cost: 6_000,
         blurb: "Your callsign under the canopy rail and on the nameplate.",
@@ -1774,14 +1774,14 @@ const ARMORY: [Rung; 16] = [
     Rung {
         tier: 5,
         name: "MK.V  REVENANT",
-        class: "AIRFRAME",
+        class: "SHIP",
         cost: 60_000,
         blurb: "Fifth hull. The chase item: months of sorties, not one evening.",
     },
     Rung {
         tier: 6,
-        name: "ADMIN PROTOTYPE",
-        class: "AIRFRAME",
+        name: "ADMIN SHIP",
+        class: "SHIP",
         cost: 125_000,
         blurb: "Unchanged at 125,000. A genuine flex should stay out of reach.",
     },
@@ -2515,7 +2515,7 @@ fn col(gap_px: f32) -> Node {
 ///
 /// **Fixed width on purpose.** A content-sized column takes the width of its
 /// widest child and wraps every longer one, which is what put "NETWORK
-/// OPERATIONS" on two lines under "SOLO OPERATIONS" in the first pass.
+/// OPERATIONS" on two lines under "SINGLE PLAYER" in the first pass.
 fn page_col(width_pct: f32) -> Node {
     Node {
         width: percent(width_pct),
@@ -2790,12 +2790,12 @@ fn display_of(visible: bool) -> Display {
 
 /// The self test's lines, and what each reports.
 const BOOT_TEST: [(&str, &str); BOOT_LINES] = [
-    ("AVIONICS BUS", "OK"),
+    ("SETTINGS", "OK"),
     ("INERTIAL REFERENCE", "ALIGNED"),
     ("FLIGHT MODEL", "OK"),
     ("ORDNANCE BUS", "SAFE"),
     ("RADAR", "STANDBY"),
-    ("DATA LINK", "NO CARRIER"),
+    ("CONNECTION", "NO CARRIER"),
     ("REQUISITION CACHE", "STALE"),
 ];
 
@@ -3112,12 +3112,12 @@ fn build_menu(
                         })
                         .with_children(|r| {
                             for (screen, label) in [
-                                (Screen::Main, "BOARD"),
+                                (Screen::Main, "MAIN"),
                                 (Screen::Solo, "SOLO"),
-                                (Screen::Net, "NETWORK"),
-                                (Screen::Armory, "ARMORY"),
-                                (Screen::Record, "RECORD"),
-                                (Screen::Config, "SYSTEMS"),
+                                (Screen::Net, "MULTIPLAYER"),
+                                (Screen::Armory, "CUSTOMISE"),
+                                (Screen::Record, "STATS"),
+                                (Screen::Config, "SETTINGS"),
                             ] {
                                 // Rail keys belong to no page: they are live on
                                 // all of them, and `Boot` is the sentinel for
@@ -3133,7 +3133,7 @@ fn build_menu(
                                 );
                             }
                             r.spawn(grow());
-                            section(r, f, "THEATRE");
+                            section(r, f, "MAP");
                             control_row(
                                 r,
                                 &mut ui,
@@ -3229,7 +3229,7 @@ fn build_menu(
                         ..default()
                     })
                     .with_children(|ft| {
-                        ft.spawn(caption(f, "ESC  BACK      ENTER  EXEC", 8.0, dim(0.4)));
+                        ft.spawn(caption(f, "ESC  BACK      ENTER  SELECT", 8.0, dim(0.4)));
                         ft.spawn(grow());
                         notice = ft.spawn(caption(f, "READY", 9.0, pal::AMBER)).id();
                         ft.spawn(grow());
@@ -3450,20 +3450,20 @@ fn build_pages(
                 dossier.board_line = c.spawn(readout(f, "", 10.0, dim(0.6))).id();
                 c.spawn(gap(44.0));
                 for (screen, label) in [
-                    (Screen::Solo, "SOLO OPERATIONS"),
-                    (Screen::Net, "NETWORK OPERATIONS"),
-                    (Screen::Armory, "ARMORY"),
-                    (Screen::Record, "SERVICE RECORD"),
-                    (Screen::Auth, "PILOT AUTHENTICATION"),
-                    (Screen::Config, "SYSTEMS"),
+                    (Screen::Solo, "SINGLE PLAYER"),
+                    (Screen::Net, "MULTIPLAYER"),
+                    (Screen::Armory, "CUSTOMISE"),
+                    (Screen::Record, "YOUR STATS"),
+                    (Screen::Auth, "LOG IN"),
+                    (Screen::Config, "SETTINGS"),
                 ] {
                     control_row(c, ui, Screen::Main, Action::Go(screen), label, None, 18.0);
                 }
                 c.spawn(gap(44.0));
-                section(c, f, "ARMED");
+                section(c, f, "SELECTED");
                 *armed = c.spawn(readout(f, "", 13.0, pal::WHITE)).id();
                 c.spawn(gap(12.0));
-                control_row(c, ui, Screen::Main, Action::Execute, "EXECUTE", None, 15.0);
+                control_row(c, ui, Screen::Main, Action::Execute, "START", None, 15.0);
             });
         })
         .id();
@@ -3474,8 +3474,8 @@ fn build_pages(
         .with_children(|p| {
             p.spawn(page_col(52.0)).with_children(|c| {
                 for (pick, label) in [
-                    (SoloPick::Tutorial, "FAMILIARISATION"),
-                    (SoloPick::Train, "ADVERSARY TRAINING"),
+                    (SoloPick::Tutorial, "TUTORIAL"),
+                    (SoloPick::Train, "TRAIN VS BOT"),
                     (SoloPick::Skirmish, "SKIRMISH"),
                 ] {
                     control_row(
@@ -3497,17 +3497,14 @@ fn build_pages(
                 c.spawn(hint(f));
                 c.spawn(gap(32.0));
                 for (screen, label) in [
-                    (Screen::Trials, "TIME TRIAL CIRCUITS"),
-                    (Screen::Campaign, "CAMPAIGN OPERATIONS"),
+                    (Screen::Trials, "TIME TRIALS"),
+                    (Screen::Campaign, "CAMPAIGN"),
                 ] {
                     control_row(c, ui, Screen::Solo, Action::Go(screen), label, None, 18.0);
                 }
             });
             p.spawn(page_col(38.0)).with_children(|c| {
-                for (i, k) in ["OBJECTIVE", "ADVERSARY", "DURATION"]
-                    .into_iter()
-                    .enumerate()
-                {
+                for (i, k) in ["OBJECTIVE", "ENEMY", "DURATION"].into_iter().enumerate() {
                     c.spawn(col(3.0)).with_children(|b| {
                         b.spawn(caption(f, k, 8.0, dim(0.4)));
                         brief[i] = b.spawn(readout(f, "", 13.0, pal::WHITE)).id();
@@ -3589,7 +3586,7 @@ fn build_pages(
                     ui,
                     Screen::Net,
                     Action::Go(Screen::Create),
-                    "CREATE SORTIE",
+                    "CREATE GAME",
                     None,
                     18.0,
                 );
@@ -3598,7 +3595,7 @@ fn build_pages(
                     ui,
                     Screen::Net,
                     Action::Go(Screen::Browser),
-                    "TASKING ORDERS",
+                    "FIND GAME",
                     None,
                     18.0,
                 );
@@ -3619,8 +3616,8 @@ fn build_pages(
                 net.endpoint_row = ui.controls.len() - 1;
             });
             p.spawn(page_col(38.0)).with_children(|c| {
-                section(c, f, "DATA LINK");
-                net.link_values[0] = kv(c, f, "ENDPOINT", "- - - -", pal::rgba(0xea_f6_ff, 0.8));
+                section(c, f, "CONNECTION");
+                net.link_values[0] = kv(c, f, "SERVER", "- - - -", pal::rgba(0xea_f6_ff, 0.8));
                 net.link_values[1] = kv(c, f, "IDENTITY", "GUEST", pal::AMBER);
                 net.link_values[2] = kv(c, f, "FRAMES", "0 OUT   0 IN", pal::rgba(0xea_f6_ff, 0.8));
             });
@@ -3652,13 +3649,13 @@ fn build_pages(
                     15.0,
                 );
                 c.spawn(gap(30.0));
-                section(c, f, "COMPLEMENT");
+                section(c, f, "PLAYERS");
                 control_row(
                     c,
                     ui,
                     Screen::Create,
                     Action::SetAutoBot(true),
-                    "AUTO-FILL WITH BOT",
+                    "ADD A BOT",
                     None,
                     15.0,
                 );
@@ -3677,7 +3674,7 @@ fn build_pages(
                     ui,
                     Screen::Create,
                     Action::Transmit,
-                    "TRANSMIT",
+                    "CONFIRM",
                     None,
                     15.0,
                 );
@@ -3883,7 +3880,7 @@ fn build_pages(
                     ui,
                     Screen::Armory,
                     Action::Go(Screen::Livery),
-                    "LIVERY",
+                    "COLOURS",
                     None,
                     15.0,
                 );
@@ -3976,7 +3973,7 @@ fn build_pages(
                         ("FLIGHT HOURS", pal::PHOSPHOR),
                         ("KILL MARKS", pal::AMBER),
                         ("EXCHANGE", pal::WHITE),
-                        ("SORTIES", pal::WHITE),
+                        ("GAMES", pal::WHITE),
                         ("BOTS DOWNED", pal::WHITE),
                         ("CAPITAL KILLS", pal::WHITE),
                     ]
@@ -4039,7 +4036,7 @@ fn build_pages(
                     ui,
                     Screen::Record,
                     Action::Go(Screen::Standings),
-                    "SQUADRON STANDINGS",
+                    "LEADERBOARD",
                     None,
                     15.0,
                 );
@@ -4048,7 +4045,7 @@ fn build_pages(
                     ui,
                     Screen::Record,
                     Action::Go(Screen::Auth),
-                    "PILOT AUTHENTICATION",
+                    "LOG IN",
                     None,
                     15.0,
                 );
@@ -4129,13 +4126,12 @@ fn build_pages(
         .spawn(page(on(Screen::Auth)))
         .with_children(|p| {
             p.spawn(page_col(56.0)).with_children(|c| {
-                section(c, f, "CREDENTIALS");
+                section(c, f, "ACCOUNT");
                 // The cursor resting on one of these *is* the caret; there is no
                 // second focus model. `control_row`'s value node is what the
                 // typed text goes into, which is why both are registered as
                 // controls rather than drawn as `kv` lines.
-                for (field, label) in [(Field::Callsign, "CALLSIGN"), (Field::Secret, "PASSPHRASE")]
-                {
+                for (field, label) in [(Field::Callsign, "CALLSIGN"), (Field::Secret, "PASSWORD")] {
                     control_row(
                         c,
                         ui,
@@ -4156,8 +4152,8 @@ fn build_pages(
                     2.4,
                 ));
                 c.spawn(gap(34.0));
-                control_row(c, ui, Screen::Auth, Action::SignIn, "IDENTIFY", None, 17.0);
-                control_row(c, ui, Screen::Auth, Action::Enlist, "ENLIST", None, 15.0);
+                control_row(c, ui, Screen::Auth, Action::SignIn, "LOG IN", None, 17.0);
+                control_row(c, ui, Screen::Auth, Action::Enlist, "SIGN UP", None, 15.0);
                 control_row(c, ui, Screen::Auth, Action::SignOut, "SIGN OUT", None, 15.0);
             });
             p.spawn(page_col(34.0)).with_children(|c| {
@@ -4213,7 +4209,7 @@ fn build_pages(
                 }
             });
             p.spawn(page_col(46.0)).with_children(|c| {
-                section(c, f, "SYSTEMS");
+                section(c, f, "SETTINGS");
                 // No ON/OFF column. The label and the cursor tick go amber
                 // when a flag is set, which says it without a second word — and
                 // a static "OFF" beside a lit label, which is what the first
@@ -4833,7 +4829,7 @@ fn apply(
         Action::Refresh => {
             ops.open_link();
             menu.pending = Some(Pending::List);
-            menu.say("REQUESTING ORDERS");
+            menu.say("LOOKING FOR GAMES");
         }
         Action::JoinSortie => match ops.session.rooms.get(usize::from(menu.sortie)) {
             Some(room) => {
@@ -4841,14 +4837,14 @@ fn apply(
                 menu.pending = Some(Pending::Join(room.code.clone()));
                 menu.say("JOINING");
             }
-            None => menu.say("NO SUCH SORTIE"),
+            None => menu.say("GAME NOT FOUND"),
         },
         Action::LaunchNet => {
             if ops.session.host {
                 ops.send(ClientMessage::Start);
                 menu.say("LAUNCHING");
             } else {
-                menu.say("THE FLIGHT LEAD LAUNCHES");
+                menu.say("ONLY THE HOST CAN START");
             }
         }
         Action::LeaveRoom => {
@@ -4869,7 +4865,7 @@ fn apply(
         }
         Action::SetTrial(t) => {
             if trial_locked(t) {
-                menu.say("CIRCUIT NOT CLEARED");
+                menu.say("FINISH THE PREVIOUS TRIAL");
                 return;
             }
             menu.trial = t;
@@ -4877,7 +4873,7 @@ fn apply(
         }
         Action::SetMission(m) => {
             if mission_locked(m) {
-                menu.say("OPERATION NOT CLEARED");
+                menu.say("FINISH THE PREVIOUS MISSION");
                 return;
             }
             menu.mission = m;
@@ -4909,7 +4905,7 @@ fn apply(
             // too, so there is no route by which the armed sortie is a row that
             // is not there.
             if usize::from(s) >= ops.session.rooms.len() {
-                menu.say("NO SUCH SORTIE");
+                menu.say("GAME NOT FOUND");
                 return;
             }
             menu.sortie = s;
@@ -4969,7 +4965,7 @@ fn apply(
                 },
                 Stock::Held => menu.say("ALREADY HELD"),
                 Stock::Short => menu.say("INSUFFICIENT BALANCE"),
-                Stock::Locked => menu.say("TIER NOT CLEARED"),
+                Stock::Locked => menu.say("BUY THE PREVIOUS TIER FIRST"),
             }
         }
 
@@ -5000,7 +4996,7 @@ fn apply(
             menu.form.rev = menu.form.rev.wrapping_add(1);
             if action == Action::Enlist {
                 ops.ask(ApiRequest::Enlist { username, password });
-                menu.say("ENLISTING");
+                menu.say("SIGNING UP");
             } else {
                 ops.ask(ApiRequest::SignIn { username, password });
                 menu.say("IDENTIFYING");
@@ -5044,7 +5040,7 @@ fn execute(
         online,
     });
     menu.open = false;
-    menu.say("EXECUTING");
+    menu.say("STARTING");
 }
 
 /// Circuits 3 and 4, and operation 3, are not flown yet.
@@ -5160,8 +5156,8 @@ fn follow_session(
     // lobby's own words.
     if let Some(message) = session.take_notice() {
         menu.say(match message.as_str() {
-            "Room not found" => "NO SUCH SORTIE",
-            "Game already started" => "SORTIE ALREADY UNDERWAY",
+            "Room not found" => "GAME NOT FOUND",
+            "Game already started" => "GAME ALREADY STARTED",
             _ => "SERVER REFUSED",
         });
         menu.pending = None;
@@ -5190,7 +5186,7 @@ fn follow_session(
             // The match is behind the menu now, so `ESC` means "resume" rather
             // than "there is no page below".
             menu.resumable = true;
-            menu.say("EXECUTING");
+            menu.say("STARTING");
         }
         Phase::Offline | Phase::Idle if menu.screen == Screen::Waiting => {
             menu.go(Screen::Net);
@@ -6200,7 +6196,9 @@ fn tasking_name(menu: &Menu) -> String {
     match menu.screen {
         Screen::Trials => format!("CIRCUIT {}", menu.trial + 1),
         Screen::Campaign => format!("OPERATION {}", menu.mission + 1),
-        Screen::Net | Screen::Create | Screen::Browser | Screen::Waiting => "NETWORK".to_owned(),
+        Screen::Net | Screen::Create | Screen::Browser | Screen::Waiting => {
+            "MULTIPLAYER".to_owned()
+        }
         _ => match menu.solo {
             SoloPick::Tutorial => "TUTORIAL",
             SoloPick::Train => "TRAIN",
@@ -6213,8 +6211,8 @@ fn tasking_name(menu: &Menu) -> String {
 /// The three values in [`Screen::Solo`]'s brief.
 fn brief_lines(menu: &Menu) -> [&'static str; 3] {
     match menu.solo {
-        SoloPick::Tutorial => ["FAMILIARISATION", "NONE", "UNLIMITED"],
-        SoloPick::Train => ["DEFEAT ONE ADVERSARY", "1 BOT", "3:00"],
+        SoloPick::Tutorial => ["TUTORIAL", "NONE", "UNLIMITED"],
+        SoloPick::Train => ["DEFEAT ONE ENEMY", "1 BOT", "3:00"],
         SoloPick::Skirmish => ["TEAM DEATHMATCH", "5 BOTS / 4 ALLIED", "5:00"],
     }
 }
@@ -6515,7 +6513,7 @@ mod tests {
             assert!(!rungs.is_empty(), "tier {t} is empty");
             if tier != 1 {
                 assert!(
-                    rungs.iter().any(|r| r.class == "AIRFRAME"),
+                    rungs.iter().any(|r| r.class == "SHIP"),
                     "tier {t} has no airframe to anchor it"
                 );
             }
@@ -7206,7 +7204,11 @@ mod tests {
             let (_, sent) = activate(action, &mut menu);
             assert!(menu.open, "{action:?} left the display");
             assert!(sent.is_empty(), "{action:?} launched a locked tasking");
-            assert!(menu.notice.contains("NOT CLEARED"), "{}", menu.notice);
+            assert!(
+                menu.notice.contains("FINISH THE PREVIOUS"),
+                "{}",
+                menu.notice
+            );
         }
         // The rows that *are* open still are, so the gate is the ladder rather
         // than a blanket refusal.
@@ -7294,7 +7296,7 @@ mod tests {
         let (_, sent, _) = activate_online(Action::JoinSortie, &mut menu, &session);
         assert!(sent.is_empty());
         assert_eq!(menu.pending, None);
-        assert_eq!(menu.notice, "NO SUCH SORTIE");
+        assert_eq!(menu.notice, "GAME NOT FOUND");
     }
 
     /// The browser page's controls, in the order the cursor visits them: six
@@ -7412,7 +7414,7 @@ mod tests {
             menu.sortie, 0,
             "an empty slot must not become the selection"
         );
-        assert_eq!(menu.notice, "NO SUCH SORTIE");
+        assert_eq!(menu.notice, "GAME NOT FOUND");
 
         let (_, _, _) = activate_online(Action::SetSortie(0), &mut menu, &session);
         assert_eq!(menu.sortie, 0);
@@ -7534,7 +7536,7 @@ mod tests {
             secret: "12345".to_owned(),
             rev: 0,
         };
-        assert!(weak.complaint().unwrap().contains("PASSPHRASE"));
+        assert!(weak.complaint().unwrap().contains("PASSWORD"));
 
         let good = AuthForm {
             callsign: "MAVERICK".to_owned(),
@@ -7937,7 +7939,7 @@ mod tests {
 
         let (_, sent, _) = activate_online(Action::LaunchNet, &mut menu, &in_room(false));
         assert!(sent.is_empty());
-        assert_eq!(menu.notice, "THE FLIGHT LEAD LAUNCHES");
+        assert_eq!(menu.notice, "ONLY THE HOST CAN START");
     }
 
     /// Walking out of the crew room gives the seat up. Without this the server
