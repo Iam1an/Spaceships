@@ -1,10 +1,47 @@
-//! The in-game HUD, in `bevy_ui`.
+//! The in-game HUD: a combining-glass gun sight, in `bevy_ui`.
 //!
-//! A port of the `#healthbar` / `#boostbar` / `#heatbar` / `#chargebar` /
-//! `#missilehud` / `#flarehud` / `#reticle` / `#missile-lock-warning` /
-//! `#hit-vignette` / `#deathbanner` / `#matchhud` block of `public/index.html`,
-//! driven by [`sim::world::HudState`] instead of by closure variables in
-//! `main.js`.
+//! Drives the same six meters, reticle, warnings, killfeed and match clock the
+//! `#healthbar` / `#boostbar` / `#heatbar` / `#chargebar` / `#missilehud` /
+//! `#flarehud` / `#reticle` / `#missile-lock-warning` / `#hit-vignette` /
+//! `#deathbanner` / `#matchhud` block of `public/index.html` did, off
+//! [`sim::world::HudState`] instead of closure variables in `main.js`.
+//!
+//! # It is no longer a port of the CSS
+//!
+//! It was, and that was the complaint: `ui.rs` and `cockpit.rs` are the same
+//! aircraft — instrument screens `#05080b`, gauge wells `#0d151c`, phosphor
+//! green, cyan and amber, with a test in `ui.rs` pinning the shared list — and
+//! this file sat on top of them as a web page. `--glass-bg` panels with
+//! `blur(16px)` behind them, 8px rounded rectangles, a
+//! `linear-gradient(90deg, #2980b9, #3498db)` boost bar and an hsl green-to-red
+//! health bar. Glassmorphism over avionics.
+//!
+//! So the palette is now [`crate::ui::palette`] — literally the same module the
+//! menu draws from, which is `cockpit.rs`'s `Palette` — and the *drawing* is a
+//! head-up display rather than a web UI:
+//!
+//! ```text
+//!         ┌ 420        ╭───╮        100 ┐
+//!         │ 400        │ ✛ │         90 │
+//!         │ 380        ╰───╯         80 │
+//!         │ SPD                    HULL │
+//!
+//!               ▁▃▅▇ GUN   ▁▃▅ BST
+//!               MSL ▮▮▮▮    FLR ▮▮▮
+//! ```
+//!
+//! Thin strokes, no fills, no panels, no rounded boxes: everything is a line on
+//! the canopy. Two vertical tapes carry speed and hull, ladders that scroll past
+//! a fixed index rather than bars that grow; the four bars become segment
+//! stacks; every surviving readout is drawn in phosphor, amber for a caution and
+//! red for a warning, in the one hue a real combining glass has.
+//!
+//! **The tapes adapt to the map.** An altitude tape is meaningless in space, so
+//! the block under the hull tape reads [`sim::ship::terrain_height`] as `AGL` on
+//! [`MapKind::Terrain`] — with the ground-proximity `PULL UP` that only makes
+//! sense there — and range to the boresight contact as `RNG` on
+//! [`MapKind::Space`]. Same two nodes, one caption apart. The terrain map has no
+//! renderer yet; this is designed for it and does not wait on it.
 //!
 //! # The bug this is escaping
 //!
@@ -100,25 +137,41 @@
 //! drawing through the moon; [`sync_world_markers`] says what it costs and why
 //! it runs last.
 //!
+//! # What the tapes cost, which is the reason they are tapes
+//!
+//! A ladder is **built once and never rewritten**. Every tick mark and every
+//! number on both tapes exists from startup at a fixed offset, and reading a
+//! new speed moves the whole ladder with a single [`UiTransform`] — no text
+//! written, no node resized, no relayout. The scroll is quantised to whole
+//! pixels, so a ship holding a speed writes nothing at all.
+//!
+//! The four bars became segment stacks for the same reason. A bar's width is a
+//! continuous quantity and the old port quantised it to a tenth of a percent,
+//! which still moves most frames under acceleration; ten segments quantise the
+//! same reading to a tenth, so a meter that has not crossed a segment boundary
+//! costs zero writes rather than one `Node` write and the layout pass behind it.
+//!
 //! # What it is not
 //!
-//! `bevy_ui` has no CSS transitions, no `backdrop-filter`, and no
-//! `mix-blend-mode`; where the CSS relies on those the port lands on the end
-//! state rather than the animation, and the deviations are noted at each site.
-//! It also has no *dashed* border, which is what `.lead-marker` uses to say
-//! "the assist has this target but your nose is not on it" — see
-//! [`lead_marker`] for how that state is drawn instead.
+//! `bevy_ui` has no CSS transitions and no `mix-blend-mode`; where an effect
+//! relied on those it lands on the end state rather than the animation, and the
+//! deviations are noted at each site. It also has no *dashed* border, which is
+//! what the lead marker uses to say "the assist has this target but your nose is
+//! not on it" — see [`lead_marker`] for how that state is drawn instead.
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::text::{FontSource, FontWeight, Justify, LetterSpacing};
 
 use sim::rules::Rules;
-use sim::world::{is_boss_hitbox, EntityId, Frame, GunMode, HudState, ShipFlags, SimEvent};
+use sim::world::{
+    is_boss_hitbox, EntityId, Frame, GunMode, HudState, MapKind, ShipFlags, SimEvent,
+};
 use spaceships_sim as sim;
 
 use crate::scene::ShipRoot;
 use crate::sim_bridge::{Roster, SimFrame, SimSet, LOCAL_ID};
+use crate::ui::palette as pal;
 
 /// Wires the HUD in: one tree at startup, one diffing system per frame.
 pub struct HudPlugin;
@@ -128,7 +181,7 @@ impl Plugin for HudPlugin {
         app.init_resource::<AppliedHud>()
             .init_resource::<AppliedMarkers>()
             .init_resource::<KillFeed>()
-            .init_resource::<TargetLock>()
+            .init_resource::<Boresight>()
             .init_resource::<MatchResult>()
             .add_systems(Startup, spawn_hud)
             // `SimSet` lives in `FixedUpdate` and this is `Update`, so the
@@ -159,67 +212,54 @@ impl Plugin for HudPlugin {
 // Design tokens
 // ---------------------------------------------------------------------------
 
-/// `rgba()` as the CSS writes it: 8-bit channels, float alpha.
+/// `#rrggbb` at an alpha, for the two colours below that are not a swatch.
 const fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
     Color::srgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a)
 }
 
-/// `#rrggbb` as the CSS writes it.
-const fn rgb(r: u8, g: u8, b: u8) -> Color {
-    rgba(r, g, b, 1.0)
+/// The glass's own hue: everything not calling for attention is drawn in this.
+///
+/// `Swatch::blip_friendly`, which is `cockpit.rs`'s phosphor and the colour its
+/// scope, its gauges and its captions are all built on.
+const PHOSPHOR: Color = pal::PHOSPHOR;
+/// A caution — hull below [`HULL_CAUTION`], a full brake charge, an empty tank.
+/// `ADMIN_PROFILE::accent`.
+const AMBER: Color = pal::AMBER;
+/// A warning: hull below [`HULL_WARNING`], an overheated gun, an overload.
+/// `Swatch::red`.
+const WARN: Color = pal::RED;
+/// A hostile contact. The same `Swatch::blip_hostile` the cockpit scope paints
+/// an enemy blip with, so a bracket on the glass and a blip on the panel agree.
+const HOSTILE: Color = pal::RED;
+/// Ordnance aboard: the missile pips. `Swatch::orange` — a store you have is
+/// not a caution, but it is not the glass's own hue either.
+const ORDNANCE: Color = pal::ORANGE;
+/// The friendly half of the scoreline. `DEFAULT_PROFILE::accent`.
+const FRIENDLY: Color = pal::CYAN;
+
+/// A legend — `SPD`, `HULL`, `GUN`, `MSL`. `Palette::caption`, dimmed.
+fn legend() -> Color {
+    pal::rgba(pal::CAPTION, 0.72)
 }
 
-/// `--glass-bg`.
-const GLASS_BG: Color = rgba(6, 12, 24, 0.65);
-/// The colour half of `--glass-border`. The `1px` half is a [`Node::border`].
-const GLASS_BORDER: Color = rgba(102, 221, 255, 0.2);
-/// `--color-blue`.
-const BLUE: Color = rgb(0x66, 0xdd, 0xff);
-/// `--color-gold`.
-const GOLD: Color = rgb(0xff, 0xe0, 0x7a);
-/// `--color-red`.
-const RED: Color = rgb(0xff, 0x55, 0x66);
-/// `--color-red-bright`, the one the reticle, the lock warning and the death
-/// banner use. Distinct from `--color-red`.
-const RED_BRIGHT: Color = rgb(0xff, 0x33, 0x33);
-// `#matchhud`'s own `color: #e8f4ff` has no constant here: all three of its
-// cells set their own colour, so nothing would ever inherit it.
+/// The dimmest thing on the glass: an unlit segment, the far end of a tape.
+///
+/// A real gun sight simply does not draw an unlit segment, but then the scale
+/// cannot be read at a glance — so the unlit half is the legend colour taken
+/// down until it reads as structure rather than as information.
+fn unlit() -> Color {
+    pal::rgba(pal::CAPTION, 0.2)
+}
 
-/// The reticle's cyan, `rgba(102,221,255,0.8)`.
-const RETICLE_CYAN: Color = rgba(102, 221, 255, 0.8);
+/// A hairline: the tape spines, their end caps, the scoreline's dividers.
+fn hairline() -> Color {
+    PHOSPHOR.with_alpha(0.45)
+}
 
-/// The bars' well, `rgba(0,0,0,0.6)`. `#healthbar` uses `0.7`.
-const METER_WELL: Color = rgba(0, 0, 0, 0.6);
-/// `#healthbar`'s slightly darker well.
-const HEALTH_WELL: Color = rgba(0, 0, 0, 0.7);
-/// `.meterbar` border.
-const METER_BORDER: Color = rgba(255, 255, 255, 0.1);
-/// `#healthbar` border.
-const HEALTH_BORDER: Color = rgba(255, 255, 255, 0.15);
-/// `#boostbar` border.
-const BOOST_BORDER: Color = rgba(52, 152, 219, 0.3);
-/// `#heatbar` border.
-const HEAT_BORDER: Color = rgba(230, 126, 34, 0.3);
-/// `.overheated` / `.overload` border, `#e74c3c`.
-const ALERT_BORDER: Color = rgb(0xe7, 0x4c, 0x3c);
-/// `#chargebar.full` border, `rgba(255,255,255,0.8)`.
-const CHARGE_FULL_BORDER: Color = rgba(255, 255, 255, 0.8);
-
-/// Missile pip fill, `#e67e22`.
-const MSL_PIP: Color = rgb(0xe6, 0x7e, 0x22);
-/// Missile pip when spent, `rgba(230,126,34,0.1)`.
-const MSL_PIP_EMPTY: Color = rgba(230, 126, 34, 0.1);
-/// Missile pip outline when spent, `rgba(230,126,34,0.4)`.
-const MSL_PIP_EMPTY_BORDER: Color = rgba(230, 126, 34, 0.4);
-/// Flare pip fill, `#f1c40f`.
-const FLA_PIP: Color = rgb(0xf1, 0xc4, 0x0f);
-/// Flare pip when spent, `rgba(241,196,15,0.1)`.
-const FLA_PIP_EMPTY: Color = rgba(241, 196, 15, 0.1);
-/// Flare pip outline when spent, `rgba(241,196,15,0.4)`.
-const FLA_PIP_EMPTY_BORDER: Color = rgba(241, 196, 15, 0.4);
-
-/// The label colour shared by `.meterbar-label`, `.msl-label` and `.fla-label`.
-const LABEL_WHITE: Color = rgba(255, 255, 255, 0.9);
+/// Hull fraction below which the tape turns amber.
+const HULL_CAUTION: f32 = 0.5;
+/// ...and below which it turns red.
+const HULL_WARNING: f32 = 0.25;
 
 /// Orbitron, the face the JS HUD is set in.
 ///
@@ -255,24 +295,85 @@ fn hud_font(font: &HudFont, size: f32, weight: u16) -> TextFont {
 // Layout constants, straight off the CSS
 // ---------------------------------------------------------------------------
 
-/// `width: min(400px, 90vw)`, shared by all four bars.
-const BAR_WIDTH: f32 = 400.0;
-/// `#healthbar { bottom: 32px; height: 24px }`.
-const HEALTH_BOTTOM: f32 = 32.0;
-const HEALTH_HEIGHT: f32 = 24.0;
-/// `#boostbar { bottom: 64px }`, `.meterbar { height: 12px }`.
-const BOOST_BOTTOM: f32 = 64.0;
-/// `#heatbar { bottom: 84px }`.
-const HEAT_BOTTOM: f32 = 84.0;
-const METER_HEIGHT: f32 = 12.0;
-/// `#chargebar { bottom: 124px; height: 8px }`.
-const CHARGE_BOTTOM: f32 = 124.0;
-const CHARGE_HEIGHT: f32 = 8.0;
-/// `#missilehud` / `#flarehud { bottom: 104px }`.
-const PIP_ROW_BOTTOM: f32 = 104.0;
-/// `.msl-pip` / `.fla-pip { width: 16px; height: 12px }`.
-const PIP_WIDTH: f32 = 16.0;
-const PIP_HEIGHT: f32 = 12.0;
+/// Height of a tape's window — how much ladder is on the glass at once.
+const TAPE_H: f32 = 168.0;
+/// Pixels per unit on both tapes. Two is what puts a major graduation 40 px
+/// apart on the speed tape and the same 40 px apart on the hull tape, so the
+/// two ladders read at one rate and the eye does not have to rescale between
+/// them.
+const TAPE_PPU: f32 = 2.0;
+/// Width of the ladder window: long tick, gap, three digits.
+const TAPE_W: f32 = 42.0;
+/// Width of the current-value readout beside the index.
+const TAPE_VALUE_W: f32 = 52.0;
+/// Air either side of that readout.
+const TAPE_VALUE_GAP: f32 = 5.0;
+/// Width of a whole tape row: readout, its air, the spine, the ladder.
+const TAPE_ROW_W: f32 = TAPE_VALUE_W + TAPE_VALUE_GAP * 2.0 + 1.0 + TAPE_W;
+/// Length of a major graduation, and of a minor one.
+const TICK_MAJOR: f32 = 9.0;
+const TICK_MINOR: f32 = 5.0;
+/// Height of one ladder row. Only has to clear the 10 px numerals.
+const TAPE_ROW_H: f32 = 14.0;
+/// The index caret: a stub through the spine at the reading line.
+const CARET_W: f32 = 8.0;
+const CARET_H: f32 = 2.0;
+/// How far off screen centre a tape's inboard edge sits.
+///
+/// A percentage rather than a pixel count so the pair frames the boresight the
+/// same way at any window size, which is what a combining glass does — the
+/// symbology is fixed in the pilot's field of view, not in the panel.
+const TAPE_INSET: f32 = 17.0;
+
+/// Graduations on the speed ladder: a number every [`SPD_MAJOR`], a bare tick
+/// every [`SPD_MINOR`].
+const SPD_MAJOR: i32 = 20;
+const SPD_MINOR: i32 = 10;
+/// Graduations on the hull ladder.
+const HULL_MAJOR: i32 = 20;
+const HULL_MINOR: i32 = 5;
+
+/// Top of the speed ladder, rounded up to a whole graduation.
+///
+/// Derived rather than typed: the fastest a ship can legitimately go is full
+/// throttle, boosting, with a fully charged brake-release on top — the same
+/// quantity `scene.rs::TOP_SPEED` computes for its teleport threshold — so a
+/// rules change that raises the ceiling extends the tape instead of running the
+/// needle off the end of it.
+const SPD_TOP: i32 = {
+    let top = Rules::DEFAULT.ship.max_throttle * Rules::DEFAULT.ship.boost_factor
+        + Rules::DEFAULT.ship.brake_boost_bonus_max;
+    (top as i32 / SPD_MAJOR + 1) * SPD_MAJOR
+};
+
+/// Lit segments in the `GUN` and `BST` stacks.
+///
+/// Ten, which is what quantises those two readings to a tenth and is why
+/// neither writes anything on a frame that did not cross a boundary.
+const METER_SEGS: usize = 10;
+/// Ticks in the brake-charge strip. Finer than the meters because the whole
+/// charge is over in [`sim::rules::ShipRules::brake_full_time`] seconds and a
+/// coarse strip would jump from empty to full in three steps.
+const CHARGE_SEGS: usize = 12;
+/// Width of one meter segment, and the gap between two.
+const SEG_W: f32 = 4.0;
+const SEG_GAP: f32 = 2.0;
+/// Shortest and tallest segment in a stack — the `▁▃▅▇` ramp.
+const SEG_H_MIN: f32 = 4.0;
+const SEG_H_MAX: f32 = 13.0;
+/// The charge strip's ticks are uniform, so it cannot be mistaken for a meter.
+const CHARGE_SEG_H: f32 = 6.0;
+
+/// One missile or flare pip: a tall thin stroke, not a rounded chip.
+const PIP_WIDTH: f32 = 4.0;
+const PIP_HEIGHT: f32 = 13.0;
+
+/// Distance off the floor of the three symbology rows, bottom up.
+const PIP_ROW_BOTTOM: f32 = 46.0;
+const METER_ROW_BOTTOM: f32 = 70.0;
+const CHARGE_ROW_BOTTOM: f32 = 94.0;
+/// Gap between screen centre and the inboard edge of a paired row.
+const ROW_SPLIT: f32 = 18.0;
 
 /// Missile pips drawn. From the rules rather than from the markup's four
 /// hardcoded `<span>`s — `rules.rs` is where a carried-count lives.
@@ -282,18 +383,33 @@ const FLARE_PIPS: usize = Rules::DEFAULT.weapons.flare_max as usize;
 /// Denominator of the health readout, `100`.
 const MAX_HP: i32 = Rules::DEFAULT.ship.max_hp;
 
-/// `#missile-lock-warning`'s string.
-///
-/// The markup reads `⚠ MISSILE LOCK ⚠`. The `default_font` feature's embedded
-/// FiraMono subset is documented as ASCII-only, so U+26A0 renders as a tofu
-/// box — visibly worse than no glyph. Restore the warning signs together with
-/// the Orbitron swap described on [`hud_font`]; both are blocked on the same
-/// missing font file.
+/// The lock warning. `⚠ MISSILE LOCK ⚠` in the markup; Orbitron has no U+26A0,
+/// so the chevrons stand in rather than a pair of tofu boxes.
 const LOCK_WARNING_TEXT: &str = ">> MISSILE LOCK <<";
 
-/// `z-index: 4` — `#hit-vignette` and `#matchhud`.
+/// The ground-proximity warning, terrain only.
+const PULL_UP_TEXT: &str = "PULL UP";
+
+/// Height above ground below which [`PULL_UP_TEXT`] lights, as a multiple of
+/// the clearance that actually kills you.
+///
+/// `sim::ship::kill_floor` is `terrain_height + terrain_kill_clearance`, so the
+/// warning is anchored to the real floor rather than to a number picked here
+/// and can only ever move with it. Twelve gives about three quarters of a
+/// second of notice at [`SPD_TOP`].
+const GROUND_WARN_CLEARANCES: f64 = 12.0;
+
+/// Quantisation of the altitude and range readout, in world units.
+///
+/// Both are continuous and neither is read to the unit — five is under a pixel
+/// of digit movement and keeps a diving ship to a couple of writes a second
+/// instead of one every frame, which is the discipline the module header
+/// describes.
+const ALT_STEP: f32 = 5.0;
+
+/// `z-index: 4` — the vignette and the scoreline.
 const Z_OVERLAY: i32 = 4;
-/// `z-index: 5` — `#missile-lock-warning`.
+/// `z-index: 5` — the lock warning.
 const Z_WARNING: i32 = 5;
 
 // --- the world-space layer -------------------------------------------------
@@ -308,23 +424,22 @@ const Z_WARNING: i32 = 5;
 /// twenty of them and they are one ship), so the campaign cannot exhaust it.
 const TARGET_POOL: usize = 8;
 
-/// `.target-box`, tightened.
+/// The target bracket, tightened.
 ///
-/// The CSS is 64px square with 14px arms. At 64 the bracket is wider than the
+/// The CSS was 64px square with 14px arms. At 64 the bracket is wider than the
 /// ship inside it at any range worth shooting at, and two enemies flying
 /// together put their brackets through each other — which is what a skirmish
 /// spawn looks like the moment it starts. 44 is the same drawing at the size
 /// the thing it is bracketing actually occupies.
 const BOX_SIZE: f32 = 44.0;
-/// The length of one corner bracket arm — the `14px` colour stop in each of
-/// `.target-box`'s eight gradients, scaled with the box.
+/// The length of one corner bracket arm, scaled with the box.
 const BOX_CORNER: f32 = 10.0;
-/// Bracket thickness — the `2px` in `background-size: 100% 2px`.
+/// Bracket thickness.
 const BOX_STROKE: f32 = 2.0;
-/// `.target-label { left: 70px }`, moved in with the box's edge.
+/// Where the callsign hangs off the bracket, moved in with its edge.
 const LABEL_LEFT: f32 = 50.0;
 
-/// `.lead-marker { width: 16px; height: 16px }`.
+/// Diameter of the lead marker.
 const LEAD_SIZE: f32 = 16.0;
 /// Dashes in the scattered ring. See [`lead_marker`].
 const LEAD_DASHES: usize = 8;
@@ -389,6 +504,17 @@ const AIM_RANGE: f32 = 1000.0;
 /// put the reticle behind the camera.
 const AIM_RANGE_MIN: f32 = 20.0;
 
+/// Diameter of the boresight's aiming circle.
+///
+/// Bigger than the old 16 px ring, because it is now the gun cross rather than
+/// a web crosshair: the circle is the thing you fly a target into, and at 16 px
+/// it was smaller than the ship it was meant to contain at gun range.
+const SIGHT_D: f32 = 30.0;
+/// Length of one of the four radial ticks outside the circle.
+const SIGHT_TICK: f32 = 7.0;
+/// The pipper: the actual aim point, at the centre of the circle.
+const SIGHT_PIP: f32 = 3.0;
+
 /// Rows in the killfeed. `main.js:2039` trims to five.
 const KILLFEED_ROWS: usize = 5;
 /// How long a killfeed row stays up.
@@ -398,21 +524,14 @@ const KILLFEED_ROWS: usize = 5;
 /// moment the JS finishes fading it.
 const KILL_TTL: f64 = 4.0;
 
-/// `.kf-entry` background, `rgba(6,12,24,0.7)`.
-const KF_BG: Color = rgba(6, 12, 24, 0.7);
-/// `.kf-victim` colour, `#8fb6d6`.
-const KF_VICTIM: Color = rgb(0x8f, 0xb6, 0xd6);
-/// `.kf-icon` colour, `rgba(255,255,255,0.5)`.
-const KF_ICON: Color = rgba(255, 255, 255, 0.5);
-/// `.kf-icon`'s `→`. The `default_font` fallback is ASCII-only (see
-/// [`LOCK_WARNING_TEXT`]), and Orbitron has no U+2192 either.
+/// The `→` between killer and victim. Orbitron has no U+2192.
 const KF_ARROW: &str = ">>";
 
 // ---------------------------------------------------------------------------
 // The model
 // ---------------------------------------------------------------------------
 
-/// What `#chargebar`'s class list can say.
+/// What the brake-charge strip can say.
 ///
 /// `main.js:1336` toggles `active`, `full` and `overload` independently, but
 /// they are strictly nested — `overload` implies `full` implies `active` — so
@@ -420,15 +539,60 @@ const KF_ARROW: &str = ">>";
 /// comparison rather than three.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum ChargeState {
-    /// No class: `opacity: 0`.
+    /// Not braking: the strip is not drawn.
     #[default]
     Idle,
-    /// `.active`.
+    /// Charging.
     Active,
-    /// `.active.full`.
+    /// Charged, and every extra tenth of a second is now overcharge.
     Full,
-    /// `.active.full.overload`.
+    /// Overcharged past the warning threshold; taking damage shortly.
     Overload,
+}
+
+/// How urgent a reading is. One enum for every readout that changes colour, so
+/// "did the caution move" is one comparison wherever it is asked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Alert {
+    #[default]
+    Ok,
+    Caution,
+    Warning,
+}
+
+impl Alert {
+    /// The glass has three colours and this is where they are chosen.
+    fn colour(self) -> Color {
+        match self {
+            Alert::Ok => PHOSPHOR,
+            Alert::Caution => AMBER,
+            Alert::Warning => WARN,
+        }
+    }
+}
+
+/// The block under the hull tape: `AGL` on terrain, `RNG` in space.
+///
+/// One structure for both because they are the same instrument — a distance you
+/// are managing, with a caption saying which — and because keeping them as one
+/// field means the map switch is a single comparison rather than two readouts
+/// each guarding themselves against the other's map.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct AltBlock {
+    /// Whether there is anything to say. False in space with no contact, which
+    /// is the honest answer rather than a zero.
+    shown: bool,
+    /// True on [`MapKind::Terrain`], which is what picks the caption and is the
+    /// *only* thing that allows [`AltBlock::warn`] to be set.
+    agl: bool,
+    /// The reading, in [`ALT_STEP`]s of a world unit.
+    steps: u16,
+    /// Ground proximity. Terrain only — there is no ground in space, and a
+    /// warning about one would be a lie.
+    warn: bool,
+    /// The lit half of the ground-proximity blink. **Forced false when `warn`
+    /// is false**, for the reason the module header gives.
+    blink: bool,
 }
 
 /// Everything drawable about one frame of the HUD, quantised to what a pixel
@@ -437,36 +601,42 @@ enum ChargeState {
 /// The whole design rests on this being `Eq`: no floats, so two frames of an
 /// unchanging situation compare equal and [`sync_hud`] can bail out before
 /// touching a single component. Every field is either a discrete simulation
-/// value (hit points, missiles remaining) or a float rounded to the precision
-/// the JS already rounded to when it wrote a percentage string.
+/// value (hit points, missiles remaining), a count of segments, or a whole
+/// number of *pixels* — which is the finest a tape can move and still be seen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 struct HudModel {
     /// Whether there is a local ship at all. False before the simulation has
     /// spawned one, and the whole tree is hidden.
     present: bool,
-    /// Whether the local ship is alive; drives `#deathbanner`.
+    /// Whether the local ship is alive; drives the death banner.
     alive: bool,
 
-    /// Hit points, for the `"h / 100"` readout.
-    hp: i32,
-    /// Health bar width in tenths of a percent — the `.toFixed(1)` of
-    /// `main.js:1978`.
-    hp_mil: u16,
-    /// `Math.round(pct * 120)` from `main.js:1979`, the hue of the health
-    /// gradient. Tracked separately from `hp_mil` so the gradient is rebuilt
-    /// only when the *colour* moves, not merely when the width does.
-    hp_hue: u16,
+    /// Speed, whole units, for the readout beside the index.
+    spd: u16,
+    /// Where the speed ladder is scrolled to, in whole pixels off its own top.
+    /// The one field the left tape moves on.
+    spd_px: i16,
+    /// The commanded-throttle bug, as a pixel offset down the tape window,
+    /// already clamped into it.
+    thr_px: i16,
 
-    /// Boost bar width, tenths of a percent.
-    boost_mil: u16,
-    /// Gun bar width, tenths of a percent.
-    heat_mil: u16,
-    /// `#heatbar.overheated`: `ammo < cost`, i.e. the selected gun cannot fire.
+    /// Hit points, for the readout beside the hull index.
+    hp: i32,
+    /// Where the hull ladder is scrolled to, in whole pixels.
+    hull_px: i16,
+    /// What colour the hull tape is drawn in.
+    hull_alert: Alert,
+
+    /// Lit segments in the `BST` stack.
+    boost_seg: u8,
+    /// Lit segments in the `GUN` stack.
+    gun_seg: u8,
+    /// `ammo < cost`, i.e. the selected gun cannot fire.
     overheated: bool,
 
-    /// Charge bar width, tenths of a percent.
-    charge_mil: u16,
-    /// `#chargebar`'s class list.
+    /// Lit ticks in the brake-charge strip.
+    charge_seg: u8,
+    /// What the strip is saying.
     charge: ChargeState,
 
     /// Missiles remaining.
@@ -474,33 +644,36 @@ struct HudModel {
     /// Flares remaining.
     flares: u8,
 
-    /// `#reticle.locked`.
+    /// The altitude-or-range block under the hull tape.
+    alt: AltBlock,
+
+    /// Whether the boresight is on a target.
     reticle_locked: bool,
-    /// Whether `#missile-lock-warning` is shown at all.
+    /// Whether the missile-lock warning is shown at all.
     lock_warning: bool,
-    /// The lit half of the 4 Hz `msl-lock-blink` square wave. **Forced false
-    /// when `lock_warning` is false**, so an unlocked HUD has a constant model.
+    /// The lit half of the 4 Hz lock blink. **Forced false when `lock_warning`
+    /// is false**, so an unlocked HUD has a constant model.
     lock_blink: bool,
-    /// The `chargebar-overload-pulse` / `heatpulse` phase, quantised to
-    /// [`PULSE_STEPS`]. **Forced zero when nothing is pulsing.**
+    /// The overheat / overload glow phase, quantised to [`PULSE_STEPS`].
+    /// **Forced zero when nothing is pulsing.**
     pulse: u8,
 
-    /// `#hit-vignette`'s opacity, in 64ths.
+    /// The hit vignette's opacity, in 64ths.
     vignette: u8,
 
-    /// Whether `#matchhud` is shown.
+    /// Whether the scoreline is shown.
     match_on: bool,
-    /// `#team0score`.
+    /// Friendly kills.
     team0: u32,
-    /// `#team1score`.
+    /// Hostile kills.
     team1: u32,
     /// Whole seconds on the clock, `Math.ceil` as `fmtTime` does.
     clock: u32,
 
-    /// `#killfeed`, newest row first.
+    /// The killfeed, newest row first.
     kills: [KillRowModel; KILLFEED_ROWS],
 
-    /// `#matchresult`: the finished match's outcome, or `None` mid-match.
+    /// The finished match's outcome, or `None` mid-match.
     ///
     /// Outside the `present` early-out's protection on purpose — a match can
     /// end while the local ship is dead or gone, and the card still has to
@@ -554,9 +727,8 @@ struct MarkerModel {
     id: EntityId,
     /// The target's hit points, for the label.
     hp: i32,
-    /// `.lead-marker.aligned` — the ring is solid rather than scattered. At
-    /// most one slot has this set: it is *the* lock, not a threshold several
-    /// targets can pass at once.
+    /// The ring is solid rather than scattered. At most one slot has this set:
+    /// it is *the* lock, not a threshold several targets can pass at once.
     aligned: bool,
     /// Whether aim assist is currently holding *this* target
     /// ([`HudState::assist_target`]), which brightens the bracket.
@@ -567,15 +739,33 @@ struct MarkerModel {
 #[derive(Resource, Default)]
 struct AppliedMarkers([MarkerModel; TARGET_POOL]);
 
-/// Whether the player's aim is on a target this frame.
+/// What the boresight is looking at this frame.
 ///
 /// Written by [`sync_world_markers`], which is the only system that knows where
-/// anything projects to, and read by [`sync_hud`] for `#reticle.locked`. A
-/// resource rather than a return value because the two run in different
-/// schedules; the lock therefore lights one frame after the alignment, which no
-/// one can see and which is the same latency the marker itself has.
-#[derive(Resource, Default)]
-struct TargetLock(bool);
+/// anything projects to, and read by [`sync_hud`] for the locked reticle and for
+/// the `RNG` half of [`AltBlock`]. A resource rather than a return value because
+/// the two run in different schedules; the lock therefore lights one frame after
+/// the alignment, which no one can see and which is the same latency the marker
+/// itself has.
+#[derive(Resource)]
+struct Boresight {
+    /// Whether the player's aim is on a target.
+    locked: bool,
+    /// Range to the best-aligned contact, or [`f32::INFINITY`] with none.
+    ///
+    /// Infinity rather than `Option` so the resource stays `Copy`-cheap and the
+    /// "no contact" case is one `is_finite` at the single site that reads it.
+    range: f32,
+}
+
+impl Default for Boresight {
+    fn default() -> Boresight {
+        Boresight {
+            locked: false,
+            range: f32::INFINITY,
+        }
+    }
+}
 
 /// The killfeed's backing store: five rows, newest first.
 ///
@@ -631,6 +821,9 @@ const PULSE_STEPS: u8 = 8;
 const PULSE_HALF_PERIOD: f32 = 0.3;
 /// `msl-lock-blink` is `0.25s step-start`, on for the first half.
 const BLINK_HALF_PERIOD: f32 = 0.125;
+/// The ground-proximity warning flashes slower than the lock warning, because
+/// it is telling you to do one thing rather than to look for something.
+const PULL_UP_HALF_PERIOD: f32 = 0.2;
 /// Quantisation of `#hit-vignette`'s opacity. The flash decays over well under
 /// a second, so 64 steps is a handful of writes per hit and none afterwards.
 const VIGNETTE_STEPS: f32 = 64.0;
@@ -651,17 +844,50 @@ const VIGNETTE_HEALTHY_GAIN: f32 = 0.45;
 /// Pure, and deliberately free of Bevy — which is what lets the tests below
 /// assert the no-change property directly.
 ///
-/// `locked` comes from [`TargetLock`] rather than from the frame: whether the
-/// player's aim is on someone is a question about *projection*, and only
-/// [`sync_world_markers`] can answer it.
-fn model(
-    frame: &Frame,
+/// The inputs [`model`] needs that are not on the [`Frame`].
+///
+/// Grouped rather than passed one by one because there are now five of them and
+/// a six-argument pure function is where a call site starts getting its
+/// booleans the wrong way round.
+#[derive(Clone, Copy)]
+struct Env {
+    /// The render clock, for the two square waves.
     time: f32,
+    /// Whether the meters stand down: seated in the cockpit, or the lobby is up.
     seated: bool,
+    /// Whether the boresight is on a target, which only
+    /// [`sync_world_markers`] can answer — it is a question about *projection*.
     locked: bool,
-    feed: &KillFeed,
-    result: Option<Outcome>,
-) -> HudModel {
+    /// Range to that target, or [`f32::INFINITY`]. Same source, same reason.
+    range: f32,
+    /// Which map, which is what decides whether the block under the hull tape
+    /// is an altimeter or a rangefinder.
+    map: MapKind,
+    /// [`crate::weapons::forced_hull`]: the screenshot hook that pins the hull.
+    /// `None` in every real run.
+    hull: Option<f32>,
+}
+
+impl Default for Env {
+    fn default() -> Env {
+        Env {
+            time: 0.0,
+            seated: false,
+            locked: false,
+            range: f32::INFINITY,
+            map: MapKind::Space,
+            hull: None,
+        }
+    }
+}
+
+fn model(frame: &Frame, env: Env, feed: &KillFeed, result: Option<Outcome>) -> HudModel {
+    let Env {
+        time,
+        seated,
+        locked,
+        ..
+    } = env;
     // Seated in the cockpit the 3D panel replaces the *bars*, and only the
     // bars. This used to return `HudModel::default()` and stand the whole
     // overlay down, which also took the reticle with it — so the cockpit had no
@@ -697,7 +923,14 @@ fn model(
     let hud: &HudState = &frame.hud;
     let alive = me.flags.contains(ShipFlags::ALIVE);
 
-    let hp01 = hud.hp01.clamp(0.0, 1.0);
+    // `SPACESHIPS_HULL` pins the hull so the damage states can be looked at.
+    // Defined once, in `weapons.rs`, because the plume reads it too and a tape
+    // that disagreed with the smoke coming off the wing would be worse than no
+    // hook at all. `None` in every real run.
+    let (hp, hp01) = match env.hull {
+        Some(forced) => ((forced * MAX_HP as f32).round() as i32, forced),
+        None => (hud.hp, hud.hp01.clamp(0.0, 1.0)),
+    };
     let charge01 = hud.charge01.clamp(0.0, 1.0);
 
     // `heatbar.classList.toggle('overheated', ammo < (gunMode === 'beam' ? 3 : 1))`
@@ -739,6 +972,27 @@ fn model(
     let pulsing = !seated && (overheated || charge == ChargeState::Overload);
     let lock_warning = hud.missile_lock_warning && alive;
 
+    // The speed tape. `spd_px` is the whole reading: it is where the ladder is
+    // scrolled to, so a ship holding a speed produces an identical model and
+    // the tape is not touched at all.
+    let speed = hud.speed.max(0.0).min(SPD_TOP as f32);
+    let spd_px = tape_px(speed);
+    let cmd = (hud.throttle01.clamp(0.0, 1.0) * Rules::DEFAULT.ship.max_throttle as f32)
+        .min(SPD_TOP as f32);
+    // Clamped into the window rather than allowed off the end of it, which is
+    // what a real airspeed bug does: parked against the edge it still says
+    // "commanded is above what you are doing".
+    let thr_px = (f32::from((TAPE_H / 2.0) as i16 + spd_px - tape_px(cmd)))
+        .clamp(CARET_H, TAPE_H - CARET_H) as i16;
+
+    let hull_alert = if hp01 < HULL_WARNING {
+        Alert::Warning
+    } else if hp01 < HULL_CAUTION {
+        Alert::Caution
+    } else {
+        Alert::Ok
+    };
+
     HudModel {
         present: true,
         alive,
@@ -746,32 +1000,46 @@ fn model(
         bars_hidden: seated,
         result,
 
-        hp: if seated { 0 } else { hud.hp.max(0) },
-        hp_mil: if seated { 0 } else { mil(hp01) },
-        // `Math.round(pct * 120)`: pure green at full, pure red at zero.
-        hp_hue: if seated {
-            0
-        } else {
-            (hp01 * 120.0).round() as u16
-        },
+        // The speed tape is *not* on the cockpit's hidden list, and that is
+        // deliberate rather than an oversight: `index.html:865`–`:870` hides six
+        // elements and `#hud-stats`, which carried the speed readout, is not one
+        // of them. A real aircraft shows airspeed on the glass and on the panel
+        // both, and so does this.
+        spd: speed.round() as u16,
+        spd_px,
+        thr_px,
 
-        boost_mil: if seated {
+        hp: if seated { 0 } else { hp.max(0) },
+        hull_px: if seated {
             0
         } else {
-            mil(hud.boost01.clamp(0.0, 1.0))
+            tape_px(hp.clamp(0, MAX_HP) as f32)
         },
-        heat_mil: if seated {
+        hull_alert: if seated { Alert::Ok } else { hull_alert },
+
+        boost_seg: if seated {
             0
         } else {
-            mil(hud.ammo01.clamp(0.0, 1.0))
+            segments(hud.boost01, METER_SEGS)
+        },
+        gun_seg: if seated {
+            0
+        } else {
+            segments(hud.ammo01, METER_SEGS)
         },
         overheated: overheated && !seated,
 
-        charge_mil: if seated { 0 } else { mil(charge01) },
+        charge_seg: if seated {
+            0
+        } else {
+            segments(charge01, CHARGE_SEGS)
+        },
         charge: if seated { ChargeState::Idle } else { charge },
 
         missiles: if seated { 0 } else { hud.missiles },
         flares: if seated { 0 } else { hud.flares },
+
+        alt: alt_block(me, env),
 
         // `main.js:1929` — `anyVisible && bestAlignment < 22`, which is a
         // question about where things land on screen and so is answered by
@@ -817,13 +1085,69 @@ fn model(
     }
 }
 
-/// `0..1` to tenths of a percent — the precision `(x * 100).toFixed(1)` keeps.
+/// A tape reading, in whole pixels down its own ladder.
 ///
-/// This is the quantisation that makes the whole scheme work: a bar that is
-/// full, or empty, or simply not moving fast enough to shift by a thousandth
-/// of its width, compares equal to last frame and is not written.
-fn mil(v: f32) -> u16 {
-    (v * 1000.0).round().clamp(0.0, 1000.0) as u16
+/// This is the quantisation the two tapes rest on: a ladder that has not moved
+/// by a whole pixel cannot look any different, so the model compares equal and
+/// nothing is written. It is a strictly coarser filter than the old
+/// tenth-of-a-percent bar width and a strictly better-founded one — a pixel is
+/// a thing the display has, a per-mille is not.
+fn tape_px(value: f32) -> i16 {
+    (value.max(0.0) * TAPE_PPU).round() as i16
+}
+
+/// A `0..1` reading as a count of lit segments, rounded **up**.
+///
+/// Up rather than to nearest, because the bottom segment has to mean "there is
+/// some left": a gun with four rounds in ninety is not empty, and a stack that
+/// showed it as empty would be lying about the one fact the stack exists for.
+fn segments(v01: f32, segs: usize) -> u8 {
+    let n = (v01.clamp(0.0, 1.0) * segs as f32).ceil();
+    n as u8
+}
+
+/// The block under the hull tape: height above ground, or range to target.
+///
+/// The map is the whole switch. On terrain this is a radar altimeter reading
+/// [`sim::ship::terrain_height`] under the ship — the same height field the
+/// simulation kills you against, so the number and the floor cannot disagree —
+/// and it is the only configuration in which [`AltBlock::warn`] can be set. In
+/// space there is no ground and an altimeter would be furniture, so the same two
+/// nodes carry range to whatever the boresight is on, which is the other
+/// distance a pilot manages and is already computed by [`sync_world_markers`].
+fn alt_block(me: &sim::world::ShipView, env: Env) -> AltBlock {
+    if env.map == MapKind::Terrain {
+        let rules = &Rules::DEFAULT;
+        let ground = sim::ship::terrain_height(f64::from(me.pos[0]), f64::from(me.pos[2]), rules);
+        let agl = (f64::from(me.pos[1]) - ground).max(0.0);
+        let warn = agl < rules.world.terrain_kill_clearance * GROUND_WARN_CLEARANCES;
+        return AltBlock {
+            shown: true,
+            agl: true,
+            steps: quantise(agl as f32),
+            warn,
+            // Forced still while the warning is off, for the reason the module
+            // header gives: a phase that advanced regardless would make every
+            // frame's model differ and delete the early-out.
+            blink: warn && phase(env.time, PULL_UP_HALF_PERIOD).is_multiple_of(2),
+        };
+    }
+
+    if !env.range.is_finite() {
+        return AltBlock::default();
+    }
+    AltBlock {
+        shown: true,
+        agl: false,
+        steps: quantise(env.range),
+        warn: false,
+        blink: false,
+    }
+}
+
+/// A distance in [`ALT_STEP`]s, saturating rather than wrapping.
+fn quantise(v: f32) -> u16 {
+    (v / ALT_STEP).round().clamp(0.0, f32::from(u16::MAX)) as u16
 }
 
 /// Which half-period `time` falls in. Used for square waves.
@@ -869,33 +1193,47 @@ struct HudNodes {
     /// and what this port originally got wrong.
     cockpit_hidden: [Entity; 6],
 
-    health_fill: Entity,
-    health_text: Entity,
+    /// The speed tape. Not on the hidden list — see [`HudModel::spd`].
+    spd: TapeNodes,
+    /// The hull tape, which is `cockpit_hidden[0]`'s whole content.
+    hull: TapeNodes,
 
-    boost_fill: Entity,
+    /// The `AGL`/`RNG` block: its own row, its caption, and its value.
+    alt_row: Entity,
+    alt_caption: Entity,
+    alt_value: Entity,
+    /// `PULL UP`, terrain only.
+    pull_up: Entity,
 
-    heat_frame: Entity,
-    heat_fill: Entity,
+    /// The `BST` stack, outboard segment first — index 0 is the *bottom* of the
+    /// ramp, so `n` lit is a prefix of the array and the diff is a range.
+    boost_segs: [Entity; METER_SEGS],
+    /// The `GUN` stack, and its legend, which reddens when it cannot fire.
+    gun_segs: [Entity; METER_SEGS],
+    gun_label: Entity,
 
-    charge_frame: Entity,
-    charge_fill: Entity,
+    /// The brake-charge strip and its ticks.
+    charge_row: Entity,
+    charge_segs: [Entity; CHARGE_SEGS],
 
     missile_pips: [Entity; MISSILE_PIPS],
     flare_pips: [Entity; FLARE_PIPS],
 
-    /// The node that carries the reticle's *position*. Split from the ring
-    /// below because `sync_hud` owns the ring's `.locked` scale and
-    /// `sync_world_markers` owns the position, and a `UiTransform` holds both
-    /// scale and translation — one component, two writers, one clobbering the
-    /// other. Two nodes, one writer each.
+    /// The node that carries the boresight's *position*. Split from the sight
+    /// below because `sync_hud` owns the locked scale and `sync_world_markers`
+    /// owns the position, and a `UiTransform` holds both scale and translation —
+    /// one component, two writers, one clobbering the other. Two nodes, one
+    /// writer each.
     reticle_anchor: Entity,
     reticle: Entity,
-    reticle_ticks: [Entity; 2],
+    /// The circle's four radial ticks and the pipper at its centre, all of
+    /// which take the lock colour with it.
+    reticle_marks: [Entity; 5],
 
     lock_warning: Entity,
     vignette: Entity,
     death_banner: Entity,
-    /// `#matchresult`. One line of text, recoloured per outcome.
+    /// The result card. One line of text, recoloured per outcome.
     result_banner: Entity,
     result_text: Entity,
 
@@ -908,24 +1246,55 @@ struct HudNodes {
     killfeed: [KillRowNodes; KILLFEED_ROWS],
 }
 
+/// One tape's writable entities. Everything else about a tape — every tick,
+/// every numeral, the spine, the caps and the caption — is built once and never
+/// touched again.
+#[derive(Clone, Copy)]
+struct TapeNodes {
+    /// The whole assembly, for the hull tape's cockpit stand-down.
+    root: Entity,
+    /// The ladder. Carries the scroll, and nothing else ever writes to it.
+    ladder: Entity,
+    /// The current-value readout beside the index.
+    value: Entity,
+    /// The index caret through the spine, which takes the alert colour.
+    caret: Entity,
+    /// The commanded-throttle bug, or [`Entity::PLACEHOLDER`] on a tape that
+    /// has no commanded value.
+    bug: Entity,
+}
+
+impl Default for TapeNodes {
+    fn default() -> Self {
+        TapeNodes {
+            root: Entity::PLACEHOLDER,
+            ladder: Entity::PLACEHOLDER,
+            value: Entity::PLACEHOLDER,
+            caret: Entity::PLACEHOLDER,
+            bug: Entity::PLACEHOLDER,
+        }
+    }
+}
+
 /// One world-space target slot's entities.
 #[derive(Clone, Copy)]
 struct MarkerNodes {
-    /// `.target-box`. Carries the slot's position and its visibility; the
+    /// The corner bracket. Carries the slot's position and its visibility; the
     /// label rides along as a child, which is what `main.js:679`
     /// (`box.appendChild(label)`) does and what keeps the label to one write.
     boxes: Entity,
     /// The four corner brackets, whose colour says whether aim assist has
     /// picked this target.
     corners: [Entity; 4],
-    /// `.target-label`.
+    /// The callsign and hit points.
     label: Entity,
-    /// `.lead-marker`, positioned separately because it is 16px where the box
-    /// is 64 and the two therefore need different offsets from the same point.
+    /// The lead marker, positioned separately because it is 16px where the
+    /// bracket is 44 and the two therefore need different offsets from the same
+    /// point.
     lead: Entity,
-    /// The `.aligned` ring: solid, filled.
+    /// The aligned ring: solid, filled.
     lead_solid: Entity,
-    /// The scattered ring that stands in for `border-style: dashed`.
+    /// The scattered ring that stands in for a dashed border.
     lead_dashed: Entity,
 }
 
@@ -942,14 +1311,14 @@ impl Default for MarkerNodes {
     }
 }
 
-/// One `.kf-entry`'s entities.
+/// One killfeed row's entities.
 #[derive(Clone, Copy)]
 struct KillRowNodes {
     /// The row itself, hidden when the entry has expired.
     row: Entity,
-    /// `.kf-killer`.
+    /// Who scored it.
     killer: Entity,
-    /// `.kf-victim`.
+    /// Who died.
     victim: Entity,
 }
 
@@ -966,16 +1335,15 @@ impl Default for KillRowNodes {
 /// Builds the HUD. Runs once.
 ///
 /// No system after this one spawns, despawns, re-parents, inserts or removes
-/// anything. Everything a CSS class would toggle is present from the start with
-/// its inactive value — a zero-alpha border, a zero-alpha shadow, a hidden
-/// node — so a state change is only ever a write to an existing component and
-/// never an archetype move.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one contiguous declaration of the tree; splitting it into a \
-              dozen single-use builders would hide the layout rather than \
-              clarify it"
-)]
+/// anything. Everything a state change could want is present from the start with
+/// its inactive value — an unlit segment, a hidden warning, a caret at rest — so
+/// a state change is only ever a write to an existing component and never an
+/// archetype move.
+///
+/// The two ladders are the extreme case of that and the reason the tapes are
+/// shaped the way they are: about seventy tick and numeral nodes exist here
+/// from startup and **not one of them is ever written to again**. Reading a new
+/// speed moves their common parent.
 fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
     let font = HudFont(assets.load(FONT_PATH));
     // No camera is spawned here. `bevy_ui` renders root nodes to the default UI
@@ -983,32 +1351,7 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
     // targeting the primary window — `camera.rs`'s `Camera3d`. Adding a
     // `Camera2d` would give the window a second camera and make that choice
     // ambiguous.
-    // `[health, charge, boost, heat, missile, flare]`, filled below in spawn
-    // order rather than in that order; see `HudNodes::cockpit_hidden`.
-    let mut cockpit_hidden = [Entity::PLACEHOLDER; 6];
-    let mut health_fill = Entity::PLACEHOLDER;
-    let mut health_text = Entity::PLACEHOLDER;
-    let mut boost_fill = Entity::PLACEHOLDER;
-    let mut heat_frame = Entity::PLACEHOLDER;
-    let mut heat_fill = Entity::PLACEHOLDER;
-    let mut charge_frame = Entity::PLACEHOLDER;
-    let mut charge_fill = Entity::PLACEHOLDER;
-    let mut missile_pips = [Entity::PLACEHOLDER; MISSILE_PIPS];
-    let mut flare_pips = [Entity::PLACEHOLDER; FLARE_PIPS];
-    let mut reticle_anchor = Entity::PLACEHOLDER;
-    let mut reticle = Entity::PLACEHOLDER;
-    let mut reticle_ticks = [Entity::PLACEHOLDER; 2];
-    let mut markers = [MarkerNodes::default(); TARGET_POOL];
-    let mut killfeed = [KillRowNodes::default(); KILLFEED_ROWS];
-    let mut lock_warning = Entity::PLACEHOLDER;
-    let mut vignette = Entity::PLACEHOLDER;
-    let mut death_banner = Entity::PLACEHOLDER;
-    let mut result_banner = Entity::PLACEHOLDER;
-    let mut result_text = Entity::PLACEHOLDER;
-    let mut match_panel = Entity::PLACEHOLDER;
-    let mut team0 = Entity::PLACEHOLDER;
-    let mut team1 = Entity::PLACEHOLDER;
-    let mut clock = Entity::PLACEHOLDER;
+    let mut n = Nodes::default();
 
     let root = commands
         .spawn((
@@ -1020,357 +1363,737 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
                 height: percent(100),
                 ..default()
             },
-            // Hidden until the simulation produces a local ship, which is what
-            // `display:none` does for every one of these elements in the markup.
+            // Hidden until the simulation produces a local ship.
             Visibility::Hidden,
         ))
         .with_children(|hud| {
-            // -- #healthbar -------------------------------------------------
-            cockpit_hidden[0] = hud
-                .spawn(centred_row(HEALTH_BOTTOM))
-                .with_children(|row| {
-                    row.spawn((
-                        bar_frame(HEALTH_HEIGHT, HEALTH_WELL, HEALTH_BORDER, 2.0),
-                        // `box-shadow: 0 8px 24px rgba(0,0,0,0.6)`.
-                        BoxShadow::new(rgba(0, 0, 0, 0.6), px(0), px(8), px(0), px(24)),
-                    ))
-                    .with_children(|bar| {
-                        health_fill = bar
-                            .spawn((
-                                fill_node(),
-                                // The CSS declares a static green gradient which
-                                // `main.js:1980` immediately overwrites with an
-                                // hsl one every frame. This is the one the player
-                                // actually sees; it is rebuilt here only when the
-                                // hue moves.
-                                health_gradient(120),
-                            ))
-                            .id();
-                        // `#healthbar-text`: `inset: 0`, flex-centred both ways.
-                        bar.spawn(Node {
-                            position_type: PositionType::Absolute,
-                            left: px(0),
-                            right: px(0),
-                            top: px(0),
-                            bottom: px(0),
-                            align_items: AlignItems::Center,
-                            justify_content: JustifyContent::Center,
-                            ..default()
-                        })
-                        .with_children(|slot| {
-                            health_text = slot
-                                .spawn((
-                                    Text::new(format!("{MAX_HP} / {MAX_HP}")),
-                                    hud_font(&font, 14.0, 800),
-                                    TextColor(Color::WHITE),
-                                    LetterSpacing::Px(4.0),
-                                    // `text-shadow: 0 2px 4px rgba(0,0,0,0.9)`.
-                                    // Bevy's shadow has an offset but no blur.
-                                    TextShadow {
-                                        offset: Vec2::new(0.0, 2.0),
-                                        color: rgba(0, 0, 0, 0.9),
-                                    },
-                                ))
-                                .id();
-                        });
-                    });
-                })
-                .id();
+            build_tapes(hud, &font, &mut n);
+            build_meters(hud, &font, &mut n);
+            build_pips(hud, &font, &mut n);
 
-            // -- #boostbar --------------------------------------------------
-            cockpit_hidden[2] = hud
-                .spawn(centred_row(BOOST_BOTTOM))
-                .with_children(|row| {
-                    row.spawn((
-                        bar_frame(METER_HEIGHT, METER_WELL, BOOST_BORDER, 1.0),
-                        meter_shadow(),
-                    ))
-                    .with_children(|bar| {
-                        boost_fill = bar
-                            .spawn((
-                                fill_node(),
-                                // `linear-gradient(90deg, #2980b9 0%, #3498db 100%)`.
-                                gradient_90(rgb(0x29, 0x80, 0xb9), rgb(0x34, 0x98, 0xdb)),
-                            ))
-                            .id();
-                        bar.spawn(meter_label_slot()).with_children(|slot| {
-                            slot.spawn(meter_label(&font, "BOOST"));
-                        });
-                    });
-                })
-                .id();
-
-            // -- #heatbar ---------------------------------------------------
-            cockpit_hidden[3] = hud
-                .spawn(centred_row(HEAT_BOTTOM))
-                .with_children(|row| {
-                    heat_frame = row
-                        .spawn((
-                            bar_frame(METER_HEIGHT, METER_WELL, HEAT_BORDER, 1.0),
-                            // `.overheated` swaps this drop shadow for a red glow.
-                            // Spawned present so the swap is a value change.
-                            meter_shadow(),
-                        ))
-                        .with_children(|bar| {
-                            heat_fill = bar
-                                .spawn((
-                                    fill_node(),
-                                    // `linear-gradient(90deg, #d35400 0%, #e67e22 100%)`.
-                                    gradient_90(rgb(0xd3, 0x54, 0x00), rgb(0xe6, 0x7e, 0x22)),
-                                ))
-                                .id();
-                            bar.spawn(meter_label_slot()).with_children(|slot| {
-                                slot.spawn(meter_label(&font, "GUN"));
-                            });
-                        })
-                        .id();
-                })
-                .id();
-
-            // -- #chargebar -------------------------------------------------
-            cockpit_hidden[1] = hud
-                .spawn(centred_row(CHARGE_BOTTOM))
-                .with_children(|row| {
-                    charge_frame = row
-                        .spawn((
-                            bar_frame(CHARGE_HEIGHT, METER_WELL, METER_BORDER, 1.0),
-                            meter_shadow(),
-                            // `opacity: 0` until `.active`. `Visibility` rather
-                            // than `Display::None`: hiding by display would drop
-                            // the node out of layout and force a relayout on every
-                            // brake, which is the cost this port exists to avoid.
-                            Visibility::Hidden,
-                        ))
-                        .with_children(|bar| {
-                            charge_fill = bar
-                                .spawn((
-                                    Node {
-                                        // `#chargebar-fill { width: 0% }` — the one
-                                        // bar that starts empty rather than full.
-                                        width: percent(0),
-                                        height: percent(100),
-                                        ..default()
-                                    },
-                                    charge_gradient(false),
-                                ))
-                                .id();
-                        })
-                        .id();
-                })
-                .id();
-
-            // -- #missilehud ------------------------------------------------
-            // `transform: translateX(calc(-100% - 16px))` off `left: 50%`,
-            // which is "right edge 16px left of centre" — expressed here as
-            // `right: 50%` plus a 16px right margin, no transform needed.
-            cockpit_hidden[4] = hud
-                .spawn(Node {
-                    position_type: PositionType::Absolute,
-                    right: percent(50),
-                    bottom: px(PIP_ROW_BOTTOM),
-                    margin: UiRect::right(px(16)),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: px(8),
-                    ..default()
-                })
-                .with_children(|row| {
-                    row.spawn(pip_label(&font, "MSL"));
-                    for slot in &mut missile_pips {
-                        *slot = row.spawn(pip(MSL_PIP)).id();
-                    }
-                })
-                .id();
-
-            // -- #flarehud --------------------------------------------------
-            cockpit_hidden[5] = hud
-                .spawn(Node {
-                    position_type: PositionType::Absolute,
-                    left: percent(50),
-                    bottom: px(PIP_ROW_BOTTOM),
-                    margin: UiRect::left(px(16)),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: px(8),
-                    ..default()
-                })
-                .with_children(|row| {
-                    row.spawn(pip_label(&font, "FLR"));
-                    for slot in &mut flare_pips {
-                        *slot = row.spawn(pip(FLA_PIP)).id();
-                    }
-                })
-                .id();
-
-            // -- .target-box / .target-label / .lead-marker ------------------
-            // The pool. Built once, hidden, and thereafter only ever moved and
-            // shown — never spawned, never despawned, never re-parented. Boxes
-            // first so the lead rings and the reticle draw over them.
-            for slot in &mut markers {
+            // The target pool goes in before the boresight so the sight draws
+            // over a bracket rather than under it.
+            for slot in &mut n.markers {
                 *slot = spawn_marker(hud, &font);
             }
+            build_boresight(hud, &mut n);
 
-            // -- #reticle ---------------------------------------------------
-            // Two nodes: an anchor that `sync_world_markers` slides onto the
-            // projected aim point, and the ring itself, whose `.locked`
-            // transform `sync_hud` owns. The anchor starts screen-centred, so
-            // a frame before the first projection — or a frame with no local
-            // ship — draws the reticle exactly where it used to be.
-            reticle_anchor = hud
-                .spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: percent(50),
-                        top: percent(50),
-                        width: px(16),
-                        height: px(16),
-                        // `margin: -8px 0 0 -8px`.
-                        margin: UiRect::new(px(-8), px(0), px(-8), px(0)),
-                        ..default()
-                    },
-                    UiTransform::IDENTITY,
-                ))
-                .with_children(|anchor| {
-                    reticle = anchor
-                        .spawn((
-                            Node {
-                                position_type: PositionType::Absolute,
-                                left: px(0),
-                                top: px(0),
-                                width: percent(100),
-                                height: percent(100),
-                                border: UiRect::all(px(1)),
-                                border_radius: BorderRadius::all(percent(50)),
-                                ..default()
-                            },
-                            BorderColor::all(RETICLE_CYAN),
-                            BoxShadow::new(rgba(102, 221, 255, 0.4), px(0), px(0), px(0), px(8)),
-                            // `.locked` scales to 1.2. A `UiTransform` is
-                            // applied after layout, so the lock state costs no
-                            // relayout — where animating `width`/`height`
-                            // would.
-                            UiTransform::IDENTITY,
-                        ))
-                        .with_children(|r| {
-                            // `#reticle::before` — a 1x6 tick above the ring.
-                            reticle_ticks[0] = r
-                                .spawn((
-                                    Node {
-                                        position_type: PositionType::Absolute,
-                                        left: percent(50),
-                                        top: px(-8),
-                                        width: px(1),
-                                        height: px(6),
-                                        ..default()
-                                    },
-                                    BackgroundColor(RETICLE_CYAN),
-                                ))
-                                .id();
-                            // `#reticle::after` — a 6x1 tick to the left of it.
-                            // The crosshair really is asymmetric in the CSS;
-                            // this is not a porting slip.
-                            reticle_ticks[1] = r
-                                .spawn((
-                                    Node {
-                                        position_type: PositionType::Absolute,
-                                        top: percent(50),
-                                        left: px(-8),
-                                        width: px(6),
-                                        height: px(1),
-                                        ..default()
-                                    },
-                                    BackgroundColor(RETICLE_CYAN),
-                                ))
-                                .id();
-                        })
-                        .id();
-                })
-                .id();
+            build_killfeed(hud, &font, &mut n);
+            build_banners(hud, &font, &mut n);
+            build_scoreline(hud, &font, &mut n);
+        })
+        .id();
 
-            // -- #killfeed --------------------------------------------------
-            hud.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    top: px(44),
-                    left: px(16),
-                    max_width: vw(70),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: px(8),
-                    ..default()
-                },
-                ZIndex(Z_OVERLAY),
-            ))
-            .with_children(|feed| {
-                for slot in &mut killfeed {
-                    *slot = spawn_kill_row(feed, &font);
-                }
-            });
+    commands.insert_resource(n.into_nodes(root));
+}
 
-            // -- #deathbanner -----------------------------------------------
-            hud.spawn(Node {
+/// Scratch for [`spawn_hud`]'s builders.
+///
+/// One mutable struct rather than thirty `let mut ... = Entity::PLACEHOLDER`
+/// threaded through closures: the tree is deep enough that passing the ids back
+/// out by hand was most of the function.
+struct Nodes {
+    cockpit_hidden: [Entity; 6],
+    spd: TapeNodes,
+    hull: TapeNodes,
+    alt_row: Entity,
+    alt_caption: Entity,
+    alt_value: Entity,
+    pull_up: Entity,
+    boost_segs: [Entity; METER_SEGS],
+    gun_segs: [Entity; METER_SEGS],
+    gun_label: Entity,
+    charge_row: Entity,
+    charge_segs: [Entity; CHARGE_SEGS],
+    missile_pips: [Entity; MISSILE_PIPS],
+    flare_pips: [Entity; FLARE_PIPS],
+    reticle_anchor: Entity,
+    reticle: Entity,
+    reticle_marks: [Entity; 5],
+    lock_warning: Entity,
+    vignette: Entity,
+    death_banner: Entity,
+    result_banner: Entity,
+    result_text: Entity,
+    match_panel: Entity,
+    team0: Entity,
+    team1: Entity,
+    clock: Entity,
+    markers: [MarkerNodes; TARGET_POOL],
+    killfeed: [KillRowNodes; KILLFEED_ROWS],
+}
+
+impl Default for Nodes {
+    fn default() -> Nodes {
+        // `Entity` has no `Default` — deliberately, since there is no sensible
+        // "no entity" — so every field starts at the placeholder the builders
+        // then overwrite.
+        Nodes {
+            cockpit_hidden: [Entity::PLACEHOLDER; 6],
+            spd: TapeNodes::default(),
+            hull: TapeNodes::default(),
+            alt_row: Entity::PLACEHOLDER,
+            alt_caption: Entity::PLACEHOLDER,
+            alt_value: Entity::PLACEHOLDER,
+            pull_up: Entity::PLACEHOLDER,
+            boost_segs: [Entity::PLACEHOLDER; METER_SEGS],
+            gun_segs: [Entity::PLACEHOLDER; METER_SEGS],
+            gun_label: Entity::PLACEHOLDER,
+            charge_row: Entity::PLACEHOLDER,
+            charge_segs: [Entity::PLACEHOLDER; CHARGE_SEGS],
+            missile_pips: [Entity::PLACEHOLDER; MISSILE_PIPS],
+            flare_pips: [Entity::PLACEHOLDER; FLARE_PIPS],
+            reticle_anchor: Entity::PLACEHOLDER,
+            reticle: Entity::PLACEHOLDER,
+            reticle_marks: [Entity::PLACEHOLDER; 5],
+            lock_warning: Entity::PLACEHOLDER,
+            vignette: Entity::PLACEHOLDER,
+            death_banner: Entity::PLACEHOLDER,
+            result_banner: Entity::PLACEHOLDER,
+            result_text: Entity::PLACEHOLDER,
+            match_panel: Entity::PLACEHOLDER,
+            team0: Entity::PLACEHOLDER,
+            team1: Entity::PLACEHOLDER,
+            clock: Entity::PLACEHOLDER,
+            markers: [MarkerNodes::default(); TARGET_POOL],
+            killfeed: [KillRowNodes::default(); KILLFEED_ROWS],
+        }
+    }
+}
+
+impl Nodes {
+    fn into_nodes(self, root: Entity) -> HudNodes {
+        HudNodes {
+            root,
+            cockpit_hidden: self.cockpit_hidden,
+            spd: self.spd,
+            hull: self.hull,
+            alt_row: self.alt_row,
+            alt_caption: self.alt_caption,
+            alt_value: self.alt_value,
+            pull_up: self.pull_up,
+            boost_segs: self.boost_segs,
+            gun_segs: self.gun_segs,
+            gun_label: self.gun_label,
+            charge_row: self.charge_row,
+            charge_segs: self.charge_segs,
+            missile_pips: self.missile_pips,
+            flare_pips: self.flare_pips,
+            reticle_anchor: self.reticle_anchor,
+            reticle: self.reticle,
+            reticle_marks: self.reticle_marks,
+            lock_warning: self.lock_warning,
+            vignette: self.vignette,
+            death_banner: self.death_banner,
+            result_banner: self.result_banner,
+            result_text: self.result_text,
+            match_panel: self.match_panel,
+            team0: self.team0,
+            team1: self.team1,
+            clock: self.clock,
+            markers: self.markers,
+            killfeed: self.killfeed,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The tapes
+// ---------------------------------------------------------------------------
+
+/// Which side of the glass a tape lives on.
+///
+/// It decides three things at once and they all have to agree: which screen
+/// edge the assembly is pinned to, which way round the ladder's tick and
+/// numeral sit, and which side of the spine the readout hangs off. Getting one
+/// of them backwards is a tape that reads outward.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// Speed, on the left, spine outboard of the numbers.
+    Left,
+    /// Hull, on the right, spine outboard of the numbers.
+    Right,
+}
+
+/// Everything one ladder needs to be drawn.
+struct Ladder {
+    /// Top of the scale, in its own units. The bottom is always zero.
+    top: i32,
+    /// A numeral every this many units.
+    major: i32,
+    /// A bare tick every this many.
+    minor: i32,
+}
+
+fn build_tapes(hud: &mut ChildSpawnerCommands, font: &HudFont, n: &mut Nodes) {
+    n.spd = spawn_tape(
+        hud,
+        font,
+        Side::Left,
+        "SPD",
+        &Ladder {
+            top: SPD_TOP,
+            major: SPD_MAJOR,
+            minor: SPD_MINOR,
+        },
+        true,
+    );
+
+    // The hull tape *is* the health bar, so it is the first thing
+    // `body.cockpit-view` stands down. The altitude block below is its own root
+    // and stays up: `index.html:865`–`:870` hides six elements and there was
+    // never an altimeter among them, and the instrument panel has no altimeter
+    // to duplicate one with.
+    n.hull = spawn_tape(
+        hud,
+        font,
+        Side::Right,
+        "HULL",
+        &Ladder {
+            top: MAX_HP,
+            major: HULL_MAJOR,
+            minor: HULL_MINOR,
+        },
+        false,
+    );
+    n.cockpit_hidden[0] = n.hull.root;
+
+    // -- AGL / RNG, under the hull tape ---------------------------------------
+    n.alt_row = hud
+        .spawn((
+            Node {
                 position_type: PositionType::Absolute,
-                left: px(0),
-                right: px(0),
-                top: percent(40),
-                justify_content: JustifyContent::Center,
+                left: percent(50.0 + TAPE_INSET),
+                top: percent(50),
+                margin: UiRect::top(px(TAPE_H / 2.0 + 26.0)),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(3),
+                ..default()
+            },
+            // Down at startup, which is what `AltBlock::default()` says. Every
+            // node whose resting state is not the tree's spawned state is a
+            // first-frame write waiting to be skipped — see `sync_hud`.
+            Visibility::Hidden,
+        ))
+        .with_children(|col| {
+            col.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Baseline,
+                column_gap: px(6),
                 ..default()
             })
             .with_children(|row| {
-                death_banner = row
+                n.alt_caption = row.spawn(caption(font, "RNG", 9.0)).id();
+                n.alt_value = row
                     .spawn((
-                        Node {
-                            padding: UiRect::axes(px(48), px(12)),
-                            border_radius: BorderRadius::all(px(16)),
-                            ..default()
-                        },
-                        BackgroundColor(rgba(255, 0, 0, 0.1)),
-                        Text::new("DESTROYED"),
-                        // `clamp(36px, 8vw, 72px)`; 8vw exceeds 72 at any
-                        // window wider than 900px, so this is the clamped value
-                        // for every realistic size. `FontSize` has no clamp.
-                        hud_font(&font, 72.0, 800),
-                        TextColor(RED_BRIGHT),
-                        LetterSpacing::Px(12.0),
-                        Visibility::Hidden,
+                        Text::new("0"),
+                        hud_font(font, 15.0, 600),
+                        TextColor(PHOSPHOR),
+                        LetterSpacing::Px(1.0),
+                        TextLayout::new(Justify::Left, LineBreak::NoWrap),
                     ))
                     .id();
             });
+            n.pull_up = col
+                .spawn((
+                    Text::new(PULL_UP_TEXT.to_owned()),
+                    hud_font(font, 12.0, 800),
+                    TextColor(WARN),
+                    LetterSpacing::Px(4.0),
+                    TextLayout::new(Justify::Left, LineBreak::NoWrap),
+                    Visibility::Hidden,
+                ))
+                .id();
+        })
+        .id();
+}
 
-            // -- #matchresult -----------------------------------------------
-            // Above the death banner's line, because a match can perfectly
-            // well end while you are dead and the two would otherwise overlap.
-            result_banner = hud
+/// One tape: a scrolling ladder past a fixed index, with a legend under it.
+///
+/// The ladder is built whole — every tick and every numeral from zero to the
+/// top of the scale — and clipped by a window [`TAPE_H`] tall. That is the
+/// trade this design makes: about forty nodes that exist forever and cost one
+/// layout pass at startup, against a recycling pool that would have to rewrite
+/// a numeral every time a graduation crossed the window edge. Forty static
+/// nodes are free every frame; a text write is not.
+fn spawn_tape(
+    hud: &mut ChildSpawnerCommands,
+    font: &HudFont,
+    side: Side,
+    legend_text: &str,
+    ladder: &Ladder,
+    with_bug: bool,
+) -> TapeNodes {
+    let mut out = TapeNodes::default();
+
+    // Pinned to a fraction of the viewport rather than to a pixel count, so the
+    // pair frames the boresight the same way at any window size.
+    let mut anchor = Node {
+        position_type: PositionType::Absolute,
+        top: percent(50),
+        margin: UiRect::top(px(-TAPE_H / 2.0)),
+        flex_direction: FlexDirection::Column,
+        row_gap: px(4),
+        ..default()
+    };
+    match side {
+        Side::Left => anchor.right = percent(50.0 + TAPE_INSET),
+        Side::Right => anchor.left = percent(50.0 + TAPE_INSET),
+    }
+
+    out.root = hud
+        .spawn(anchor)
+        .with_children(|col| {
+            col.spawn(Node {
+                height: px(TAPE_H),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|row| {
+                // Spine, then ladder, reading in from the screen edge — the
+                // `┌ 420` and `100 ┐` of the sketch — with the current-value
+                // readout outboard of the spine, where a real airspeed box
+                // sits. The order of the three reverses with the side and
+                // nothing else does.
+                if side == Side::Right {
+                    spawn_ladder_window(row, font, side, ladder, &mut out, with_bug);
+                    spawn_spine(row, side, &mut out);
+                    out.value = row.spawn(tape_value(font, side)).id();
+                } else {
+                    out.value = row.spawn(tape_value(font, side)).id();
+                    spawn_spine(row, side, &mut out);
+                    spawn_ladder_window(row, font, side, ladder, &mut out, with_bug);
+                }
+            });
+
+            // The legend, tucked against the spine on the ladder's side of it —
+            // `│ SPD` and `HULL ┘`. Padded out past the readout rather than
+            // justified, because the readout is the wider of the two halves and
+            // justifying would put the word under it.
+            let past_readout = px(TAPE_VALUE_W + TAPE_VALUE_GAP * 2.0 + 4.0);
+            col.spawn(Node {
+                width: px(TAPE_ROW_W),
+                padding: match side {
+                    Side::Left => UiRect::left(past_readout),
+                    Side::Right => UiRect::right(past_readout),
+                },
+                justify_content: match side {
+                    Side::Left => JustifyContent::Start,
+                    Side::Right => JustifyContent::End,
+                },
+                ..default()
+            })
+            .with_children(|r| {
+                r.spawn(caption(font, legend_text, 9.0));
+            });
+        })
+        .id();
+
+    out
+}
+
+/// The tape's vertical rule, with a cap turned in at each end.
+///
+/// Three one-pixel nodes. They are the `┌ │ └` of the sketch and the only
+/// structural lines in the whole design.
+fn spawn_spine(row: &mut ChildSpawnerCommands, side: Side, out: &mut TapeNodes) {
+    row.spawn((
+        Node {
+            width: px(1),
+            height: px(TAPE_H),
+            ..default()
+        },
+        BackgroundColor(hairline()),
+    ))
+    .with_children(|spine| {
+        for top in [0.0, TAPE_H - 1.0] {
+            // The caps turn in over the ladder, which is on the inboard side of
+            // the spine on the left tape and the outboard side on the right —
+            // `┌`/`└` against `┐`/`┘`. Anchoring both to `left` drew the right
+            // tape's caps out into empty sky.
+            let mut cap = Node {
+                position_type: PositionType::Absolute,
+                top: px(top),
+                width: px(TICK_MAJOR),
+                height: px(1),
+                ..default()
+            };
+            match side {
+                Side::Left => cap.left = px(0),
+                Side::Right => cap.right = px(0),
+            }
+            spine.spawn((cap, BackgroundColor(hairline())));
+        }
+        // The index. Sits *through* the spine at the reading line, and is the
+        // one part of the frame that takes the alert colour.
+        out.caret = spine
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(-CARET_W / 2.0),
+                    top: px((TAPE_H - CARET_H) / 2.0),
+                    width: px(CARET_W),
+                    height: px(CARET_H),
+                    ..default()
+                },
+                BackgroundColor(PHOSPHOR),
+            ))
+            .id();
+    });
+}
+
+/// The clipped window and the ladder inside it.
+fn spawn_ladder_window(
+    row: &mut ChildSpawnerCommands,
+    font: &HudFont,
+    side: Side,
+    ladder: &Ladder,
+    out: &mut TapeNodes,
+    with_bug: bool,
+) {
+    row.spawn(Node {
+        width: px(TAPE_W),
+        height: px(TAPE_H),
+        // Without this the ladder draws its whole two hundred units down the
+        // canopy.
+        overflow: Overflow::clip(),
+        ..default()
+    })
+    .with_children(|window| {
+        out.ladder = window
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0),
+                    top: px(0),
+                    width: percent(100),
+                    height: px(ladder.top as f32 * TAPE_PPU),
+                    ..default()
+                },
+                // The only thing ever written to a tape's ladder.
+                UiTransform::IDENTITY,
+            ))
+            .with_children(|l| {
+                spawn_graduations(l, font, side, ladder);
+            })
+            .id();
+
+        if with_bug {
+            // The commanded-throttle bug. Rides the window rather than the
+            // ladder: its position is already the difference between two tape
+            // readings, so it moves against the *glass*, not against the scale.
+            out.bug = window
                 .spawn((
                     Node {
                         position_type: PositionType::Absolute,
                         left: px(0),
-                        right: px(0),
-                        top: percent(26),
-                        justify_content: JustifyContent::Center,
+                        top: px(-CARET_H / 2.0),
+                        width: px(TICK_MINOR),
+                        height: px(CARET_H),
                         ..default()
                     },
+                    BackgroundColor(AMBER),
+                    UiTransform::IDENTITY,
+                ))
+                .id();
+        }
+    });
+}
+
+/// Every tick and numeral on one ladder, laid out once.
+fn spawn_graduations(l: &mut ChildSpawnerCommands, font: &HudFont, side: Side, ladder: &Ladder) {
+    let mut v = 0;
+    while v <= ladder.top {
+        let major = v % ladder.major == 0;
+        // Zero at the bottom, `top` at the top, which is the way a tape runs.
+        let y = (ladder.top - v) as f32 * TAPE_PPU - TAPE_ROW_H / 2.0;
+        let mut node = Node {
+            position_type: PositionType::Absolute,
+            left: px(0),
+            right: px(0),
+            top: px(y),
+            height: px(TAPE_ROW_H),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(4),
+            ..default()
+        };
+        // The tick always touches the spine, so on the right-hand tape the row
+        // packs to its end and the numeral leads.
+        node.justify_content = if side == Side::Left {
+            JustifyContent::Start
+        } else {
+            JustifyContent::End
+        };
+
+        l.spawn(node).with_children(|r| {
+            let tick = (
+                Node {
+                    width: px(if major { TICK_MAJOR } else { TICK_MINOR }),
+                    height: px(1),
+                    ..default()
+                },
+                BackgroundColor(if major {
+                    PHOSPHOR.with_alpha(0.6)
+                } else {
+                    PHOSPHOR.with_alpha(0.3)
+                }),
+            );
+            if side == Side::Left {
+                r.spawn(tick);
+                if major {
+                    r.spawn(graduation(font, v));
+                }
+            } else {
+                if major {
+                    r.spawn(graduation(font, v));
+                }
+                r.spawn(tick);
+            }
+        });
+
+        v += ladder.minor;
+    }
+}
+
+/// One numeral on a ladder. Never rewritten — see [`spawn_tape`].
+fn graduation(font: &HudFont, v: i32) -> impl Bundle {
+    (
+        Text::new(v.to_string()),
+        hud_font(font, 10.0, 500),
+        TextColor(PHOSPHOR.with_alpha(0.72)),
+        TextLayout::new(Justify::Left, LineBreak::NoWrap),
+    )
+}
+
+/// The current-value readout that sits against the index.
+fn tape_value(font: &HudFont, side: Side) -> impl Bundle {
+    (
+        Node {
+            width: px(TAPE_VALUE_W),
+            margin: UiRect::axes(px(TAPE_VALUE_GAP), px(0)),
+            ..default()
+        },
+        Text::new("0"),
+        hud_font(font, 19.0, 700),
+        TextColor(PHOSPHOR),
+        LetterSpacing::Px(1.0),
+        TextLayout::new(
+            if side == Side::Left {
+                Justify::Right
+            } else {
+                Justify::Left
+            },
+            LineBreak::NoWrap,
+        ),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The meters
+// ---------------------------------------------------------------------------
+
+fn build_meters(hud: &mut ChildSpawnerCommands, font: &HudFont, n: &mut Nodes) {
+    // -- the brake-charge strip -----------------------------------------------
+    // Uniform ticks, so it cannot be read as one of the two ramped stacks. It
+    // is only on the glass while the brake is charging, which is what the CSS
+    // said with `opacity: 0` and what `Visibility` says here.
+    //
+    // Two nodes, not one, and the reason is a rule this module runs on: a
+    // `Visibility` may have exactly one writer. The outer row is what
+    // `body.cockpit-view` stands down and the inner strip is what the brake
+    // raises, and folding them together meant leaving the cockpit re-showed an
+    // idle strip — the seat's write landing after the brake's and nothing left
+    // to correct it.
+    n.cockpit_hidden[1] = hud
+        .spawn(centred_row(CHARGE_ROW_BOTTOM))
+        .with_children(|row| {
+            n.charge_row = row
+                .spawn((
+                    Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: px(SEG_GAP),
+                        ..default()
+                    },
+                    // `Visibility` rather than `Display::None`: hiding by
+                    // display drops the node out of layout and forces a
+                    // relayout on every brake, which is the cost this module
+                    // exists to avoid.
                     Visibility::Hidden,
                 ))
-                .with_children(|row| {
-                    result_text = row
-                        .spawn((
-                            Node {
-                                padding: UiRect::axes(px(48), px(12)),
-                                border_radius: BorderRadius::all(px(16)),
-                                ..default()
-                            },
-                            BackgroundColor(rgba(0, 0, 0, 0.55)),
-                            Text::new(Outcome::Draw.text()),
-                            hud_font(&font, 64.0, 800),
-                            TextColor(Color::WHITE),
-                            LetterSpacing::Px(12.0),
-                        ))
-                        .id();
+                .with_children(|strip| {
+                    for slot in &mut n.charge_segs {
+                        *slot = strip
+                            .spawn((
+                                Node {
+                                    width: px(SEG_W - 1.0),
+                                    height: px(CHARGE_SEG_H),
+                                    ..default()
+                                },
+                                BackgroundColor(unlit()),
+                            ))
+                            .id();
+                    }
                 })
                 .id();
+        })
+        .id();
 
-            // -- #hit-vignette ----------------------------------------------
-            vignette = hud
+    // -- GUN, left of centre; BST, right of it --------------------------------
+    // `▁▃▅▇ GUN   ▁▃▅ BST`. Both ramps climb the same way rather than mirroring
+    // about the boresight: a mirrored pair reads as one wide symbol and the eye
+    // stops telling the two apart, which is the opposite of what a glance at a
+    // meter is for.
+    let gun = hud
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            right: percent(50),
+            bottom: px(METER_ROW_BOTTOM),
+            margin: UiRect::right(px(ROW_SPLIT)),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::End,
+            column_gap: px(7),
+            ..default()
+        })
+        .with_children(|row| {
+            spawn_stack(row, &mut n.gun_segs, false);
+            n.gun_label = row.spawn(caption(font, "GUN", 9.0)).id();
+        })
+        .id();
+    n.cockpit_hidden[3] = gun;
+
+    let boost = hud
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            left: percent(50),
+            bottom: px(METER_ROW_BOTTOM),
+            margin: UiRect::left(px(ROW_SPLIT)),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::End,
+            column_gap: px(7),
+            ..default()
+        })
+        .with_children(|row| {
+            spawn_stack(row, &mut n.boost_segs, false);
+            row.spawn(caption(font, "BST", 9.0));
+        })
+        .id();
+    n.cockpit_hidden[2] = boost;
+}
+
+/// One `▁▃▅▇` stack. `reversed` runs the ramp right to left.
+///
+/// Index 0 is always the *shortest* segment, whichever way the ramp is drawn,
+/// so "n lit" is a prefix of the array and [`sync_stack`] can compare one
+/// integer per segment rather than reasoning about direction.
+fn spawn_stack(row: &mut ChildSpawnerCommands, segs: &mut [Entity; METER_SEGS], reversed: bool) {
+    row.spawn(Node {
+        flex_direction: if reversed {
+            FlexDirection::RowReverse
+        } else {
+            FlexDirection::Row
+        },
+        align_items: AlignItems::End,
+        column_gap: px(SEG_GAP),
+        ..default()
+    })
+    .with_children(|stack| {
+        for (i, slot) in segs.iter_mut().enumerate() {
+            let t = i as f32 / (METER_SEGS - 1) as f32;
+            *slot = stack
+                .spawn((
+                    Node {
+                        width: px(SEG_W),
+                        height: px(SEG_H_MIN + (SEG_H_MAX - SEG_H_MIN) * t),
+                        ..default()
+                    },
+                    BackgroundColor(unlit()),
+                ))
+                .id();
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Stores
+// ---------------------------------------------------------------------------
+
+fn build_pips(hud: &mut ChildSpawnerCommands, font: &HudFont, n: &mut Nodes) {
+    let msl = hud
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            right: percent(50),
+            bottom: px(PIP_ROW_BOTTOM),
+            margin: UiRect::right(px(ROW_SPLIT)),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(7),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn(caption(font, "MSL", 9.0));
+            row.spawn(pip_row()).with_children(|pips| {
+                for slot in &mut n.missile_pips {
+                    *slot = pips.spawn(pip(ORDNANCE)).id();
+                }
+            });
+        })
+        .id();
+    n.cockpit_hidden[4] = msl;
+
+    let flr = hud
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            left: percent(50),
+            bottom: px(PIP_ROW_BOTTOM),
+            margin: UiRect::left(px(ROW_SPLIT)),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(7),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn(caption(font, "FLR", 9.0));
+            row.spawn(pip_row()).with_children(|pips| {
+                for slot in &mut n.flare_pips {
+                    *slot = pips.spawn(pip(AMBER)).id();
+                }
+            });
+        })
+        .id();
+    n.cockpit_hidden[5] = flr;
+}
+
+// ---------------------------------------------------------------------------
+// The boresight
+// ---------------------------------------------------------------------------
+
+/// The gun cross: a circle, four radial ticks, and the pipper at its centre.
+///
+/// **This is the reticle, and where it sits is not decoration.**
+/// [`sync_world_markers`] slides the anchor onto the gun line at the range of
+/// whatever the nose is nearest to, because the camera is not on that line and a
+/// sight pinned to screen centre is wrong by a degree of parallax — which is
+/// what made the lock never fill in. The anchor is laid out screen-centred so a
+/// frame before the first projection draws it in the right place anyway.
+fn build_boresight(hud: &mut ChildSpawnerCommands, n: &mut Nodes) {
+    n.reticle_anchor = hud
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: percent(50),
+                top: percent(50),
+                width: px(SIGHT_D),
+                height: px(SIGHT_D),
+                margin: UiRect::new(px(-SIGHT_D / 2.0), px(0), px(-SIGHT_D / 2.0), px(0)),
+                ..default()
+            },
+            UiTransform::IDENTITY,
+        ))
+        .with_children(|anchor| {
+            n.reticle = anchor
                 .spawn((
                     Node {
                         position_type: PositionType::Absolute,
@@ -1378,123 +2101,245 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
                         top: px(0),
                         width: percent(100),
                         height: percent(100),
+                        border: UiRect::all(px(1)),
+                        border_radius: BorderRadius::all(percent(50)),
                         ..default()
                     },
-                    vignette_gradient(0.0),
-                    ZIndex(Z_OVERLAY),
-                    Visibility::Hidden,
+                    BorderColor::all(PHOSPHOR),
+                    // A `UiTransform` is applied after layout, so the lock
+                    // state costs no relayout — where animating `width` would.
+                    UiTransform::IDENTITY,
                 ))
-                .id();
-
-            // -- #matchhud --------------------------------------------------
-            hud.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: px(0),
-                    right: px(0),
-                    top: px(16),
-                    justify_content: JustifyContent::Center,
-                    ..default()
-                },
-                ZIndex(Z_OVERLAY),
-            ))
-            .with_children(|row| {
-                match_panel = row
-                    .spawn((
-                        Node {
-                            flex_direction: FlexDirection::Row,
-                            align_items: AlignItems::Center,
-                            column_gap: px(24),
-                            padding: UiRect::axes(px(32), px(12)),
-                            border: UiRect::all(px(1)),
-                            border_radius: BorderRadius::all(px(8)),
-                            ..default()
-                        },
-                        // `--glass-bg` + `--glass-border`. `backdrop-filter:
-                        // blur(16px)` has no `bevy_ui` equivalent, so the panel
-                        // is flat glass rather than frosted.
-                        BackgroundColor(GLASS_BG),
-                        BorderColor::all(GLASS_BORDER),
-                        BoxShadow::new(rgba(0, 0, 0, 0.6), px(0), px(12), px(0), px(40)),
-                        Visibility::Hidden,
-                    ))
-                    .with_children(|panel| {
-                        team0 = panel
-                            .spawn(score_text(&font, BLUE, 32.0, Justify::Right))
-                            .id();
-                        clock = panel
+                .with_children(|r| {
+                    // Four ticks radiating from the circle, clockwise from the
+                    // top. A real gun cross has them; they are what tells you
+                    // the sight is level when the horizon is not in view.
+                    let arms: [(Val, Val, f32, f32); 4] = [
+                        (percent(50), px(-SIGHT_TICK - 1.0), 1.0, SIGHT_TICK),
+                        (percent(100), percent(50), SIGHT_TICK, 1.0),
+                        (percent(50), percent(100), 1.0, SIGHT_TICK),
+                        (px(-SIGHT_TICK - 1.0), percent(50), SIGHT_TICK, 1.0),
+                    ];
+                    for (slot, (left, top, w, h)) in n.reticle_marks.iter_mut().zip(arms) {
+                        *slot = r
                             .spawn((
-                                score_text(&font, GOLD, 72.0, Justify::Center),
-                                LetterSpacing::Px(2.0),
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left,
+                                    top,
+                                    width: px(w),
+                                    height: px(h),
+                                    ..default()
+                                },
+                                BackgroundColor(PHOSPHOR),
                             ))
                             .id();
-                        team1 = panel
-                            .spawn(score_text(&font, RED, 32.0, Justify::Left))
-                            .id();
-                    })
-                    .id();
-            });
+                    }
+                    // The pipper. The aim point itself, and the only filled
+                    // shape on the glass.
+                    n.reticle_marks[4] = r
+                        .spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(SIGHT_D / 2.0 - SIGHT_PIP / 2.0),
+                                top: px(SIGHT_D / 2.0 - SIGHT_PIP / 2.0),
+                                width: px(SIGHT_PIP),
+                                height: px(SIGHT_PIP),
+                                border_radius: BorderRadius::all(percent(50)),
+                                ..default()
+                            },
+                            BackgroundColor(PHOSPHOR),
+                        ))
+                        .id();
+                })
+                .id();
+        })
+        .id();
+}
 
-            // -- #missile-lock-warning --------------------------------------
-            hud.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: px(0),
-                    right: px(0),
-                    top: px(120),
-                    justify_content: JustifyContent::Center,
-                    ..default()
-                },
-                ZIndex(Z_WARNING),
+// ---------------------------------------------------------------------------
+// Killfeed, banners, scoreline
+// ---------------------------------------------------------------------------
+
+fn build_killfeed(hud: &mut ChildSpawnerCommands, font: &HudFont, n: &mut Nodes) {
+    hud.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            // `main.rs` notes the macOS traffic lights float over the top-left
+            // ~80x30 px of the viewport, so the feed starts below them.
+            top: px(44),
+            left: px(20),
+            max_width: vw(70),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(5),
+            ..default()
+        },
+        ZIndex(Z_OVERLAY),
+    ))
+    .with_children(|feed| {
+        for slot in &mut n.killfeed {
+            *slot = spawn_kill_row(feed, font);
+        }
+    });
+}
+
+fn build_banners(hud: &mut ChildSpawnerCommands, font: &HudFont, n: &mut Nodes) {
+    // -- the hit vignette -----------------------------------------------------
+    n.vignette = hud
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                top: px(0),
+                width: percent(100),
+                height: percent(100),
+                ..default()
+            },
+            vignette_gradient(0.0),
+            ZIndex(Z_OVERLAY),
+            Visibility::Hidden,
+        ))
+        .id();
+
+    // -- DESTROYED ------------------------------------------------------------
+    hud.spawn(Node {
+        position_type: PositionType::Absolute,
+        left: px(0),
+        right: px(0),
+        top: percent(42),
+        justify_content: JustifyContent::Center,
+        ..default()
+    })
+    .with_children(|row| {
+        n.death_banner = row
+            .spawn((
+                Text::new("DESTROYED"),
+                hud_font(font, 54.0, 800),
+                TextColor(WARN),
+                LetterSpacing::Px(14.0),
+                Visibility::Hidden,
             ))
-            .with_children(|row| {
-                lock_warning = row
-                    .spawn((
-                        Node {
-                            padding: UiRect::axes(px(32), px(8)),
-                            border_radius: BorderRadius::all(px(8)),
-                            ..default()
-                        },
-                        BackgroundColor(rgba(255, 0, 0, 0.1)),
-                        Text::new(LOCK_WARNING_TEXT),
-                        hud_font(&font, 20.0, 800),
-                        TextColor(RED_BRIGHT),
-                        LetterSpacing::Px(8.0),
-                        Visibility::Hidden,
-                    ))
-                    .id();
-            });
+            .id();
+    });
+
+    // -- the result card ------------------------------------------------------
+    // Above the death banner's line, because a match can perfectly well end
+    // while you are dead and the two would otherwise overlap.
+    n.result_banner = hud
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                right: px(0),
+                top: percent(28),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            Visibility::Hidden,
+        ))
+        .with_children(|row| {
+            n.result_text = row
+                .spawn((
+                    Text::new(Outcome::Draw.text()),
+                    hud_font(font, 48.0, 800),
+                    TextColor(PHOSPHOR),
+                    LetterSpacing::Px(14.0),
+                ))
+                .id();
         })
         .id();
 
-    commands.insert_resource(HudNodes {
-        root,
-        cockpit_hidden,
-        health_fill,
-        health_text,
-        boost_fill,
-        heat_frame,
-        heat_fill,
-        charge_frame,
-        charge_fill,
-        missile_pips,
-        flare_pips,
-        reticle_anchor,
-        reticle,
-        reticle_ticks,
-        lock_warning,
-        vignette,
-        death_banner,
-        result_banner,
-        result_text,
-        match_panel,
-        team0,
-        team1,
-        clock,
-        markers,
-        killfeed,
+    // -- the missile-lock warning ---------------------------------------------
+    hud.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0),
+            right: px(0),
+            top: px(96),
+            justify_content: JustifyContent::Center,
+            ..default()
+        },
+        ZIndex(Z_WARNING),
+    ))
+    .with_children(|row| {
+        n.lock_warning = row
+            .spawn((
+                Text::new(LOCK_WARNING_TEXT.to_owned()),
+                hud_font(font, 15.0, 800),
+                TextColor(WARN),
+                LetterSpacing::Px(7.0),
+                Visibility::Hidden,
+            ))
+            .id();
     });
 }
+
+/// The scoreline: two counts and a clock, separated by hairlines.
+///
+/// No panel behind it. The old one was `--glass-bg` with a blurred backdrop and
+/// a rounded border, which is the single most web-looking thing that was on the
+/// screen.
+fn build_scoreline(hud: &mut ChildSpawnerCommands, font: &HudFont, n: &mut Nodes) {
+    hud.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0),
+            right: px(0),
+            top: px(18),
+            justify_content: JustifyContent::Center,
+            ..default()
+        },
+        ZIndex(Z_OVERLAY),
+    ))
+    .with_children(|row| {
+        n.match_panel = row
+            .spawn((
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px(16),
+                    ..default()
+                },
+                Visibility::Hidden,
+            ))
+            .with_children(|panel| {
+                n.team0 = panel.spawn(score_text(font, FRIENDLY, Justify::Right)).id();
+                panel.spawn(divider());
+                n.clock = panel
+                    .spawn((
+                        Node {
+                            min_width: px(76),
+                            ..default()
+                        },
+                        Text::new("0:00"),
+                        hud_font(font, 26.0, 700),
+                        TextColor(PHOSPHOR),
+                        LetterSpacing::Px(2.0),
+                        TextLayout::new(Justify::Center, LineBreak::NoWrap),
+                    ))
+                    .id();
+                panel.spawn(divider());
+                n.team1 = panel.spawn(score_text(font, HOSTILE, Justify::Left)).id();
+            })
+            .id();
+    });
+}
+
+/// A vertical hairline between two cells of the scoreline.
+fn divider() -> impl Bundle {
+    (
+        Node {
+            width: px(1),
+            height: px(16),
+            ..default()
+        },
+        BackgroundColor(hairline()),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The world-space markers
+// ---------------------------------------------------------------------------
 
 /// Builds one target slot: a bracketed box with a label, and a lead ring.
 ///
@@ -1505,12 +2350,10 @@ fn spawn_marker(hud: &mut ChildSpawnerCommands, font: &HudFont) -> MarkerNodes {
     let mut corners = [Entity::PLACEHOLDER; 4];
     let mut label = Entity::PLACEHOLDER;
 
-    // `.target-box`'s eight stacked linear gradients draw a 2px, 14px-long arm
-    // along each end of each edge — which is four L-shaped corner brackets.
-    // `bevy_ui` has no multi-stop background layers, so the brackets are four
-    // 14x14 nodes wearing two borders each. Same pixels, and it means the
-    // "which target is the assist on" state is four colour writes rather than
-    // an eight-layer gradient string.
+    // Four L-shaped corner brackets: four small nodes wearing two borders each.
+    // The web original stacked eight linear gradients to draw the same thing,
+    // which also made "which target is the assist on" an eight-layer gradient
+    // string rather than four colour writes.
     let boxes = hud
         .spawn((
             Node {
@@ -1521,7 +2364,7 @@ fn spawn_marker(hud: &mut ChildSpawnerCommands, font: &HudFont) -> MarkerNodes {
                 height: px(BOX_SIZE),
                 ..default()
             },
-            // `margin: -32px 0 0 -32px` is folded into the translation
+            // The half-box offset is folded into the translation
             // `sync_world_markers` writes, so there is one source of position.
             UiTransform::IDENTITY,
             Visibility::Hidden,
@@ -1556,9 +2399,7 @@ fn spawn_marker(hud: &mut ChildSpawnerCommands, font: &HudFont) -> MarkerNodes {
                             },
                             ..default()
                         },
-                        BorderColor::all(RED),
-                        // `filter: drop-shadow(0 0 6px rgba(255,85,102,0.6))`.
-                        BoxShadow::new(rgba(255, 85, 102, 0.6), px(0), px(0), px(0), px(6)),
+                        BorderColor::all(HOSTILE),
                     ))
                     .id();
             }
@@ -1572,14 +2413,10 @@ fn spawn_marker(hud: &mut ChildSpawnerCommands, font: &HudFont) -> MarkerNodes {
                         ..default()
                     },
                     Text::new(String::new()),
-                    hud_font(font, 11.0, 600),
-                    TextColor(RED),
-                    LetterSpacing::Px(1.0),
+                    hud_font(font, 10.0, 600),
+                    TextColor(HOSTILE),
+                    LetterSpacing::Px(1.5),
                     TextLayout::new(Justify::Left, LineBreak::NoWrap),
-                    TextShadow {
-                        offset: Vec2::new(0.0, 1.0),
-                        color: rgba(0, 0, 0, 0.9),
-                    },
                 ))
                 .id();
         })
@@ -1597,22 +2434,15 @@ fn spawn_marker(hud: &mut ChildSpawnerCommands, font: &HudFont) -> MarkerNodes {
     }
 }
 
-/// `.lead-marker`, in both of its states.
+/// The lead marker, in both of its states.
 ///
-/// The CSS is a 16px circle with a **dashed** 2px border that goes **solid and
-/// filled** when the shot is lined up:
-///
-/// ```text
-/// .lead-marker         { border: 2px dashed var(--color-red); border-radius: 50% }
-/// .lead-marker.aligned { background: rgba(255,85,102,0.4); border-style: solid }
-/// ```
-///
-/// `bevy_ui` has one border style and it is solid, so the scattered state is
-/// drawn rather than styled: eight dots on the same 16px circle, which is what
-/// a 2px dash pattern resolves to at that diameter anyway. Both rings are built
-/// here and the swap is two `Visibility` writes — no archetype move, no
-/// relayout, and no per-frame cost, since it only happens when the shot goes
-/// from lined up to not.
+/// A 16px circle with a **dashed** outline that goes **solid and filled** when
+/// the shot is lined up. `bevy_ui` has one border style and it is solid, so the
+/// scattered state is drawn rather than styled: eight dots on the same circle,
+/// which is what a 2px dash pattern resolves to at that diameter anyway. Both
+/// rings are built here and the swap is two `Visibility` writes — no archetype
+/// move, no relayout, and no per-frame cost, since it only happens when the shot
+/// goes from lined up to not.
 ///
 /// Returns `(root, solid, scattered)`.
 fn lead_marker(hud: &mut ChildSpawnerCommands) -> (Entity, Entity, Entity) {
@@ -1645,9 +2475,8 @@ fn lead_marker(hud: &mut ChildSpawnerCommands) -> (Entity, Entity, Entity) {
                         border_radius: BorderRadius::all(percent(50)),
                         ..default()
                     },
-                    BorderColor::all(RED),
-                    BackgroundColor(rgba(255, 85, 102, 0.4)),
-                    BoxShadow::new(rgba(255, 85, 102, 0.5), px(0), px(0), px(0), px(10)),
+                    BorderColor::all(HOSTILE),
+                    BackgroundColor(HOSTILE.with_alpha(0.35)),
                     Visibility::Hidden,
                 ))
                 .id();
@@ -1679,7 +2508,7 @@ fn lead_marker(hud: &mut ChildSpawnerCommands) -> (Entity, Entity, Entity) {
                                 border_radius: BorderRadius::all(percent(50)),
                                 ..default()
                             },
-                            BackgroundColor(RED),
+                            BackgroundColor(HOSTILE),
                         ));
                     }
                 })
@@ -1690,7 +2519,7 @@ fn lead_marker(hud: &mut ChildSpawnerCommands) -> (Entity, Entity, Entity) {
     (root, solid, dashed)
 }
 
-/// One `.kf-entry`: killer, arrow, victim, on a glass slab with a blue spine.
+/// One killfeed row: killer, arrow, victim. No slab, no border, no spine.
 fn spawn_kill_row(feed: &mut ChildSpawnerCommands, font: &HudFont) -> KillRowNodes {
     let mut killer = Entity::PLACEHOLDER;
     let mut victim = Entity::PLACEHOLDER;
@@ -1700,39 +2529,19 @@ fn spawn_kill_row(feed: &mut ChildSpawnerCommands, font: &HudFont) -> KillRowNod
             Node {
                 flex_direction: FlexDirection::Row,
                 align_items: AlignItems::Center,
-                column_gap: px(10),
-                padding: UiRect::axes(px(16), px(8)),
-                // `border: 1px solid ...; border-left: 4px solid --color-blue`.
-                border: UiRect {
-                    left: px(4),
-                    right: px(1),
-                    top: px(1),
-                    bottom: px(1),
-                },
-                border_radius: BorderRadius::all(px(8)),
+                column_gap: px(8),
                 ..default()
             },
-            BackgroundColor(KF_BG),
-            BorderColor {
-                left: BLUE,
-                right: GLASS_BORDER,
-                top: GLASS_BORDER,
-                bottom: GLASS_BORDER,
-            },
-            BoxShadow::new(rgba(0, 0, 0, 0.5), px(0), px(8), px(0), px(24)),
-            // `animation: kf-in` has no `bevy_ui` equivalent; the row lands on
-            // its end state, which is the same rule the rest of this module
-            // follows for CSS animations.
             Visibility::Hidden,
         ))
         .with_children(|r| {
-            killer = r.spawn(kill_text(font, BLUE)).id();
+            killer = r.spawn(kill_text(font, PHOSPHOR)).id();
             r.spawn((
                 Text::new(KF_ARROW.to_owned()),
-                hud_font(font, 10.0, 600),
-                TextColor(KF_ICON),
+                hud_font(font, 9.0, 600),
+                TextColor(legend()),
             ));
-            victim = r.spawn(kill_text(font, KF_VICTIM)).id();
+            victim = r.spawn(kill_text(font, legend())).id();
         })
         .id();
 
@@ -1743,14 +2552,14 @@ fn spawn_kill_row(feed: &mut ChildSpawnerCommands, font: &HudFont) -> KillRowNod
     }
 }
 
-/// A `.kf-killer` / `.kf-victim` cell. `text-transform: uppercase` is applied
-/// when the string is written, since `bevy_text` has no such property.
+/// A killfeed cell. `text-transform: uppercase` is applied when the string is
+/// written, since `bevy_text` has no such property.
 fn kill_text(font: &HudFont, colour: Color) -> impl Bundle {
     (
         Text::new(String::new()),
-        hud_font(font, 11.0, 600),
+        hud_font(font, 10.0, 600),
         TextColor(colour),
-        LetterSpacing::Px(1.0),
+        LetterSpacing::Px(1.5),
         TextLayout::new(Justify::Left, LineBreak::NoWrap),
     )
 }
@@ -1758,11 +2567,6 @@ fn kill_text(font: &HudFont, colour: Color) -> impl Bundle {
 // --- tree helpers ----------------------------------------------------------
 
 /// A full-width row pinned `bottom` pixels off the floor, centring its child.
-///
-/// CSS centres these with `left: 50%; transform: translateX(-50%)`, which does
-/// not survive `width: min(400px, 90vw)` cleanly — the -50% is of the resolved
-/// width. A centring row gets the same result for any width and costs one node
-/// that is never written to again.
 fn centred_row(bottom: f32) -> Node {
     Node {
         position_type: PositionType::Absolute,
@@ -1774,167 +2578,61 @@ fn centred_row(bottom: f32) -> Node {
     }
 }
 
-/// The well of a bar: `min(400px, 90vw)` wide, rounded, clipping its fill.
-fn bar_frame(height: f32, well: Color, border: Color, border_px: f32) -> impl Bundle {
+/// A legend: upper case, tracked, dim. `SPD`, `HULL`, `GUN`, `MSL`, `AGL`.
+///
+/// Tracked at a fifth of the size, which is `ui.rs::caption`'s ratio — the two
+/// surfaces set their captions the same way as well as in the same colour.
+fn caption(font: &HudFont, text: &str, size: f32) -> impl Bundle {
     (
-        Node {
-            width: px(BAR_WIDTH),
-            max_width: vw(90),
-            height: px(height),
-            border: UiRect::all(px(border_px)),
-            border_radius: BorderRadius::all(px(4)),
-            // `overflow: hidden`, which is what lets the fill be a plain
-            // percentage-width child with rounded corners.
-            overflow: Overflow::clip(),
-            ..default()
-        },
-        BackgroundColor(well),
-        BorderColor::all(border),
+        Text::new(text.to_owned()),
+        hud_font(font, size, 700),
+        TextColor(legend()),
+        LetterSpacing::Px(size * 0.2),
+        TextLayout::new(Justify::Left, LineBreak::NoWrap),
     )
 }
 
-/// A bar's fill, full width to start with — as `#healthbar-fill`,
-/// `#boostbar-fill` and `#heatbar-fill` all are.
-fn fill_node() -> Node {
+/// The row a set of pips sits in.
+fn pip_row() -> Node {
     Node {
-        width: percent(100),
-        height: percent(100),
-        ..default()
-    }
-}
-
-/// `box-shadow: 0 4px 12px rgba(0,0,0,0.5)`, shared by `.meterbar` and
-/// `#chargebar`.
-fn meter_shadow() -> BoxShadow {
-    BoxShadow::new(rgba(0, 0, 0, 0.5), px(0), px(4), px(0), px(12))
-}
-
-/// The box `.meterbar-label` sits in: 12px from the left edge, full height, its
-/// child centred against the cross axis.
-///
-/// The label has to be a *child* of this rather than living on it. A `Node`
-/// that carries `Text` lays its glyphs out at its own origin, and its
-/// `align_items` / `justify_content` govern its children — of which a text node
-/// has none. Putting both on one entity silently top-left-aligns the text,
-/// which is a mistake that looks fine on a 12px bar and obvious on a 24px one.
-fn meter_label_slot() -> Node {
-    Node {
-        position_type: PositionType::Absolute,
-        left: px(12),
-        top: px(0),
-        bottom: px(0),
+        flex_direction: FlexDirection::Row,
         align_items: AlignItems::Center,
+        column_gap: px(3),
         ..default()
     }
 }
 
-/// `.meterbar-label` — "BOOST", "GUN". Drawn over the fill.
-fn meter_label(font: &HudFont, text: &str) -> impl Bundle {
-    (
-        Text::new(text.to_owned()),
-        hud_font(font, 10.0, 800),
-        TextColor(LABEL_WHITE),
-        LetterSpacing::Px(2.0),
-        TextShadow {
-            offset: Vec2::new(0.0, 1.0),
-            color: rgba(0, 0, 0, 0.9),
-        },
-    )
-}
-
-/// `.msl-label` / `.fla-label`.
-fn pip_label(font: &HudFont, text: &str) -> impl Bundle {
-    (
-        Text::new(text.to_owned()),
-        hud_font(font, 11.0, 800),
-        TextColor(LABEL_WHITE),
-        LetterSpacing::Px(2.0),
-        TextShadow {
-            offset: Vec2::new(0.0, 1.0),
-            color: rgba(0, 0, 0, 0.8),
-        },
-    )
-}
-
-/// One missile or flare pip, in its full state.
+/// One missile or flare pip: a stroke, present or spent.
 ///
-/// The border is spawned at width 1 and colour `NONE` even though a full pip
-/// has no border in the CSS: with `BoxSizing::BorderBox` a 1px border does not
-/// change the pip's 16x12 footprint, so `.empty` can be reached by writing two
-/// colours and never by changing the layout. Same reasoning for the shadow.
-///
-/// `transform: skew(-10deg)` is dropped — `UiTransform` has translation, scale
-/// and rotation but no skew, and the pips are 16px wide.
+/// The border is spawned at width 1 and colour `NONE` even though a loaded pip
+/// has no outline: with `BoxSizing::BorderBox` a 1px border does not change the
+/// footprint, so "spent" is reached by writing two colours and never by changing
+/// the layout.
 fn pip(colour: Color) -> impl Bundle {
     (
         Node {
             width: px(PIP_WIDTH),
             height: px(PIP_HEIGHT),
             border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(2)),
             ..default()
         },
         BackgroundColor(colour),
         BorderColor::all(Color::NONE),
-        BoxShadow::new(colour.with_alpha(0.8), px(0), px(0), px(0), px(12)),
     )
 }
 
-/// A `#matchhud` cell: fixed minimum width, its own colour and alignment.
-fn score_text(font: &HudFont, colour: Color, min_width: f32, justify: Justify) -> impl Bundle {
+/// A scoreline cell: fixed minimum width, its own colour and alignment.
+fn score_text(font: &HudFont, colour: Color, justify: Justify) -> impl Bundle {
     (
         Node {
-            min_width: px(min_width),
+            min_width: px(34),
             ..default()
         },
         Text::new("0"),
-        // `font-size: clamp(16px, 2.5vw, 22px)`; 2.5vw passes 22px at 880px
-        // wide, so this is the clamped value in practice.
-        hud_font(font, 22.0, 800),
+        hud_font(font, 20.0, 700),
         TextColor(colour),
         TextLayout::new(justify, LineBreak::NoWrap),
     )
-}
-
-// --- gradients -------------------------------------------------------------
-
-/// `linear-gradient(90deg, from 0%, to 100%)`.
-fn gradient_90(from: Color, to: Color) -> BackgroundGradient {
-    BackgroundGradient::from(LinearGradient {
-        angle: LinearGradient::TO_RIGHT,
-        stops: vec![
-            ColorStop::new(from, percent(0)),
-            ColorStop::new(to, percent(100)),
-        ],
-        ..default()
-    })
-}
-
-/// `main.js:1980`'s health gradient, at a given hue.
-///
-/// `linear-gradient(180deg, hsl(h,80%,60%) 0%, hsl(h,70%,38%) 100%)`. 180deg in
-/// CSS is top-to-bottom, which is `LinearGradient::TO_BOTTOM`.
-fn health_gradient(hue: u16) -> BackgroundGradient {
-    let h = f32::from(hue);
-    BackgroundGradient::from(LinearGradient {
-        angle: LinearGradient::TO_BOTTOM,
-        stops: vec![
-            ColorStop::new(Color::hsl(h, 0.8, 0.6), percent(0)),
-            ColorStop::new(Color::hsl(h, 0.7, 0.38), percent(100)),
-        ],
-        ..default()
-    })
-}
-
-/// `#chargebar-fill`'s gradient, normal or `.overload`.
-fn charge_gradient(overload: bool) -> BackgroundGradient {
-    if overload {
-        // `linear-gradient(90deg, #c0392b 0%, #e74c3c 100%)`.
-        gradient_90(rgb(0xc0, 0x39, 0x2b), rgb(0xe7, 0x4c, 0x3c))
-    } else {
-        // `linear-gradient(90deg, #e67e22 0%, #f1c40f 100%)`.
-        gradient_90(rgb(0xe6, 0x7e, 0x22), rgb(0xf1, 0xc4, 0x0f))
-    }
 }
 
 /// `#hit-vignette`'s radial gradient at a given opacity.
@@ -2004,14 +2702,18 @@ fn vignette_gradient(alpha: f32) -> BackgroundGradient {
 /// borrowed at once, which [`sync_pips`] needs.
 #[derive(bevy::ecs::system::SystemParam)]
 struct HudWrite<'w, 's> {
-    node: Query<'w, 's, &'static mut Node>,
     vis: Query<'w, 's, &'static mut Visibility>,
     bg: Query<'w, 's, &'static mut BackgroundColor>,
     border: Query<'w, 's, &'static mut BorderColor>,
+    /// The vignette's radial gradient, which is the only gradient left on the
+    /// glass — every bar it used to share the query with is a segment stack
+    /// now, and a segment is a flat colour.
     grad: Query<'w, 's, &'static mut BackgroundGradient>,
-    shadow: Query<'w, 's, &'static mut BoxShadow>,
     text: Query<'w, 's, &'static mut Text>,
     text_colour: Query<'w, 's, &'static mut TextColor>,
+    /// The tape scrolls, the throttle bug, and the boresight's lock scale.
+    /// **No `Node` query at all**: nothing in this HUD resizes, which is what
+    /// keeps `bevy_ui`'s layout out of the frame entirely.
     xform: Query<'w, 's, &'static mut UiTransform>,
 }
 
@@ -2031,10 +2733,11 @@ fn sync_hud(
     time: Res<Time>,
     view: Res<crate::cockpit::ViewMode>,
     lobby: Option<Res<crate::ui::LobbyOpen>>,
+    setup: Res<crate::sim_bridge::MatchSetup>,
     nodes: Option<Res<HudNodes>>,
     roster: Res<Roster>,
     feed: Res<KillFeed>,
-    lock: Res<TargetLock>,
+    sight: Res<Boresight>,
     result: Res<MatchResult>,
     mut applied: ResMut<AppliedHud>,
     mut w: HudWrite,
@@ -2047,9 +2750,14 @@ fn sync_hud(
     let hidden = view.seated || lobby.is_some_and(|l| l.0);
     let next = model(
         &frame.0,
-        time.elapsed_secs(),
-        hidden,
-        lock.0,
+        Env {
+            time: time.elapsed_secs(),
+            seated: hidden,
+            locked: sight.locked,
+            range: sight.range,
+            map: setup.map,
+            hull: crate::weapons::forced_hull(),
+        },
         &feed,
         result.outcome,
     );
@@ -2057,13 +2765,33 @@ fn sync_hud(
 
     // The early-out. On a frame where nothing the player can see has changed —
     // the overwhelming majority of frames — this system ends here, having read
-    // two resources and compared twenty integers. No `Mut` is taken, so no
+    // two resources and compared thirty integers. No `Mut` is taken, so no
     // component is flagged changed, so `bevy_ui` skips the node in layout and
     // the render world skips it in extraction.
     if prev == Some(next) {
         return;
     }
     applied.0 = Some(next);
+
+    // **The frame the HUD comes up is a full write.**
+    //
+    // Every guard below asks "did this field move", and before the first ship
+    // exists the applied model is `HudModel::default()` — so any field whose
+    // first *real* value happens to equal its default is judged unchanged and
+    // never written, leaving that node in whatever state `spawn_hud` left it.
+    // That is not hypothetical: it shipped a speed tape parked at the top of its
+    // own ladder, because a stationary ship reads zero and zero is the default;
+    // and an `RNG 0` under the hull tape, because "no contact" is the default
+    // too and the row had never been told to hide.
+    //
+    // Dropping `prev` on the transition costs one full pass on the frame a match
+    // starts and nothing on any other frame, and it removes the whole class
+    // rather than the two instances that were noticed.
+    let prev = if next.present && prev.is_none_or(|p| !p.present) {
+        None
+    } else {
+        prev
+    };
 
     /// True if this is the first write, or if any named field moved.
     macro_rules! moved {
@@ -2084,7 +2812,7 @@ fn sync_hud(
         );
     }
 
-    // -- #matchresult -------------------------------------------------------
+    // -- the result card ----------------------------------------------------
     // Before the `present` early-out, because the card has to survive the local
     // ship: a match can end while you are dead.
     if moved!(result) {
@@ -2108,159 +2836,192 @@ fn sync_hud(
     }
 
     // -- body.cockpit-view --------------------------------------------------
-    // Six writes on the frame `V` is pressed and none after it. The bars' own
-    // values are zeroed while hidden (see `model`), so the guards below are
-    // all comparing an unchanging zero and none of them fire either.
+    // Six writes on the frame `V` is pressed and none after it. The values
+    // behind the hidden elements are zeroed while seated (see `model`), so the
+    // guards below are all comparing an unchanging zero and none of them fire.
     if moved!(bars_hidden) {
         for node in nodes.cockpit_hidden {
             set_visible(&mut w.vis, node, !next.bars_hidden);
         }
     }
 
-    // -- #healthbar ---------------------------------------------------------
-    if moved!(hp_mil) {
-        set_width(&mut w.node, nodes.health_fill, next.hp_mil);
+    // -- the speed tape -----------------------------------------------------
+    //
+    // Two writes at most, and only while accelerating: the ladder's scroll and
+    // the digits beside the index. Nothing on the ladder itself is ever touched.
+    if moved!(spd_px) {
+        set_scroll(&mut w.xform, nodes.spd.ladder, next.spd_px, SPD_TOP);
     }
-    if moved!(hp_hue) {
-        set(&mut w.grad, nodes.health_fill, health_gradient(next.hp_hue));
+    if moved!(spd) {
+        set_text(&mut w.text, nodes.spd.value, || next.spd.to_string());
+    }
+    if moved!(thr_px) {
+        set(
+            &mut w.xform,
+            nodes.spd.bug,
+            UiTransform::from_translation(Val2::px(0.0, f32::from(next.thr_px))),
+        );
+    }
+
+    // -- the hull tape ------------------------------------------------------
+    if moved!(hull_px) {
+        set_scroll(&mut w.xform, nodes.hull.ladder, next.hull_px, MAX_HP);
     }
     if moved!(hp) {
-        set_text(&mut w.text, nodes.health_text, || {
-            format!("{} / {MAX_HP}", next.hp)
-        });
+        set_text(&mut w.text, nodes.hull.value, || next.hp.to_string());
+    }
+    if moved!(hull_alert) {
+        // The readout and the index take the alert colour together; the ladder
+        // stays phosphor, because a scale that changed colour would read as a
+        // different scale.
+        let colour = next.hull_alert.colour();
+        set(&mut w.text_colour, nodes.hull.value, TextColor(colour));
+        set(&mut w.bg, nodes.hull.caret, BackgroundColor(colour));
     }
 
-    // -- #boostbar ----------------------------------------------------------
-    if moved!(boost_mil) {
-        set_width(&mut w.node, nodes.boost_fill, next.boost_mil);
+    // -- AGL / RNG ----------------------------------------------------------
+    if moved!(alt) {
+        set_visible(&mut w.vis, nodes.alt_row, next.alt.shown);
+        if next.alt.shown {
+            set_text(&mut w.text, nodes.alt_caption, || {
+                if next.alt.agl { "AGL" } else { "RNG" }.to_owned()
+            });
+            set_text(&mut w.text, nodes.alt_value, || {
+                (u32::from(next.alt.steps) * ALT_STEP as u32).to_string()
+            });
+            set(
+                &mut w.text_colour,
+                nodes.alt_value,
+                TextColor(if next.alt.warn { WARN } else { PHOSPHOR }),
+            );
+            set_visible(&mut w.vis, nodes.pull_up, next.alt.warn);
+            // A square wave, so two writes per 200 ms rather than sixty, and
+            // none at all with the ground where it belongs.
+            set(
+                &mut w.text_colour,
+                nodes.pull_up,
+                TextColor(WARN.with_alpha(if next.alt.blink { 1.0 } else { 0.15 })),
+            );
+        }
     }
 
-    // -- #heatbar -----------------------------------------------------------
-    if moved!(heat_mil) {
-        set_width(&mut w.node, nodes.heat_fill, next.heat_mil);
+    // -- BST and GUN --------------------------------------------------------
+    //
+    // The pattern the DOM HUD got wrong, done right: each segment's own lit-ness
+    // is compared against its own previous lit-ness, so a tenth of a tank writes
+    // one segment. Rewriting all ten would still be cheap — the point is that
+    // the shape does not degrade as the stack gets longer, which is exactly how
+    // "8 writes per player" became 64.
+    sync_stack(
+        &mut w.bg,
+        &nodes.boost_segs,
+        prev.map(|p| p.boost_seg),
+        next.boost_seg,
+        FRIENDLY,
+    );
+    // The gun stack cannot use that diff, because its *colour* changes as well
+    // as its count: a segment whose lit-ness did not move still has to be
+    // repainted when the gun goes out, and one left red when it comes back
+    // would stay red forever. Ten writes, only on a frame where the count, the
+    // overheat or the pulse moved — and the pulse only advances while the gun
+    // is actually out.
+    if moved!(gun_seg, overheated, pulse) {
+        if next.overheated {
+            // Every segment, not just the lit ones. An out gun is an alarm, and
+            // an empty stack is exactly what the glass looks like at rest — the
+            // one state it must not be confused with.
+            let alert = WARN.with_alpha(0.55 + 0.45 * pulse01(next.pulse));
+            for &seg in &nodes.gun_segs {
+                set(&mut w.bg, seg, BackgroundColor(alert));
+            }
+        } else {
+            for (i, &seg) in nodes.gun_segs.iter().enumerate() {
+                set(
+                    &mut w.bg,
+                    seg,
+                    BackgroundColor(if i < next.gun_seg as usize {
+                        PHOSPHOR
+                    } else {
+                        unlit()
+                    }),
+                );
+            }
+        }
     }
     if moved!(overheated) {
+        // The legend says it in words, since an empty stack and a stack with
+        // one segment left look much the same at a glance.
         set(
-            &mut w.border,
-            nodes.heat_frame,
-            BorderColor::all(if next.overheated {
-                ALERT_BORDER
-            } else {
-                HEAT_BORDER
-            }),
-        );
-    }
-    if moved!(overheated, pulse) {
-        set(
-            &mut w.shadow,
-            nodes.heat_frame,
-            if next.overheated {
-                alert_glow(next.pulse)
-            } else {
-                meter_shadow()
-            },
+            &mut w.text_colour,
+            nodes.gun_label,
+            TextColor(if next.overheated { WARN } else { legend() }),
         );
     }
 
-    // -- #chargebar ---------------------------------------------------------
-    if moved!(charge_mil) {
-        set_width(&mut w.node, nodes.charge_fill, next.charge_mil);
-    }
+    // -- the brake-charge strip ---------------------------------------------
     if moved!(charge) {
-        let overload = next.charge == ChargeState::Overload;
         set_visible(
             &mut w.vis,
-            nodes.charge_frame,
+            nodes.charge_row,
             next.charge != ChargeState::Idle,
         );
-        set(
-            &mut w.border,
-            nodes.charge_frame,
-            BorderColor::all(match next.charge {
-                ChargeState::Overload => ALERT_BORDER,
-                ChargeState::Full => CHARGE_FULL_BORDER,
-                _ => METER_BORDER,
-            }),
-        );
-        set(&mut w.grad, nodes.charge_fill, charge_gradient(overload));
     }
-    if moved!(charge, pulse) {
-        set(
-            &mut w.shadow,
-            nodes.charge_frame,
-            match next.charge {
-                ChargeState::Overload => alert_glow(next.pulse),
-                // `#chargebar.full { box-shadow: 0 0 16px rgba(255,217,122,0.6) }`.
-                ChargeState::Full => {
-                    BoxShadow::new(rgba(255, 217, 122, 0.6), px(0), px(0), px(0), px(16))
-                }
-                _ => meter_shadow(),
-            },
-        );
+    if moved!(charge, charge_seg, pulse) {
+        let colour = match next.charge {
+            ChargeState::Overload => WARN.with_alpha(0.55 + 0.45 * pulse01(next.pulse)),
+            ChargeState::Full => AMBER,
+            _ => PHOSPHOR,
+        };
+        for (i, &seg) in nodes.charge_segs.iter().enumerate() {
+            set(
+                &mut w.bg,
+                seg,
+                BackgroundColor(if i < next.charge_seg as usize {
+                    colour
+                } else {
+                    unlit()
+                }),
+            );
+        }
     }
 
-    // -- pip rows -----------------------------------------------------------
-    //
-    // The pattern the DOM HUD got wrong, done right: each pip's own emptiness
-    // is compared against its own previous emptiness, so firing one missile
-    // writes one pip. Rewriting all four would still be cheap here — the point
-    // is that the shape does not degrade as the row gets longer, which is
-    // exactly how "8 writes per player" became 64.
+    // -- stores -------------------------------------------------------------
     sync_pips(
         &mut w.bg,
         &mut w.border,
-        &mut w.shadow,
         &nodes.missile_pips,
         prev.map(|p| p.missiles),
         next.missiles,
-        MSL_PIP,
-        MSL_PIP_EMPTY,
-        MSL_PIP_EMPTY_BORDER,
+        ORDNANCE,
     );
     sync_pips(
         &mut w.bg,
         &mut w.border,
-        &mut w.shadow,
         &nodes.flare_pips,
         prev.map(|p| p.flares),
         next.flares,
-        FLA_PIP,
-        FLA_PIP_EMPTY,
-        FLA_PIP_EMPTY_BORDER,
+        AMBER,
     );
 
-    // -- #reticle -----------------------------------------------------------
+    // -- the boresight ------------------------------------------------------
     if moved!(reticle_locked) {
-        let colour = if next.reticle_locked {
-            RED_BRIGHT
-        } else {
-            RETICLE_CYAN
-        };
+        let colour = if next.reticle_locked { WARN } else { PHOSPHOR };
         set(&mut w.border, nodes.reticle, BorderColor::all(colour));
-        for tick in nodes.reticle_ticks {
-            set(&mut w.bg, tick, BackgroundColor(colour));
+        for mark in nodes.reticle_marks {
+            set(&mut w.bg, mark, BackgroundColor(colour));
         }
-        set(
-            &mut w.shadow,
-            nodes.reticle,
-            if next.reticle_locked {
-                BoxShadow::new(RED_BRIGHT, px(0), px(0), px(0), px(12))
-            } else {
-                BoxShadow::new(rgba(102, 221, 255, 0.4), px(0), px(0), px(0), px(8))
-            },
-        );
         set(
             &mut w.xform,
             nodes.reticle,
             if next.reticle_locked {
-                UiTransform::from_scale(Vec2::splat(1.2))
+                UiTransform::from_scale(Vec2::splat(1.15))
             } else {
                 UiTransform::IDENTITY
             },
         );
     }
 
-    // -- #missile-lock-warning ----------------------------------------------
+    // -- the missile-lock warning -------------------------------------------
     if moved!(lock_warning) {
         set_visible(&mut w.vis, nodes.lock_warning, next.lock_warning);
     }
@@ -2271,11 +3032,11 @@ fn sync_hud(
         set(
             &mut w.text_colour,
             nodes.lock_warning,
-            TextColor(RED_BRIGHT.with_alpha(if next.lock_blink { 1.0 } else { 0.1 })),
+            TextColor(WARN.with_alpha(if next.lock_blink { 1.0 } else { 0.1 })),
         );
     }
 
-    // -- #hit-vignette ------------------------------------------------------
+    // -- the hit vignette ---------------------------------------------------
     if moved!(vignette) {
         set_visible(&mut w.vis, nodes.vignette, next.vignette > 0);
         if next.vignette > 0 {
@@ -2287,12 +3048,12 @@ fn sync_hud(
         }
     }
 
-    // -- #deathbanner -------------------------------------------------------
+    // -- DESTROYED ----------------------------------------------------------
     if moved!(alive) {
         set_visible(&mut w.vis, nodes.death_banner, !next.alive);
     }
 
-    // -- #matchhud ----------------------------------------------------------
+    // -- the scoreline ------------------------------------------------------
     if moved!(match_on) {
         set_visible(&mut w.vis, nodes.match_panel, next.match_on);
     }
@@ -2308,7 +3069,7 @@ fn sync_hud(
         }
     }
 
-    // -- #killfeed ----------------------------------------------------------
+    // -- the killfeed -------------------------------------------------------
     //
     // Per row, not per feed: a kill scrolls every row down one place, but a row
     // whose `serial` did not change is the same row and keeps its strings. The
@@ -2330,19 +3091,101 @@ fn sync_hud(
         set_text(&mut w.text, slot.victim, || {
             roster.callsign(row.victim).to_uppercase()
         });
-        // `.kf-you` — the row is about you, on one side or the other.
+        // The row is about you, on one side or the other.
         set(
             &mut w.text_colour,
             slot.killer,
-            TextColor(if row.killer == LOCAL_ID { GOLD } else { BLUE }),
+            TextColor(if row.killer == LOCAL_ID {
+                AMBER
+            } else {
+                PHOSPHOR
+            }),
         );
         set(
             &mut w.text_colour,
             slot.victim,
             TextColor(if row.victim == LOCAL_ID {
-                RED
+                WARN
             } else {
-                KF_VICTIM
+                legend()
+            }),
+        );
+    }
+}
+
+/// Slides a ladder so its reading sits on the index.
+///
+/// The ladder runs top-down from `top` to zero and `px_up` is the reading in
+/// pixels up from its bottom, so putting that reading on the middle of the
+/// window is one subtraction. It lives here rather than in the model because it
+/// is a statement about this tree's layout; the model's `spd_px` is a statement
+/// about the aircraft, and stays one.
+fn set_scroll(q: &mut Query<&mut UiTransform>, ladder: Entity, px_up: i16, top: i32) {
+    let y = TAPE_H / 2.0 + f32::from(px_up) - top as f32 * TAPE_PPU;
+    set(q, ladder, UiTransform::from_translation(Val2::px(0.0, y)));
+}
+
+/// The overheat / overload pulse as a `0..1` ramp.
+fn pulse01(step: u8) -> f32 {
+    f32::from(step) / f32::from(PULSE_STEPS)
+}
+
+/// Brings one segment stack in line with the count lit, writing only the
+/// segments whose state actually flipped.
+fn sync_stack(
+    q_bg: &mut Query<&mut BackgroundColor>,
+    segs: &[Entity],
+    prev: Option<u8>,
+    next: u8,
+    lit: Color,
+) {
+    for (i, &seg) in segs.iter().enumerate() {
+        let i = u8::try_from(i).unwrap_or(u8::MAX);
+        let is_lit = i < next;
+        // A segment whose lit-ness is unchanged is skipped outright.
+        if prev.is_some_and(|p| (i < p) == is_lit) {
+            continue;
+        }
+        set(
+            q_bg,
+            seg,
+            BackgroundColor(if is_lit { lit } else { unlit() }),
+        );
+    }
+}
+
+/// Brings one pip row in line with the count remaining, writing only the pips
+/// whose state actually flipped.
+///
+/// A spent pip keeps its footprint and loses its fill: the outline stays so the
+/// row still says how many you started with, which is the whole reason a pip row
+/// beats a number.
+fn sync_pips(
+    q_bg: &mut Query<&mut BackgroundColor>,
+    q_border: &mut Query<&mut BorderColor>,
+    pips: &[Entity],
+    prev: Option<u8>,
+    next: u8,
+    full: Color,
+) {
+    for (i, &pip) in pips.iter().enumerate() {
+        let i = u8::try_from(i).unwrap_or(u8::MAX);
+        let is_empty = i >= next;
+        if prev.is_some_and(|p| (i >= p) == is_empty) {
+            continue;
+        }
+        set(
+            q_bg,
+            pip,
+            BackgroundColor(if is_empty { Color::NONE } else { full }),
+        );
+        set(
+            q_border,
+            pip,
+            BorderColor::all(if is_empty {
+                full.with_alpha(0.35)
+            } else {
+                Color::NONE
             }),
         );
     }
@@ -2395,9 +3238,9 @@ impl Outcome {
 
     fn colour(self) -> Color {
         match self {
-            Outcome::Draw => Color::WHITE,
-            Outcome::Victory => rgb(0x66, 0xff, 0x88),
-            Outcome::Defeat => rgb(0xff, 0x55, 0x66),
+            Outcome::Draw => pal::WHITE,
+            Outcome::Victory => PHOSPHOR,
+            Outcome::Defeat => WARN,
         }
     }
 }
@@ -2584,7 +3427,7 @@ fn sync_world_markers(
     setup: Res<crate::sim_bridge::MatchSetup>,
     nodes: Option<Res<HudNodes>>,
     mut applied: ResMut<AppliedMarkers>,
-    mut lock: ResMut<TargetLock>,
+    mut sight: ResMut<Boresight>,
     cameras: Query<(&Camera, &GlobalTransform, Option<&RenderLayers>), With<Camera3d>>,
     ships: Query<(&ShipRoot, &GlobalTransform)>,
     mut q_vis: Query<&mut Visibility>,
@@ -2604,20 +3447,17 @@ fn sync_world_markers(
         .iter()
         .find(|(_, _, layers)| layers.is_none_or(|l: &RenderLayers| l.intersects(&scene_layer)));
     let Some((camera, cam_tf, _)) = camera else {
-        hide_all(&mut applied, &mut q_vis, &nodes);
-        lock.0 = false;
+        hide_all(&mut applied, &mut q_vis, &nodes, &mut sight);
         return;
     };
     let Some(viewport) = camera.logical_viewport_size() else {
-        hide_all(&mut applied, &mut q_vis, &nodes);
-        lock.0 = false;
+        hide_all(&mut applied, &mut q_vis, &nodes, &mut sight);
         return;
     };
 
     // The local ship, from the interpolated transform rather than the frame.
     let Some((_, me)) = ships.iter().find(|(root, _)| root.0 == LOCAL_ID) else {
-        hide_all(&mut applied, &mut q_vis, &nodes);
-        lock.0 = false;
+        hide_all(&mut applied, &mut q_vis, &nodes, &mut sight);
         return;
     };
 
@@ -2752,7 +3592,14 @@ fn sync_world_markers(
         .filter_map(|(i, c)| c.map(|c| (i, c)))
         .min_by(|a, b| a.1.align.total_cmp(&b.1.align));
     let locked_on = best.filter(|(_, c)| c.align < ALIGN_PX).map(|(i, _)| i);
-    lock.0 = locked_on.is_some();
+    sight.locked = locked_on.is_some();
+    // The `RNG` half of the altitude block, published here because this is the
+    // only system that knows which contact the boresight is nearest to. Only a
+    // *boxed* contact counts: a ring three kilometres out is not a range you are
+    // managing, and putting its distance under the hull tape would be noise.
+    sight.range = best
+        .filter(|(_, c)| c.boxed)
+        .map_or(f32::INFINITY, |(_, c)| c.range);
 
     // -- the reticle --------------------------------------------------------
     //
@@ -2858,7 +3705,11 @@ fn sync_world_markers(
             // The 22-pixel test above says "your nose is on them"; this says
             // "the assist has picked them", which is a different fact and the
             // one that tells a player why their aim is being helped.
-            let colour = if now.assisted { RED_BRIGHT } else { RED };
+            let colour = if now.assisted {
+                HOSTILE
+            } else {
+                HOSTILE.with_alpha(0.7)
+            };
             for corner in slot.corners {
                 set(&mut q_border, corner, BorderColor::all(colour));
             }
@@ -2870,7 +3721,18 @@ fn sync_world_markers(
 ///
 /// The frames with no camera, no viewport or no local ship — the first few, and
 /// every frame in the lobby. A slot that is already down costs one comparison.
-fn hide_all(applied: &mut AppliedMarkers, q_vis: &mut Query<&mut Visibility>, nodes: &HudNodes) {
+fn hide_all(
+    applied: &mut AppliedMarkers,
+    q_vis: &mut Query<&mut Visibility>,
+    nodes: &HudNodes,
+    sight: &mut Boresight,
+) {
+    // Guarded rather than assigned: this runs on every frame in the lobby, and
+    // an unconditional write through the `ResMut` would flag the resource
+    // changed sixty times a second for a value that never moves.
+    if sight.locked || sight.range.is_finite() {
+        *sight = Boresight::default();
+    }
     for (slot, was) in nodes.markers.iter().zip(&mut applied.0) {
         if was.shown {
             set_visible(q_vis, slot.boxes, false);
@@ -2878,74 +3740,6 @@ fn hide_all(applied: &mut AppliedMarkers, q_vis: &mut Query<&mut Visibility>, no
             *was = MarkerModel::default();
         }
     }
-}
-
-/// Brings one pip row in line with the count remaining, writing only the pips
-/// whose state actually flipped.
-///
-/// Long in the arguments because the two rows differ only in their palette, and
-/// one parameterised function beats two copies of the loop.
-fn sync_pips(
-    q_bg: &mut Query<&mut BackgroundColor>,
-    q_border: &mut Query<&mut BorderColor>,
-    q_shadow: &mut Query<&mut BoxShadow>,
-    pips: &[Entity],
-    prev: Option<u8>,
-    next: u8,
-    full: Color,
-    empty: Color,
-    empty_border: Color,
-) {
-    for (i, &pip) in pips.iter().enumerate() {
-        let i = u8::try_from(i).unwrap_or(u8::MAX);
-        let is_empty = i >= next;
-        // A pip whose emptiness is unchanged is skipped outright.
-        if prev.is_some_and(|p| (i >= p) == is_empty) {
-            continue;
-        }
-        set(
-            q_bg,
-            pip,
-            BackgroundColor(if is_empty { empty } else { full }),
-        );
-        set(
-            q_border,
-            pip,
-            BorderColor::all(if is_empty { empty_border } else { Color::NONE }),
-        );
-        set(
-            q_shadow,
-            pip,
-            // `.empty { box-shadow: none }`. Kept as a zero-alpha shadow rather
-            // than a removed component so the pip's archetype never moves.
-            BoxShadow::new(
-                if is_empty {
-                    Color::NONE
-                } else {
-                    full.with_alpha(0.8)
-                },
-                px(0),
-                px(0),
-                px(0),
-                px(12),
-            ),
-        );
-    }
-}
-
-/// The red glow shared by `.overheated` and `.overload`, at a pulse step.
-///
-/// Both CSS animations run `box-shadow: 0 0 8px rgba(231,76,60,0.6)` to
-/// `0 0 24px rgba(231,76,60,0.9)` and back over 0.6 s.
-fn alert_glow(step: u8) -> BoxShadow {
-    let t = f32::from(step) / f32::from(PULSE_STEPS);
-    BoxShadow::new(
-        rgba(231, 76, 60, 0.6 + 0.3 * t),
-        px(0),
-        px(0),
-        px(0),
-        px(8.0 + 16.0 * t),
-    )
 }
 
 // --- write helpers ---------------------------------------------------------
@@ -2967,17 +3761,7 @@ fn set<T: Component<Mutability = bevy::ecs::component::Mutable> + PartialEq>(
     }
 }
 
-/// Sets a fill's width from a per-mille model value.
-fn set_width(q: &mut Query<&mut Node>, entity: Entity, mil: u16) {
-    if let Ok(mut node) = q.get_mut(entity) {
-        let width = percent(f32::from(mil) / 10.0);
-        if node.width != width {
-            node.width = width;
-        }
-    }
-}
-
-/// `display: none` in the markup, `Visibility` here — see `#chargebar`.
+/// `display: none` in the markup, `Visibility` here — see the charge strip.
 fn set_visible(q: &mut Query<&mut Visibility>, entity: Entity, visible: bool) {
     let want = if visible {
         Visibility::Inherited
@@ -3009,11 +3793,6 @@ fn set_text(q: &mut Query<&mut Text>, entity: Entity, value: impl FnOnce() -> St
 // None of them blocks the HUD; each costs a small fidelity compromise, noted at
 // the site that makes it.
 //
-// - **No `match_active`.** `World::match_state` has an `active: bool` that says
-//   whether the clock and team kills apply at all — false in trials, campaign
-//   and the tutorial — and it is not copied into `HudState`. `#matchhud` is
-//   gated on `match_timer > 0.0` instead, which is right for a running
-//   deathmatch and wrong for a paused or unstarted one.
 // - **No braking flag.** `main.js:1336` shows `#chargebar` while `braking ||
 //   brakeCharge > 0`. `HudState` has `charge01` but not the brake input, so the
 //   bar appears a frame late, on the first non-zero charge.
@@ -3037,6 +3816,12 @@ fn set_text(q: &mut Query<&mut Text>, entity: Entity, value: impl FnOnce() -> St
 //   line actually hits. [`AIM_RANGE`] pins it at maximum range instead, which
 //   differs by about a degree of parallax. A hit distance on `HudState`, or a
 //   ray query on `sim`, would remove the approximation.
+// - **No height query.** The `AGL` half of [`AltBlock`] calls
+//   [`sim::ship::terrain_height`] straight, which is a seven-octave noise sum
+//   per frame on the render thread for a number `sim::ship` has already computed
+//   this tick to decide whether the ship is still alive. One `f32` on `HudState`
+//   would delete it, and the same field would let the cockpit grow a radar
+//   altimeter without a second copy of the sum.
 //
 // Separately, and not a `HudState` problem: `sim_bridge::tick` does not yet
 // populate `overcharge01` or `missile_lock_warning` — the projectile and
@@ -3050,9 +3835,19 @@ mod tests {
     use sim::world::ShipView;
 
     /// [`model`] with the out-of-frame inputs at rest — no target lock, no
-    /// killfeed, match still running. The cases that care pass their own.
+    /// killfeed, match still running, in space. The cases that care pass their
+    /// own [`Env`].
     fn model(frame: &Frame, time: f32, seated: bool) -> HudModel {
-        super::model(frame, time, seated, false, &KillFeed::default(), None)
+        super::model(
+            frame,
+            Env {
+                time,
+                seated,
+                ..Env::default()
+            },
+            &KillFeed::default(),
+            None,
+        )
     }
 
     /// A frame with one live local ship and a given HUD state.
@@ -3107,13 +3902,11 @@ mod tests {
         );
 
         assert_ne!(before.hp, after.hp);
-        assert_ne!(before.hp_mil, after.hp_mil);
-        assert_ne!(before.hp_hue, after.hp_hue);
+        assert_ne!(before.hull_px, after.hull_px);
         assert_eq!(
             HudModel {
                 hp: before.hp,
-                hp_mil: before.hp_mil,
-                hp_hue: before.hp_hue,
+                hull_px: before.hull_px,
                 ..after
             },
             before,
@@ -3121,33 +3914,66 @@ mod tests {
         );
     }
 
-    /// The health hue is `main.js:1979`'s: 120 (green) at full, 0 (red) at zero.
+    /// The hull tape runs phosphor to amber to red, and the thresholds are the
+    /// ones a pilot is told about rather than a gradient nobody can read a
+    /// number off.
     #[test]
-    fn the_health_hue_runs_green_to_red() {
-        assert_eq!(model(&frame(healthy()), 0.0, false).hp_hue, 120);
-        let dead = model(
-            &frame(HudState {
-                hp: 0,
-                hp01: 0.0,
-                ..healthy()
-            }),
-            0.0,
-            false,
-        );
-        assert_eq!(dead.hp_hue, 0);
+    fn the_hull_tape_escalates_as_the_hull_goes() {
+        let at = |hp01: f32| {
+            model(
+                &frame(HudState {
+                    hp: (hp01 * 100.0) as i32,
+                    hp01,
+                    ..healthy()
+                }),
+                0.0,
+                false,
+            )
+            .hull_alert
+        };
+        assert_eq!(at(1.0), Alert::Ok);
+        assert_eq!(at(HULL_CAUTION), Alert::Ok, "the threshold is exclusive");
+        assert_eq!(at(HULL_CAUTION - 0.01), Alert::Caution);
+        assert_eq!(at(HULL_WARNING - 0.01), Alert::Warning);
+        assert_eq!(at(0.0), Alert::Warning);
     }
 
-    /// Bar widths quantise to the tenth of a percent the JS `toFixed(1)`s to,
-    /// so sub-pixel drift does not produce a write.
+    /// A tape reading quantises to the pixel it will be drawn on, which is what
+    /// stops a ship holding a speed from writing anything at all.
     #[test]
-    fn bar_widths_quantise_to_a_tenth_of_a_percent() {
-        assert_eq!(mil(1.0), 1000);
-        assert_eq!(mil(0.0), 0);
-        assert_eq!(mil(0.5), 500);
-        // Two boost readings a ten-thousandth apart are the same pixel.
-        assert_eq!(mil(0.500_01), mil(0.500_02));
-        // And one a thousandth apart is not.
-        assert_ne!(mil(0.5), mil(0.501));
+    fn tape_readings_quantise_to_a_pixel() {
+        assert_eq!(tape_px(0.0), 0);
+        assert_eq!(tape_px(100.0), (100.0 * TAPE_PPU) as i16);
+        // Two speeds a hundredth of a unit apart land on the same pixel...
+        assert_eq!(tape_px(40.00), tape_px(40.01));
+        // ...and a whole unit apart do not, at two pixels per unit.
+        assert_ne!(tape_px(40.0), tape_px(41.0));
+        // Never negative, so the ladder cannot be scrolled off its own top.
+        assert_eq!(tape_px(-5.0), 0);
+    }
+
+    /// The speed ladder covers everything the ship can actually do, derived
+    /// from the rules rather than typed in — a needle off the end of its own
+    /// tape is the one failure a tape must not have.
+    #[test]
+    fn the_speed_tape_covers_the_top_speed() {
+        let ship = &Rules::DEFAULT.ship;
+        let top = ship.max_throttle * ship.boost_factor + ship.brake_boost_bonus_max;
+        assert!(f64::from(SPD_TOP) >= top, "{SPD_TOP} does not reach {top}");
+        assert_eq!(SPD_TOP % SPD_MAJOR, 0, "the top of the scale is a numeral");
+    }
+
+    /// A segment stack rounds *up*, so "some left" never reads as empty.
+    #[test]
+    fn segment_stacks_never_round_the_last_one_away() {
+        assert_eq!(segments(0.0, METER_SEGS), 0);
+        assert_eq!(segments(1.0, METER_SEGS), METER_SEGS as u8);
+        assert_eq!(segments(0.5, METER_SEGS), 5);
+        // One round in ninety is a lit segment, not an empty stack.
+        assert_eq!(segments(1.0 / 90.0, METER_SEGS), 1);
+        // ...and quantised, so nine tenths of a tank and a hair more are one
+        // reading and cost no write.
+        assert_eq!(segments(0.901, METER_SEGS), segments(0.999, METER_SEGS));
     }
 
     /// A gun with less ammo than its shot costs is "overheated". The threshold
@@ -3283,19 +4109,25 @@ mod tests {
         assert_eq!(
             (
                 seated.hp,
-                seated.hp_mil,
-                seated.hp_hue,
-                seated.boost_mil,
-                seated.heat_mil,
-                seated.charge_mil,
+                seated.hull_px,
+                seated.boost_seg,
+                seated.gun_seg,
+                seated.charge_seg,
                 seated.missiles,
                 seated.flares,
                 seated.pulse
             ),
-            (0, 0, 0, 0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0, 0),
         );
         assert!(!seated.overheated);
         assert_eq!(seated.charge, ChargeState::Idle);
+        assert_eq!(seated.hull_alert, Alert::Ok);
+
+        // The speed tape is deliberately *not* on the list: the six elements
+        // `body.cockpit-view` hides never included the speed readout, and an
+        // aircraft shows airspeed on the glass and on the panel both.
+        assert_eq!(seated.spd, out.spd);
+        assert_eq!(seated.spd_px, out.spd_px);
 
         // And everything the JS keeps, this keeps. The match clock is the
         // readable proxy: it is driven from the same model and is not on the
@@ -3491,6 +4323,145 @@ mod tests {
         assert_eq!(MAX_HP, 100);
     }
 
+    /// Why [`sync_hud`] drops `prev` on the first `present` frame.
+    ///
+    /// A stationary ship's model **equals `HudModel::default()`** in several
+    /// fields, so a diff taken against the default writes none of them and the
+    /// tree keeps whatever `spawn_hud` left there. This pins the collision that
+    /// caused it, so the guard cannot be deleted as redundant.
+    #[test]
+    fn a_fresh_ship_reads_the_same_as_no_ship_in_the_fields_that_bit() {
+        let live = model(&frame(healthy()), 0.0, false);
+        let none = HudModel::default();
+
+        assert_eq!(live.spd_px, none.spd_px, "a parked ship reads zero");
+        assert_eq!(live.spd, none.spd);
+        assert_eq!(live.alt, none.alt, "space with no contact is the default");
+        assert_eq!(live.charge_seg, none.charge_seg);
+
+        // `present` is the one field that always moves, which is exactly what
+        // makes it the trigger the guard can hang off.
+        assert_ne!(live.present, none.present);
+    }
+
+    /// The block under the hull tape is an altimeter on terrain and a
+    /// rangefinder in space, and it is the map that decides — not a guess about
+    /// which mode is running.
+    #[test]
+    fn the_altitude_block_follows_the_map() {
+        let mut f = frame(healthy());
+        // Well clear of the ground, and with a contact on the boresight.
+        f.ships[0].pos = [0.0, 900.0, 0.0];
+
+        let space = super::model(
+            &f,
+            Env {
+                map: MapKind::Space,
+                range: 420.0,
+                ..Env::default()
+            },
+            &KillFeed::default(),
+            None,
+        )
+        .alt;
+        assert!(space.shown && !space.agl, "space reads range");
+        assert_eq!(space.steps, quantise(420.0));
+        assert!(!space.warn, "there is no ground to be near");
+
+        let terrain = super::model(
+            &f,
+            Env {
+                map: MapKind::Terrain,
+                range: 420.0,
+                ..Env::default()
+            },
+            &KillFeed::default(),
+            None,
+        )
+        .alt;
+        assert!(terrain.shown && terrain.agl, "terrain reads height");
+        assert!(!terrain.warn, "900 units up is not a ground warning");
+        // Height *above ground*, not altitude — and the ground under the origin
+        // is a long way up, which is the whole reason this is a radar altimeter
+        // and not `pos.y`. Expected from `sim::ship` rather than assumed flat.
+        let ground = sim::ship::terrain_height(0.0, 0.0, &Rules::DEFAULT);
+        assert!(ground > 0.0, "the origin is not on the sea floor");
+        assert_eq!(terrain.steps, quantise(900.0 - ground as f32));
+    }
+
+    /// With nothing on the boresight, space says nothing rather than zero.
+    #[test]
+    fn the_range_readout_is_absent_without_a_contact() {
+        let alt = model(&frame(healthy()), 0.0, false).alt;
+        assert!(!alt.shown);
+        assert_eq!(alt, AltBlock::default(), "and is the constant model");
+    }
+
+    /// `PULL UP` is terrain-only, and its threshold is anchored to the floor
+    /// that actually kills you rather than to a number picked here.
+    #[test]
+    fn the_ground_warning_is_terrain_only() {
+        let floor = (Rules::DEFAULT.world.terrain_kill_clearance * GROUND_WARN_CLEARANCES) as f32;
+        // Measured off the height field, not off zero: the ground under the
+        // origin is several hundred units up, so an absolute altitude says
+        // nothing about how close to it you are.
+        let ground = sim::ship::terrain_height(0.0, 0.0, &Rules::DEFAULT) as f32;
+        let agl = |clearance: f32, map| {
+            let mut f = frame(healthy());
+            f.ships[0].pos = [0.0, ground + clearance, 0.0];
+            super::model(
+                &f,
+                Env {
+                    map,
+                    ..Env::default()
+                },
+                &KillFeed::default(),
+                None,
+            )
+            .alt
+        };
+
+        let low = agl(floor * 0.5, MapKind::Terrain);
+        assert!(low.warn, "half the warning height must warn");
+        assert!(low.blink, "and the warning blinks");
+
+        assert!(
+            !agl(floor * 2.0, MapKind::Terrain).warn,
+            "twice it must not"
+        );
+        // The same *height* in space is not a warning, because there is no
+        // ground under it to hit.
+        let in_space = agl(floor * 0.5, MapKind::Space);
+        assert!(!in_space.warn && !in_space.blink);
+    }
+
+    /// The blink is forced still while the warning is off, or the model would
+    /// differ every frame and the whole early-out would go with it.
+    #[test]
+    fn the_ground_warning_blink_is_still_when_clear() {
+        let mut f = frame(healthy());
+        // Well above the height field under the origin, so the warning is off.
+        f.ships[0].pos = [
+            0.0,
+            sim::ship::terrain_height(0.0, 0.0, &Rules::DEFAULT) as f32 + 900.0,
+            0.0,
+        ];
+        for time in [0.0, 0.1, 0.35, 2.0] {
+            let alt = super::model(
+                &f,
+                Env {
+                    time,
+                    map: MapKind::Terrain,
+                    ..Env::default()
+                },
+                &KillFeed::default(),
+                None,
+            )
+            .alt;
+            assert!(!alt.blink, "blink advanced at {time} with no warning");
+        }
+    }
+
     // --- the world-space layer ---------------------------------------------
 
     /// The reticle's lock comes from where things land on screen, not from the
@@ -3502,19 +4473,23 @@ mod tests {
             assist_target: 7,
             ..healthy()
         });
+        let aimed = Env {
+            locked: true,
+            ..Env::default()
+        };
         assert!(
-            !super::model(&held, 0.0, false, false, &KillFeed::default(), None).reticle_locked,
+            !super::model(&held, Env::default(), &KillFeed::default(), None).reticle_locked,
             "the assist holding a target is not a lock"
         );
         assert!(
-            super::model(&held, 0.0, false, true, &KillFeed::default(), None).reticle_locked,
+            super::model(&held, aimed, &KillFeed::default(), None).reticle_locked,
             "being lined up on one is"
         );
 
         // And a corpse never locks, however well aimed.
         let mut dead = frame(healthy());
         dead.ships[0].flags = ShipFlags::LOCAL;
-        assert!(!super::model(&dead, 0.0, false, true, &KillFeed::default(), None).reticle_locked);
+        assert!(!super::model(&dead, aimed, &KillFeed::default(), None).reticle_locked);
     }
 
     /// A kill lands on top and scrolls the rest down, and the ones that did not
@@ -3574,11 +4549,15 @@ mod tests {
         let f = frame(healthy());
         let mut feed = KillFeed::default();
 
-        let quiet = super::model(&f, 0.0, false, false, &feed, None);
-        assert_eq!(quiet, super::model(&f, 5.0, false, false, &feed, None));
+        let quiet = super::model(&f, Env::default(), &feed, None);
+        let later = Env {
+            time: 5.0,
+            ..Env::default()
+        };
+        assert_eq!(quiet, super::model(&f, later, &feed, None));
 
         feed.push(2, 3, 0.0);
-        let loud = super::model(&f, 0.0, false, false, &feed, None);
+        let loud = super::model(&f, Env::default(), &feed, None);
         assert_ne!(quiet, loud);
         assert_eq!(
             HudModel {

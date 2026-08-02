@@ -59,6 +59,19 @@
 //! here: a single mesh cannot sort its own triangles, and additive blending is
 //! the family of effects that does not need it to.
 //!
+//! ## Battle damage
+//!
+//! [`emit_damage`] is the one effect here with no JS to port: smoke that
+//! thickens as a hull drops and fire at the wing root when it is nearly gone,
+//! on **every** ship the frame carries rather than only the local one. Watching
+//! a bandit start to stream is the whole point, and nothing in the old client
+//! said anything about anybody else's hull.
+//!
+//! It costs one more `Vec<Mote>` and one more quad per particle, on its own
+//! fixed cap so it cannot evict the engine trails. See [`SMOKE_AT`] for why the
+//! smoke is a light haze rather than dark smoke — the answer is that this
+//! module has exactly one material and it is additive.
+//!
 //! # What is missing from `Frame`
 //!
 //! - **`ProjView` has no owner or team.** `bullets.js` keeps three material
@@ -160,6 +173,14 @@ const FLARE_GLOW_R: f32 = 1.10;
 /// bounds the vertex rebuild — see [`Effects::motes`].
 const MAX_MOTES: usize = 320;
 
+/// Cap on battle-damage particles, kept **separate** from [`MAX_MOTES`].
+///
+/// One shared pool would let a squadron of burning wrecks evict every engine
+/// trail in the match, and vice versa — the two effects would silently fight
+/// over the same 320 slots. Two pools mean each is bounded on its own and
+/// neither can starve the other; the mesh budget below covers both.
+const MAX_DAMAGE_MOTES: usize = 260;
+
 /// Fixed vertex and index budget for the effects mesh.
 ///
 /// The mesh is rebuilt every frame, and it **must not change size** doing so --
@@ -253,6 +274,141 @@ const EMIT_BRAKE: EmitMode = EmitMode {
 const TRAIL_MIN_SPEED: f32 = 5.0;
 
 // ---------------------------------------------------------------------------
+// Battle damage
+// ---------------------------------------------------------------------------
+//
+// Nothing in the JS client to port: a damaged ship there is a health bar and a
+// red flash on the hull and nothing else, so from outside there is no way to
+// tell a fresh enemy from one that is one burst from dead. That is the gap this
+// fills, and it is worth more on *other* people's ships than on your own —
+// watching a bandit start to stream is the read the game was missing.
+//
+// # Why the smoke is light and not dark
+//
+// This module has exactly one material and it is `AlphaMode::Add` — see the
+// header. Additive blending can only ever *add* light, so genuinely dark smoke
+// is not available here at any alpha: a black puff over space contributes
+// nothing at all. The plume is therefore a dim, desaturated haze, deliberately
+// held **below** the camera's 0.9 bloom prefilter threshold so it reads as
+// matter catching the light rather than as something glowing. The fire above it
+// is the opposite and is authored well over that threshold.
+//
+// Buying real dark smoke means a second mesh on `AlphaMode::Blend`, which is a
+// second draw call *and* a sorted pass that a single unsorted buffer cannot
+// serve correctly — the exact trade the module header rejects. Not worth it for
+// one effect.
+
+/// Hull fraction at or below which a ship begins to stream.
+const SMOKE_AT: f32 = 0.6;
+/// Hull fraction at or below which fire takes at the wing root.
+const FIRE_AT: f32 = 0.28;
+/// Smoke particles a second at zero hull, ramping up from nothing at
+/// [`SMOKE_AT`].
+const SMOKE_RATE: f32 = 42.0;
+/// Fire particles a second at zero hull, from nothing at [`FIRE_AT`].
+const FIRE_RATE: f32 = 26.0;
+
+/// Anchors for the damage plume, in **unfitted ship** units — the space
+/// `cockpit.rs`'s profiles are authored in and the space
+/// [`crate::scene::ship_fit`] maps *from*.
+///
+/// This is the piece that has to go through the fit rather than round it. The
+/// hull is drawn at `q' = scale * (q + offset)` and an anchor that skips that
+/// stays where `spaceship.glb` put it while the aircraft moves out from under
+/// it — which for `jet.glb`, fitted at 1.62 and shifted nose-ward, is a plume
+/// hanging in the air behind the tailfins. `cockpit.rs` hit exactly this and
+/// solved it the same way; `trail_offsets` below is the older, per-model form
+/// of the same idea.
+///
+/// Mid-wing, and **just aft of the trailing edge** rather than on it. Ships pick
+/// one anchor or the other by id (see [`emit_damage`]), so the damage reads as
+/// damage to a *place* rather than as an aura around the whole aircraft.
+///
+/// The clearance behind the wing is not cosmetic. These quads are transparent
+/// and still depth-test against the hull, so an anchor *on* the skin buries
+/// every puff inside solid geometry and the plume is rejected wholesale —
+/// which is exactly what the first pass looked like on screen: a ship at 12
+/// hit points with nothing coming off it. The trailing edge is also where a
+/// plume physically is, since a particle does not move once released and the
+/// aircraft flies out from in front of it.
+const DAMAGE_ANCHORS_LEGACY: [Vec3; 2] =
+    [Vec3::new(-2.90, 0.00, -1.80), Vec3::new(2.90, 0.00, -1.80)];
+
+/// The same two points on the F-22 airframe.
+///
+/// Its unfitted geometry is the one `JET_PROFILE` measures against — the canopy
+/// is x ±0.268, z 0.78..1.97 — and inverting [`TRAIL_OFFSETS_JET`] back through
+/// the fit puts the nozzles at x ±0.28, z -2.87, which pins the tail. So ±1.15
+/// is a little over half way out the span and -2.875 is the nozzles' own plane
+/// — outboard of the exhaust, on the wing's trailing edge, in the same clear
+/// air the engine trails already draw into without being cut by the hull.
+///
+/// Further aft than this and the plume visibly detaches: the chase camera looks
+/// slightly *down* at the ship, so a point behind it projects low on the screen
+/// and reads as a blob hanging under the aircraft rather than as coming off it.
+const DAMAGE_ANCHORS_JET: [Vec3; 2] = [
+    Vec3::new(-1.15, -0.14, -2.875),
+    Vec3::new(1.15, -0.14, -2.875),
+];
+
+/// The damage anchors for whichever hull is flying, in ship space.
+///
+/// Unlike [`trail_offsets`], which multiplies its per-model constants by
+/// [`crate::scene::SHIP_SCALE`] alone, this runs the anchors through the *whole*
+/// fit — `ship_fit` folds `SHIP_SCALE` in, so the two agree for
+/// `spaceship.glb`, where the model fit is the identity, and only this one is
+/// right for a hull the fit actually moves.
+fn damage_offsets() -> [Vec3; 2] {
+    let (scale, offset) = crate::scene::ship_fit();
+    let anchors = if jet_hull() {
+        DAMAGE_ANCHORS_JET
+    } else {
+        DAMAGE_ANCHORS_LEGACY
+    };
+    anchors.map(|q| (q + offset) * scale)
+}
+
+/// Whether `jet.glb` is the hull in the air, on the same switch `scene.rs` and
+/// `cockpit.rs` read.
+fn jet_hull() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var("SPACESHIPS_SHIP_MODEL").is_ok_and(|m| m.contains("jet"))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
+/// `SPACESHIPS_HULL=0.4`: pins every ship's hull fraction.
+///
+/// A screenshot hook, for the same reason `SPACESHIPS_COCKPIT` and
+/// `SPACESHIPS_SCREENSHOT` exist — a visual check of what a burning ship looks
+/// like should not need somebody to sit and be shot down first, and the states
+/// worth looking at are exactly the ones you cannot hold still in.
+///
+/// `pub(crate)` and cached in a [`OnceLock`] because `hud.rs` reads it too: the
+/// hull tape and the plume have to agree about how hurt the ship is, and one
+/// definition is how they cannot disagree. Native only; there is no environment
+/// on the web, and the whole hook compiles out there.
+pub(crate) fn forced_hull() -> Option<f32> {
+    #[cfg(target_arch = "wasm32")]
+    return None;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static FORCED: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        *FORCED.get_or_init(|| {
+            std::env::var("SPACESHIPS_HULL")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|v| v.clamp(0.0, 1.0))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -268,7 +424,10 @@ impl Plugin for WeaponsPlugin {
             // would emit twice on a frame that ran two ticks and not at all on
             // a frame that ran none, which is the same class of bug
             // `scene.rs`'s interpolation exists to avoid.
-            .add_systems(FixedUpdate, (consume_events, emit_trails).after(SimSet))
+            .add_systems(
+                FixedUpdate,
+                (consume_events, emit_trails, emit_damage).after(SimSet),
+            )
             // Ageing and the rebuild are per *frame*: they are what makes the
             // effects smooth on a display that is not the tick rate.
             .add_systems(Update, (run_demo, age_effects).chain())
@@ -432,11 +591,18 @@ struct Effects {
     shells: Vec<Shell>,
     beams: Vec<BeamFx>,
     motes: Vec<Mote>,
+    /// Battle-damage smoke and fire. Its own pool, on its own cap — see
+    /// [`MAX_DAMAGE_MOTES`].
+    damage: Vec<Mote>,
     /// Trail emission accumulators, keyed by ship id. A ship emitting at 45 Hz
     /// against a 60 Hz tick owes a fractional particle each tick.
     trail_debt: HashMap<i32, f32>,
     /// Missile exhaust accumulators, keyed by `ProjView::key`.
     exhaust_debt: HashMap<u64, f32>,
+    /// Damage emission accumulators, keyed by ship id. Same fractional-particle
+    /// problem [`Effects::trail_debt`] solves, and two emitters per ship — one
+    /// for smoke and one for fire — so the entry is a pair.
+    damage_debt: HashMap<i32, [f32; 2]>,
     rng: Rng,
     /// `SPACESHIPS_FX_DEMO` state; empty unless the variable is set.
     demo: Demo,
@@ -735,6 +901,152 @@ fn emit_trails(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
     }
 }
 
+/// Battle damage: smoke that thickens as the hull goes, then fire.
+///
+/// Runs on **every** ship the frame carries, not just the local one. That is
+/// most of the point — the health bar already tells you about your own hull, and
+/// nothing at all used to tell you about anybody else's.
+///
+/// Shape is deliberately [`emit_trails`]'s: a rate that comes out of state, a
+/// debt accumulator so a fractional particle per tick still emits at the right
+/// average, and a fixed-capacity pool that drops its oldest. Nothing here
+/// allocates a mesh, spawns an entity or touches the scene graph.
+fn emit_damage(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
+    let dt = sim::world::TICK_DT as f32;
+    let max_hp = RULES.ship.max_hp as f32;
+    let anchors = damage_offsets();
+    let forced = forced_hull();
+
+    let live: Vec<i32> = frame.0.ships.iter().map(|s| s.id).collect();
+    fx.damage_debt.retain(|id, _| live.contains(id));
+
+    for ship in &frame.0.ships {
+        // A wreck stops smoking: the death explosion is the effect for that,
+        // and a corpse trailing fire is a ship the player will keep shooting.
+        // Boss hitboxes are twenty bodies wearing one hull and would light
+        // twenty plumes.
+        if !ship.flags.contains(ShipFlags::ALIVE) || ship.flags.contains(ShipFlags::BOSS_HITBOX) {
+            fx.damage_debt.remove(&ship.id);
+            continue;
+        }
+
+        let hull = forced.unwrap_or((ship.hp as f32 / max_hp).clamp(0.0, 1.0));
+        // Linear in how far past each threshold the hull has fallen, so the
+        // plume thickens continuously rather than switching on in stages: a
+        // ship at 55% barely wisps and one at 10% is streaming.
+        let smoke = ramp(hull, SMOKE_AT) * SMOKE_RATE;
+        let fire = ramp(hull, FIRE_AT) * FIRE_RATE;
+        if smoke <= 0.0 && fire <= 0.0 {
+            fx.damage_debt.remove(&ship.id);
+            continue;
+        }
+
+        let owed = {
+            let debt = fx.damage_debt.entry(ship.id).or_insert([0.0; 2]);
+            debt[0] += smoke * dt;
+            debt[1] += fire * dt;
+            let n = [debt[0].floor(), debt[1].floor()];
+            debt[0] -= n[0];
+            debt[1] -= n[1];
+            [n[0] as u32, n[1] as u32]
+        };
+
+        // One wing, picked off the id and therefore stable for the life of the
+        // ship. Both wings at once reads as an aura; one reads as a hit.
+        let anchor = anchors[(ship.id.unsigned_abs() % 2) as usize];
+        let nozzle = to_vec3(ship.pos) + rot(ship.quat) * anchor;
+
+        for _ in 0..owed[0] {
+            let j = SMOKE_JITTER;
+            let jitter = Vec3::new(
+                fx.rng.range(-j, j),
+                fx.rng.range(-j, j),
+                fx.rng.range(-j, j),
+            );
+            let scale = fx.rng.range(1.1, 2.1);
+            let life = fx.rng.range(1.00, 1.70);
+            push_damage(
+                &mut fx.damage,
+                Mote {
+                    pos: nozzle + jitter,
+                    age: 0.0,
+                    life,
+                    half: scale * 0.5,
+                    // Grows and does not shrink: a puff of smoke expands as it
+                    // is left behind, which is what turns a string of particles
+                    // into a widening plume rather than a dotted line.
+                    grow: 2.4,
+                    shrink: 0.0,
+                    color: SMOKE,
+                    // Deliberately low, and it is the *count* that carries the
+                    // effect rather than this number. Additive blending means a
+                    // single puff contributes almost nothing over an unlit sky,
+                    // so a plume is made of overlap — and pushing alpha instead
+                    // of density is what turned an early pass into a small sun
+                    // the moment three of them landed on the same pixel.
+                    opacity: 0.15 + 0.15 * ramp(hull, SMOKE_AT),
+                },
+            );
+        }
+
+        for _ in 0..owed[1] {
+            let j = FIRE_JITTER;
+            let jitter = Vec3::new(
+                fx.rng.range(-j, j),
+                fx.rng.range(-j, j),
+                fx.rng.range(-j, j),
+            );
+            let scale = fx.rng.range(0.45, 0.95);
+            // Short-lived, so the flame stays *on* the wing while the smoke
+            // trails away from it. The two lifetimes are what separates them.
+            let life = fx.rng.range(0.10, 0.20);
+            // Drawn before the push: `fx.rng` and `fx.damage` are sibling
+            // fields, and the borrow checker sees one `&mut fx` through the
+            // call rather than two disjoint borrows — the same shape
+            // `age_effects` documents for the exhaust debt.
+            let color = fx.rng.pick(&FIRE_COLORS);
+            push_damage(
+                &mut fx.damage,
+                Mote {
+                    pos: nozzle + jitter,
+                    age: 0.0,
+                    life,
+                    half: scale * 0.5,
+                    grow: 0.5,
+                    shrink: 0.5,
+                    color,
+                    opacity: 0.95,
+                },
+            );
+        }
+    }
+}
+
+/// How far below `at` a hull fraction has fallen, as `0..1`.
+fn ramp(hull: f32, at: f32) -> f32 {
+    ((at - hull) / at).clamp(0.0, 1.0)
+}
+
+/// Position jitter on a smoke puff, and on a flame. The flame is much tighter
+/// because it is attached to a place on the airframe and the smoke is not.
+///
+/// The smoke's is deliberately large. A particle does not move after release,
+/// so a *stationary* damaged ship emits every puff into the same cubic metre —
+/// and thirty additive quads stacked on one point is not a plume, it is a small
+/// sun, which is precisely what a tight jitter produced. Scattering them over a
+/// couple of units gives the volume a moving ship gets for free from its own
+/// velocity.
+const SMOKE_JITTER: f32 = 1.20;
+const FIRE_JITTER: f32 = 0.30;
+
+/// Pushes a damage particle, dropping the oldest when its own cap is reached.
+fn push_damage(damage: &mut Vec<Mote>, mote: Mote) {
+    if damage.len() >= MAX_DAMAGE_MOTES {
+        damage.remove(0);
+    }
+    damage.push(mote);
+}
+
 /// Pushes a particle, dropping the oldest when the global cap is reached.
 ///
 /// `trails.js` does `list.shift()` on overflow, which is the same policy. The
@@ -766,6 +1078,11 @@ fn age_effects(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
         m.age += dt;
     }
     fx.motes.retain(|m| m.age < m.life);
+
+    for m in &mut fx.damage {
+        m.age += dt;
+    }
+    fx.damage.retain(|m| m.age < m.life);
 
     // Missile exhaust. Emitted here rather than in `emit_trails` because the
     // 0.028 s interval is finer than a 16.7 ms tick and the missiles it hangs
@@ -1120,8 +1437,12 @@ fn build_surface(
         );
     }
 
-    // ── trail and exhaust motes ──────────────────────────────────────────
-    for m in &fx.motes {
+    // ── trail, exhaust and damage motes ──────────────────────────────────
+    //
+    // Damage first, so a fresh flame draws over the smoke it came out of rather
+    // than under it. Both lists are the same record and the same quad; they are
+    // separate only so their caps are.
+    for m in fx.damage.iter().chain(fx.motes.iter()) {
         let t = (m.age / m.life).clamp(0.0, 1.0);
         let r = m.half * (1.0 + t * m.grow) * (1.0 - t * m.shrink);
         build.puff(
@@ -1187,6 +1508,19 @@ static MISSILE_NOZZLE: LinearRgba = LinearRgba::rgb(5.10, 1.30, 0.0);
 static FLARE_CORE: LinearRgba = LinearRgba::rgb(5.10, 5.10, 5.10);
 /// `missiles.js` flare glow `0xffcc22`.
 static FLARE_GLOW: LinearRgba = LinearRgba::rgb(3.40, 2.02, 0.11);
+
+/// Damage smoke: a warm grey haze, held **under** `camera.rs`'s 0.9 bloom
+/// prefilter threshold on every channel so it does not glow. See the note above
+/// [`SMOKE_AT`] on why it cannot simply be dark.
+static SMOKE: LinearRgba = LinearRgba::rgb(0.22, 0.20, 0.18);
+
+/// Fire, well over the bloom threshold and picked from per flame so a burning
+/// wing flickers between yellow and deep orange instead of pulsing as one.
+static FIRE_COLORS: [LinearRgba; 3] = [
+    LinearRgba::rgb(5.60, 2.30, 0.30),
+    LinearRgba::rgb(4.40, 1.20, 0.12),
+    LinearRgba::rgb(6.00, 3.40, 0.70),
+];
 
 // ---------------------------------------------------------------------------
 // The stress harness
@@ -1717,6 +2051,166 @@ mod tests {
         assert_eq!(motes.len(), MAX_MOTES);
         // The survivors are the newest ones.
         assert_eq!(motes[0].pos.x, 40.0);
+    }
+
+    // --- battle damage ------------------------------------------------------
+
+    /// Runs [`emit_damage`] against one ship for a given number of seconds.
+    ///
+    /// Seconds rather than ticks, so the expectations below follow `TICK_HZ`
+    /// instead of being pinned to whatever it happens to be — the same reason
+    /// `a_boosting_ship_smokes_from_both_nozzles` counts that way.
+    fn burn(hp: i32, seconds: f64) -> Effects {
+        let mut app = App::new();
+        app.init_resource::<SimFrame>()
+            .init_resource::<Effects>()
+            .add_systems(Update, emit_damage);
+        app.world_mut()
+            .resource_mut::<SimFrame>()
+            .0
+            .ships
+            .push(sim::world::ShipView {
+                id: 1,
+                hp,
+                flags: ShipFlags::ALIVE,
+                quat: [0.0, 0.0, 0.0, 1.0],
+                ..Default::default()
+            });
+
+        let ticks = (seconds * sim::world::TICK_HZ).round() as u32;
+        for _ in 0..ticks {
+            app.update();
+        }
+        app.world_mut().remove_resource::<Effects>().unwrap()
+    }
+
+    /// A healthy ship is clean, and does not even keep an accumulator.
+    #[test]
+    fn a_healthy_ship_does_not_smoke() {
+        let fx = burn(RULES.ship.max_hp, 0.5);
+        assert!(fx.damage.is_empty());
+        assert!(fx.damage_debt.is_empty(), "no debt kept for a clean hull");
+    }
+
+    /// The plume thickens as the hull goes, which is the whole read.
+    #[test]
+    fn the_plume_thickens_as_the_hull_goes() {
+        let count = |hp| burn(hp, 0.5).damage.len();
+        let light = count(55);
+        let heavy = count(30);
+        let dying = count(8);
+
+        assert!(light > 0, "a hull past the threshold streams something");
+        assert!(heavy > light, "{heavy} at 30 HP is not more than {light}");
+        assert!(dying > heavy, "{dying} at 8 HP is not more than {heavy}");
+    }
+
+    /// Fire is a *separate* threshold, and it only lights near the end.
+    #[test]
+    fn fire_only_takes_at_low_hull() {
+        // Smoke is dim and under the bloom floor; fire is over it. That is what
+        // tells the two apart in the pool without a discriminant field.
+        let lit = |fx: &Effects| {
+            fx.damage
+                .iter()
+                .filter(|m| m.color.red.max(m.color.green).max(m.color.blue) > 0.9)
+                .count()
+        };
+        assert_eq!(lit(&burn(50, 0.5)), 0, "half a hull is smoke, not fire");
+        assert!(lit(&burn(10, 0.5)) > 0, "a tenth of a hull is burning");
+    }
+
+    /// A wreck stops streaming — the death explosion is the effect for that —
+    /// and a boss hitbox never starts, since twenty of them are one ship.
+    #[test]
+    fn the_dead_and_the_boss_do_not_burn() {
+        let mut app = App::new();
+        app.init_resource::<SimFrame>()
+            .init_resource::<Effects>()
+            .add_systems(Update, emit_damage);
+        app.world_mut().resource_mut::<SimFrame>().0.ships.extend([
+            sim::world::ShipView {
+                id: 1,
+                hp: 5,
+                flags: ShipFlags::NONE,
+                quat: [0.0, 0.0, 0.0, 1.0],
+                ..Default::default()
+            },
+            sim::world::ShipView {
+                id: 2,
+                hp: 5,
+                flags: ShipFlags::ALIVE.with(ShipFlags::BOSS_HITBOX),
+                quat: [0.0, 0.0, 0.0, 1.0],
+                ..Default::default()
+            },
+        ]);
+        for _ in 0..30 {
+            app.update();
+        }
+        let fx = app.world_mut().remove_resource::<Effects>().unwrap();
+        assert!(fx.damage.is_empty());
+        assert!(fx.damage_debt.is_empty());
+    }
+
+    /// The pool is bounded on its own, so a squadron of burning wrecks cannot
+    /// evict a single engine trail — and neither list can grow without limit.
+    #[test]
+    fn the_damage_pool_is_capped_separately() {
+        let fx = burn(1, 30.0);
+        assert!(fx.damage.len() <= MAX_DAMAGE_MOTES);
+        assert_eq!(fx.damage.len(), MAX_DAMAGE_MOTES, "30s should fill it");
+        assert!(fx.motes.is_empty(), "damage must not touch the trail pool");
+
+        // And both together stay inside the mesh's fixed vertex budget, which
+        // is what stops the slab allocator's use-after-free coming back.
+        const { assert!(MAX_MOTES + MAX_DAMAGE_MOTES < MESH_QUAD_CAPACITY) };
+    }
+
+    /// Every particle sits on the wing, not at the hull origin — the fit test.
+    ///
+    /// With an identity rotation and the ship at the origin, a mote's position
+    /// *is* the anchor plus its jitter, so this reads placement directly.
+    #[test]
+    fn the_plume_hangs_off_an_anchor_that_follows_the_fit() {
+        let anchors = damage_offsets();
+        // The fit is a scale about a shifted origin, so an anchor is never at
+        // the ship's own origin — which is the failure this guards.
+        assert!(anchors[0].length() > 1.0, "{:?}", anchors[0]);
+        assert!((anchors[0].x + anchors[1].x).abs() < 1e-4, "wings mirror");
+
+        let fx = burn(10, 0.5);
+        for m in &fx.damage {
+            let d = anchors
+                .iter()
+                .map(|a| m.pos.distance(*a))
+                .fold(f32::INFINITY, f32::min);
+            assert!(d <= SMOKE_JITTER * 2.0, "mote at {:?} is {d} off", m.pos);
+            assert!(m.half > 0.0 && m.life > 0.0);
+        }
+    }
+
+    /// Smoke is additive and therefore cannot be dark; it must at least be
+    /// dim enough not to bloom, or it reads as light rather than as matter.
+    #[test]
+    fn smoke_stays_under_the_bloom_floor_and_fire_clears_it() {
+        let peak = |c: LinearRgba| c.red.max(c.green).max(c.blue);
+        assert!(peak(SMOKE) < 0.9, "smoke peaks at {}", peak(SMOKE));
+        for c in FIRE_COLORS {
+            assert!(peak(c) > 0.9, "fire colour peaks at {}", peak(c));
+        }
+    }
+
+    /// The ramp is continuous, so the plume grows into view rather than
+    /// switching on.
+    #[test]
+    fn the_damage_ramp_is_continuous() {
+        assert_eq!(ramp(1.0, SMOKE_AT), 0.0);
+        assert_eq!(ramp(SMOKE_AT, SMOKE_AT), 0.0);
+        assert_eq!(ramp(0.0, SMOKE_AT), 1.0);
+        assert!((ramp(SMOKE_AT / 2.0, SMOKE_AT) - 0.5).abs() < 1e-6);
+        // Fire is the tighter threshold of the two, so a ship always smokes
+        // before it burns.
+        const { assert!(FIRE_AT < SMOKE_AT) };
     }
 
     /// The palette constants are hand-resolved from the JS hexes, so a test
