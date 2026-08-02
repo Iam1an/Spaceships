@@ -764,7 +764,11 @@ impl Plugin for ScenePlugin {
                 RunFixedMainLoop,
                 draw_interpolated.in_set(RunFixedMainLoopSystems::AfterFixedMainLoop),
             )
-            .add_systems(Update, report_batches);
+            // Per *frame*, not per tick: the moon is scenery, nothing reads its
+            // transform, and `draw_interpolated` has no `Interp` on it to fight
+            // over. `Update` also runs before `PostUpdate`'s propagation, so the
+            // rotation lands in the same frame it is applied.
+            .add_systems(Update, (report_batches, spin_bodies));
     }
 }
 
@@ -834,18 +838,67 @@ fn setup(
     // its mesh. Radius comes from the rules so the two can never disagree.
     let moon_r = rules.world.moon_radius as f32;
     commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(moon_r).mesh().uv(96, 48))),
+        Mesh3d(meshes.add(moon_mesh(moon_r))),
         MeshMaterial3d(materials.add(StandardMaterial {
+            // **Not** `moon.js`'s texture, and deliberately.
+            //
+            // The JS loads `sounds/Moon2.jpeg`, a 300x188 tiling crater photo on
+            // `RepeatWrapping`. It has to: it maps onto an `IcosahedronGeometry`,
+            // whose UVs are per-face scraps with no global layout, so the only
+            // image that survives them is one with no layout to lose.
+            //
+            // This moon is a UV sphere, which has true equirectangular UVs — so
+            // the asset that belongs on it is an equirectangular albedo, and
+            // `public/moon Texture.jpg` is exactly that at 2048x1024. It gives
+            // real maria and ray systems in the right places instead of the same
+            // crater field tiled, at 37x the texel count. `Moon2.jpeg` on these
+            // UVs would be one stretched, pole-pinched smear.
+            //
+            // The honest cost: at the ~150 px the moon covers from spawn, the
+            // JS's crater photo reads *crisper*, because it is a high-contrast
+            // detail shot repeated at high frequency while this is a soft albedo
+            // map resolved down. The trade is deliberate — the moon sits at the
+            // centre of the map and players fly around it, and at close range a
+            // coherent 2048px map is the one that holds up.
+            //
+            // Nothing in `public/src/` references `moon Texture.jpg`; it is an
+            // asset the JS shipped and never used.
             base_color_texture: Some(sharp_texture(&assets, "moon Texture.jpg")),
+            // **A grey, where `moon.js:23` has `color: 0xffffff` — because the
+            // two textures are not the same brightness.**
+            //
+            // `Moon2.jpeg` is a mid-grey photograph; `moon Texture.jpg` is a
+            // near-white albedo map. Multiplied by the same white, the second is
+            // 3.4x the radiance of the first — measured, by rendering the JS
+            // moon with each map under Ultra and comparing the lit hemisphere.
+            // At that brightness the fill light alone carries the shadow side
+            // past the point where it reads as shadow, so the moon loses its
+            // terminator and goes flat: a bright sticker rather than a body.
+            //
+            // 0.3 is the reciprocal of that measurement, so this moon sits at
+            // the luminance the rig was balanced against. It is a correction for
+            // the asset swap and nothing more: it is on this one material, and
+            // no other object in the scene sees it.
+            base_color: LinearRgba::rgb(0.3, 0.3, 0.3).into(),
             perceptual_roughness: 0.95,
-            metallic: 0.0,
+            // `moon.js:25` is `metalness: 0.02`.
+            metallic: 0.02,
             ..default()
         })),
         Transform::from_xyz(
             rules.world.moon_pos.x as f32,
             rules.world.moon_pos.y as f32,
             rules.world.moon_pos.z as f32,
-        ),
+        )
+        // Stand the moon up. Bevy's UV sphere puts its poles on ±Z, and the
+        // match runs down the Z axis — spawns at ∓540, motherships at ±600 — so
+        // the pole pointed straight down the flight corridor and the face
+        // everyone saw was the one part of an equirectangular map with nothing
+        // on it. A quarter turn about X sends the pole to +Y and turns the
+        // equator, where the maria are, toward the player.
+        .with_rotation(Quat::from_rotation_x(-FRAC_PI_2)),
+        // `moon.js:31`.
+        Spin(Vec3::new(0.005, 0.012, 0.003)),
         // `graphics.js`: "Big background props stay out of the shadow pass."
         NotShadowCaster,
     ));
@@ -1197,9 +1250,27 @@ fn install_space_lights(commands: &mut Commands, rules: &sim::rules::Rules) {
     // `skybox.rs` installs a `GeneratedEnvironmentMapLight` from the nebula
     // cubemap — which is exactly what `applyEnvironment`'s PMREM pass does in
     // the JS. This ambient is the neutral lift underneath it.
+    //
+    // **This was 120, and that is why everything unlit went black.** The other
+    // three lights are all anchored to the key by the JS's own ratios; this one
+    // was not, and it came out an order of magnitude short. Derived the same way
+    // as the others:
+    //
+    // three's hemisphere light gives a surface `mix(ground, sky, 0.5 * n.y +
+    // 0.5) * intensity`, so averaged over every normal on a sphere it is
+    // `(sky + ground) / 2 * 0.55` = `(0.217, 0.245, 0.289)`. Against the key's
+    // `0xfff2dd * 2.7` = `(2.70, 2.56, 2.34)` that is 8-12% of key. Bevy
+    // multiplies `color * brightness` for its own irradiance, so matching that
+    // fraction of [`KEY_LUX`] through `0x9fb4d0` wants `brightness` near 1160 —
+    // and all three channels agree on it to within 2%.
+    //
+    // At 120 the fill and rim were carrying the entire shadow side on their own,
+    // which is a tenth of what the JS gives it: the moon's dark limb vanished
+    // into the sky rather than reading as a dark limb, and every hull turned
+    // away from the key was a silhouette.
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb_u8(0x9f, 0xb4, 0xd0),
-        brightness: 120.0,
+        brightness: 1160.0,
         ..default()
     });
 }
@@ -1563,7 +1634,7 @@ fn draw_interpolated(fixed: Res<Time<Fixed>>, mut q: Query<(&Interp, &mut Transf
 }
 
 // ---------------------------------------------------------------------------
-// Asteroid meshes
+// Displaced meshes: the rocks and the moon
 // ---------------------------------------------------------------------------
 
 /// One deformed unit icosphere, matching `asteroids.js:29` (`buildVariants`).
@@ -1572,27 +1643,38 @@ fn draw_interpolated(fixed: Res<Time<Fixed>>, mut q: Query<(&Interp, &mut Transf
 /// roughens the surface. Flat normals afterwards, for the faceted look the JS
 /// gets from `flatShading: true`.
 ///
+/// The displacement runs *before* [`Mesh::duplicate_vertices`], on the indexed
+/// icosphere — the same order as `asteroids.js:33`'s `mergeVertices` then
+/// displace. It is what keeps the rock watertight: a shared vertex is moved
+/// once, so the faces around it stay joined however far it travels.
+///
 /// Six of these are built once and shared by every rock, so the whole field is
 /// six mesh handles and one material — see the batching note in
 /// [`crate`]'s docs.
 ///
-/// Uses `sim::rng::Rng` rather than a `rand` dependency: it is already in the
-/// graph, and seeding it per variant keeps the six shapes reproducible.
+/// **The mesh is not the hitbox and must not become one.** `lobe * bump` reaches
+/// about 1.19 at its peak, so a spike pokes a fifth of a radius outside the
+/// sphere the simulation collides against — an asteroid's `radius` is `size *
+/// 0.95` and stays a sphere. The JS has the same overhang and the same test; a
+/// rock is a sphere no matter how it is drawn.
 fn rock_mesh(variant: u32) -> Mesh {
     let mut mesh = Sphere::new(1.0)
         .mesh()
         .ico(2)
         .expect("subdivision 2 is well within the icosphere limit");
 
-    let offsets = noise_offsets(variant);
+    // `asteroids.js:37` seeds the lobe with the variant index and the bump with
+    // `v + 7`, so the two octaves of one rock are uncorrelated.
+    let seed = f64::from(variant);
 
     if let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) =
         mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
     {
         for p in positions.iter_mut() {
             let [x, y, z] = *p;
-            let lobe = 0.78 + 0.34 * value_noise(x * 1.3, y * 1.3, z * 1.3, &offsets);
-            let bump = 0.94 + 0.12 * value_noise(x * 4.1, y * 4.1, z * 4.1, &offsets);
+            let (x64, y64, z64) = (f64::from(x), f64::from(y), f64::from(z));
+            let lobe = 0.78 + 0.34 * pseudo_noise(x64 * 1.3, y64 * 1.3, z64 * 1.3, seed);
+            let bump = 0.94 + 0.12 * pseudo_noise(x64 * 4.1, y64 * 4.1, z64 * 4.1, seed + 7.0);
             let n = lobe * bump;
             *p = [x * n, y * n, z * n];
         }
@@ -1611,25 +1693,166 @@ fn rock_mesh(variant: u32) -> Mesh {
     mesh
 }
 
-/// Per-variant phase offsets, so the six rocks are different shapes rather than
-/// six rotations of one shape.
-fn noise_offsets(variant: u32) -> [f32; 6] {
-    let mut rng = sim::rng::Rng::with_stream(0xA57E_401D, u64::from(variant));
-    let mut out = [0.0f32; 6];
-    for o in &mut out {
-        *o = (rng.next_f64() * 100.0) as f32;
+/// How finely the moon is tessellated, in sectors and stacks.
+///
+/// **Chosen for the vertex spacing, not the smoothness.** The displacement below
+/// is per-vertex white noise, so spacing *is* the lump size, and getting it
+/// wrong changes the surface completely: the same ±3% radius at a quarter of the
+/// spacing is four times the slope, which stops reading as a lumpy moon and
+/// starts reading as sandpaper.
+///
+/// `moon.js:12` builds `IcosahedronGeometry(1, 4)`. Three.js's `detail` is edge
+/// *segments minus one*, so that is 5 segments per icosahedron edge — 500
+/// triangles and 252 vertices, not the 2562 a recursive reading suggests. Spread
+/// over a sphere that is `sqrt(4*PI / 252) = 0.22` of a radius apart, or 17.9
+/// units on an 80-unit moon. A 32-sector UV sphere is 15.7 units at the equator
+/// and 15.7 between stacks at 16 — the closest near-uniform match, and inside
+/// the range Bevy's own docs call a sensible default.
+///
+/// This was `uv(96, 48)`, which was chosen when the sphere was undisplaced and
+/// only the silhouette mattered.
+const MOON_SECTORS: u32 = 32;
+const MOON_STACKS: u32 = 16;
+
+/// The moon, lumpy. `moon.js:11` (`createMoon`).
+///
+/// This was `Sphere::new(moon_r).mesh().uv(96, 48)` — a mathematically perfect
+/// sphere, which is the whole of why it read as "too round": a circle for a
+/// silhouette and a terminator with nothing on it to catch light.
+///
+/// `moon.js` displaces every vertex by `0.985 + 0.03 * pseudoNoise(...)` and
+/// recomputes **smooth** normals — not flat, unlike the rocks. The moon is meant
+/// to be subtly lumpy, not faceted, so the ±3% radius (±2.4 units here) shows as
+/// a knobbly limb and mottled shading rather than as visible triangles.
+///
+/// A UV sphere rather than the JS's icosphere, and that is not a compromise —
+/// see the texture note at the call site. It does mean the seam and the poles
+/// carry duplicate vertices, which is what [`weld_smooth_normals`] is for.
+fn moon_mesh(radius: f32) -> Mesh {
+    let mut mesh = Sphere::new(radius).mesh().uv(MOON_SECTORS, MOON_STACKS);
+
+    // The JS displaces a *unit* sphere and scales the mesh afterwards, so the
+    // noise is sampled on unit coordinates. Bevy's builder emits the final
+    // radius directly, hence the divide: feeding it 80-unit coordinates would
+    // sample a different — equally random, equally arbitrary — field.
+    let unit = f64::from(radius).recip();
+
+    if let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+    {
+        for p in positions.iter_mut() {
+            let [x, y, z] = *p;
+            let n = 3.7 * unit;
+            let bump = 0.985
+                + 0.03 * pseudo_noise(f64::from(x) * n, f64::from(y) * n, f64::from(z) * n, 11.0);
+            *p = [x * bump, y * bump, z * bump];
+        }
     }
-    out
+
+    weld_smooth_normals(&mut mesh);
+
+    // Same reasoning as `rock_mesh`: nothing raycasts this, the simulation
+    // collides against a sphere at the origin. Set last — the edits above need
+    // `MAIN_WORLD` access.
+    mesh.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    mesh
 }
 
-/// Cheap smooth pseudo-noise in `-1..1`. Not a real gradient noise — three
-/// summed sine products, which is what `asteroids.js`'s `pseudoNoise` amounts
-/// to and is plenty for displacing 162 vertices six times at startup.
-fn value_noise(x: f32, y: f32, z: f32, o: &[f32; 6]) -> f32 {
-    let a = (x * 1.7 + o[0]).sin() * (y * 1.3 + o[1]).cos();
-    let b = (y * 2.1 + o[2]).sin() * (z * 1.9 + o[3]).cos();
-    let c = (z * 1.5 + o[4]).sin() * (x * 2.3 + o[5]).cos();
-    (a + b + c) / 3.0
+/// Constant angular velocity about the entity's own axes, in rad/s.
+///
+/// Only the moon has one. `moon.js:31` spins it on `(0.005, 0.012, 0.003)`,
+/// which is slow enough to read as a body rather than a prop — a full turn takes
+/// nine minutes — and is what stops the lumps above being a fixed pattern baked
+/// into one face of the sky. Asteroid spin is not this: it is simulation state,
+/// arrives in [`SimFrame`], and is interpolated like any other pose.
+#[derive(Component)]
+struct Spin(Vec3);
+
+/// `moon.js:32`'s `update`, verbatim: Euler increments about the local axes.
+fn spin_bodies(time: Res<Time>, mut q: Query<(&Spin, &mut Transform)>) {
+    let dt = time.delta_secs();
+    for (spin, mut tf) in &mut q {
+        tf.rotate_local_x(spin.0.x * dt);
+        tf.rotate_local_y(spin.0.y * dt);
+        tf.rotate_local_z(spin.0.z * dt);
+    }
+}
+
+/// `pseudoNoise` from `asteroids.js:202` and `moon.js:7`, digit for digit.
+///
+/// **The discontinuity is the feature.** This is a sine *hash*, not a noise
+/// field: the multipliers are large and coprime enough that two vertices a
+/// tenth of a unit apart land in unrelated parts of the sine, so the output is
+/// effectively white noise per vertex. That is what makes a rock spiky. An
+/// earlier port here summed three sine products instead — smooth, continuous,
+/// interpolating — and the identical `0.78 + 0.34 * n` displacement came out as
+/// rounded lobes: a pebble rather than a shard. Same formula around it, entirely
+/// different silhouette, and it is the whole of why the rocks looked soft.
+///
+/// The determinism ban on `sin` (see CLAUDE.md) does **not** reach here. It
+/// applies to `crates/sim`, which has no dependency on this crate and no path to
+/// this function; six meshes built once at startup on the machine that draws
+/// them can differ in the last bit between platforms without anything noticing.
+///
+/// `f64` because the JS is `f64`: `sin(..) * 43758.5453` is around 4e4, where an
+/// `f32` has about 256 representable steps left inside one unit interval — the
+/// fractional part would come out quantized to that ladder rather than uniform.
+fn pseudo_noise(x: f64, y: f64, z: f64, seed: f64) -> f32 {
+    let s = (x * 12.9898 + y * 78.233 + z * 37.719 + seed * 4.7).sin() * 43758.5453;
+    ((s - s.floor()) * 2.0 - 1.0) as f32
+}
+
+/// Smooth normals that treat vertices sharing a **position** as one vertex.
+///
+/// [`Mesh::compute_smooth_normals`] averages by *index*, and the UV sphere has
+/// two sets of indices at the same place: a full seam column, duplicated so the
+/// texture can wrap from u=1 back to u=0, and a fan of coincident vertices at
+/// each pole. Averaging those separately gives the two sides of the seam
+/// different normals, which under smooth shading draws a lit line from pole to
+/// pole — invisible on a true sphere, where both halves average to the same
+/// radial normal, and glaring once [`moon_mesh`] displaces the surface with a
+/// per-vertex hash and the two halves no longer agree.
+///
+/// This is `mergeVertices` + `computeVertexNormals` (`moon.js:13`, `:20`) with
+/// the merge left implicit: positions are bucketed, each face normal is added to
+/// every vertex in its corners' buckets, and Bevy normalizes at the end. The
+/// buckets are keyed on the exact bits of the position, which is sound here
+/// because the duplicates are *copies* — the mesh builder pushes the same
+/// computed `[f32; 3]` twice — rather than two arrivals at the same point by
+/// different arithmetic.
+fn weld_smooth_normals(mesh: &mut Mesh) {
+    // `group_of[vertex]` indexes `groups`, and `groups[g]` lists every vertex at
+    // that one position. Built before the mutable borrow below.
+    let (groups, group_of) = {
+        let Some(positions) = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .and_then(|p| p.as_float3())
+        else {
+            return;
+        };
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut index: HashMap<[u32; 3], usize> = HashMap::new();
+        let mut group_of: Vec<usize> = Vec::with_capacity(positions.len());
+        for (i, p) in positions.iter().enumerate() {
+            let key = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+            let g = *index.entry(key).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[g].push(i);
+            group_of.push(g);
+        }
+        (groups, group_of)
+    };
+
+    mesh.compute_custom_smooth_normals(|[a, b, c], pos, normals| {
+        let n = Vec3::from(bevy::mesh::triangle_normal(pos[a], pos[b], pos[c]));
+        for corner in [a, b, c] {
+            for &i in &groups[group_of[corner]] {
+                normals[i] += n;
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

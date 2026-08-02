@@ -14,18 +14,27 @@
 //! | `UnrealBloomPass(0.58, 0.62, 0.92)` | [`Bloom`] |
 //! | `uAberration: 0.0014` | [`ChromaticAberration`] |
 //! | `uVignette: 0.34` | [`Vignette`] |
+//! | lift / gain / saturation / contrast / grain | [`FilmGrade`] |
 //! | `PCFSoftShadowMap` | [`ShadowFilteringMethod::Gaussian`] |
 //! | `antialias: false` | [`Msaa::Off`] |
 //!
 //! Only the JS's chase camera is ported. `_updateFreeLook` needs
 //! right-mouse-drag and a mouse-delta accumulator, which is input work.
 
+use bevy::asset::uuid_handle;
 use bevy::camera::Hdr;
-use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::core_pipeline::fullscreen_material::{FullscreenMaterial, FullscreenMaterialPlugin};
+use bevy::core_pipeline::tonemapping::{tonemapping, Tonemapping};
+use bevy::core_pipeline::Core3dSystems;
+use bevy::ecs::schedule::ScheduleConfigs;
+use bevy::ecs::system::BoxedSystem;
 use bevy::light::ShadowFilteringMethod;
 use bevy::post_process::bloom::{Bloom, BloomPrefilter};
 use bevy::post_process::effect_stack::{ChromaticAberration, Vignette};
 use bevy::prelude::*;
+use bevy::render::extract_component::ExtractComponent;
+use bevy::render::render_resource::ShaderType;
+use bevy::shader::{Shader, ShaderRef};
 
 use crate::scene::ShipRoot;
 use crate::LOCAL_ID;
@@ -80,10 +89,12 @@ pub struct FollowCameraPlugin;
 
 impl Plugin for FollowCameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_camera)
+        app.add_plugins(FullscreenMaterialPlugin::<FilmGrade>::default())
+            .add_systems(Startup, (install_grade_shader, spawn_camera))
             // The chase target is a transform, so this has to land before
             // transform propagation or the camera trails by a frame.
-            .add_systems(PostUpdate, follow.before(TransformSystems::Propagate));
+            .add_systems(PostUpdate, follow.before(TransformSystems::Propagate))
+            .add_systems(Update, advance_grain);
     }
 }
 
@@ -130,20 +141,9 @@ pub fn spawn_camera(mut commands: Commands) {
             smoothness: 0.55,
             ..default()
         },
-        // TODO(grade): film grain, and the lift/gain/saturation/contrast trim
-        // in `GradeShader`, have no Bevy component. They are a small custom
-        // post-process node — one fullscreen shader — and are the only part of
-        // the Ultra stack that does not map onto something built in.
-        //
-        // Still open, deliberately. `bevy::core_pipeline::fullscreen_material`
-        // has the whole node in 0.19 — a `FullscreenMaterial` impl scheduled
-        // `after(tonemapping)`, which is where `GradeShader` grades — so this
-        // is perhaps eighty lines whenever someone wants it. It is not being
-        // built *here* because nothing else needs it: `warp.rs` is world-space
-        // geometry and a projection change, and standing up a fullscreen pass
-        // that only carries a grain and a colour trim is infrastructure the
-        // effect does not use.
-        //
+        // The rest of `GradeShader`: the lift/gain/saturation/contrast trim and
+        // the film grain, which have no Bevy component. See [`FilmGrade`].
+        FilmGrade::default(),
         // `PCFSoftShadowMap`.
         ShadowFilteringMethod::Gaussian,
         // Ultra sets `antialias: false` on purpose and leans on a high pixel
@@ -163,6 +163,162 @@ pub fn spawn_camera(mut commands: Commands) {
         FlightCamera,
         Transform::from_xyz(0.0, HEIGHT, -540.0 - DISTANCE),
     ));
+}
+
+// ---------------------------------------------------------------------------
+// The grade pass
+// ---------------------------------------------------------------------------
+
+/// The tail of `graphics.js`'s `GradeShader`, as a fullscreen pass.
+///
+/// Bevy owns four of the six things that shader does — ACES, chromatic
+/// aberration, vignette, and the sRGB encode — so what is left, and what this
+/// carries, is the part that changes the *character* of the image rather than
+/// its shape: a lift and gain that cool the shadows and warm nothing, a
+/// saturation push, a contrast curve, and animated grain. Ultra without it is
+/// the same scene rendered flat and slightly grey: the contrast curve alone
+/// takes everything under 0.024 linear to black, which is the difference
+/// between the JS's tight blue nebula on a dead-black sky and a milky wash over
+/// the whole frame.
+///
+/// **Scheduled `after(tonemapping)`, which is where the JS grades.** The default
+/// for a [`FullscreenMaterial`] is *before* it, and that would be wrong twice
+/// over: contrast about 0.5 and a saturation mix are display-referred
+/// operations, meaningless on an HDR buffer whose highlights run to 20; and the
+/// grain would be tone-mapped after being added, so its amplitude would depend
+/// on scene brightness. `Core3dSystems::PostProcess` still runs before
+/// `upscaling`, so this is the last thing to touch the image.
+///
+/// # Three uniform members, not seven
+///
+/// WebGL2 requires every uniform struct member to be 16-byte aligned, so the
+/// scalars ride in the `w` lanes of the vectors they belong with rather than
+/// as their own fields — the same packing, and the same reason, as `scene.rs`'s
+/// `DamageFlash`. It also keeps the buffer at 48 bytes with no padding to get
+/// wrong.
+///
+/// # Not ported
+///
+/// `uExposure: 1.10`, which the JS applies to the HDR colour *before* ACES.
+/// There is nowhere for it here: this pass runs after tone mapping, and Bevy's
+/// pre-tonemap exposure is [`bevy::camera::Exposure`], in EV100 against
+/// physical light units, while `install_space_lights` already anchors its key
+/// light by eye because three.js's intensities are unitless. Folding a 10%
+/// linear lift into a scale that is neither linear nor calibrated to the same
+/// zero would be a number that looks like a port and is not one. The exposure
+/// that matters is in the lights.
+#[derive(Component, ExtractComponent, Clone, Copy, ShaderType)]
+pub struct FilmGrade {
+    /// `rgb`: `uLift`. `a`: `uSaturation`.
+    lift: Vec4,
+    /// `rgb`: `uGain`. `a`: `uContrast`.
+    gain: Vec4,
+    /// `x`: `uGrain`. `y`: `uTime`, in seconds. `zw`: unused padding.
+    grain: Vec4,
+}
+
+impl Default for FilmGrade {
+    /// `GradeShader`'s uniform defaults (`graphics.js:487`), verbatim.
+    ///
+    /// The lift is not neutral grey: `(0.004, 0.006, 0.016)` puts four times as
+    /// much blue as red into the toe, so black reads as deep space rather than
+    /// as a dead pixel. The gain answers it at the top with `(1.00, 0.995,
+    /// 1.025)`, a quarter-stop of blue in the highlights. Together they are the
+    /// cool cast the JS image has and a straight ACES render does not.
+    fn default() -> Self {
+        Self {
+            lift: Vec4::new(0.004, 0.006, 0.016, 1.14),
+            gain: Vec4::new(1.00, 0.995, 1.025, 1.05),
+            grain: Vec4::new(0.009, 0.0, 0.0, 0.0),
+        }
+    }
+}
+
+impl FullscreenMaterial for FilmGrade {
+    fn fragment_shader() -> ShaderRef {
+        ShaderRef::Handle(GRADE_SHADER)
+    }
+
+    fn schedule_configs(system: ScheduleConfigs<BoxedSystem>) -> ScheduleConfigs<BoxedSystem> {
+        system.in_set(Core3dSystems::PostProcess).after(tonemapping)
+    }
+}
+
+/// Compiled in rather than loaded from the asset root, for the reasons
+/// `scene.rs`'s `DAMAGE_FLASH_SHADER` gives: the asset root is `public/`, shared
+/// with the Three.js client, and `build-wasm.sh` copies a named list out of it.
+const GRADE_SHADER: Handle<Shader> = uuid_handle!("0d3f2a41-6c8e-4b52-9f17-2d4a86b0c913");
+
+/// The whole of the grade, as a fragment shader.
+///
+/// `FullscreenVertexOutput` is declared here rather than imported from
+/// `bevy_core_pipeline::fullscreen_vertex_shader` on purpose. That module also
+/// holds the `@vertex` entry point, and [`FullscreenMaterialPlugin`] builds its
+/// pipeline with `entry_point: None` — it relies on the fragment module having
+/// exactly one entry point to pick. Declaring the struct locally keeps that true
+/// no matter how the composer treats an imported module's entry points; the
+/// layout is the contract, and it is four lines.
+///
+/// Everything here runs on **display-referred linear** colour: ACES has already
+/// clamped to 0..1, and the sRGB encode happens in the blit to the swapchain.
+/// That is the same space `GradeShader` grades in — its own `pow(1/2.4)` encode
+/// is the last thing it does, after all of this.
+const GRADE_WGSL: &str = r#"
+struct FullscreenVertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+struct FilmGrade {
+    // rgb: lift.       a: saturation.
+    lift: vec4<f32>,
+    // rgb: gain.       a: contrast.
+    gain: vec4<f32>,
+    // x: grain amount. y: time.
+    grain: vec4<f32>,
+}
+
+@group(0) @binding(0) var screen: texture_2d<f32>;
+@group(0) @binding(1) var screen_sampler: sampler;
+@group(0) @binding(2) var<uniform> grade: FilmGrade;
+
+@fragment
+fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
+    var col = textureSample(screen, screen_sampler, in.uv).rgb;
+
+    col = col * grade.gain.rgb + grade.lift.rgb;
+
+    // Rec. 709 luma, and the same value gates the grain below — noise lives in
+    // the shadows, where a sensor's does.
+    let luma = dot(col, vec3<f32>(0.2126, 0.7152, 0.0722));
+    col = mix(vec3<f32>(luma), col, grade.lift.a);
+    col = clamp((col - 0.5) * grade.gain.a + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    let seed = in.uv * 1024.0 + fract(grade.grain.y) * 91.7;
+    let n = fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5;
+    col += n * grade.grain.x * (1.0 - smoothstep(0.0, 0.7, luma));
+
+    return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
+fn install_grade_shader(mut shaders: ResMut<Assets<Shader>>) {
+    shaders
+        .insert(
+            &GRADE_SHADER,
+            Shader::from_wgsl(GRADE_WGSL, "spaceships/grade.wgsl"),
+        )
+        .expect("a uuid handle has no generation to be stale");
+}
+
+/// `grade.uniforms.uTime.value += dt` (`graphics.js:603`).
+///
+/// The shader only ever uses `fract(time)`, so an elapsed count is as good as an
+/// accumulator and cannot drift.
+fn advance_grain(time: Res<Time>, mut grades: Query<&mut FilmGrade>) {
+    for mut grade in &mut grades {
+        grade.grain.y = time.elapsed_secs_wrapped();
+    }
 }
 
 // Reads the ship's *interpolated* `Transform`, not its pose in `SimFrame`.
