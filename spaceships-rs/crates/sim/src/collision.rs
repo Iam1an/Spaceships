@@ -364,6 +364,60 @@ pub fn swept_sphere_aabb(origin: Vec3, motion: Vec3, radius: f64, target: Aabb) 
     swept_sphere_box_features(origin, motion, radius, target)
 }
 
+/// How far a point inside `target` must travel along `dir` to reach its
+/// surface, or `None` if the point is not strictly inside.
+///
+/// The escape hatch for a body that is *already* interpenetrating and cannot be
+/// resolved by pushing along one surface normal — a ship in the crevice where
+/// two overlapping asteroids meet, where each rock's push-out lands it inside
+/// the other. Moving along a single direction until every body is behind it
+/// always terminates, because the bodies are bounded; this is the "how far"
+/// half of that. See `slide_clear` in [`crate::ship`].
+///
+/// `dir` must be unit length. The answer is a distance in world units, not a
+/// fraction of a step — there is no step here, only a displacement to apply.
+///
+/// Solved as the far root of the same quadratic [`swept_sphere_sphere`] uses,
+/// with `a == 1` because `dir` is normalized. Strictly inside means the
+/// constant term is negative, so the discriminant is positive and the root is
+/// real without a branch on it.
+///
+/// ```
+/// use spaceships_sim::collision::{sphere_exit_distance, Sphere};
+/// use spaceships_sim::math::Vec3;
+///
+/// // Five units inside a radius-10 sphere, heading out along +z: 15 to go.
+/// let rock = Sphere::new(Vec3::ZERO, 10.0);
+/// let d = sphere_exit_distance(Vec3::new(0.0, 0.0, -5.0), Vec3::Z, rock);
+/// assert_eq!(d, Some(15.0));
+/// // Outside it already: nothing to do.
+/// assert_eq!(sphere_exit_distance(Vec3::new(0.0, 0.0, -20.0), Vec3::Z, rock), None);
+/// ```
+#[inline]
+#[must_use]
+pub fn sphere_exit_distance(origin: Vec3, dir: Vec3, target: Sphere) -> Option<f64> {
+    let f = origin - target.center;
+    let c = f.length_squared() - target.radius * target.radius;
+    if c >= 0.0 || c.is_nan() {
+        // The NaN arm is explicit: `c >= 0.0` is false for a NaN, and letting
+        // one through would reach the square root and return a NaN distance.
+        return None;
+    }
+    let b = f.dot(dir);
+    let disc = b * b - c;
+    if disc < 0.0 {
+        // Unreachable for a unit `dir` and `c < 0`; a non-unit or non-finite
+        // one lands here instead of returning a NaN distance.
+        return None;
+    }
+    let s = -b + disc.sqrt();
+    if s.is_finite() && s > 0.0 {
+        Some(s)
+    } else {
+        None
+    }
+}
+
 /// True if two spheres share any point. Tangent spheres count as overlapping.
 ///
 /// The cheap static test for spawn placement: reject a candidate asteroid or
@@ -674,9 +728,9 @@ fn keep_earlier(best: Option<f64>, candidate: Option<f64>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        quadratic_interval, ray_aabb_entry, sphere_overlaps_aabb, sphere_overlaps_sphere,
-        sweep_first_hit, swept_sphere_aabb, swept_sphere_sphere, swept_sphere_vs_moving_sphere,
-        Aabb, Sphere,
+        quadratic_interval, ray_aabb_entry, sphere_exit_distance, sphere_overlaps_aabb,
+        sphere_overlaps_sphere, sweep_first_hit, swept_sphere_aabb, swept_sphere_sphere,
+        swept_sphere_vs_moving_sphere, Aabb, Sphere,
     };
     use crate::math::Vec3;
     use crate::rng::Rng;
@@ -1107,6 +1161,91 @@ mod tests {
             swept_sphere_vs_moving_sphere(Vec3::ZERO, motion, 0.5, touching, motion),
             Some(0.0)
         );
+    }
+
+    #[test]
+    fn the_exit_distance_lands_exactly_on_the_surface() {
+        let rock = Sphere::new(v(3.0, -2.0, 10.0), 12.0);
+        // From the centre, every bearing exits at the radius.
+        for dir in [Vec3::X, -Vec3::Y, Vec3::Z] {
+            let d = sphere_exit_distance(rock.center, dir, rock).expect("inside");
+            assert!((d - 12.0).abs() < 1e-12, "{d}");
+        }
+        // From an off-centre point, the exit really is on the surface.
+        let inside = rock.center + v(4.0, 3.0, -2.0);
+        let dir = v(1.0, 2.0, 3.0).normalize();
+        let d = sphere_exit_distance(inside, dir, rock).expect("inside");
+        let out = inside + dir * d;
+        assert!((out.distance(rock.center) - rock.radius).abs() < 1e-9);
+        // And one step further really is outside.
+        assert!(sphere_exit_distance(out + dir * 1e-6, dir, rock).is_none());
+    }
+
+    #[test]
+    fn the_exit_distance_is_none_from_outside_and_from_nowhere() {
+        let rock = Sphere::new(Vec3::ZERO, 10.0);
+        // Outside, whichever way it is pointing.
+        assert_eq!(sphere_exit_distance(v(0.0, 0.0, 40.0), Vec3::Z, rock), None);
+        assert_eq!(
+            sphere_exit_distance(v(0.0, 0.0, 40.0), -Vec3::Z, rock),
+            None
+        );
+        // Exactly on the surface is not inside.
+        assert_eq!(sphere_exit_distance(v(0.0, 0.0, 10.0), Vec3::Z, rock), None);
+        // And nothing non-finite escapes as a distance.
+        let nan = v(f64::NAN, 0.0, 0.0);
+        assert_eq!(sphere_exit_distance(nan, Vec3::Z, rock), None);
+        assert_eq!(sphere_exit_distance(Vec3::ZERO, nan, rock), None);
+        assert_eq!(
+            sphere_exit_distance(Vec3::ZERO, Vec3::Z, Sphere::new(nan, 10.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fixed_bearing_leaves_a_knot_of_spheres_for_good() {
+        // The property `ship::slide_clear` rests on: pick a bearing, step to the
+        // far side of each sphere still containing the point, and every sphere
+        // left behind stays behind — spheres are convex, so a ray leaves each of
+        // them exactly once. Without that, the escape can cycle forever.
+        let mut rng = Rng::new(0x5111_DE01);
+        for _ in 0..400 {
+            let field: Vec<Sphere> = (0..5)
+                .map(|_| {
+                    Sphere::new(
+                        v(
+                            rng.range_f64(-25.0, 25.0),
+                            rng.range_f64(-25.0, 25.0),
+                            rng.range_f64(-25.0, 25.0),
+                        ),
+                        rng.range_f64(8.0, 28.0),
+                    )
+                })
+                .collect();
+            let dir = v(
+                rng.next_f64_signed(),
+                rng.next_f64_signed(),
+                rng.next_f64_signed(),
+            )
+            .normalize();
+            let mut p = Vec3::ZERO;
+            for _ in 0..8 {
+                let travel = field
+                    .iter()
+                    .filter_map(|s| sphere_exit_distance(p, dir, *s))
+                    .fold(0.0f64, f64::max);
+                if travel <= 0.0 {
+                    break;
+                }
+                p += dir * (travel + 1e-9);
+            }
+            for s in &field {
+                assert!(
+                    p.distance(s.center) >= s.radius,
+                    "still inside {s:?} at {p:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1695,6 +1695,16 @@ fn draw_interpolated(fixed: Res<Time<Fixed>>, mut q: Query<(&Interp, &mut Transf
 /// roughens the surface. Flat normals afterwards, for the faceted look the JS
 /// gets from `flatShading: true`.
 ///
+/// **Every number in the displacement comes from
+/// [`sim::rules::AsteroidMeshRules`]**, and none of them is written here. The
+/// simulation collides against a sphere of
+/// [`sim::rules::AsteroidFieldRules::collision_radius_scale`], which *is* the
+/// mean of this displacement — so the mesh and the hitbox are two readings of
+/// one description rather than two numbers that happen to look similar. They did
+/// not look similar: the sphere used to be the JS's `size * 0.95` while this
+/// surface averages `size * 0.7332`, which is a quarter of a rock of hitbox that
+/// nothing was drawn in.
+///
 /// The displacement runs *before* [`Mesh::duplicate_vertices`], on the indexed
 /// icosphere — the same order as `asteroids.js:33`'s `mergeVertices` then
 /// displace. It is what keeps the rock watertight: a shared vertex is moved
@@ -1704,16 +1714,16 @@ fn draw_interpolated(fixed: Res<Time<Fixed>>, mut q: Query<(&Interp, &mut Transf
 /// six mesh handles and one material — see the batching note in
 /// [`crate`]'s docs.
 ///
-/// **The mesh is not the hitbox and must not become one.** `lobe * bump` reaches
-/// about 1.19 at its peak, so a spike pokes a fifth of a radius outside the
-/// sphere the simulation collides against — an asteroid's `radius` is `size *
-/// 0.95` and stays a sphere. The JS has the same overhang and the same test; a
-/// rock is a sphere no matter how it is drawn.
+/// **The mesh is still not the hitbox.** A single sphere cannot follow a surface
+/// that ranges from 0.36 to 1.19 of the nominal radius with hard facets; it can
+/// only be centred on it, and `max_radius_scale` says how far a spike reaches
+/// past it. A rock is a sphere no matter how it is drawn.
 fn rock_mesh(variant: u32) -> Mesh {
+    let shape = RULES.world.asteroid_field.mesh;
     let mut mesh = Sphere::new(1.0)
         .mesh()
-        .ico(2)
-        .expect("subdivision 2 is well within the icosphere limit");
+        .ico(shape.subdivisions)
+        .expect("the rules' subdivision level is within the icosphere limit");
 
     // `asteroids.js:37` seeds the lobe with the variant index and the bump with
     // `v + 7`, so the two octaves of one rock are uncorrelated.
@@ -1725,8 +1735,14 @@ fn rock_mesh(variant: u32) -> Mesh {
         for p in positions.iter_mut() {
             let [x, y, z] = *p;
             let (x64, y64, z64) = (f64::from(x), f64::from(y), f64::from(z));
-            let lobe = 0.78 + 0.34 * pseudo_noise(x64 * 1.3, y64 * 1.3, z64 * 1.3, seed);
-            let bump = 0.94 + 0.12 * pseudo_noise(x64 * 4.1, y64 * 4.1, z64 * 4.1, seed + 7.0);
+            let (lf, bf) = (shape.lobe_freq, shape.bump_freq);
+            // The noise is sampled in `f64` (see `pseudo_noise`) and applied in
+            // `f32`, which is what the vertex buffer holds.
+            let lobe = shape.lobe_base as f32
+                + shape.lobe_amp as f32 * pseudo_noise(x64 * lf, y64 * lf, z64 * lf, seed);
+            let bump = shape.bump_base as f32
+                + shape.bump_amp as f32
+                    * pseudo_noise(x64 * bf, y64 * bf, z64 * bf, seed + shape.bump_seed_offset);
             let n = lobe * bump;
             *p = [x * n, y * n, z * n];
         }

@@ -1037,7 +1037,15 @@ mod tests {
     /// once. If it fails, a client and a server built at different times will
     /// disagree about where the rocks are. Either revert the change, or treat it
     /// as a protocol break and version the seed.
-    const GOLDEN_FIELD_CHECKSUM: u64 = 0xF1A0_DC66_FD67_E3C5;
+    ///
+    /// Moved once, knowingly:
+    /// [`crate::rules::AsteroidFieldRules::collision_radius_scale`] stopped
+    /// being the JS's literal 0.95 and became the drawn mesh's mean radius, so
+    /// every rock's `radius` — which this hashes — moved with it. Rocks are in
+    /// the same places, at the same sizes, in the same order; only the sphere
+    /// standing in for each one is smaller. Like any rule change it needs client
+    /// and server rebuilt together, which the seed does not version.
+    const GOLDEN_FIELD_CHECKSUM: u64 = 0x4A7C_1A8F_DC9C_7ECF;
 
     #[test]
     fn generation_sequence_is_pinned() {
@@ -1321,7 +1329,10 @@ mod tests {
                     spec.max_size
                 );
                 assert_eq!(a.hp, spec.hp);
-                assert_eq!(a.radius, a.size * 0.95);
+                assert_eq!(
+                    a.radius,
+                    a.size * rules().world.asteroid_field.collision_radius_scale
+                );
                 assert!(a.variant < 6);
                 assert_eq!(a.hit_flash, 0.0);
                 for r in [a.rot.x, a.rot.y, a.rot.z] {
@@ -1333,6 +1344,138 @@ mod tests {
         for (i, n) in seen.iter().enumerate() {
             assert!(*n > 0, "tier {i} never appeared");
         }
+    }
+
+    #[test]
+    fn the_collision_sphere_is_the_drawn_rocks_mean_radius() {
+        // "Their hitboxes are weird and not accurate", measured.
+        //
+        // A rock is drawn as a unit icosphere with every vertex displaced to
+        // `lobe * bump` of the nominal radius, each octave an independent
+        // per-vertex hash in [-1, 1) — see `AsteroidMeshRules`. Integrating over
+        // that square is integrating over the drawn surface, because the hash is
+        // what the vertex radii are drawn from.
+        //
+        // The JS collided against `size * 0.95`. This is what that sphere was
+        // standing in front of.
+        let mesh = rules().world.asteroid_field.mesh;
+        let scale = rules().world.asteroid_field.collision_radius_scale;
+        const JS_SCALE: f64 = 0.95;
+        const STEPS: i32 = 401;
+
+        let mut sum = 0.0f64;
+        let mut js_gap = 0.0f64;
+        let mut outside_js = 0u32;
+        let mut outside_ours = 0u32;
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        let mut samples = 0u32;
+        for i in 0..STEPS {
+            let n1 = -1.0 + 2.0 * f64::from(i) / f64::from(STEPS - 1);
+            for j in 0..STEPS {
+                let n2 = -1.0 + 2.0 * f64::from(j) / f64::from(STEPS - 1);
+                let drawn =
+                    (mesh.lobe_base + mesh.lobe_amp * n1) * (mesh.bump_base + mesh.bump_amp * n2);
+                sum += drawn;
+                js_gap += JS_SCALE - drawn;
+                outside_js += u32::from(drawn > JS_SCALE);
+                outside_ours += u32::from(drawn > scale);
+                lo = lo.min(drawn);
+                hi = hi.max(drawn);
+                samples += 1;
+            }
+        }
+        let n = f64::from(samples);
+        let mean = sum / n;
+
+        // The description's mean is exactly the product of the two octaves'
+        // means, because each noise term is symmetric about zero.
+        assert!((mean - mesh.mean_radius_scale()).abs() < 1e-12, "{mean}");
+        assert_eq!(scale, mesh.mean_radius_scale());
+        assert!((scale - 0.7332).abs() < 1e-12, "{scale}");
+
+        // The envelope the description can reach, and the sphere sitting inside
+        // it rather than around it.
+        assert!((lo - mesh.min_radius_scale()).abs() < 1e-12, "{lo}");
+        assert!((hi - mesh.max_radius_scale()).abs() < 1e-12, "{hi}");
+        assert!(lo < scale && scale < hi);
+
+        // What was wrong: the JS sphere stood 0.217 of a `size` clear of the
+        // surface it was standing in for — 23 % of its own radius, 2.2 times the
+        // volume, and 11.9 units of invisible wall on the largest rock tier.
+        let js_mean_gap = js_gap / n;
+        assert!((js_mean_gap - 0.2168).abs() < 1e-4, "{js_mean_gap}");
+        let biggest = ASTEROID_TIERS[ASTEROID_TIER_COUNT - 1].max_size;
+        assert!((js_mean_gap * biggest - 11.9).abs() < 0.1);
+        assert!(((JS_SCALE / scale).powi(3) - 2.18).abs() < 0.01);
+
+        // And the sphere that replaces it splits the surface down the middle,
+        // where the JS's had 84 % of the rock inside it.
+        let ours = f64::from(outside_ours) / n;
+        let js = f64::from(outside_js) / n;
+        assert!((ours - 0.5).abs() < 0.02, "{ours} of the surface pokes out");
+        assert!(js < 0.16, "{js}");
+    }
+
+    #[test]
+    fn every_rocks_hitbox_is_derived_from_the_mesh_and_not_from_a_literal() {
+        // The property that stops the two drifting apart again: nothing writes
+        // a collision radius down, it comes off the same description the
+        // renderer builds the mesh from.
+        let field = rules().world.asteroid_field;
+        for a in space_field(SEED) {
+            assert_eq!(a.radius, a.size * field.mesh.mean_radius_scale());
+            assert!(a.radius > a.size * field.mesh.min_radius_scale());
+            assert!(a.radius < a.size * field.mesh.max_radius_scale());
+        }
+        // A rule set whose sphere is not somewhere on the rock is not a rule set.
+        let mut absurd = rules();
+        absurd.world.asteroid_field.collision_radius_scale = 2.0;
+        assert!(absurd.validate().is_err());
+    }
+
+    #[test]
+    fn generated_rocks_overlap_each_other_because_nothing_separates_them() {
+        // Pinned because it is load-bearing elsewhere: `ship::depenetrate`
+        // iterates precisely because a ship can end a step inside two rocks at
+        // once, and this is why that is not a hypothetical. Placement is tested
+        // against the moon and the motherships (`avoid_volumes`) and never
+        // against another rock — in all three JS generators, and here.
+        //
+        // Not a bug to be fixed by separating them: a field of touching rocks is
+        // what an asteroid field looks like, and it is what the campaign's three
+        // slabs are *for*. The fix belongs in the resolver, which is where it is.
+        let knotted = |field: &[Asteroid]| {
+            let mut count = 0;
+            for (i, a) in field.iter().enumerate() {
+                let body = Sphere::new(a.pos, a.radius);
+                if field.iter().enumerate().any(|(j, b)| {
+                    i != j && sphere_overlaps_sphere(body, Sphere::new(b.pos, b.radius))
+                }) {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        // The campaign packs 280 rocks into three slabs, and it shows: 118 of
+        // them — 42 % — are touching another rock. That is the field the mission
+        // flies down.
+        let campaign = campaign_field(SEED);
+        let campaign_knotted = knotted(&campaign);
+        assert!(
+            campaign_knotted > campaign.len() / 4,
+            "{campaign_knotted} of {} campaign rocks are in a knot",
+            campaign.len()
+        );
+
+        // A deathmatch field is far sparser — 60 rocks in a 400-unit sphere —
+        // but not empty of knots either, over enough seeds.
+        let mut space_knotted = 0;
+        for seed in 0..20u64 {
+            space_knotted += knotted(&space_field(seed));
+        }
+        assert!(space_knotted > 0, "no knots in twenty deathmatch fields");
     }
 
     #[test]

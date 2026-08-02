@@ -891,6 +891,108 @@ impl CombatRules {
 // Static world geometry
 // ---------------------------------------------------------------------------
 
+/// The shape of a rock, as one description both the renderer and the
+/// simulation read.
+///
+/// A rock is drawn as a unit icosphere whose every vertex is pushed along its
+/// own radius by two octaves of noise (`asteroids.js:37`, ported to
+/// `client/src/scene.rs::rock_mesh`):
+///
+/// ```text
+/// lobe   = lobe_base + lobe_amp * noise(v * lobe_freq, seed)
+/// bump   = bump_base + bump_amp * noise(v * bump_freq, seed + bump_seed_offset)
+/// radius = size * lobe * bump
+/// ```
+///
+/// with each `noise` in `[-1, 1)`. It is a *hash*, not a field — two vertices a
+/// tenth of a unit apart land in unrelated parts of it — so the two octaves are
+/// independent per vertex and the surface is faceted rather than lumpy. See
+/// `pseudo_noise` in `scene.rs` for why that discontinuity is the point.
+///
+/// # Why the simulation has an opinion about a mesh
+///
+/// It does not draw one. It needs the *statistics*: the collision sphere is
+/// [`AsteroidFieldRules::collision_radius_scale`] of a rock's `size`, and that
+/// number is only meaningful next to the surface it is standing in for. When
+/// the two were written down separately they disagreed by a quarter of a rock —
+/// see the note on that field. So the displacement lives here, once, and both
+/// sides read it: the renderer to build the mesh, the simulation to size the
+/// sphere.
+///
+/// Nothing here is on a simulation path. [`Self::mean_radius_scale`] and its
+/// siblings are `+ - *` on constants, evaluated at compile time; the `sin` that
+/// `noise` is built from stays in the renderer, where the determinism ban does
+/// not reach.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AsteroidMeshRules {
+    /// Mean of the coarse octave — the one that makes a rock lumpy rather than
+    /// round. `asteroids.js:37` (`0.78 + 0.34 * n`).
+    pub lobe_base: f64,
+    /// Half-range of the coarse octave.
+    pub lobe_amp: f64,
+    /// Coordinate scale the coarse octave is sampled at.
+    pub lobe_freq: f64,
+    /// Mean of the fine octave — surface roughness. `asteroids.js:38`
+    /// (`0.94 + 0.12 * n`).
+    pub bump_base: f64,
+    /// Half-range of the fine octave.
+    pub bump_amp: f64,
+    /// Coordinate scale the fine octave is sampled at.
+    pub bump_freq: f64,
+    /// Added to the variant index for the fine octave's seed, so the two
+    /// octaves of one rock are uncorrelated. `asteroids.js:38` (`v + 7`).
+    pub bump_seed_offset: f64,
+    /// Icosphere subdivision level the displacement is applied to.
+    ///
+    /// Render-side, and listed here because it belongs with the rest of the
+    /// description: the noise is per *vertex*, so the subdivision is what sets
+    /// the size of a facet. `asteroids.js:31` builds `IcosahedronGeometry(1, 2)`.
+    pub subdivisions: u32,
+}
+
+impl AsteroidMeshRules {
+    /// The frozen default. `asteroids.js:37`–`:38`, digit for digit.
+    pub const DEFAULT: Self = Self {
+        lobe_base: 0.78,
+        lobe_amp: 0.34,
+        lobe_freq: 1.3,
+        bump_base: 0.94,
+        bump_amp: 0.12,
+        bump_freq: 4.1,
+        bump_seed_offset: 7.0,
+        subdivisions: 2,
+    };
+
+    /// Mean displaced radius, as a fraction of a rock's `size`.
+    ///
+    /// The two octaves are independent and each noise term is symmetric about
+    /// zero, so the mean of the product is the product of the means and the
+    /// amplitudes drop out entirely: `0.78 * 0.94 = 0.7332`.
+    ///
+    /// This is the sphere that splits the difference — half the drawn surface
+    /// inside it, half outside — which is why it is what
+    /// [`AsteroidFieldRules::collision_radius_scale`] is set to.
+    #[must_use]
+    pub const fn mean_radius_scale(self) -> f64 {
+        self.lobe_base * self.bump_base
+    }
+
+    /// Smallest displaced radius the description can produce, as a fraction of
+    /// `size`: both octaves at their trough.
+    #[must_use]
+    pub const fn min_radius_scale(self) -> f64 {
+        (self.lobe_base - self.lobe_amp) * (self.bump_base - self.bump_amp)
+    }
+
+    /// Largest displaced radius the description can produce, as a fraction of
+    /// `size`: both octaves at their peak. 1.187 with the shipped numbers, so a
+    /// spike reaches a fifth of a radius beyond the nominal size.
+    #[must_use]
+    pub const fn max_radius_scale(self) -> f64 {
+        (self.lobe_base + self.lobe_amp) * (self.bump_base + self.bump_amp)
+    }
+}
+
 /// Asteroid field generation.
 ///
 /// One generator replaces three: `asteroids.js:110` (`createAsteroidField`,
@@ -917,9 +1019,39 @@ pub struct AsteroidFieldRules {
     /// Clearance added to a rock's size when testing an avoidance volume.
     /// `asteroids.js:116` and `server/index.js:543` — both 6.
     pub avoid_margin: f64,
-    /// Collision radius as a fraction of mesh size. `asteroids.js:93`/`:184`
-    /// (`size * 0.95`).
+    /// Collision radius as a fraction of a rock's `size`.
+    ///
+    /// **Divergence resolved — this is what "the hitboxes are not accurate"
+    /// was.** Both JS generators write `size * 0.95` (`asteroids.js:93` and
+    /// `:184`), and 0.95 is a plausible-looking number for a sphere standing in
+    /// for a rock — until you measure it against the rock that is actually
+    /// drawn. [`AsteroidMeshRules`] displaces every vertex to `lobe * bump` of
+    /// the nominal radius, which averages
+    /// [`AsteroidMeshRules::mean_radius_scale`] = **0.7332** and never exceeds
+    /// [`AsteroidMeshRules::max_radius_scale`] = 1.187.
+    ///
+    /// So the 0.95 sphere sat 0.217 of a `size` *outside* the mean drawn
+    /// surface — 22 % of the sphere's radius, and 12 units of invisible wall on
+    /// a 55-unit rock. A ship "hit" a rock it was clearly a ship's width away
+    /// from, and a bullet died in the gap. That is the whole complaint, and it
+    /// is measurable rather than a matter of taste:
+    /// `the_collision_sphere_is_the_drawn_rocks_mean_radius` in
+    /// [`crate::asteroids`] integrates the displacement and pins it.
+    ///
+    /// Set to the mesh's **mean** radius, which is the sphere with as much
+    /// drawn rock outside it as empty space inside it. Not the max (1.187 would
+    /// be a hitbox three times the rock's volume, all of it invisible) and not
+    /// the min (0.36 would let a ship fly through the middle of a rock). A
+    /// single sphere cannot describe a faceted surface that ranges over ±25 %
+    /// of its own radius; it can be centred on it, and that is what this is.
+    ///
+    /// Derived rather than written down, so that changing the mesh moves the
+    /// hitbox with it and the two cannot drift apart again.
     pub collision_radius_scale: f64,
+    /// The displacement that turns a unit icosphere into a rock, which is where
+    /// [`Self::collision_radius_scale`] comes from and what the renderer builds
+    /// its meshes with.
+    pub mesh: AsteroidMeshRules,
     /// Number of deformed-icosahedron meshes a rock can pick from. The index
     /// is simulation state (it must match across clients); the meshes
     /// themselves are render-side. `asteroids.js:126` and
@@ -1032,7 +1164,10 @@ impl WorldRules {
             y_flatten: 0.4,
             place_attempts: 10,
             avoid_margin: 6.0,
-            collision_radius_scale: 0.95,
+            // Was the JS's literal 0.95. See the field's doc comment: that
+            // number was a quarter of a rock bigger than the rock.
+            collision_radius_scale: AsteroidMeshRules::DEFAULT.mean_radius_scale(),
+            mesh: AsteroidMeshRules::DEFAULT,
             variant_count: 6,
             avoid_moon: true,
             trials_counts: [120, 150, 180, 210],
@@ -1851,6 +1986,22 @@ impl Rules {
             field.collision_radius_scale > 0.0,
             "world.asteroid_field.collision_radius_scale",
             "must be positive",
+        )?;
+        check(
+            field.mesh.lobe_amp >= 0.0
+                && field.mesh.lobe_amp < field.mesh.lobe_base
+                && field.mesh.bump_amp >= 0.0
+                && field.mesh.bump_amp < field.mesh.bump_base,
+            "world.asteroid_field.mesh",
+            "each octave's amplitude must be below its base, or a rock can turn \
+             inside out at a vertex",
+        )?;
+        check(
+            field.collision_radius_scale >= field.mesh.min_radius_scale()
+                && field.collision_radius_scale <= field.mesh.max_radius_scale(),
+            "world.asteroid_field.collision_radius_scale",
+            "must lie inside the range of radii the mesh description can draw, \
+             or the hitbox is not standing in for any part of the rock",
         )?;
         check(
             field.avoid_moon,
