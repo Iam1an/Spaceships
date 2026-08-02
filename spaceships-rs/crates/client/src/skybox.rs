@@ -84,6 +84,16 @@ const NEBULAE: [Nebula; 4] = [
     },
 ];
 
+/// The nebula cubemap, kept so it can be put back.
+///
+/// [`crate::terrain`] takes the [`Skybox`] off the camera on the Sierras map —
+/// a starfield over green hills is the wrong sky — and needs the handle again
+/// when the lobby comes back to space. Building it a second time would be a
+/// second megabyte of texture for the identical image, and the seed makes it
+/// identical.
+#[derive(Resource)]
+pub struct NebulaCubemap(pub Handle<Image>);
+
 pub struct SkyboxPlugin;
 
 impl Plugin for SkyboxPlugin {
@@ -112,6 +122,7 @@ fn attach_sky(
     cameras: Query<(Entity, Option<&RenderTarget>), With<Camera3d>>,
 ) {
     let handle = images.add(nebula_cubemap());
+    commands.insert_resource(NebulaCubemap(handle.clone()));
     for (cam, target) in &cameras {
         // `RenderTarget` is a separate component in 0.19, and absent means the
         // default — the primary window. Only an explicit `Image` target is the
