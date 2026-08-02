@@ -1533,6 +1533,91 @@ fn encode_uri_component(s: &str) -> String {
     out
 }
 
+/// Overrides [`api_base_for`] outright. A full base URL, no trailing slash.
+#[cfg(not(target_arch = "wasm32"))]
+const API_ENV: &str = "SPACESHIPS_API";
+
+/// Where the REST endpoints are, given where the socket is.
+///
+/// `api.rs` calls this and nothing else; the asymmetry it encodes is a
+/// *transport* fact and belongs beside [`socket_url`], which is the other half
+/// of it.
+///
+/// # The asymmetry, and the rule that resolves it
+///
+/// `deploy/README.md`: Caddy runs `handle_path /spaceships/*` — which **strips**
+/// the prefix — and a separate `handle /ws`, which does not. So in production
+/// the client calls `/spaceships/api/login` and the server sees `/api/login`,
+/// while the socket is `/ws` at the root. Locally there is no proxy at all, and
+/// `/spaceships/api/*` 404s; `CLAUDE.md` documents that as expected.
+///
+/// The rule here is therefore **an explicit port means no proxy**:
+///
+/// | socket endpoint            | REST base                     |
+/// |----------------------------|-------------------------------|
+/// | `ws://gheat.net/ws`        | `http://gheat.net/spaceships` |
+/// | `ws://127.0.0.1:4000/ws`   | `http://127.0.0.1:4000`       |
+/// | `ws://192.168.1.5:4100/ws` | `http://192.168.1.5:4100`     |
+///
+/// Which is exactly right for both [`ENDPOINTS`] and for a LAN game, because a
+/// game server is reached on its own port and Caddy is reached on 80. It is a
+/// heuristic and it is allowed to be wrong; [`API_ENV`] is the way out, and the
+/// only configuration this needs that the socket did not already need.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+pub fn api_base_for(ws_url: &str) -> String {
+    match std::env::var(API_ENV).ok().filter(|s| !s.is_empty()) {
+        Some(explicit) => explicit.trim_end_matches('/').to_owned(),
+        None => api_base_from_socket(ws_url),
+    }
+}
+
+/// The derivation itself, without the environment override, so it can be
+/// tested on a machine that happens to have [`API_ENV`] set.
+#[cfg(not(target_arch = "wasm32"))]
+fn api_base_from_socket(ws_url: &str) -> String {
+    let (scheme, rest) = match ws_url.strip_prefix("ws://") {
+        Some(rest) => ("http", rest),
+        // Refused later, by name, in `api::split_url` — this only has to not
+        // invent a scheme.
+        None => ("https", ws_url.strip_prefix("wss://").unwrap_or(ws_url)),
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // A port after the *last* colon, so an IPv6 literal in brackets survives.
+    let direct = authority
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
+    if direct {
+        format!("{scheme}://{authority}")
+    } else {
+        format!("{scheme}://{authority}/spaceships")
+    }
+}
+
+/// The browser asks the page instead.
+///
+/// The socket URL is no help here: it is `/ws` at the root by Caddy's own
+/// routing, and carries none of the path the page was served under. So the base
+/// is the page's own directory — `/spaceships/index.html` gives `/spaceships`,
+/// a site root gives the origin — which is right whether the wasm client is
+/// deployed under the prefix or served from a bare static server for a look.
+#[cfg(target_arch = "wasm32")]
+#[must_use]
+pub fn api_base_for(_ws_url: &str) -> String {
+    let Some(window) = web_sys::window() else {
+        return String::new();
+    };
+    let location = window.location();
+    let origin = location.origin().unwrap_or_default();
+    let path = location.pathname().unwrap_or_default();
+    // Everything up to the last `/`: the directory the document is in.
+    let dir = match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
+    };
+    format!("{origin}{}", dir.trim_end_matches('/'))
+}
+
 /// The endpoint and token this platform defaults to.
 #[cfg(not(target_arch = "wasm32"))]
 fn default_endpoint() -> (String, Option<String>) {
@@ -1991,6 +2076,48 @@ mod tests {
         assert_eq!(encode_uri_component("a+b/c=d&e?f"), "a%2Bb%2Fc%3Dd%26e%3Ff");
         // Multi-byte characters go out as UTF-8 octets.
         assert_eq!(encode_uri_component("é"), "%C3%A9");
+    }
+
+    /// The routing asymmetry `deploy/README.md` describes, pinned. Getting this
+    /// wrong is a client that 404s every REST call in production while the
+    /// socket works perfectly, which reads like an auth bug and is not one.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_rest_base_follows_the_proxy_and_not_the_socket() {
+        // Production: Caddy on 80 strips `/spaceships`, so the client must add
+        // it back.
+        assert_eq!(
+            api_base_from_socket(DEFAULT_URL),
+            "http://gheat.net/spaceships"
+        );
+        // A server on its own port has nothing in front of it.
+        assert_eq!(
+            api_base_from_socket("ws://127.0.0.1:4000/ws"),
+            "http://127.0.0.1:4000"
+        );
+        assert_eq!(
+            api_base_from_socket(ENDPOINTS[1]),
+            "http://127.0.0.1:4000",
+            "the lobby's local endpoint is the direct case"
+        );
+        // A LAN party.
+        assert_eq!(
+            api_base_from_socket("ws://192.168.1.5:4100/ws"),
+            "http://192.168.1.5:4100"
+        );
+        // An IPv6 literal keeps its brackets and its port.
+        assert_eq!(
+            api_base_from_socket("ws://[::1]:4000/ws"),
+            "http://[::1]:4000"
+        );
+        assert_eq!(
+            api_base_from_socket("ws://[::1]/ws"),
+            "http://[::1]/spaceships",
+            "no port is still the proxied case"
+        );
+        // `wss://` maps to `https://` rather than to a silently plain scheme;
+        // `api::split_url` is what refuses it, with a reason.
+        assert!(api_base_from_socket("wss://example.com/ws").starts_with("https://"));
     }
 
     #[test]

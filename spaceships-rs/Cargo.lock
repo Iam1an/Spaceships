@@ -5227,12 +5227,14 @@ dependencies = [
  "bevy",
  "futures-util",
  "getrandom 0.3.4",
+ "js-sys",
  "serde_json",
  "spaceships-protocol",
  "spaceships-sim",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

@@ -67,6 +67,7 @@
 //! Controls: `W`/`S` throttle, arrows steer, `A`/`D` roll, `Space` brake/drift,
 //! `Shift` boost.
 
+mod api;
 mod audio;
 mod camera;
 mod cockpit;
@@ -228,6 +229,7 @@ fn main() {
         audio::AudioPlugin,
         hud::HudPlugin,
         net::NetPlugin,
+        api::ApiPlugin,
         weapons::WeaponsPlugin,
         cockpit::CockpitPlugin,
         ui::UiPlugin,

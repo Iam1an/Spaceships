@@ -133,6 +133,16 @@ features = ["webgl2"]
 getrandom = { version = "=0.3.4", default-features = false, features = ["wasm_js"] }
 wasm-bindgen = "=0.2.126"
 
+# ── api.rs, wasm half ────────────────────────────────────────────────────────
+# `window.fetch` returns a `Promise`, and a `Promise` has to be awaited; these
+# two are what turn it into a future the browser's own microtask queue drives.
+# Both are already in the lockfile at these versions (Bevy resolves them), so
+# naming them adds no crate to the graph — and, as with wasm-bindgen above, the
+# versions *must* match what is already there or build-wasm.sh's schema-hash
+# check on the bindgen step fails.
+js-sys = "=0.3.103"
+wasm-bindgen-futures = "=0.4.76"
+
 # ── net.rs, native half ──────────────────────────────────────────────────────
 # The socket runs on one dedicated OS thread with a current-thread tokio
 # runtime; see the `native` module in src/net.rs for why it is not on Bevy's
@@ -167,17 +177,17 @@ futures-util.workspace = true
 # particular *must* match, because build-wasm.sh checks the CLI against the
 # lockfile and a mismatched schema hash fails the bindgen step.
 
-# getrandom has no default backend on wasm32-unknown-unknown; something in the
-# graph (wgpu -> uuid, and bevy's own asset ids) pulls it in. Needs both this
-# feature and `RUSTFLAGS=--cfg getrandom_backend="wasm_js"` at build time — see
-# build-wasm.sh. Missing either produces a link error about
-# `__getrandom_v03_custom` that reads like a Bevy problem and is not one.
-getrandom = { version = "=0.3.4", default-features = false, features = ["wasm_js"] }
+# (A second, identical `getrandom` line used to sit here. It was below the
+# *native* table header rather than the wasm one, so it added a wasm-only
+# dependency to every desktop build — silently, because the `wasm_js` feature
+# compiles to nothing off the web. The real one is up beside `wasm-bindgen`.)
 
-# Every DOM type net.rs touches, named explicitly — web-sys gates all 1700+ of
-# its bindings behind features and compiles only what is asked for.
-# `Window`/`Location`/`Storage` are for deriving the socket URL and the JWT from
-# the page the way `public/src/lobby/net.js` does.
+# Every DOM type net.rs and api.rs touch, named explicitly — web-sys gates all
+# 1700+ of its bindings behind features and compiles only what is asked for.
+# `Window`/`Location`/`Storage` are for deriving the socket URL, the REST base,
+# and the JWT from the page the way `public/src/lobby/net.js` does.
+# `Headers`/`Request`/`RequestInit`/`RequestMode`/`Response` are `api.rs`'s
+# whole transport.
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "=0.3.103"
 features = [
@@ -185,8 +195,13 @@ features = [
   "CloseEvent",
   "ErrorEvent",
   "Event",
+  "Headers",
   "Location",
   "MessageEvent",
+  "Request",
+  "RequestInit",
+  "RequestMode",
+  "Response",
   "Storage",
   "WebSocket",
   "Window",

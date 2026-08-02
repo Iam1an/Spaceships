@@ -96,19 +96,25 @@
 //!
 //! [`ui_focus_system`]: bevy::ui::ui_focus_system
 //!
-//! # Where the data comes from, and where it does not
+//! # Where the data comes from
 //!
-//! Auth, the room list, matchmaking, credits and the leaderboard are all server
-//! state over HTTP and WebSocket. `net.rs` owns the socket and does not expose
-//! an HTTP client, and a second transport here would be the wrong answer, so
-//! **every page reads [`LobbyData`]** — one resource, filled at startup by
-//! [`LobbyData::placeholder`] and marked [`DataSource::Placeholder`]. Wiring it
-//! to the server means writing that resource from somewhere else and flipping
-//! the enum; no page changes. The `FEED` annunciator reads `CACHED` in amber
-//! while the source is placeholder, so a screenshot never lies about it.
+//! Three seams, and this module owns none of them.
 //!
-//! The one thing that *is* wired: [`LaunchRequest`]. See its docs for the
-//! handover `sim_bridge.rs` needs to complete.
+//! - **[`LobbyData`] and [`Account`]**, from `api.rs` over HTTP: the pilot's
+//!   record, the balance, the unlock ladder, the standings, and who is signed
+//!   in. Every page reads the resource; nothing here builds a request. What the
+//!   lobby *does* is write an [`ApiRequest`] — "sign me in", "refresh" — and
+//!   that is the whole of its vocabulary.
+//! - **[`NetSession`]**, from `net.rs` over the socket: the room browser, the
+//!   crew room, the match handover.
+//! - **[`LaunchRequest`]**, outward, to `sim_bridge.rs`.
+//!
+//! This used to be one seam with nothing behind it: `LobbyData` was filled by
+//! its own `placeholder()` and the `FEED` annunciator honestly read `CACHED`
+//! for the life of the process. The placeholder is still there and is still
+//! what the pages show before anything has been fetched — the lamp says which,
+//! in [`DataSource`]'s own words, so a screenshot cannot present invented
+//! numbers as the server's.
 //!
 //! # Seeing the screens
 //!
@@ -124,6 +130,7 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::camera::RenderTarget;
 use bevy::ecs::system::SystemParam;
 use bevy::image::Image;
+use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -141,6 +148,10 @@ use sim::world::{MapKind, Mode};
 
 use spaceships_protocol::ClientMessage;
 
+use crate::api::{
+    unlock_key, Account, ApiRequest, DataSource, LobbyData, CALLSIGN_MAX, CALLSIGN_MIN,
+    PASSWORD_MAX, PASSWORD_MIN,
+};
 use crate::cockpit::ViewMode;
 use crate::net::{
     wire_map, ConnState, NetCommand, NetConfig, NetSession, NetStatus, Phase, ToServer,
@@ -156,10 +167,12 @@ pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
+        // `LobbyData` is *not* inserted here: `api::ApiPlugin` owns it, because
+        // the module that fills a resource should own it and this one only
+        // draws it.
         app.init_resource::<Menu>()
             .init_resource::<Applied>()
             .init_resource::<PreviewSkin>()
-            .insert_resource(LobbyData::placeholder())
             .add_message::<LaunchRequest>()
             .add_message::<ReturnToLobby>()
             .add_systems(Update, reopen_menu)
@@ -168,6 +181,10 @@ impl Plugin for UiPlugin {
             // the page the keyboard acts on.
             .add_systems(Update, follow_session.before(read_input))
             .add_systems(Startup, forced_room)
+            // `PreUpdate`, after `bevy_input` has published the frame's keys
+            // and before any consumer in `Update` reads them. See
+            // [`swallow_typing`] for why it has to be here and not later.
+            .add_systems(PreUpdate, swallow_typing.after(bevy::input::InputSystems))
             .add_plugins(UiMaterialPlugin::<Crt>::default())
             // Chained: the shader has to exist before the material that names
             // it, and the material before the node that draws it.
@@ -1015,12 +1032,17 @@ enum Screen {
     Record,
     /// Squadron standings. Its LEADERBOARD tab.
     Standings,
+    /// Sign in, enlist, or fly as a guest. `#auth-overlay`, which in the JS is
+    /// a modal over everything and here is a page like any other — because a
+    /// guest never has to visit it, and a modal that must be dismissed before
+    /// the game can be seen is the one thing `#auth-overlay` gets wrong.
+    Auth,
     /// Systems configuration. `#settingsPanel`.
     Config,
 }
 
 impl Screen {
-    const ALL: [Screen; 14] = [
+    const ALL: [Screen; 15] = [
         Screen::Boot,
         Screen::Main,
         Screen::Solo,
@@ -1034,6 +1056,7 @@ impl Screen {
         Screen::Livery,
         Screen::Record,
         Screen::Standings,
+        Screen::Auth,
         Screen::Config,
     ];
 
@@ -1056,6 +1079,7 @@ impl Screen {
             Screen::Livery => "LIVERY",
             Screen::Record => "SERVICE RECORD",
             Screen::Standings => "SQUADRON STANDINGS",
+            Screen::Auth => "PILOT AUTHENTICATION",
             Screen::Config => "SYSTEMS",
         }
     }
@@ -1069,7 +1093,7 @@ impl Screen {
             Screen::Solo | Screen::Trials | Screen::Campaign => 1,
             Screen::Net | Screen::Create | Screen::Browser | Screen::Waiting => 2,
             Screen::Armory | Screen::Livery => 3,
-            Screen::Record | Screen::Standings => 4,
+            Screen::Record | Screen::Standings | Screen::Auth => 4,
             Screen::Config => 5,
         })
     }
@@ -1085,7 +1109,7 @@ impl Screen {
             Screen::Create | Screen::Browser => Screen::Net,
             Screen::Waiting => Screen::Net,
             Screen::Livery => Screen::Armory,
-            Screen::Standings => Screen::Record,
+            Screen::Standings | Screen::Auth => Screen::Record,
         })
     }
 
@@ -1102,6 +1126,11 @@ impl Screen {
     }
 
     /// `SPACESHIPS_UI=<name>`.
+    ///
+    /// Only [`forced_screen`] calls it, and that is native-only — the browser
+    /// has no environment. The tests do too, and they are native, so this is an
+    /// `allow` on one target rather than a `cfg` that would hide it from them.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn parse(s: &str) -> Option<Screen> {
         Some(match s.to_ascii_lowercase().as_str() {
             "boot" => Screen::Boot,
@@ -1117,6 +1146,7 @@ impl Screen {
             "livery" | "colours" | "colors" => Screen::Livery,
             "record" | "profile" => Screen::Record,
             "standings" | "leaderboard" => Screen::Standings,
+            "auth" | "login" | "signin" => Screen::Auth,
             "config" | "settings" => Screen::Config,
             _ => return None,
         })
@@ -1227,7 +1257,14 @@ struct Menu {
 
     /// The footer message, and a counter so that re-issuing the same string
     /// still reads as a change to the model.
-    notice: &'static str,
+    ///
+    /// A `String` rather than a `&'static str`, which is what it used to be.
+    /// The footer now also prints things the *server* said — a rejected
+    /// sign-in, a callsign already taken — and those are not known at compile
+    /// time. It still allocates only when something happens: `notice_rev` is
+    /// what [`MenuModel`] watches, and `say` is called on an action, never on a
+    /// frame.
+    notice: String,
     notice_rev: u16,
 
     /// What the socket last reported. See [`NetView`].
@@ -1240,6 +1277,116 @@ struct Menu {
     /// trip; this is the one frame of state that spans it, and
     /// [`follow_session`] sends it the moment [`Phase::Idle`] is reached.
     pending: Option<Pending>,
+
+    /// What the REST client last reported. See [`AccountView`].
+    acct: AccountView,
+    /// What is typed into [`Screen::Auth`]'s two fields.
+    form: AuthForm,
+    /// Whether the cursor is resting on one of those fields, and the keyboard
+    /// is therefore the form's rather than the aircraft's. Written by
+    /// [`read_input`], read by [`swallow_typing`].
+    typing: bool,
+}
+
+/// [`Screen::Auth`]'s two fields.
+///
+/// The only text input in the client. It is deliberately tiny: no caret, no
+/// selection, no clipboard — a callsign is `[A-Za-z0-9]{3,20}` by the server's
+/// own rule and a passphrase is typed once, so what is actually needed is
+/// "append a character" and "remove the last one". Anything more is a text
+/// editor, and a text editor rendered through a barrel-warped CRT shader with
+/// no pointer resolution is not a thing to write casually.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AuthForm {
+    callsign: String,
+    /// Never drawn, never logged, never sent anywhere but `/api/login` and
+    /// `/api/register` over the body of a POST. [`AuthForm::masked`] is what
+    /// reaches a node.
+    secret: String,
+    /// Bumped on every edit. [`MenuModel`] watches this rather than the text,
+    /// which cannot go in a `Copy` model — the same trick as
+    /// [`NetSession::rev`], and it has the pleasant side effect that the
+    /// passphrase never enters the diffing path at all.
+    rev: u16,
+}
+
+impl AuthForm {
+    /// The passphrase as it is drawn.
+    fn masked(&self) -> String {
+        "*".repeat(self.secret.chars().count())
+    }
+
+    /// Whether these credentials are worth sending.
+    ///
+    /// The server's own rules (`server/db.js`'s `registerPilot`), checked here
+    /// so a typo costs no round trip and the reason is specific. The server
+    /// still checks: this is courtesy, not enforcement.
+    fn complaint(&self) -> Option<&'static str> {
+        if self.callsign.chars().count() < CALLSIGN_MIN {
+            Some("CALLSIGN IS 3-20 LETTERS AND DIGITS")
+        } else if self.secret.chars().count() < PASSWORD_MIN {
+            Some("PASSPHRASE IS 6 CHARACTERS OR MORE")
+        } else {
+            None
+        }
+    }
+
+    /// Appends what a key produced, if this field will have it.
+    ///
+    /// Returns whether anything changed, so the caller can bump [`Self::rev`]
+    /// only on a real edit — an arrow key must not mark the menu dirty.
+    fn push(&mut self, field: Field, text: &str) -> bool {
+        let (buffer, max, keep): (&mut String, usize, fn(char) -> bool) = match field {
+            Field::Callsign => (&mut self.callsign, CALLSIGN_MAX, |c: char| {
+                c.is_ascii_alphanumeric()
+            }),
+            // A passphrase is whatever the pilot chose, so the only rule is
+            // that it is printable: control characters here would be a header
+            // or a JSON escape, never a character somebody meant to type.
+            Field::Secret => (&mut self.secret, PASSWORD_MAX, |c: char| {
+                c.is_ascii_graphic() || c == ' '
+            }),
+        };
+        let mut changed = false;
+        for c in text.chars().filter(|c| keep(*c)) {
+            if buffer.chars().count() >= max {
+                break;
+            }
+            buffer.push(c);
+            changed = true;
+        }
+        changed
+    }
+
+    fn backspace(&mut self, field: Field) -> bool {
+        let buffer = match field {
+            Field::Callsign => &mut self.callsign,
+            Field::Secret => &mut self.secret,
+        };
+        buffer.pop().is_some()
+    }
+}
+
+/// Which of [`AuthForm`]'s two fields a control edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Callsign,
+    Secret,
+}
+
+/// The part of [`Account`] the pages colour themselves from.
+///
+/// A `Copy`/`Eq` mirror, for exactly the reason [`NetView`] is one: [`model`]
+/// compares the whole screen as a single value, and a `String` token cannot go
+/// in it. [`follow_session`] is the only writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AccountView {
+    /// [`Account::rev`].
+    rev: u32,
+    signed_in: bool,
+    /// Whether a request is in flight, which is what the auth page shows as
+    /// `WORKING` and what stops a second sign-in being fired over the first.
+    busy: bool,
 }
 
 /// A lobby request that could not go out yet. See [`Menu::pending`].
@@ -1336,10 +1483,13 @@ impl Default for Menu {
             scheme: 0,
             flags: Flag::DEFAULTS,
             volume: [6, 8],
-            notice: "READY",
+            notice: "READY".to_owned(),
             notice_rev: 0,
             net: NetView::default(),
             pending: None,
+            acct: AccountView::default(),
+            form: AuthForm::default(),
+            typing: false,
         }
     }
 }
@@ -1349,9 +1499,32 @@ impl Menu {
         self.focus[self.screen.index()]
     }
 
-    fn say(&mut self, msg: &'static str) {
-        self.notice = msg;
+    fn say(&mut self, msg: impl Into<String>) {
+        self.notice = msg.into();
         self.notice_rev = self.notice_rev.wrapping_add(1);
+    }
+
+    /// Mirrors the socket's view onto the menu.
+    ///
+    /// The one place [`NetView`] is written, and it does one thing besides
+    /// copying: **it keeps the armed sortie inside the list it indexes.** The
+    /// browser is a fixed pool of six rows over a list that changes under it,
+    /// so a refresh that comes back shorter — somebody's room filled up, or
+    /// started — would otherwise leave the selection pointing at a row that has
+    /// just become empty, and `JOIN` would refuse a browser that is visibly
+    /// showing rooms. That is the same failure [`arms_on_focus`] describes,
+    /// arriving from the server's side rather than the cursor's.
+    ///
+    /// Guarded, because an unconditional write would mark [`Menu`] changed
+    /// every frame and defeat [`MenuModel`]'s early out.
+    fn watch(&mut self, view: NetView) {
+        if self.net == view {
+            return;
+        }
+        self.net = view;
+        if self.sortie >= view.rooms {
+            self.sortie = 0;
+        }
     }
 
     fn go(&mut self, screen: Screen) {
@@ -1442,169 +1615,12 @@ const SCHEMES: [&str; 3] = ["MOUSE + KEYS", "KEYBOARD", "GAMEPAD"];
 // The data seam
 // ---------------------------------------------------------------------------
 
-/// Whether [`LobbyData`] came from the server or from this file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DataSource {
-    /// [`LobbyData::placeholder`]. The `FEED` annunciator reads `CACHED`.
-    Placeholder,
-    /// Something wrote the resource from the network. Nothing does yet.
-    #[allow(dead_code)]
-    Live,
-}
-
-/// One pilot's dossier. `GET /api/profile/:username` plus `GET /api/credits`.
-#[derive(Debug, Clone)]
-struct PilotRecord {
-    callsign: String,
-    rank: &'static str,
-    service_no: &'static str,
-    enlisted: &'static str,
-    credits: u32,
-    kills: u32,
-    deaths: u32,
-    matches_won: u32,
-    matches_lost: u32,
-    bots_killed: u32,
-    /// Derived from `games_played` at the nominal five-minute match.
-    flight_minutes: u32,
-    /// `trial1_best`–`trial4_best`, seconds. `None` is "no time set".
-    trial_best: [Option<f32>; 4],
-    /// `campaign{1,2,3}_best_lives`. `None` is "not beaten".
-    campaign_lives: [Option<u8>; 3],
-    campaign_boss_kills: u32,
-    /// Which armory rungs are held, as a bitset over [`ARMORY`].
-    owned: u32,
-}
-
-/// One row of [`Screen::Standings`]. `GET /api/leaderboard`.
-#[derive(Debug, Clone, Copy)]
-struct Standing {
-    callsign: &'static str,
-    rank: &'static str,
-    kills: u32,
-    wins: u32,
-    /// Drawn amber: this is the local pilot.
-    you: bool,
-}
-
-// The room browser's rows and the crew room's seats were once here too, as
-// placeholder tables. They are gone: both are live now and come straight off
-// the socket as `spaceships_protocol::RoomSummary` and `PlayerInfo` — see
-// [`NetSession`], which is the *second* data seam this module reads and the
-// only one that is not placeholder.
-
-/// Everything the pages read that this client does not simulate.
-///
-/// **This is the seam.** No page touches `net.rs`, an HTTP client, or a
-/// database; they read this resource and nothing else. Filling it from the
-/// server is a matter of writing it — from a system reading
-/// `MessageReader<FromServer>` for the WebSocket half, and from whatever
-/// `net.rs` grows for the REST half — and setting [`LobbyData::source`]. No
-/// layout, no builder and no comparison in this module changes.
-#[derive(Resource, Debug, Clone)]
-struct LobbyData {
-    source: DataSource,
-    pilot: PilotRecord,
-    standings: Vec<Standing>,
-}
-
-impl LobbyData {
-    /// Plausible numbers, so the pages can be looked at and judged.
-    ///
-    /// The balance is deliberately mid-ladder: tiers 0 to 2 are held, tier 3 is
-    /// open with one rung out of reach, and everything above it is locked but
-    /// visible. That is all four rung states on one screenshot.
-    fn placeholder() -> LobbyData {
-        LobbyData {
-            source: DataSource::Placeholder,
-            pilot: PilotRecord {
-                // The one placeholder field that is not decoration: it is the
-                // name that goes out with `name` and that every other pilot in
-                // the room reads off a target box. `sim_bridge::MatchSetup`
-                // already takes it from here, so a callsign set once names the
-                // pilot in a solo scoreboard and in a networked room alike.
-                callsign: MatchSetup::from_env().callsign,
-                rank: "FLIGHT LIEUTENANT",
-                service_no: "SR-4471-K",
-                enlisted: "2026-03-11",
-                credits: 5_200,
-                kills: 418,
-                deaths: 261,
-                matches_won: 63,
-                matches_lost: 41,
-                bots_killed: 1_206,
-                flight_minutes: 1_247,
-                trial_best: [Some(92.4), Some(118.7), None, None],
-                campaign_lives: [Some(3), Some(1), None],
-                campaign_boss_kills: 2,
-                // Tiers 0, 1 and 2 cleared, which opens tier 3 — where 8,000
-                // is out of reach and 4,500 and 3,000 are not. That is what
-                // puts held, affordable, unaffordable *and* locked rungs on one
-                // screenshot; a balance that could clear the shop would hide
-                // the exact problem this ladder is fixing.
-                owned: 0b0000_0000_1111_1111,
-            },
-            standings: vec![
-                Standing {
-                    callsign: "VANDAL",
-                    rank: "GRAND ADMIRAL",
-                    kills: 4_120,
-                    wins: 611,
-                    you: false,
-                },
-                Standing {
-                    callsign: "HALCYON",
-                    rank: "FLEET ADMIRAL",
-                    kills: 3_884,
-                    wins: 552,
-                    you: false,
-                },
-                Standing {
-                    callsign: "NOMAD",
-                    rank: "ADMIRAL",
-                    kills: 2_940,
-                    wins: 480,
-                    you: false,
-                },
-                Standing {
-                    callsign: "SABLE",
-                    rank: "COMMODORE",
-                    kills: 2_311,
-                    wins: 402,
-                    you: false,
-                },
-                Standing {
-                    callsign: "IRONSIDE",
-                    rank: "CAPTAIN",
-                    kills: 1_884,
-                    wins: 340,
-                    you: false,
-                },
-                Standing {
-                    callsign: "MERIDIAN",
-                    rank: "COMMANDER",
-                    kills: 1_402,
-                    wins: 288,
-                    you: false,
-                },
-                Standing {
-                    callsign: "PILOT",
-                    rank: "FLIGHT LIEUTENANT",
-                    kills: 418,
-                    wins: 63,
-                    you: true,
-                },
-                Standing {
-                    callsign: "TALLY-HO",
-                    rank: "FLIGHT LIEUTENANT",
-                    kills: 402,
-                    wins: 60,
-                    you: false,
-                },
-            ],
-        }
-    }
-}
+// The data seam itself — `LobbyData`, `PilotRecord`, `Standing`, `DataSource`
+// — lives in `api.rs`, which is the module that fills it. The room browser's
+// rows and the crew room's seats come off the socket instead, as
+// `spaceships_protocol::RoomSummary` and `PlayerInfo`; see [`NetSession`].
+//
+// Nothing below this line knows how either of them arrived.
 
 // ---------------------------------------------------------------------------
 // The armory ladder
@@ -2021,6 +2037,21 @@ enum Action {
     LaunchNet,
     /// `leave`: give the seat up without closing the socket.
     LeaveRoom,
+
+    // -- the account --------------------------------------------------------
+    //
+    // Five more, and the same reasoning as the network seven: `Action` is
+    // `Copy` and `Eq`, and `api::ApiRequest` carries a `String` and is neither.
+    /// Put the caret in one of [`Screen::Auth`]'s two fields.
+    Edit(Field),
+    /// `POST /api/login` with what is typed.
+    SignIn,
+    /// `POST /api/register`, and then sign in with the same credentials.
+    Enlist,
+    /// Drop the token and go back to being a guest.
+    SignOut,
+    /// Re-read the record, the balance, the ladder and the standings.
+    RefreshData,
 }
 
 /// One focusable row, and the entities whose colour expresses its state.
@@ -2112,6 +2143,19 @@ struct MenuModel {
     /// screen**, which is the only thing that draws it — it moves at 20 Hz
     /// while a match runs and belongs to no other page.
     frames: u32,
+    /// [`LobbyData::rev`], which moves whenever a reply lands. The dossier, the
+    /// standings and the trial bests are all behind this one comparison, for
+    /// the same reason the roster is behind `NetView::rev`: none of them is
+    /// `Copy`.
+    data_rev: u32,
+    /// The `FEED` lamp's source, as an index — so a refresh that changed
+    /// nothing but the *provenance* still repaints the lamp.
+    feed: u8,
+    /// Who is signed in. **Zeroed when closed**, like `net`.
+    acct: AccountView,
+    /// [`AuthForm::rev`]. The text itself never enters the model, which is
+    /// incidentally why the passphrase cannot reach a diff.
+    form: u16,
 }
 
 /// The model [`drive_menu`] last wrote. `None` until the first frame, which is
@@ -2191,10 +2235,9 @@ fn model(m: &Menu, data: &LobbyData, net: &NetStatus, now: f32) -> MenuModel {
         ConnState::Retrying => 3,
         ConnState::Failed => 4,
     };
-    // What can raise a caution: no data link, or placeholder data standing in
-    // for the server's.
-    let cautioning =
-        !booting && (net.state != ConnState::Online || data.source == DataSource::Placeholder);
+    // What can raise a caution: no data link, or numbers that are not the
+    // server's current answer — never fetched, or fetched and since gone stale.
+    let cautioning = !booting && (net.state != ConnState::Online || data.source.is_suspect());
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let sweep = if booting {
@@ -2227,6 +2270,15 @@ fn model(m: &Menu, data: &LobbyData, net: &NetStatus, now: f32) -> MenuModel {
         } else {
             0
         },
+        data_rev: data.rev,
+        feed: match data.source {
+            DataSource::Placeholder => 0,
+            DataSource::Public => 1,
+            DataSource::Live => 2,
+            DataSource::Stale => 3,
+        },
+        acct: m.acct,
+        form: m.form.rev,
     }
 }
 
@@ -2271,6 +2323,8 @@ struct MenuNodes {
     detail: [Entity; 4],
     /// Everything the four network pages write. See [`NetNodes`].
     net: NetNodes,
+    /// Everything the pilot's own pages write. See [`DossierNodes`].
+    dossier: DossierNodes,
     controls: Vec<ControlDef>,
     /// Last-applied state byte per control.
     applied: Vec<u8>,
@@ -2305,6 +2359,97 @@ impl NetNodes {
         sortie_rows: [usize::MAX; SORTIE_ROWS],
         launch_row: usize::MAX,
         endpoint_row: usize::MAX,
+    };
+}
+
+/// Rows the standings draw.
+///
+/// `GET /api/leaderboard` returns the top fifty. Ten is what fits on the tube
+/// at a size the phosphor bleed leaves legible, and a scroll view on a CRT is
+/// the wrong instrument — the same reasoning as [`SORTIE_ROWS`]. The rows past
+/// the end of a shorter list are hidden rather than blanked.
+const STANDING_ROWS: usize = 10;
+
+/// The kill-mark tally's pool, one mark per ten kills.
+///
+/// Fixed, and hidden down to the count, because the tree is built once: a
+/// dossier that respawned its marks on every refresh would be the per-frame
+/// churn this module is shaped to avoid, and 70 marks is 700 kills, which is
+/// past `Captain` on the live ladder.
+const KILL_MARKS: usize = 70;
+
+/// Everything the pilot's own pages write.
+///
+/// One struct rather than nine more out-parameters on [`build_pages`], for the
+/// same reason [`NetNodes`] is one. These pages used to be built *once* from
+/// [`LobbyData::placeholder`] and never touched again — which was fine while
+/// the data could not change and is exactly wrong now that it arrives over the
+/// network a second after the page does.
+#[derive(Debug, Clone, Copy)]
+struct DossierNodes {
+    /// [`Screen::Main`]'s callsign and the rank line under it.
+    board_name: Entity,
+    board_line: Entity,
+    /// [`Screen::Record`]'s, likewise.
+    record_name: Entity,
+    record_line: Entity,
+    /// The six numbers in the record's grid, in build order.
+    stats: [Entity; 6],
+    /// The kill-mark pool, shown down to `kills / 10`.
+    marks: [Entity; KILL_MARKS],
+    /// [`Screen::Standings`]'s pool: the row, then its five columns.
+    standings: [StandingNodes; STANDING_ROWS],
+    /// [`Screen::Auth`]: the two field values, and the line that says who is
+    /// signed in.
+    fields: [Entity; 2],
+    identity: Entity,
+    /// Control indices whose *value* is live: the four circuits' best times,
+    /// the three operations' state, and every rung's `HELD`/price/`LOCKED`.
+    trial_rows: [usize; 4],
+    mission_rows: [usize; 3],
+    rung_rows: [usize; ARMORY.len()],
+    /// The seven tier headings, which go dead above the ladder's open tier.
+    tier_captions: [Entity; TIERS.len()],
+}
+
+impl DossierNodes {
+    const EMPTY: DossierNodes = DossierNodes {
+        board_name: Entity::PLACEHOLDER,
+        board_line: Entity::PLACEHOLDER,
+        record_name: Entity::PLACEHOLDER,
+        record_line: Entity::PLACEHOLDER,
+        stats: [Entity::PLACEHOLDER; 6],
+        marks: [Entity::PLACEHOLDER; KILL_MARKS],
+        standings: [StandingNodes::EMPTY; STANDING_ROWS],
+        fields: [Entity::PLACEHOLDER; 2],
+        identity: Entity::PLACEHOLDER,
+        trial_rows: [usize::MAX; 4],
+        mission_rows: [usize::MAX; 3],
+        rung_rows: [usize::MAX; ARMORY.len()],
+        tier_captions: [Entity::PLACEHOLDER; TIERS.len()],
+    };
+}
+
+/// One standings row's writable parts.
+#[derive(Debug, Clone, Copy)]
+struct StandingNodes {
+    /// The row itself, hidden with `Display::None` past the end of the list.
+    root: Entity,
+    position: Entity,
+    callsign: Entity,
+    rank: Entity,
+    kills: Entity,
+    wins: Entity,
+}
+
+impl StandingNodes {
+    const EMPTY: StandingNodes = StandingNodes {
+        root: Entity::PLACEHOLDER,
+        position: Entity::PLACEHOLDER,
+        callsign: Entity::PLACEHOLDER,
+        rank: Entity::PLACEHOLDER,
+        kills: Entity::PLACEHOLDER,
+        wins: Entity::PLACEHOLDER,
     };
 }
 
@@ -2766,6 +2911,7 @@ fn build_menu(
     let mut brief = [Entity::PLACEHOLDER; 3];
     let mut detail = [Entity::PLACEHOLDER; 4];
     let mut net_nodes = NetNodes::EMPTY;
+    let mut dossier = DossierNodes::EMPTY;
 
     // -- the menu itself, rendered into the target --------------------------
     let root = commands
@@ -3026,6 +3172,7 @@ fn build_menu(
                                 &mut brief,
                                 &mut detail,
                                 &mut net_nodes,
+                                &mut dossier,
                                 &menu,
                                 &data,
                             );
@@ -3118,6 +3265,7 @@ fn build_menu(
         brief,
         detail,
         net: net_nodes,
+        dossier,
         controls,
         applied,
     });
@@ -3260,15 +3408,16 @@ fn build_pages(
     brief: &mut [Entity; 3],
     detail: &mut [Entity; 4],
     net: &mut NetNodes,
+    dossier: &mut DossierNodes,
     menu: &Menu,
     data: &LobbyData,
 ) {
+    // The pilot's own numbers are written by `drive_menu` from `LobbyData` the
+    // moment a reply lands, so the strings baked in here are only what is on
+    // screen for the first frame. They are still built from the placeholder
+    // rather than from nothing, because an empty page that fills in a second
+    // later reads as broken and a page that changes reads as live.
     let pilot = &data.pilot;
-    let hours = format!(
-        "{}:{:02}",
-        pilot.flight_minutes / 60,
-        pilot.flight_minutes % 60
-    );
 
     // Every page is the same absolute fill; only one has `Display::Flex`.
     // Vertically centred rather than top-anchored. A page's content is a
@@ -3295,24 +3444,17 @@ fn build_pages(
         .spawn(page(on(Screen::Main)))
         .with_children(|p| {
             p.spawn(page_col(52.0)).with_children(|c| {
-                c.spawn(wordmark(f, &pilot.callsign, 32.0, pal::PHOSPHOR, 9.0));
-                c.spawn(readout(
-                    f,
-                    &format!(
-                        "{}    {} KILLS    {} HRS",
-                        pilot.rank,
-                        thousands(pilot.kills),
-                        hours
-                    ),
-                    10.0,
-                    dim(0.6),
-                ));
+                dossier.board_name = c
+                    .spawn(wordmark(f, &pilot.callsign, 32.0, pal::PHOSPHOR, 9.0))
+                    .id();
+                dossier.board_line = c.spawn(readout(f, "", 10.0, dim(0.6))).id();
                 c.spawn(gap(44.0));
                 for (screen, label) in [
                     (Screen::Solo, "SOLO OPERATIONS"),
                     (Screen::Net, "NETWORK OPERATIONS"),
                     (Screen::Armory, "ARMORY"),
                     (Screen::Record, "SERVICE RECORD"),
+                    (Screen::Auth, "PILOT AUTHENTICATION"),
                     (Screen::Config, "SYSTEMS"),
                 ] {
                     control_row(c, ui, Screen::Main, Action::Go(screen), label, None, 18.0);
@@ -3396,6 +3538,9 @@ fn build_pages(
                         )),
                         18.0,
                     );
+                    // The best time is the pilot's, so it arrives with the
+                    // dossier rather than being known at build time.
+                    dossier.trial_rows[i] = ui.controls.len() - 1;
                 }
                 c.spawn(gap(10.0));
                 c.spawn(hint(f));
@@ -3426,6 +3571,7 @@ fn build_pages(
                         Some(&state),
                         18.0,
                     );
+                    dossier.mission_rows[i] = ui.controls.len() - 1;
                 }
                 c.spawn(gap(10.0));
                 c.spawn(hint(f));
@@ -3678,16 +3824,18 @@ fn build_pages(
                             c.spawn(gap(14.0));
                         }
                         last_tier = rung.tier;
-                        c.spawn(caption(
-                            f,
-                            TIERS[rung.tier as usize],
-                            8.0,
-                            if tier_open(rung.tier, pilot.owned) {
-                                dim(0.55)
-                            } else {
-                                pal::DEAD
-                            },
-                        ));
+                        dossier.tier_captions[rung.tier as usize] = c
+                            .spawn(caption(
+                                f,
+                                TIERS[rung.tier as usize],
+                                8.0,
+                                if tier_open(rung.tier, pilot.owned) {
+                                    dim(0.55)
+                                } else {
+                                    pal::DEAD
+                                },
+                            ))
+                            .id();
                     }
                     let right = match stock(i, data) {
                         Stock::Held => "HELD".to_owned(),
@@ -3704,6 +3852,11 @@ fn build_pages(
                         Some(&right),
                         13.0,
                     );
+                    // Held, priced or locked is the *pilot's* ladder, so it
+                    // arrives with the dossier. Baking it in here and never
+                    // rewriting it is what left a fresh account looking as
+                    // though it owned the first three tiers.
+                    dossier.rung_rows[i] = ui.controls.len() - 1;
                 }
             });
 
@@ -3804,21 +3957,13 @@ fn build_pages(
         .spawn(page(on(Screen::Record)))
         .with_children(|p| {
             p.spawn(page_col(94.0)).with_children(|c| {
-                c.spawn(wordmark(f, &pilot.callsign, 32.0, pal::PHOSPHOR, 9.0));
-                c.spawn(readout(
-                    f,
-                    &format!(
-                        "{}    {}    ENLISTED {}",
-                        pilot.rank, pilot.service_no, pilot.enlisted
-                    ),
-                    10.0,
-                    dim(0.6),
-                ));
+                dossier.record_name = c
+                    .spawn(wordmark(f, &pilot.callsign, 32.0, pal::PHOSPHOR, 9.0))
+                    .id();
+                dossier.record_line = c.spawn(readout(f, "", 10.0, dim(0.6))).id();
                 c.spawn(gap(46.0));
 
                 // Six numbers, no cells, no borders. The grid gaps group them.
-                #[allow(clippy::cast_precision_loss)]
-                let exchange = format!("{:.2}", pilot.kills as f32 / pilot.deaths.max(1) as f32);
                 c.spawn(Node {
                     display: Display::Grid,
                     grid_template_columns: RepeatedGridTrack::flex(3, 1.0),
@@ -3827,25 +3972,20 @@ fn build_pages(
                     ..default()
                 })
                 .with_children(|g| {
-                    for (k, v, colour) in [
-                        ("FLIGHT HOURS", hours.clone(), pal::PHOSPHOR),
-                        ("KILL MARKS", thousands(pilot.kills), pal::AMBER),
-                        ("EXCHANGE", exchange.clone(), pal::WHITE),
-                        (
-                            "SORTIES",
-                            thousands(pilot.matches_won + pilot.matches_lost),
-                            pal::WHITE,
-                        ),
-                        ("BOTS DOWNED", thousands(pilot.bots_killed), pal::WHITE),
-                        (
-                            "CAPITAL KILLS",
-                            thousands(pilot.campaign_boss_kills),
-                            pal::WHITE,
-                        ),
-                    ] {
+                    for (i, (k, colour)) in [
+                        ("FLIGHT HOURS", pal::PHOSPHOR),
+                        ("KILL MARKS", pal::AMBER),
+                        ("EXCHANGE", pal::WHITE),
+                        ("SORTIES", pal::WHITE),
+                        ("BOTS DOWNED", pal::WHITE),
+                        ("CAPITAL KILLS", pal::WHITE),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
                         g.spawn(col(4.0)).with_children(|cell| {
                             cell.spawn(caption(f, k, 8.0, dim(0.4)));
-                            cell.spawn(readout(f, &v, 24.0, colour));
+                            dossier.stats[i] = cell.spawn(readout(f, "0", 24.0, colour)).id();
                         });
                     }
                 });
@@ -3854,10 +3994,15 @@ fn build_pages(
                 // One mark per ten kills, in groups of five: a dossier's tally,
                 // and the only decoration on the page.
                 //
-                // Only the marks earned are drawn. The first pass also drew the
+                // Only the marks earned are shown. The first pass also drew the
                 // unearned ones at low alpha, which under the phosphor bleed
                 // smeared into a single bar and told the pilot nothing.
-                let bars = (pilot.kills / 10).min(70) as usize;
+                //
+                // A **fixed pool**, hidden down to the count, rather than a list
+                // rebuilt per refresh: the tree is built once, and a dossier
+                // that despawned and respawned seventy nodes every time the
+                // balance changed would be the churn this module is shaped to
+                // avoid.
                 c.spawn(Node {
                     flex_direction: FlexDirection::Row,
                     column_gap: px(14),
@@ -3866,20 +4011,24 @@ fn build_pages(
                     ..default()
                 })
                 .with_children(|marks| {
-                    for grp in 0..bars.div_ceil(5) {
+                    for grp in 0..KILL_MARKS.div_ceil(5) {
                         marks.spawn(row(4.0)).with_children(|g| {
                             for i in 0..5usize {
-                                if grp * 5 + i >= bars {
+                                let n = grp * 5 + i;
+                                if n >= KILL_MARKS {
                                     break;
                                 }
-                                g.spawn((
-                                    Node {
-                                        width: px(2),
-                                        height: px(16),
-                                        ..default()
-                                    },
-                                    BackgroundColor(pal::AMBER),
-                                ));
+                                dossier.marks[n] = g
+                                    .spawn((
+                                        Node {
+                                            width: px(2),
+                                            height: px(16),
+                                            display: Display::None,
+                                            ..default()
+                                        },
+                                        BackgroundColor(pal::AMBER),
+                                    ))
+                                    .id();
                             }
                         });
                     }
@@ -3894,11 +4043,32 @@ fn build_pages(
                     None,
                     15.0,
                 );
+                control_row(
+                    c,
+                    ui,
+                    Screen::Record,
+                    Action::Go(Screen::Auth),
+                    "PILOT AUTHENTICATION",
+                    None,
+                    15.0,
+                );
+                control_row(
+                    c,
+                    ui,
+                    Screen::Record,
+                    Action::RefreshData,
+                    "REFRESH",
+                    None,
+                    15.0,
+                );
             });
         })
         .id();
 
     // ---- STANDINGS --------------------------------------------------------
+    //
+    // A fixed pool of ten, for the reason the room browser is one: the tree is
+    // built once. The rows past the end of a shorter list stand down.
     pages[Screen::Standings.index()] = stack
         .spawn(page(on(Screen::Standings)))
         .with_children(|p| {
@@ -3909,37 +4079,99 @@ fn build_pages(
                 ..default()
             })
             .with_children(|c| {
-                for (i, s) in data.standings.iter().enumerate() {
-                    let colour = if s.you {
-                        pal::AMBER
-                    } else {
-                        pal::rgba(0xea_f6_ff, 0.75)
-                    };
-                    c.spawn(row(18.0)).with_children(|r| {
-                        r.spawn(readout(f, &format!("{:>2}", i + 1), 11.0, dim(0.35)));
-                        r.spawn((
-                            caption(f, s.callsign, 14.0, colour),
-                            Node {
-                                width: px(160),
-                                ..default()
-                            },
-                        ));
-                        r.spawn((
-                            readout(f, s.rank, 9.0, dim(0.45)),
-                            Node {
-                                flex_grow: 1.0,
-                                ..default()
-                            },
-                        ));
-                        r.spawn(readout(
-                            f,
-                            &format!("{:>6}", thousands(s.kills)),
-                            11.0,
-                            colour,
-                        ));
-                        r.spawn(readout(f, &format!("{:>5}", s.wins), 11.0, colour));
-                    });
+                for i in 0..STANDING_ROWS {
+                    let mut nodes = StandingNodes::EMPTY;
+                    // One `Node`, not a bundle of two: `row()` *is* a `Node`,
+                    // and a bundle with the same component twice is a panic at
+                    // spawn rather than a compile error.
+                    nodes.root = c
+                        .spawn(Node {
+                            display: Display::None,
+                            ..row(18.0)
+                        })
+                        .with_children(|r| {
+                            nodes.position = r.spawn(readout(f, "", 11.0, dim(0.35))).id();
+                            nodes.callsign = r
+                                .spawn((
+                                    caption(f, "", 14.0, pal::WHITE),
+                                    Node {
+                                        width: px(160),
+                                        ..default()
+                                    },
+                                ))
+                                .id();
+                            nodes.rank = r
+                                .spawn((
+                                    readout(f, "", 9.0, dim(0.45)),
+                                    Node {
+                                        flex_grow: 1.0,
+                                        ..default()
+                                    },
+                                ))
+                                .id();
+                            nodes.kills = r.spawn(readout(f, "", 11.0, pal::WHITE)).id();
+                            nodes.wins = r.spawn(readout(f, "", 11.0, pal::WHITE)).id();
+                        })
+                        .id();
+                    dossier.standings[i] = nodes;
                 }
+            });
+        })
+        .id();
+
+    // ---- AUTH -------------------------------------------------------------
+    //
+    // Two fields and four rows. The JS puts this behind `#auth-overlay`, a modal
+    // that covers the game until it is dismissed; here it is a page like any
+    // other, because a guest never has to come here at all and a wall between a
+    // player and the game they opened is the one thing that overlay gets wrong.
+    pages[Screen::Auth.index()] = stack
+        .spawn(page(on(Screen::Auth)))
+        .with_children(|p| {
+            p.spawn(page_col(56.0)).with_children(|c| {
+                section(c, f, "CREDENTIALS");
+                // The cursor resting on one of these *is* the caret; there is no
+                // second focus model. `control_row`'s value node is what the
+                // typed text goes into, which is why both are registered as
+                // controls rather than drawn as `kv` lines.
+                for (field, label) in [(Field::Callsign, "CALLSIGN"), (Field::Secret, "PASSPHRASE")]
+                {
+                    control_row(
+                        c,
+                        ui,
+                        Screen::Auth,
+                        Action::Edit(field),
+                        label,
+                        Some("_"),
+                        16.0,
+                    );
+                    dossier.fields[field as usize] = ui.controls[ui.controls.len() - 1].value;
+                }
+                c.spawn(gap(8.0));
+                c.spawn(tracked(
+                    f,
+                    "TYPE WITH THE CURSOR ON A FIELD",
+                    8.0,
+                    dim(0.35),
+                    2.4,
+                ));
+                c.spawn(gap(34.0));
+                control_row(c, ui, Screen::Auth, Action::SignIn, "IDENTIFY", None, 17.0);
+                control_row(c, ui, Screen::Auth, Action::Enlist, "ENLIST", None, 15.0);
+                control_row(c, ui, Screen::Auth, Action::SignOut, "SIGN OUT", None, 15.0);
+            });
+            p.spawn(page_col(34.0)).with_children(|c| {
+                section(c, f, "PILOT");
+                dossier.identity = c.spawn(readout(f, "GUEST", 15.0, pal::AMBER)).id();
+                c.spawn(gap(20.0));
+                // Said plainly, because it is the honest answer to "do I have
+                // to do this" and the JS buries it in a link under the form.
+                c.spawn(readout(
+                    f,
+                    "A guest flies everything.\nAn account is what makes\nit count.",
+                    9.0,
+                    dim(0.45),
+                ));
             });
         })
         .id();
@@ -4187,6 +4419,7 @@ impl Pointer<'_, '_> {
 )]
 fn read_input(
     keys: Res<ButtonInput<KeyCode>>,
+    mut typed: MessageReader<KeyboardInput>,
     time: Res<Time>,
     nodes: Option<Res<MenuNodes>>,
     session: Res<NetSession>,
@@ -4197,6 +4430,7 @@ fn read_input(
     mut launch: MessageWriter<LaunchRequest>,
     mut outbox: MessageWriter<ToServer>,
     mut commands: MessageWriter<NetCommand>,
+    mut api: MessageWriter<ApiRequest>,
     mut pointer: Pointer,
     mut audio: ResMut<crate::audio::AudioCommands>,
 ) {
@@ -4280,10 +4514,32 @@ fn read_input(
     // solo brief both describe "the selection", and a cursor that moved without
     // changing it left the two disagreeing — the ladder highlighting one rung
     // while the panel described another.
-    preview(
-        nodes.controls[list[next as usize] as usize].action,
-        &mut menu,
-    );
+    //
+    // Unless the row is dead, which is the whole of [`arms_on_focus`] and the
+    // bug it exists to stop. See there.
+    let def = &nodes.controls[list[next as usize] as usize];
+    let focused = def.action;
+    if arms_on_focus(def, &menu, &data) {
+        preview(focused, &mut menu);
+    }
+
+    // -- typing -------------------------------------------------------------
+    //
+    // The cursor resting on a field *is* the caret: there is one text input in
+    // the whole client and it has no caret model, no selection and no
+    // clipboard. Characters are consumed only while the cursor is on a field,
+    // so `W`/`A`/`S`/`D` are steering everywhere else, exactly as before.
+    let editing = matches!(focused, Action::Edit(_));
+    if menu.typing != editing {
+        menu.typing = editing;
+    }
+    if let Action::Edit(field) = focused {
+        type_into_form(&mut typed, field, &mut menu);
+    } else {
+        // Drained regardless, so a key pressed on another page cannot be
+        // delivered to a field the next time one is focused.
+        typed.clear();
+    }
 
     let was = menu.screen;
     // Cloned rather than borrowed: `apply` takes `&mut LobbyData` (a purchase
@@ -4301,12 +4557,23 @@ fn read_input(
             None => menu.say("NO PAGE BELOW"),
         }
         on_screen_change(was, &mut menu, &mut ops);
-        ops.drain(&mut outbox, &mut commands);
+        ops.drain(&mut outbox, &mut commands, &mut api);
         return;
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter) {
         audio.play(crate::audio::Sfx::UiSelect);
-        fire = Some(nodes.controls[list[next as usize] as usize].action);
+        // `ENTER` in a form means "next field", and in the last field means
+        // "submit" — which is what every login form on earth does, and what a
+        // pilot will try before they think to arrow down to `IDENTIFY`.
+        // Resolved here rather than in `apply`, because it is the *cursor* that
+        // moves and only this function knows the page's cursor order.
+        match focused {
+            Action::Edit(Field::Callsign) => {
+                menu.focus[page] = (next + 1) % n;
+            }
+            Action::Edit(Field::Secret) => fire = Some(Action::SignIn),
+            _ => fire = Some(nodes.controls[list[next as usize] as usize].action),
+        }
     }
 
     if let Some(action) = fire {
@@ -4320,7 +4587,42 @@ fn read_input(
         );
         on_screen_change(was, &mut menu, &mut ops);
     }
-    ops.drain(&mut outbox, &mut commands);
+    ops.drain(&mut outbox, &mut commands, &mut api);
+}
+
+/// Feeds one frame of keystrokes into the focused field.
+///
+/// `logical_key` rather than `key_code`, so the character is the one the
+/// keyboard *layout* produces — a French `AZERTY` and a US `QWERTY` type the
+/// same passphrase — and `text` in preference to it, because that is the field
+/// winit fills for a composed or dead-key sequence.
+///
+/// Only `Pressed` events, and only ones that produced a character:
+/// `Key::Backspace` is handled by name and everything else (`Tab`, `F5`, the
+/// arrows, the modifiers) falls through and is ignored.
+fn type_into_form(typed: &mut MessageReader<KeyboardInput>, field: Field, menu: &mut Menu) {
+    let mut changed = false;
+    for event in typed.read() {
+        if !event.state.is_pressed() {
+            continue;
+        }
+        match &event.logical_key {
+            Key::Backspace => changed |= menu.form.backspace(field),
+            Key::Character(text) => changed |= menu.form.push(field, text),
+            // `Key::Space` is its own variant and does not arrive as a
+            // `Character`, which is a real trap: without this a passphrase with
+            // a space in it silently loses it.
+            Key::Space => changed |= menu.form.push(field, " "),
+            _ => {
+                if let Some(text) = &event.text {
+                    changed |= menu.form.push(field, text);
+                }
+            }
+        }
+    }
+    if changed {
+        menu.form.rev = menu.form.rev.wrapping_add(1);
+    }
 }
 
 /// What a page change costs the socket.
@@ -4341,6 +4643,14 @@ fn on_screen_change(was: Screen, menu: &mut Menu, ops: &mut NetOps) {
         Screen::Browser => {
             ops.open_link();
             menu.pending = Some(Pending::List);
+        }
+        // The four pages that show the server's numbers ask for them on the way
+        // in. Unforced, so `api.rs`'s cooldown makes walking between them one
+        // round trip rather than four — and so a client that never opens any of
+        // them never makes a request at all, which is what keeps a guest's
+        // session genuinely silent.
+        Screen::Record | Screen::Standings | Screen::Armory | Screen::Auth => {
+            ops.ask(ApiRequest::Refresh { force: false });
         }
         _ => {}
     }
@@ -4367,11 +4677,12 @@ fn on_screen_change(was: Screen, menu: &mut Menu, ops: &mut NetOps) {
     }
 }
 
-/// The side effects an [`Action`] can have on the socket.
+/// The side effects an [`Action`] can have on the server — over the socket, and
+/// over HTTP.
 ///
 /// Collected rather than written directly. [`apply`] is called from
 /// [`read_input`] *and* from this module's tests, and a `MessageWriter` cannot
-/// be built without a `World` — so the actions push onto these two vectors and
+/// be built without a `World` — so the actions push onto these three vectors and
 /// the caller drains them. It also keeps the ordering obvious: every frame's
 /// commands go out after every frame's decisions, never interleaved with them.
 struct NetOps<'a> {
@@ -4382,6 +4693,9 @@ struct NetOps<'a> {
     callsign: &'a str,
     send: Vec<ClientMessage>,
     commands: Vec<NetCommand>,
+    /// REST requests, for `api.rs` to turn into HTTP. The lobby never builds a
+    /// request; it says what it wants.
+    api: Vec<ApiRequest>,
 }
 
 impl<'a> NetOps<'a> {
@@ -4392,11 +4706,16 @@ impl<'a> NetOps<'a> {
             callsign,
             send: Vec::new(),
             commands: Vec::new(),
+            api: Vec::new(),
         }
     }
 
     fn send(&mut self, msg: ClientMessage) {
         self.send.push(msg);
+    }
+
+    fn ask(&mut self, request: ApiRequest) {
+        self.api.push(request);
     }
 
     /// Asks for a socket, and makes sure the name that goes out with it is the
@@ -4411,14 +4730,54 @@ impl<'a> NetOps<'a> {
         self.commands.push(NetCommand::Connect);
     }
 
-    fn drain(self, out: &mut MessageWriter<ToServer>, cmds: &mut MessageWriter<NetCommand>) {
+    fn drain(
+        self,
+        out: &mut MessageWriter<ToServer>,
+        cmds: &mut MessageWriter<NetCommand>,
+        api: &mut MessageWriter<ApiRequest>,
+    ) {
         for cmd in self.commands {
             cmds.write(cmd);
         }
         for msg in self.send {
             out.write(ToServer(msg));
         }
+        for request in self.api {
+            api.write(request);
+        }
     }
+}
+
+/// Whether moving the cursor onto this control should arm what it names.
+///
+/// # The bug this is
+///
+/// *"I can see my friend's lobby but I can't physically join it."*
+///
+/// [`Screen::Browser`] is a **fixed pool of six rows** — the tree is built once,
+/// so the browser cannot grow — and the rows past the end of the live list read
+/// dead. `JOIN` sits below all six. So reaching it from the keyboard means
+/// arrowing *through* the five empty rows, and every one of them armed itself
+/// on the way past, because [`preview`] was called on whatever the cursor
+/// landed on. By the time the cursor reached `JOIN`, [`Menu::sortie`] was `5` —
+/// an empty slot — and `Action::JoinSortie` looked up row 5 of a one-room list,
+/// found nothing, and said `NO SUCH SORTIE`.
+///
+/// The room was on screen the whole time, on row 0, exactly as the player said.
+///
+/// It is also why it looked intermittent: a mouse that jumps straight to `JOIN`
+/// never crosses the empty rows, so clicking worked and arrowing did not.
+///
+/// The rule, therefore: **a row that reads dead cannot be armed**, which is the
+/// `disabled` flag [`control_state`] already computes and paints from. One
+/// definition of "this row is not a row" now serves the paint, the arming, and
+/// [`apply`]'s refusal, so they cannot disagree again. A locked circuit or
+/// operation behaves the same way — the cursor may rest on it, but the armed
+/// tasking stays whatever was last actually chosen, which is what the brief
+/// beside it goes on describing.
+fn arms_on_focus(def: &ControlDef, menu: &Menu, data: &LobbyData) -> bool {
+    let (_, disabled, _) = control_state(def, menu, data);
+    !disabled
 }
 
 /// Moves the selection a control stands for, without the side effects of
@@ -4545,6 +4904,14 @@ fn apply(
             menu.say("SCHEME SET");
         }
         Action::SetSortie(s) => {
+            // `ENTER` on an empty slot is the same mistake the cursor used to
+            // make on its way past one — see [`arms_on_focus`]. Refuse it here
+            // too, so there is no route by which the armed sortie is a row that
+            // is not there.
+            if usize::from(s) >= ops.session.rooms.len() {
+                menu.say("NO SUCH SORTIE");
+                return;
+            }
             menu.sortie = s;
             menu.say("ORDER SELECTED");
         }
@@ -4580,19 +4947,77 @@ fn apply(
             *v = if *v >= 10 { 0 } else { *v + 1 };
             menu.say("LEVEL SET");
         }
+        // Requisition is the one action that spends something real, so it is
+        // the one that must not be optimistic. The balance moves when the
+        // *server* says it did — `api.rs` writes it back out of the reply — and
+        // this only asks.
         Action::Requisition => {
             let i = menu.item as usize;
             match stock(i, data) {
-                Stock::Available => {
-                    data.pilot.credits -= ARMORY[i].cost;
-                    data.pilot.owned |= 1 << i;
-                    menu.say("REQUISITION APPROVED");
-                }
+                Stock::Available => match unlock_key(i) {
+                    Some(feature) => {
+                        ops.ask(ApiRequest::Unlock(feature));
+                        menu.say("REQUISITIONING");
+                    }
+                    // Eleven of the sixteen rungs are `BACKLOG.md`'s planned
+                    // ladder and have no column in `pilots.db`. Charging real
+                    // credits for a bit that exists only in this process would
+                    // be worse than refusing, and pretending it worked until
+                    // the next refresh silently un-bought it would be worse
+                    // still. See `api::UNLOCKS`.
+                    None => menu.say("NOT IN SERVICE"),
+                },
                 Stock::Held => menu.say("ALREADY HELD"),
                 Stock::Short => menu.say("INSUFFICIENT BALANCE"),
                 Stock::Locked => menu.say("TIER NOT CLEARED"),
             }
         }
+
+        // -- the account ----------------------------------------------------
+        //
+        // Nothing here touches a token or a URL: `api.rs` owns both, and the
+        // lobby's whole vocabulary is these four requests.
+        Action::Edit(_) => {
+            // Typing is not an activation — [`type_into_form`] handles it while
+            // the cursor rests here. `ENTER` is caught in `read_input` before it
+            // reaches this arm, so this is only reached by a click on the row.
+            menu.say("TYPE, THEN SELECT IDENTIFY");
+        }
+        Action::SignIn | Action::Enlist => {
+            if menu.acct.busy {
+                menu.say("WORKING");
+                return;
+            }
+            if let Some(complaint) = menu.form.complaint() {
+                menu.say(complaint);
+                return;
+            }
+            let username = menu.form.callsign.clone();
+            let password = std::mem::take(&mut menu.form.secret);
+            // Cleared the moment it is handed over, so it lives in the menu for
+            // as few frames as possible and a screenshot of a paused lobby can
+            // never contain it.
+            menu.form.rev = menu.form.rev.wrapping_add(1);
+            if action == Action::Enlist {
+                ops.ask(ApiRequest::Enlist { username, password });
+                menu.say("ENLISTING");
+            } else {
+                ops.ask(ApiRequest::SignIn { username, password });
+                menu.say("IDENTIFYING");
+            }
+        }
+        Action::SignOut => {
+            if menu.acct.signed_in {
+                ops.ask(ApiRequest::SignOut);
+            } else {
+                menu.say("NO PILOT SIGNED IN");
+            }
+        }
+        Action::RefreshData => {
+            ops.ask(ApiRequest::Refresh { force: true });
+            menu.say("REFRESHING");
+        }
+
         Action::Execute => execute(menu, data, setup, launch),
     }
 }
@@ -4699,6 +5124,7 @@ fn forced_room_code() -> Option<String> {
 fn follow_session(
     mut session: ResMut<NetSession>,
     data: Res<LobbyData>,
+    mut account: ResMut<Account>,
     mut config: ResMut<NetConfig>,
     mut menu: ResMut<Menu>,
     mut outbox: MessageWriter<ToServer>,
@@ -4707,14 +5133,31 @@ fn follow_session(
         config.callsign.clone_from(&data.pilot.callsign);
     }
 
-    let view = NetView::of(&session);
-    if menu.net != view {
-        menu.net = view;
+    menu.watch(NetView::of(&session));
+
+    // The account's mirror, on the same terms as the session's: guarded, so an
+    // unchanged account marks nothing dirty.
+    let acct = AccountView {
+        rev: account.rev,
+        signed_in: account.signed_in(),
+        busy: account.busy > 0,
+    };
+    if menu.acct != acct {
+        menu.acct = acct;
     }
 
-    // The server's own words, as one of this module's static strings. The
-    // footer is `&'static str` by design — a `String` there would allocate on
-    // every notice — and there are exactly two errors `server/index.js` emits.
+    // What the REST client had to say. Passed through as the server wrote it —
+    // "Callsign already taken", "Invalid callsign or password" — because those
+    // are the two messages a pilot signing in actually needs, and paraphrasing
+    // them into one house string would hide which of the two happened. This is
+    // why [`Menu::notice`] is a `String`.
+    if let Some(message) = account.take_notice() {
+        menu.say(message);
+    }
+
+    // The socket's errors are a closed set, so they *are* paraphrased: there
+    // are exactly two `server/index.js` emits, and both read better as the
+    // lobby's own words.
     if let Some(message) = session.take_notice() {
         menu.say(match message.as_str() {
             "Room not found" => "NO SUCH SORTIE",
@@ -4767,6 +5210,68 @@ fn advance_boot(time: Res<Time>, mut menu: ResMut<Menu>) {
     if time.elapsed_secs() - menu.opened_at >= BOOT_LINES as f32 * BOOT_STEP + BOOT_HOLD {
         menu.screen = Screen::Main;
         menu.say("READY");
+    }
+}
+
+/// Keys the display navigates with, which a text field must not swallow.
+///
+/// Everything else is a character while a field has the cursor. See
+/// [`swallow_typing`].
+const NAVIGATION_KEYS: [KeyCode; 7] = [
+    KeyCode::Enter,
+    KeyCode::NumpadEnter,
+    KeyCode::Escape,
+    KeyCode::ArrowUp,
+    KeyCode::ArrowDown,
+    KeyCode::ArrowLeft,
+    KeyCode::ArrowRight,
+];
+
+/// While a field has the cursor, the keyboard belongs to the form and to
+/// nothing else.
+///
+/// # The bug this is
+///
+/// Typing a passphrase pressed every hotkey in it. `L` toggles fullscreen
+/// (`input.rs`), `V` toggles the cockpit view (`cockpit.rs`), and both read
+/// `ButtonInput<KeyCode>` directly with no idea a lobby exists — so
+/// `hello` went fullscreen twice and `viper` seated the pilot in a cockpit
+/// behind the menu.
+///
+/// The arbitration belongs here for the same reason [`hold_the_stick`]'s and
+/// [`release_the_pointer`]'s do: those modules have no reason to know about a
+/// lobby, and [`LobbyOpen`] is this module's *export*, not its import. What is
+/// different is that this one cannot be done by zeroing an output afterwards —
+/// a fullscreen toggle has already happened by then — so it consumes the press
+/// instead, in `PreUpdate`, immediately after `bevy_input` publishes it and
+/// before any consumer in `Update` runs.
+///
+/// It clears **everything except [`NAVIGATION_KEYS`]** rather than a list of
+/// known hotkeys, so a hotkey added anywhere in this crate tomorrow is
+/// suppressed without anyone remembering to come back here.
+///
+/// `Menu::typing` is one frame old — [`read_input`] sets it in `Update`. That
+/// is the frame the cursor *arrives* on a field, on which nothing has been
+/// typed yet.
+fn swallow_typing(menu: Res<Menu>, mut keys: ResMut<ButtonInput<KeyCode>>) {
+    if !menu.open || !menu.typing {
+        return;
+    }
+    let swallowed: Vec<KeyCode> = keys
+        .get_just_pressed()
+        .copied()
+        .filter(|k| !NAVIGATION_KEYS.contains(k))
+        .collect();
+    // Guarded: an unchanged `ButtonInput` must not be marked dirty every frame
+    // the cursor happens to rest on a field.
+    if swallowed.is_empty() {
+        return;
+    }
+    for key in swallowed {
+        keys.clear_just_pressed(key);
+        // Released as well as un-pressed, so a held key cannot leave a consumer
+        // that reads `pressed` (rather than `just_pressed`) stuck down.
+        keys.release(key);
     }
 }
 
@@ -4880,6 +5385,7 @@ fn drive_menu(
     time: Res<Time>,
     menu: Res<Menu>,
     data: Res<LobbyData>,
+    account: Res<Account>,
     net: Res<NetStatus>,
     session: Res<NetSession>,
     config: Res<NetConfig>,
@@ -5043,9 +5549,32 @@ fn drive_menu(
         });
     }
 
+    // -- the pilot's own pages ----------------------------------------------
+    //
+    // One guard for the mission board's header, the service record, the
+    // standings, the circuits and the operations: `LobbyData::rev` moves
+    // whenever any reply lands, and `screen` covers walking onto a page whose
+    // numbers have not changed since it was last looked at. Every write inside
+    // goes through `set_text`, which takes the `Mut` only when the string
+    // actually differs — so a refresh that returned the same dossier costs
+    // comparisons and no component writes at all.
+    if moved!(data_rev, screen, acct, feed) {
+        write_dossier(
+            &nodes,
+            &data,
+            &account,
+            &mut q_node,
+            &mut q_text,
+            &mut q_colour,
+        );
+    }
+    if moved!(form, screen, focus) {
+        write_auth_fields(&nodes, &menu, &mut q_text);
+    }
+
     // -- footer -------------------------------------------------------------
     if moved!(notice) {
-        set_text(&mut q_text, nodes.notice, || menu.notice.to_owned());
+        set_text(&mut q_text, nodes.notice, || menu.notice.clone());
     }
     if moved!(clock) {
         set_text(&mut q_text, nodes.clock, || {
@@ -5208,6 +5737,176 @@ fn page_to_hide(prev: Option<MenuModel>) -> Option<usize> {
     }
 }
 
+/// Writes the pilot's own pages from [`LobbyData`].
+///
+/// The mission board's header, the service record, the standings, the circuits'
+/// best times and the operations' state. All of it used to be baked into the
+/// tree at startup from [`LobbyData::placeholder`] and never touched again,
+/// which was fine while the numbers could not change; now they arrive over the
+/// network a second after the page does, and this is what puts them on it.
+// One query per component type written, on the same terms as
+// `write_network_pages`: the alternative is four systems reading the same
+// resource behind four copies of the same guard.
+fn write_dossier(
+    nodes: &MenuNodes,
+    data: &LobbyData,
+    account: &Account,
+    q_node: &mut Query<&mut Node>,
+    q_text: &mut Query<&mut Text>,
+    q_colour: &mut Query<&mut TextColor>,
+) {
+    let d = &nodes.dossier;
+    let p = &data.pilot;
+    let hours = format!("{}:{:02}", p.flight_minutes / 60, p.flight_minutes % 60);
+    let name = p.callsign.to_ascii_uppercase();
+
+    // -- the mission board's header -----------------------------------------
+    set_text(q_text, d.board_name, || name.clone());
+    set_text(q_text, d.board_line, || {
+        format!(
+            "{}    {} KILLS    {} HRS",
+            p.rank.to_ascii_uppercase(),
+            thousands(p.kills),
+            hours
+        )
+    });
+
+    // -- the service record -------------------------------------------------
+    set_text(q_text, d.record_name, || name.clone());
+    set_text(q_text, d.record_line, || {
+        format!(
+            "{}    K/D {}    ENLISTED {}",
+            p.rank.to_ascii_uppercase(),
+            p.kdr,
+            p.enlisted
+        )
+    });
+    #[allow(clippy::cast_precision_loss)]
+    let exchange = format!("{:.2}", p.kills as f32 / p.deaths.max(1) as f32);
+    let stats = [
+        hours,
+        thousands(p.kills),
+        exchange,
+        thousands(p.matches_won + p.matches_lost),
+        thousands(p.bots_killed),
+        thousands(p.campaign_boss_kills),
+    ];
+    for (node, value) in d.stats.iter().zip(stats) {
+        set_text(q_text, *node, || value);
+    }
+    let marks = (p.kills / 10).min(KILL_MARKS as u32) as usize;
+    for (i, &mark) in d.marks.iter().enumerate() {
+        set_display(q_node, mark, i < marks);
+    }
+
+    // -- the standings ------------------------------------------------------
+    for (i, row) in d.standings.iter().enumerate() {
+        let entry = data.standings.get(i);
+        set_display(q_node, row.root, entry.is_some());
+        let Some(s) = entry else { continue };
+        let colour = if s.you {
+            pal::AMBER
+        } else {
+            pal::rgba(0xea_f6_ff, 0.75)
+        };
+        set_text(q_text, row.position, || format!("{:>2}", i + 1));
+        set_text(q_text, row.callsign, || s.callsign.to_ascii_uppercase());
+        set_text(q_text, row.rank, || s.rank.to_ascii_uppercase());
+        set_text(q_text, row.kills, || format!("{:>6}", thousands(s.kills)));
+        set_text(q_text, row.wins, || format!("{:>5}", s.wins));
+        set(q_colour, row.callsign, TextColor(colour));
+        set(q_colour, row.kills, TextColor(colour));
+        set(q_colour, row.wins, TextColor(colour));
+    }
+
+    // -- the circuits and the operations ------------------------------------
+    for (i, &control) in d.trial_rows.iter().enumerate() {
+        if control == usize::MAX {
+            continue;
+        }
+        set_text(q_text, nodes.controls[control].value, || {
+            format!(
+                "{:>2} CP     {}",
+                [12, 14, 16, 18][i],
+                fmt_trial(p.trial_best[i])
+            )
+        });
+    }
+    for (i, &control) in d.mission_rows.iter().enumerate() {
+        if control == usize::MAX {
+            continue;
+        }
+        set_text(q_text, nodes.controls[control].value, || {
+            match p.campaign_lives[i] {
+                Some(l) => format!("{l} OF 3 LIVES"),
+                None => "NOT FLOWN".to_owned(),
+            }
+        });
+    }
+
+    // -- the armory ladder --------------------------------------------------
+    //
+    // The rungs' right-hand column and the tier headings are the pilot's own
+    // ladder, not a fixed table: a fresh account holds nothing, and this page
+    // read as though it held the first three tiers for as long as it was built
+    // once from the placeholder and never written again.
+    for (i, &control) in d.rung_rows.iter().enumerate() {
+        if control == usize::MAX {
+            continue;
+        }
+        set_text(q_text, nodes.controls[control].value, || {
+            match stock(i, data) {
+                Stock::Held => "HELD".to_owned(),
+                Stock::Locked => "LOCKED".to_owned(),
+                _ => thousands(ARMORY[i].cost),
+            }
+        });
+    }
+    for (tier, &caption) in d.tier_captions.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let open = tier_open(tier as u8, p.owned);
+        set(
+            q_colour,
+            caption,
+            TextColor(if open { dim(0.55) } else { pal::DEAD }),
+        );
+    }
+
+    // -- who is signed in ---------------------------------------------------
+    set_text(q_text, d.identity, || match &account.username {
+        Some(who) => who.to_ascii_uppercase(),
+        None => "GUEST".to_owned(),
+    });
+    set(
+        q_colour,
+        d.identity,
+        TextColor(if account.signed_in() {
+            pal::PHOSPHOR
+        } else {
+            pal::AMBER
+        }),
+    );
+}
+
+/// Writes what is typed into [`Screen::Auth`]'s two fields.
+///
+/// Separate from [`write_dossier`] and behind its own guard, because it moves on
+/// every keystroke while the dossier moves once a refresh — and because the
+/// passphrase must reach exactly one node and nothing else. It is never in
+/// [`MenuModel`], never in a log line, and never drawn: [`AuthForm::masked`] is
+/// what comes out of here.
+fn write_auth_fields(nodes: &MenuNodes, menu: &Menu, q_text: &mut Query<&mut Text>) {
+    let caret = |s: String| if s.is_empty() { "_".to_owned() } else { s };
+    set_text(
+        q_text,
+        nodes.dossier.fields[Field::Callsign as usize],
+        || caret(menu.form.callsign.to_ascii_uppercase()),
+    );
+    set_text(q_text, nodes.dossier.fields[Field::Secret as usize], || {
+        caret(menu.form.masked())
+    });
+}
+
 /// Writes the four network pages from [`NetSession`].
 ///
 /// Split out of [`drive_menu`] because it is the one block that reads a
@@ -5233,8 +5932,13 @@ fn write_network_pages(
         config.endpoint_label().to_ascii_uppercase()
     });
     set_text(q_text, net.link_values[1], || {
-        // "Guest" is what the server calls a connection with no token, and it
-        // is the only identity this client has until the REST half lands.
+        // "Guest" is what the server calls a connection with no token. This
+        // reads `NetConfig::token` rather than `Account`, deliberately: it is
+        // the `DATA LINK` panel, and what it must report is what *the socket*
+        // is presenting — which is the token as of the last handshake, not the
+        // one a sign-in acquired a moment ago. The two are reconciled by
+        // `api::push_token_to_socket`, and until the reconnect lands this row
+        // is right to say the link is still a guest's.
         let who = config.callsign.to_ascii_uppercase();
         if config.token.is_some() {
             format!("{who}  AUTH")
@@ -5368,9 +6072,25 @@ fn control_state(def: &ControlDef, menu: &Menu, data: &LobbyData) -> (bool, bool
         }
         Action::Toggle(flag) => (menu.flags[flag as usize], false, false),
         Action::Requisition => {
-            let st = stock(usize::from(menu.item), data);
-            (false, st != Stock::Available, false)
+            let i = usize::from(menu.item);
+            let st = stock(i, data);
+            // Dead for a rung the server has never heard of, as well as for one
+            // that cannot be afforded — so the row says "no" before it is
+            // pressed rather than after. See `api::UNLOCKS`.
+            (
+                false,
+                st != Stock::Available || unlock_key(i).is_none(),
+                false,
+            )
         }
+        // A field is never "selected"; the cursor resting on it *is* the caret,
+        // which is the whole of this form's input model.
+        Action::Edit(_) => (false, false, false),
+        // Both are dead while a request is in flight, so a second `ENTER` on a
+        // slow link cannot queue a second sign-in behind the first.
+        Action::SignIn | Action::Enlist => (false, menu.acct.busy, false),
+        Action::SignOut => (false, !menu.acct.signed_in, false),
+        Action::RefreshData => (false, menu.acct.busy, false),
         Action::Execute | Action::Volume(_) => (false, false, false),
     }
 }
@@ -5451,12 +6171,21 @@ fn lamp_states(
         // is up.
         _ => (dim(0.4), "OFFLINE"),
     };
-    let feed = if data.source == DataSource::Placeholder {
-        // Blinks with the caution phase, so a screenshot cannot quietly present
-        // placeholder numbers as the server's.
-        (if m.caution { pal::AMBER } else { dim(0.4) }, "CACHED")
+    // The lamp says, in [`DataSource`]'s own words, where the numbers on the
+    // page came from: `CACHED` for this file's invented ones, `PUBLIC` for the
+    // leaderboard with no account behind it, `LIVE` for a signed-in pilot's,
+    // and `STALE` for real numbers a later refresh failed to renew. The two
+    // that are not the server's current answer blink with the caution phase, so
+    // a screenshot cannot quietly present them as if they were.
+    let feed = if data.source.is_suspect() {
+        (
+            if m.caution { pal::AMBER } else { dim(0.4) },
+            data.source.label(),
+        )
+    } else if data.source == DataSource::Public {
+        (pal::CYAN, data.source.label())
     } else {
-        (pal::PHOSPHOR, "LIVE")
+        (pal::PHOSPHOR, data.source.label())
     };
     let adv = if menu.hard {
         (pal::RED, "HARD")
@@ -6346,22 +7075,32 @@ mod tests {
     /// The same, plus the frames and commands the socket would have been
     /// handed. `apply` collects those into [`NetOps`] rather than writing them,
     /// precisely so a test can read them without a running app.
-    fn activate_online(
+    /// Everything one activation produced.
+    ///
+    /// [`activate`] and [`activate_online`] are narrower views onto this, kept
+    /// because the tests that predate the REST half read better without four
+    /// ignored bindings apiece.
+    struct Fired {
+        launched: Vec<LaunchRequest>,
+        sent: Vec<ClientMessage>,
+        commands: Vec<NetCommand>,
+        api: Vec<ApiRequest>,
+        setup: MatchSetup,
+        data: LobbyData,
+    }
+
+    fn fire_action(
         action: Action,
         menu: &mut Menu,
         session: &NetSession,
-    ) -> (
-        (MatchSetup, Vec<LaunchRequest>),
-        Vec<ClientMessage>,
-        Vec<NetCommand>,
-    ) {
+        mut data: LobbyData,
+    ) -> Fired {
         use bevy::ecs::message::Messages;
         use bevy::ecs::system::SystemState;
 
         let mut world = World::new();
         world.init_resource::<Messages<LaunchRequest>>();
         let mut state: SystemState<MessageWriter<LaunchRequest>> = SystemState::new(&mut world);
-        let mut data = LobbyData::placeholder();
         let mut setup = MatchSetup::default();
         let mut config = NetConfig::default();
         let callsign = data.pilot.callsign.clone();
@@ -6371,11 +7110,30 @@ mod tests {
             apply(action, menu, &mut data, &mut setup, &mut launch, &mut ops);
         }
         state.apply(&mut world);
-        let sent = world
-            .resource_mut::<Messages<LaunchRequest>>()
-            .drain()
-            .collect();
-        ((setup, sent), ops.send, ops.commands)
+        Fired {
+            launched: world
+                .resource_mut::<Messages<LaunchRequest>>()
+                .drain()
+                .collect(),
+            sent: ops.send,
+            commands: ops.commands,
+            api: ops.api,
+            setup,
+            data,
+        }
+    }
+
+    fn activate_online(
+        action: Action,
+        menu: &mut Menu,
+        session: &NetSession,
+    ) -> (
+        (MatchSetup, Vec<LaunchRequest>),
+        Vec<ClientMessage>,
+        Vec<NetCommand>,
+    ) {
+        let out = fire_action(action, menu, session, LobbyData::placeholder());
+        ((out.setup, out.launched), out.sent, out.commands)
     }
 
     /// The complaint, as a test: choosing a mode has to *be* the launch.
@@ -6537,6 +7295,632 @@ mod tests {
         assert!(sent.is_empty());
         assert_eq!(menu.pending, None);
         assert_eq!(menu.notice, "NO SUCH SORTIE");
+    }
+
+    /// The browser page's controls, in the order the cursor visits them: six
+    /// sortie rows, `REFRESH`, `JOIN`.
+    fn browser_controls() -> Vec<ControlDef> {
+        let def = |action| ControlDef {
+            screen: Screen::Browser,
+            action,
+            root: Entity::PLACEHOLDER,
+            tick: Entity::PLACEHOLDER,
+            label: Entity::PLACEHOLDER,
+            value: Entity::PLACEHOLDER,
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let mut out: Vec<ControlDef> = (0..SORTIE_ROWS as u8)
+            .map(|i| def(Action::SetSortie(i)))
+            .collect();
+        out.push(def(Action::Refresh));
+        out.push(def(Action::JoinSortie));
+        out
+    }
+
+    /// **The regression.** Arrowing down to `JOIN` must not re-arm the
+    /// selection to the last empty row it passed.
+    ///
+    /// Reported as *"I can see my friend's lobby but I can't physically join
+    /// it"*: one room on row 0, `JOIN` seven rows below it, and every empty row
+    /// between them arming itself as the cursor went past. `JOIN` then looked
+    /// up row 5 of a one-room list and refused. See [`arms_on_focus`].
+    ///
+    /// This walks the cursor exactly as `read_input` does — the same
+    /// `arms_on_focus` gate, the same `preview` — because the seam that failed
+    /// is the arming rule, not the join itself.
+    #[test]
+    fn arrowing_down_to_join_keeps_the_room_that_is_there() {
+        let session = NetSession {
+            rooms: vec![room("KILO", "HALCYON", 4)],
+            ..NetSession::default()
+        };
+        let data = LobbyData::placeholder();
+        let controls = browser_controls();
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Browser,
+            ..Menu::default()
+        };
+        menu.watch(NetView::of(&session));
+
+        // Step onto every row in turn, all the way to `JOIN`.
+        for (slot, def) in controls.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                menu.focus[Screen::Browser.index()] = slot as u8;
+            }
+            if arms_on_focus(def, &menu, &data) {
+                preview(def.action, &mut menu);
+            }
+        }
+
+        assert_eq!(
+            menu.sortie, 0,
+            "the cursor armed an empty row on its way to JOIN"
+        );
+        let (_, sent, _) = activate_online(Action::JoinSortie, &mut menu, &session);
+        assert!(sent.is_empty(), "join waits for the link");
+        assert_eq!(
+            menu.pending,
+            Some(Pending::Join("KILO".to_owned())),
+            "JOIN did not carry the only room on screen"
+        );
+    }
+
+    /// A row that is really there still arms on the way past, so the fix is a
+    /// gate rather than a blanket refusal to preview.
+    #[test]
+    fn a_live_browser_row_still_arms_itself() {
+        let session = NetSession {
+            rooms: vec![room("KILO", "HALCYON", 4), room("ZULU", "SABLE", 2)],
+            ..NetSession::default()
+        };
+        let data = LobbyData::placeholder();
+        let controls = browser_controls();
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Browser,
+            ..Menu::default()
+        };
+        menu.watch(NetView::of(&session));
+
+        for def in &controls {
+            if arms_on_focus(def, &menu, &data) {
+                preview(def.action, &mut menu);
+            }
+        }
+        assert_eq!(menu.sortie, 1, "the last *live* row is the armed one");
+
+        let (_, _, _) = activate_online(Action::JoinSortie, &mut menu, &session);
+        assert_eq!(menu.pending, Some(Pending::Join("ZULU".to_owned())));
+    }
+
+    /// `ENTER` on an empty slot is the same mistake by another route.
+    #[test]
+    fn selecting_an_empty_slot_refuses_rather_than_arming_it() {
+        let session = NetSession {
+            rooms: vec![room("KILO", "HALCYON", 4)],
+            ..NetSession::default()
+        };
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Browser,
+            ..Menu::default()
+        };
+        let (_, _, _) = activate_online(Action::SetSortie(3), &mut menu, &session);
+        assert_eq!(
+            menu.sortie, 0,
+            "an empty slot must not become the selection"
+        );
+        assert_eq!(menu.notice, "NO SUCH SORTIE");
+
+        let (_, _, _) = activate_online(Action::SetSortie(0), &mut menu, &session);
+        assert_eq!(menu.sortie, 0);
+        assert_eq!(menu.notice, "ORDER SELECTED");
+    }
+
+    /// The server's side of the same failure: a list that comes back shorter
+    /// must not leave the selection past its end.
+    #[test]
+    fn a_shrinking_room_list_pulls_the_selection_back() {
+        let mut menu = Menu {
+            sortie: 4,
+            ..Menu::default()
+        };
+        // Five rooms, then two: the host of the one at index 4 pressed start.
+        let five = NetSession {
+            rooms: (0..5).map(|i| room(&format!("R{i}"), "HOST", 1)).collect(),
+            ..NetSession::default()
+        };
+        menu.watch(NetView::of(&five));
+        assert_eq!(menu.sortie, 4, "still a real row");
+
+        let two = NetSession {
+            rooms: (0..2).map(|i| room(&format!("R{i}"), "HOST", 1)).collect(),
+            rev: 1,
+            ..NetSession::default()
+        };
+        menu.watch(NetView::of(&two));
+        assert_eq!(menu.sortie, 0, "the selection was left past the end");
+
+        // An unchanged view is not a reason to move the selection.
+        menu.sortie = 1;
+        menu.watch(NetView::of(&two));
+        assert_eq!(menu.sortie, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // The account
+    // -----------------------------------------------------------------------
+
+    fn auth_menu() -> Menu {
+        Menu {
+            open: true,
+            screen: Screen::Auth,
+            ..Menu::default()
+        }
+    }
+
+    /// The only text input in the client, and the rules it enforces are the
+    /// server's own (`registerPilot` in `server/db.js`).
+    #[test]
+    fn a_callsign_field_takes_letters_and_digits_and_nothing_else() {
+        let mut form = AuthForm::default();
+        assert!(form.push(Field::Callsign, "Mav3rick"));
+        assert_eq!(form.callsign, "Mav3rick");
+        // Everything the server would reject is dropped rather than sent and
+        // refused: no spaces, no punctuation, no control characters.
+        assert!(!form.push(Field::Callsign, " -_/\n\t"));
+        assert_eq!(form.callsign, "Mav3rick");
+
+        // ...and it stops at the server's limit rather than building a request
+        // that cannot succeed.
+        form.push(Field::Callsign, &"x".repeat(100));
+        assert_eq!(form.callsign.len(), CALLSIGN_MAX);
+        assert!(!form.push(Field::Callsign, "y"), "full is full");
+    }
+
+    /// A passphrase is whatever the pilot chose. The only rule is that it is
+    /// printable — a control character there would be a header or a JSON
+    /// escape, never something anyone typed.
+    #[test]
+    fn a_passphrase_field_takes_anything_printable_including_spaces() {
+        let mut form = AuthForm::default();
+        assert!(form.push(Field::Secret, "correct horse!"));
+        assert_eq!(form.secret, "correct horse!");
+        assert!(!form.push(Field::Secret, "\n\r\t\u{7}"));
+        assert_eq!(form.secret, "correct horse!");
+        form.push(Field::Secret, &"z".repeat(200));
+        assert_eq!(form.secret.chars().count(), PASSWORD_MAX);
+    }
+
+    /// It is never drawn, and the masking is what a screenshot of a paused
+    /// lobby shows instead.
+    #[test]
+    fn the_passphrase_is_masked_and_never_the_text() {
+        let mut form = AuthForm::default();
+        form.push(Field::Secret, "hunter2");
+        assert_eq!(form.masked(), "*******");
+        assert!(!form.masked().contains("hunter"));
+    }
+
+    #[test]
+    fn backspace_takes_the_field_the_cursor_is_on() {
+        let mut form = AuthForm::default();
+        form.push(Field::Callsign, "ACE");
+        form.push(Field::Secret, "abcdef");
+        assert!(form.backspace(Field::Callsign));
+        assert_eq!(form.callsign, "AC");
+        assert_eq!(form.secret, "abcdef", "the other field is untouched");
+        // Backspacing an empty field is not a change, so it must not mark the
+        // menu dirty.
+        form.callsign.clear();
+        assert!(!form.backspace(Field::Callsign));
+    }
+
+    /// The server's rules, checked here so a typo costs no round trip — and
+    /// worded so the pilot knows which of the two is wrong.
+    #[test]
+    fn the_form_refuses_credentials_the_server_would() {
+        let short = AuthForm {
+            callsign: "AB".to_owned(),
+            secret: "longenough".to_owned(),
+            rev: 0,
+        };
+        assert!(short.complaint().unwrap().contains("CALLSIGN"));
+
+        let weak = AuthForm {
+            callsign: "MAVERICK".to_owned(),
+            secret: "12345".to_owned(),
+            rev: 0,
+        };
+        assert!(weak.complaint().unwrap().contains("PASSPHRASE"));
+
+        let good = AuthForm {
+            callsign: "MAVERICK".to_owned(),
+            secret: "123456".to_owned(),
+            rev: 0,
+        };
+        assert_eq!(good.complaint(), None);
+    }
+
+    /// Signing in asks `api.rs` and hands the passphrase over — and the menu
+    /// stops holding it the instant it does.
+    #[test]
+    fn identifying_sends_the_credentials_and_forgets_the_passphrase() {
+        let mut menu = auth_menu();
+        menu.form.push(Field::Callsign, "MAVERICK");
+        menu.form.push(Field::Secret, "hunter22");
+
+        let out = fire_action(
+            Action::SignIn,
+            &mut menu,
+            &NetSession::default(),
+            LobbyData::placeholder(),
+        );
+        assert_eq!(
+            out.api,
+            vec![ApiRequest::SignIn {
+                username: "MAVERICK".to_owned(),
+                password: "hunter22".to_owned(),
+            }]
+        );
+        assert!(
+            menu.form.secret.is_empty(),
+            "the passphrase outlived the request"
+        );
+        assert_eq!(
+            menu.form.callsign, "MAVERICK",
+            "the callsign is not a secret"
+        );
+        assert!(out.sent.is_empty(), "this is HTTP, not the socket");
+    }
+
+    #[test]
+    fn enlisting_registers_before_it_signs_in() {
+        let mut menu = auth_menu();
+        menu.form.push(Field::Callsign, "ROOKIE");
+        menu.form.push(Field::Secret, "abcdef");
+        let out = fire_action(
+            Action::Enlist,
+            &mut menu,
+            &NetSession::default(),
+            LobbyData::placeholder(),
+        );
+        assert_eq!(
+            out.api,
+            vec![ApiRequest::Enlist {
+                username: "ROOKIE".to_owned(),
+                password: "abcdef".to_owned(),
+            }]
+        );
+    }
+
+    /// A round trip is not instant, and a second `ENTER` while the first is in
+    /// flight must not send the credentials twice.
+    #[test]
+    fn a_request_in_flight_blocks_a_second_one() {
+        let mut menu = auth_menu();
+        menu.form.push(Field::Callsign, "MAVERICK");
+        menu.form.push(Field::Secret, "hunter22");
+        menu.acct.busy = true;
+
+        let out = fire_action(
+            Action::SignIn,
+            &mut menu,
+            &NetSession::default(),
+            LobbyData::placeholder(),
+        );
+        assert!(out.api.is_empty());
+        assert_eq!(menu.notice, "WORKING");
+        assert_eq!(menu.form.secret, "hunter22", "and nothing was consumed");
+
+        // The row reads dead while it is busy, so the refusal is visible before
+        // the key is pressed rather than after.
+        let def = ControlDef {
+            screen: Screen::Auth,
+            action: Action::SignIn,
+            root: Entity::PLACEHOLDER,
+            tick: Entity::PLACEHOLDER,
+            label: Entity::PLACEHOLDER,
+            value: Entity::PLACEHOLDER,
+        };
+        let data = LobbyData::placeholder();
+        assert!(control_state(&def, &menu, &data).1);
+    }
+
+    #[test]
+    fn a_bad_form_never_reaches_the_network() {
+        let mut menu = auth_menu();
+        menu.form.push(Field::Callsign, "AB");
+        menu.form.push(Field::Secret, "abcdef");
+        let out = fire_action(
+            Action::SignIn,
+            &mut menu,
+            &NetSession::default(),
+            LobbyData::placeholder(),
+        );
+        assert!(out.api.is_empty());
+        assert!(menu.notice.contains("CALLSIGN"), "{}", menu.notice);
+        assert_eq!(menu.form.secret, "abcdef", "nothing was consumed");
+    }
+
+    /// Signing out is only offered when there is somebody to sign out.
+    #[test]
+    fn signing_out_needs_a_pilot() {
+        let mut menu = auth_menu();
+        let out = fire_action(
+            Action::SignOut,
+            &mut menu,
+            &NetSession::default(),
+            LobbyData::placeholder(),
+        );
+        assert!(out.api.is_empty());
+        assert_eq!(menu.notice, "NO PILOT SIGNED IN");
+
+        menu.acct.signed_in = true;
+        let out = fire_action(
+            Action::SignOut,
+            &mut menu,
+            &NetSession::default(),
+            LobbyData::placeholder(),
+        );
+        assert_eq!(out.api, vec![ApiRequest::SignOut]);
+    }
+
+    /// **Requisition spends real credits, so it must not be optimistic.**
+    ///
+    /// It used to move `LobbyData` itself — fine while the balance was invented
+    /// here, and wrong the moment it is the server's: the next refresh would
+    /// have silently un-bought whatever the pilot thought they had.
+    #[test]
+    fn requisition_asks_the_server_and_moves_nothing_itself() {
+        let mut data = LobbyData::placeholder();
+        // The hull colour rung: tier 1, affordable, and one of the five the
+        // database actually has a column for. Looked up rather than written as
+        // a literal, so re-ordering `ARMORY` moves the test with it.
+        let rung = crate::api::UNLOCKS
+            .iter()
+            .find(|(_, key, _)| *key == "hull")
+            .expect("the hull colour is one of the five")
+            .0;
+        data.pilot.credits = 10_000;
+        data.pilot.owned = 1;
+        let before = data.pilot.credits;
+
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Armory,
+            #[allow(clippy::cast_possible_truncation)]
+            item: rung as u8,
+            ..Menu::default()
+        };
+        let out = fire_action(
+            Action::Requisition,
+            &mut menu,
+            &NetSession::default(),
+            data.clone(),
+        );
+        assert_eq!(out.api, vec![ApiRequest::Unlock("hull")]);
+        assert_eq!(
+            out.data.pilot.credits, before,
+            "the balance moved before the server agreed"
+        );
+        assert_eq!(out.data.pilot.owned, 1, "and so did the ladder");
+    }
+
+    /// Eleven of the sixteen rungs are a planned economy with no column in
+    /// `pilots.db`. Charging for one would be spending real credits on a bit
+    /// that exists only in this process.
+    #[test]
+    fn a_rung_the_server_has_never_heard_of_refuses() {
+        let mut data = LobbyData::placeholder();
+        data.pilot.credits = 1_000_000;
+        // Everything below tier 3 held, so the MK.III is genuinely available.
+        data.pilot.owned = 0b1111_1111;
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Armory,
+            item: 8,
+            ..Menu::default()
+        };
+        assert_eq!(unlock_key(8), None);
+        let out = fire_action(
+            Action::Requisition,
+            &mut menu,
+            &NetSession::default(),
+            data.clone(),
+        );
+        assert!(out.api.is_empty());
+        assert_eq!(menu.notice, "NOT IN SERVICE");
+        assert_eq!(out.data.pilot.credits, 1_000_000);
+
+        // ...and the row says so before it is pressed.
+        let def = ControlDef {
+            screen: Screen::Armory,
+            action: Action::Requisition,
+            root: Entity::PLACEHOLDER,
+            tick: Entity::PLACEHOLDER,
+            label: Entity::PLACEHOLDER,
+            value: Entity::PLACEHOLDER,
+        };
+        assert!(control_state(&def, &menu, &data).1, "it should read dead");
+    }
+
+    /// Walking onto a page that shows the server's numbers asks for them —
+    /// unforced, so `api.rs`'s cooldown collapses a tour of all four into one
+    /// round trip.
+    #[test]
+    fn the_dossier_pages_ask_for_their_data() {
+        for screen in [
+            Screen::Record,
+            Screen::Standings,
+            Screen::Armory,
+            Screen::Auth,
+        ] {
+            let session = NetSession::default();
+            let mut config = NetConfig::default();
+            let mut menu = Menu {
+                screen,
+                ..Menu::default()
+            };
+            let mut ops = NetOps::new(&session, &mut config, "PILOT");
+            on_screen_change(Screen::Main, &mut menu, &mut ops);
+            assert_eq!(
+                ops.api,
+                vec![ApiRequest::Refresh { force: false }],
+                "{screen:?} did not ask"
+            );
+            assert!(
+                ops.commands.is_empty(),
+                "{screen:?} opened a socket it does not need"
+            );
+        }
+    }
+
+    /// A guest opening only the pages that need no account issues no request at
+    /// all — the lobby must be silent unless it is asked for something.
+    #[test]
+    fn the_pages_a_guest_lives_on_ask_for_nothing() {
+        for screen in [Screen::Main, Screen::Solo, Screen::Trials, Screen::Config] {
+            let session = NetSession::default();
+            let mut config = NetConfig::default();
+            let mut menu = Menu {
+                screen,
+                ..Menu::default()
+            };
+            let mut ops = NetOps::new(&session, &mut config, "PILOT");
+            on_screen_change(Screen::Main, &mut menu, &mut ops);
+            assert!(ops.api.is_empty(), "{screen:?} made a request");
+        }
+    }
+
+    /// The `FEED` lamp is the one thing on the display that must never flatter
+    /// itself: it says where the numbers came from, in `DataSource`'s words.
+    #[test]
+    fn the_feed_lamp_names_the_source_it_is_showing() {
+        let (menu, mut data, net) = quiet();
+        let m = model(&menu, &data, &net, 0.0);
+        for (source, want) in [
+            (DataSource::Placeholder, "CACHED"),
+            (DataSource::Public, "PUBLIC"),
+            (DataSource::Live, "LIVE"),
+            (DataSource::Stale, "STALE"),
+        ] {
+            data.source = source;
+            assert_eq!(lamp_states(&menu, &data, m)[1].1, want, "{source:?}");
+        }
+    }
+
+    /// ...and the caution lamp blinks for both of the two that are not the
+    /// server's current answer, not just for the placeholder.
+    #[test]
+    fn stale_data_cautions_as_loudly_as_no_data() {
+        let (menu, mut data, mut net) = quiet();
+        net.state = ConnState::Online;
+        for (source, want) in [
+            (DataSource::Placeholder, true),
+            (DataSource::Stale, true),
+            (DataSource::Public, false),
+            (DataSource::Live, false),
+        ] {
+            data.source = source;
+            // Half a caution period in, so the square wave is at its lit phase.
+            let m = model(&menu, &data, &net, 0.0);
+            assert_eq!(m.caution, want, "{source:?}");
+        }
+    }
+
+    /// The auth page is a page, not a modal: it has a rail key, a way back, and
+    /// a name `SPACESHIPS_UI` can open it by.
+    #[test]
+    fn the_auth_page_is_wired_in_like_any_other() {
+        assert_eq!(Screen::Auth.back(), Some(Screen::Record));
+        assert_eq!(Screen::Auth.rail(), Screen::Record.rail());
+        assert_eq!(Screen::parse("auth"), Some(Screen::Auth));
+        assert_eq!(Screen::parse("login"), Some(Screen::Auth));
+        assert!(!Screen::Auth.is_network(), "it is HTTP, not the socket");
+        // Every page is in `ALL`, and `index()` is that position — the focus
+        // and page arrays are sized from it.
+        for (i, s) in Screen::ALL.iter().enumerate() {
+            assert_eq!(s.index(), i, "{s:?}");
+        }
+    }
+
+    /// Typing a passphrase must not press every hotkey in it.
+    ///
+    /// `hello` used to toggle fullscreen twice (`input.rs` reads `L`) and
+    /// `viper` used to seat the pilot in the cockpit (`cockpit.rs` reads `V`),
+    /// because both read `ButtonInput<KeyCode>` directly and neither knows a
+    /// lobby exists. See [`swallow_typing`].
+    #[test]
+    fn typing_a_passphrase_does_not_press_the_hotkeys_in_it() {
+        use bevy::ecs::system::SystemState;
+
+        fn run(menu: Menu, pressed: &[KeyCode]) -> Vec<KeyCode> {
+            let mut world = World::new();
+            world.insert_resource(menu);
+            let mut keys = ButtonInput::<KeyCode>::default();
+            for key in pressed {
+                keys.press(*key);
+            }
+            world.insert_resource(keys);
+            let mut state: SystemState<(Res<Menu>, ResMut<ButtonInput<KeyCode>>)> =
+                SystemState::new(&mut world);
+            {
+                let (menu, keys) = state.get_mut(&mut world).expect("params validate");
+                swallow_typing(menu, keys);
+            }
+            state.apply(&mut world);
+            let mut left: Vec<KeyCode> = world
+                .resource::<ButtonInput<KeyCode>>()
+                .get_just_pressed()
+                .copied()
+                .collect();
+            left.sort_by_key(|k| format!("{k:?}"));
+            left
+        }
+
+        // `hello` and `viper`, plus the keys the menu itself needs.
+        let typed = [
+            KeyCode::KeyH,
+            KeyCode::KeyL,
+            KeyCode::KeyV,
+            KeyCode::KeyO,
+            KeyCode::Enter,
+            KeyCode::Escape,
+            KeyCode::ArrowDown,
+        ];
+
+        let typing = Menu {
+            open: true,
+            screen: Screen::Auth,
+            typing: true,
+            ..Menu::default()
+        };
+        assert_eq!(
+            run(typing, &typed),
+            vec![KeyCode::ArrowDown, KeyCode::Enter, KeyCode::Escape],
+            "a character reached a hotkey, or navigation was swallowed"
+        );
+
+        // With the cursor anywhere else, the keyboard is the aircraft's again.
+        let flying = Menu {
+            open: true,
+            screen: Screen::Auth,
+            typing: false,
+            ..Menu::default()
+        };
+        assert_eq!(run(flying, &typed).len(), typed.len());
+
+        // ...and a closed menu never touches the keyboard at all, which is
+        // every frame of every match.
+        let closed = Menu {
+            open: false,
+            typing: true,
+            ..Menu::default()
+        };
+        assert_eq!(run(closed, &typed).len(), typed.len());
     }
 
     /// Only the flight lead may start, and the server ignores a `start` from
