@@ -96,26 +96,72 @@ pub use sim_bridge::LOCAL_ID;
 /// The assets live in the repo's `public/`, shared with the Three.js client,
 /// and are deliberately not duplicated into a `crates/client/assets/`.
 ///
-/// Native: an absolute path baked in at compile time. Bevy resolves a relative
-/// `file_path` against `CARGO_MANIFEST_DIR` under `cargo run` but against the
-/// executable's directory otherwise, and those are different places; an
-/// absolute path removes the whole class of "why is the model invisible"
-/// failure. It does make the binary non-relocatable, which is fine for a dev
-/// slice and is the first thing to change if this ever ships.
-///
 /// Web: a URL path relative to the page. `build-wasm.sh` copies the assets it
 /// needs into `web/assets/`.
-#[cfg(not(target_arch = "wasm32"))]
-const ASSET_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../public");
 #[cfg(target_arch = "wasm32")]
 const ASSET_ROOT: &str = "assets";
+
+/// The repo checkout this binary was compiled from, as an absolute path.
+///
+/// The development answer, and it used to be the *only* answer. Bevy resolves a
+/// relative `file_path` against `CARGO_MANIFEST_DIR` under `cargo run` but
+/// against the executable's directory otherwise, and those are different
+/// places; baking an absolute path removes the whole class of "why is the model
+/// invisible" failure while you are working.
+///
+/// It also makes the binary non-relocatable, which this comment used to note
+/// was "the first thing to change if this ever ships". See [`asset_root`].
+#[cfg(not(target_arch = "wasm32"))]
+const DEV_ASSET_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../public");
+
+/// Where to load assets from, decided at startup rather than at compile time.
+///
+/// A packaged build has to find its own assets wherever the user dropped the
+/// app, so the baked path is now the *last* resort rather than the only one.
+/// In order:
+///
+/// 1. `SPACESHIPS_ASSETS`, for running a packaged binary against a working
+///    copy — or for anyone who wants to swap the ship models out.
+/// 2. `../Resources/assets` relative to the executable, which is where a macOS
+///    `.app` bundle puts them: the binary lives in `Contents/MacOS/`.
+/// 3. `assets` beside the executable, the plain-directory layout — a zip
+///    someone unpacked, or a Windows build.
+/// 4. [`DEV_ASSET_ROOT`], so `cargo run` from a checkout keeps working exactly
+///    as it did.
+///
+/// Each candidate is probed with `is_dir` rather than assumed, so a bundle
+/// missing its `Resources` falls through to something that works instead of
+/// starting up with every texture silently absent.
+#[cfg(not(target_arch = "wasm32"))]
+fn asset_root() -> String {
+    if let Some(explicit) = std::env::var_os("SPACESHIPS_ASSETS") {
+        return explicit.to_string_lossy().into_owned();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for candidate in ["../Resources/assets", "assets"] {
+                let path = dir.join(candidate);
+                if path.is_dir() {
+                    return path.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    DEV_ASSET_ROOT.to_owned()
+}
+
+/// The web has one answer and no filesystem to probe.
+#[cfg(target_arch = "wasm32")]
+fn asset_root() -> String {
+    ASSET_ROOT.to_owned()
+}
 
 fn main() {
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
             .set(AssetPlugin {
-                file_path: ASSET_ROOT.to_owned(),
+                file_path: asset_root(),
                 ..default()
             })
             .set(WindowPlugin {

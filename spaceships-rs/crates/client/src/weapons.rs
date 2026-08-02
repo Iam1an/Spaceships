@@ -213,9 +213,10 @@ const TRAIL_OFFSETS_JET: [Vec3; 2] = [
 
 /// Exhaust origins for whichever hull is flying.
 ///
-/// Keyed off the same `SPACESHIPS_SHIP_MODEL` switch `scene.rs` reads, so the
-/// trails follow the model rather than needing a second decision. When the jet
-/// becomes the default this collapses to one constant.
+/// Keyed off [`jet_hull`], which asks `scene::ship_model()` — the same function
+/// that decides which glb is actually loaded — so the trails follow the model
+/// rather than making a second, independent decision about it.
+///
 /// Multiplied by [`crate::scene::SHIP_SCALE`] because these are consumed in
 /// **world** space — `emit` computes `ship.pos + quat * offset` rather than
 /// parenting the motes to the hull — so unlike the mesh they do not inherit the
@@ -223,8 +224,7 @@ const TRAIL_OFFSETS_JET: [Vec3; 2] = [
 /// same pre-scale space the JS authors `TRAIL_OFFSETS` in, where they are
 /// children of a group `main.js:219` scales.
 fn trail_offsets() -> [Vec3; 2] {
-    #[cfg(not(target_arch = "wasm32"))]
-    if std::env::var("SPACESHIPS_SHIP_MODEL").is_ok_and(|m| m.contains("jet")) {
+    if jet_hull() {
         return TRAIL_OFFSETS_JET.map(|o| o * crate::scene::SHIP_SCALE);
     }
     TRAIL_OFFSETS_LEGACY.map(|o| o * crate::scene::SHIP_SCALE)
@@ -368,17 +368,16 @@ fn damage_offsets() -> [Vec3; 2] {
     anchors.map(|q| (q + offset) * scale)
 }
 
-/// Whether `jet.glb` is the hull in the air, on the same switch `scene.rs` and
-/// `cockpit.rs` read.
+/// Whether `jet.glb` is the hull in the air.
+///
+/// Asks `scene::ship_model()` rather than reading `SPACESHIPS_SHIP_MODEL`
+/// itself. Those are not the same question and the difference was a live bug:
+/// when the jet became the *default* model, an environment variable nobody had
+/// set answered "no", so the nozzles fell back to `spaceship.glb`'s — out at
+/// x = +-2.2, on the wings — while the jet was on screen. One function decides
+/// which hull is flying; everything anchored to that hull asks it.
 fn jet_hull() -> bool {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::env::var("SPACESHIPS_SHIP_MODEL").is_ok_and(|m| m.contains("jet"))
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        false
-    }
+    crate::scene::ship_model().contains("jet")
 }
 
 /// `SPACESHIPS_HULL=0.4`: pins every ship's hull fraction.

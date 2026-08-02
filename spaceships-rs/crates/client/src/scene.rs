@@ -78,9 +78,20 @@ use spaceships_sim as sim;
 
 use crate::sim_bridge::{pos, rot, SimFrame, SimSet, LOCAL_ID};
 
-/// The player model, at the asset root. `spaceshipADMIN.glb` is the other one
-/// and is 4.9 MB, which is a decision for later, not a default.
-const SHIP_MODEL: &str = "spaceship.glb";
+/// The player model, at the asset root.
+///
+/// `jet.glb` — the F-22 — as of packaging the game for people who are not going
+/// to set an environment variable. Everything tuned this cycle was tuned on it:
+/// [`model_fit`]'s scale and nose-ward shift, `weapons.rs`'s nozzle offsets,
+/// `cockpit.rs`'s `JET_PROFILE`. Shipping `spaceship.glb` by default meant a
+/// packaged build showed the old blocky hull while every fit constant around it
+/// described the aircraft.
+///
+/// `SPACESHIPS_SHIP_MODEL` still overrides, and `spaceship.glb` still works —
+/// its fit is the identity and its cockpit profile is untouched.
+/// `spaceshipADMIN.glb` is the third and is 4.9 MB, which is a decision for
+/// later, not a default.
+const SHIP_MODEL: &str = "jet.glb";
 
 /// Which model to fly, so an alternative can be judged in motion rather than
 /// from stills.

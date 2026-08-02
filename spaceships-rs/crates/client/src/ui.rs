@@ -601,14 +601,10 @@ const PREVIEW_LAYER: usize = 3;
 /// variable so the two agree the day it lands, and falls back to the model that
 /// exists today rather than to one that does not.
 fn ship_model() -> String {
-    #[cfg(target_arch = "wasm32")]
-    {
-        "spaceship.glb".to_owned()
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::env::var("SPACESHIPS_SHIP_MODEL").unwrap_or_else(|_| "spaceship.glb".to_owned())
-    }
+    // `scene::ship_model()`, not the environment variable behind it: the
+    // preview has to show the hull the player will actually fly, and those
+    // stopped being the same thing when the jet became the default.
+    crate::scene::ship_model()
 }
 
 /// `customization.js:` the preview turns 0.007 rad per frame at 60 Hz. Kept as
