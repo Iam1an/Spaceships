@@ -59,6 +59,32 @@
 //! here: a single mesh cannot sort its own triangles, and additive blending is
 //! the family of effects that does not need it to.
 //!
+//! ## The particle model, and why it is not `trails.js`'s
+//!
+//! A `trails.js` particle is a position, a scale and an opacity: `emit` stamps
+//! it and `update` only ever shrinks and dims it. Ported straight across, every
+//! effect in this module inherited three problems that a screenshot makes
+//! obvious and a code review does not:
+//!
+//! - **Nothing moves.** A mote is abandoned in world space the instant it is
+//!   born, so at cruise the engine plume is deposited on the chase camera's own
+//!   axis — hidden by the hull at the near end, already past the lens at the far
+//!   end — and is invisible in between. On afterburner it is a row of separated
+//!   beads, because the ship covers several units between one particle and the
+//!   next and each particle is a fifth of a unit across.
+//! - **Nothing cools.** One colour for a whole life. Real exhaust, fire and
+//!   fireballs shift hue as they lose energy, and holding one shade while
+//!   dimming is the clearest tell that an effect is a texture on a quad.
+//! - **Nothing has structure.** `bullets.spawnExplosion` is a single expanding
+//!   sphere, so a ship dying is a symmetrical blob that grows and fades.
+//!
+//! [`Mote`] therefore carries a velocity, a drag, a second colour, and a
+//! motion smear ([`MOTE_SMEAR`]); [`Shell`] carries a second colour and an
+//! easing; and [`spawn_explosion`] throws sparks out of the same mote pool the
+//! trails use. None of it changes the shape of the module: it is still one
+//! entity, one material, one mesh, and one draw call, and the extra fields are
+//! CPU-side state that never reaches the GPU.
+//!
 //! ## Battle damage
 //!
 //! [`emit_damage`] is the one effect here with no JS to port: smoke that
@@ -102,10 +128,13 @@
 //! second. See that function for what each number is.
 //!
 //! `SPACESHIPS_FX_DEMO=<n>` fills the effect lists with `n` synthetic
-//! projectiles so the count can be taken against a busy scene.
-//! [`crate::sim_bridge::tick`] does not yet run `sim::bullets` or
-//! `sim::missiles`, so `Frame`'s projectile slices are empty in this build and
-//! there is otherwise nothing to draw.
+//! projectiles so the count can be taken against a busy scene — far more than a
+//! real match puts in the air, which is the point of a stress harness.
+//!
+//! `SPACESHIPS_FX_SCENE=<effect>` and `SPACESHIPS_FX_TRAIL=<mode>` are the
+//! opposite: they hold **one** effect still, in front of the camera, so a
+//! before-and-after pair is a pair of the same thing. See [`fx_scene`] and
+//! [`forced_trail`].
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
@@ -169,23 +198,48 @@ const FLARE_CORE_R: f32 = 0.30;
 /// `missiles.js`: flare glow sphere radius.
 const FLARE_GLOW_R: f32 = 1.10;
 
-/// `trails.js`: `MAX_PARTICLES`. A hard cap across every ship, which is what
-/// bounds the vertex rebuild — see [`Effects::motes`].
-const MAX_MOTES: usize = 320;
+/// The particle pool shared by engine trails, missile exhaust, and explosion
+/// sparks.
+///
+/// `trails.js`'s `MAX_PARTICLES` is 250 and this was ported at 320. That is a
+/// budget from a client that spent a *draw call* per particle, and it is the
+/// reason a boosting ship's plume was a row of eight beads with gaps between
+/// them: at the rates below, one ship on afterburner alone wants about 120
+/// live particles before it reads as a continuous plume rather than a necklace.
+/// Here a particle is four vertices in a buffer that is padded to
+/// [`MESH_QUAD_CAPACITY`] every frame whatever happens, so the *upload* cost of
+/// raising this is exactly zero and what it actually buys is spent on the CPU
+/// loop that fills it. See [`MESH_QUAD_CAPACITY`] for the arithmetic that keeps
+/// every pool inside the buffer.
+const MAX_MOTES: usize = 900;
 
 /// Cap on battle-damage particles, kept **separate** from [`MAX_MOTES`].
 ///
 /// One shared pool would let a squadron of burning wrecks evict every engine
 /// trail in the match, and vice versa — the two effects would silently fight
-/// over the same 320 slots. Two pools mean each is bounded on its own and
-/// neither can starve the other; the mesh budget below covers both.
-const MAX_DAMAGE_MOTES: usize = 260;
+/// over the same slots. Two pools mean each is bounded on its own and neither
+/// can starve the other; the mesh budget below covers both.
+const MAX_DAMAGE_MOTES: usize = 320;
+
+/// Cap on live explosion shells, and on beams.
+///
+/// Neither list had one. A shell is short-lived so the count self-limits in
+/// practice, but "in practice" is not what the fixed vertex budget below is
+/// asserting, and a missile volley into a cluster of asteroids is a case that
+/// pushes many at once. Cheap insurance against silently truncating the mesh.
+const MAX_SHELLS: usize = 128;
+const MAX_BEAMS: usize = 32;
 
 /// Fixed vertex and index budget for the effects mesh.
 ///
 /// The mesh is rebuilt every frame, and it **must not change size** doing so --
 /// see the padding in `rebuild`. Sized for the worst case the caps above allow,
 /// with headroom: every quad is 4 vertices and 6 indices.
+///
+/// The worst case, counted: 900 motes + 320 damage + 128 shells + 32 beams,
+/// plus two quads each for the projectiles a ten-ship match can have in flight
+/// — 400 bolts (a 0.05 s gun cooldown against a 2 s bolt life), 40 missiles,
+/// 30 flares. That is 2 268 quads against 4 096.
 const MESH_QUAD_CAPACITY: usize = 4096;
 const MESH_VERTEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 4;
 const MESH_INDEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 6;
@@ -230,7 +284,28 @@ fn trail_offsets() -> [Vec3; 2] {
     TRAIL_OFFSETS_LEGACY.map(|o| o * crate::scene::SHIP_SCALE)
 }
 
-/// One row of `main.js`'s `EMIT_CONFIG`.
+/// One row of `main.js`'s `EMIT_CONFIG`, plus the four fields the JS has no
+/// concept of: a plume's motion, its spread, its growth, and its colour.
+///
+/// # What the JS is missing, and why it beads
+///
+/// `trails.js` particles are **static in world space**. `emit` copies a
+/// position into a mesh and `update` only ever touches scale and opacity, so a
+/// mote is stamped at the nozzle and abandoned there while the aircraft flies
+/// out from in front of it. Two things follow, and both are visible in a
+/// screenshot:
+///
+/// - At cruise the plume is *behind* the ship on the chase camera's own axis.
+///   The hull hides the near end, the far end has already swept past the lens,
+///   and the trail is invisible in between. It was.
+/// - At the emission rates above, the ship covers 2 to 4 units between one
+///   particle and the next, and each particle is a fifth of a unit across. That
+///   is a string of separated beads, not a plume — which is precisely what the
+///   afterburner looked like.
+///
+/// [`EmitMode::inherit`] is the fix for both: exhaust leaves the nozzle carrying
+/// most of the ship's momentum and only *slowly* falls behind, so it stays at
+/// the tail where it is visible and where consecutive particles overlap.
 struct EmitMode {
     /// Particles per second, per nozzle.
     rate: f32,
@@ -241,34 +316,102 @@ struct EmitMode {
     life: (f32, f32),
     /// Position jitter, ± per axis.
     jitter: f32,
-    /// Colours, chosen uniformly.
-    colors: &'static [u32],
+    /// Fraction of the ship's velocity a new particle keeps. Below 1, so the
+    /// plume recedes; well above 0, so it recedes *slowly* and stays in shot.
+    inherit: f32,
+    /// Speed the exhaust leaves the nozzle at, along the ship's own -Z. What
+    /// gives a parked ship a plume at all.
+    eject: f32,
+    /// Random sideways spread speed, which is what turns a line into a cone.
+    spread: f32,
+    /// Exponential drag, per second. Bleeds the ejection off so the cone opens
+    /// and then stalls rather than running away.
+    drag: f32,
+    /// Growth over the life, as `half * (1 + t * grow)`.
+    grow: f32,
+    /// Colour at birth and at death, as `(hex, intensity)`. Real exhaust cools;
+    /// this is the whole reason a mote is not one flat colour for its life.
+    ///
+    /// The intensities are deliberately modest — around 2, not around 5. A
+    /// plume is *dozens of overlapping additive quads*, so the brightness that
+    /// reaches the screen is the sum and not the sample, and an intensity
+    /// picked to look right on one particle clips to flat white the moment
+    /// fifteen of them stack. Everything the tone mapper clips is also hue
+    /// stripped, which is how an afterburner authored blue arrives white.
+    hot: (u32, f32),
+    cool: (u32, f32),
+    /// Per-particle alpha, for the same reason: it is the *density* that
+    /// carries a plume, and alpha is what stops density becoming a white bar.
+    alpha: f32,
 }
 
 /// `EMIT_CONFIG.move` — the idle cruise trail.
+///
+/// White-hot at the nozzle, cooling to the `0x66ddff` the JS uses flat.
 const EMIT_MOVE: EmitMode = EmitMode {
-    rate: 18.0,
-    scale: (0.16, 0.28),
-    life: (0.18, 0.30),
-    jitter: 0.05,
-    colors: &[0xffffff],
+    rate: 70.0,
+    scale: (0.34, 0.58),
+    // Short, because the plume has to *stay in frame*. The chase camera sits 11
+    // units behind the ship, so a particle receding at 30 units a second is past
+    // the lens in a third of a second and everything after that is life spent
+    // off screen — which is what the old 0.30 s at a full 80 u/s of recession
+    // was: a trail drawn almost entirely behind the viewer.
+    life: (0.24, 0.40),
+    jitter: 0.06,
+    inherit: 0.70,
+    eject: 7.0,
+    spread: 1.4,
+    drag: 2.2,
+    grow: 2.0,
+    hot: (0xe6f6ff, 1.25),
+    cool: (0x2f7dff, 0.55),
+    alpha: 0.55,
 };
 /// `EMIT_CONFIG.boost`.
 const EMIT_BOOST: EmitMode = EmitMode {
-    rate: 45.0,
-    scale: (0.50, 0.85),
-    life: (0.45, 0.65),
-    jitter: 0.13,
-    colors: &[0x66ddff, 0xffffff],
+    rate: 150.0,
+    scale: (0.42, 0.76),
+    life: (0.28, 0.46),
+    jitter: 0.14,
+    inherit: 0.72,
+    eject: 12.0,
+    spread: 1.7,
+    drag: 2.6,
+    grow: 2.4,
+    hot: (0xd6f2ff, 2.0),
+    cool: (0x1e6cff, 0.85),
+    alpha: 0.55,
 };
 /// `EMIT_CONFIG.brake`.
 const EMIT_BRAKE: EmitMode = EmitMode {
-    rate: 35.0,
-    scale: (0.36, 0.60),
-    life: (0.28, 0.45),
-    jitter: 0.10,
-    colors: &[0xffd933, 0xffaa33],
+    rate: 120.0,
+    scale: (0.36, 0.66),
+    life: (0.30, 0.48),
+    jitter: 0.12,
+    // Retro-thrust blows *forward*, so it keeps less of the ship's momentum and
+    // leaves faster — the plume overtakes the aircraft, which is the read.
+    inherit: 0.35,
+    eject: 20.0,
+    spread: 2.2,
+    drag: 3.0,
+    grow: 2.2,
+    hot: (0xffe9a8, 1.9),
+    cool: (0xff4400, 0.70),
+    alpha: 0.55,
 };
+
+/// How much of a particle's own velocity is smeared into its quad, in seconds.
+///
+/// A particle in a plume moves several of its own diameters per frame, so a
+/// round billboard reads as a bead on a string no matter how many there are.
+/// Drawing it stretched along its velocity instead — the same trick a motion
+/// blur is — bridges the gap between one particle and the next for no extra
+/// particles and no extra vertices, and it is what makes the plume a *plume*.
+///
+/// 14 ms, so a mote moving at 40 u/s is stretched by half a unit. Small enough
+/// that a slow particle stays a puff, which is why the branch in `build_surface`
+/// only takes the streak when the smear is worth more than the radius.
+const MOTE_SMEAR: f32 = 0.014;
 
 /// `main.js:1143`: below this speed a coasting ship emits nothing.
 const TRAIL_MIN_SPEED: f32 = 5.0;
@@ -304,9 +447,9 @@ const SMOKE_AT: f32 = 0.6;
 const FIRE_AT: f32 = 0.28;
 /// Smoke particles a second at zero hull, ramping up from nothing at
 /// [`SMOKE_AT`].
-const SMOKE_RATE: f32 = 42.0;
+const SMOKE_RATE: f32 = 64.0;
 /// Fire particles a second at zero hull, from nothing at [`FIRE_AT`].
-const FIRE_RATE: f32 = 26.0;
+const FIRE_RATE: f32 = 46.0;
 
 /// Anchors for the damage plume, in **unfitted ship** units — the space
 /// `cockpit.rs`'s profiles are authored in and the space
@@ -407,6 +550,39 @@ pub(crate) fn forced_hull() -> Option<f32> {
     }
 }
 
+/// `SPACESHIPS_FX_TRAIL=move|boost|brake`: pins the engine-trail emitter's mode.
+///
+/// The same kind of hook as [`forced_hull`] and for the same reason. A trail is
+/// the one effect a still of a *parked* ship cannot show — the emitter is silent
+/// below [`TRAIL_MIN_SPEED`] and the vertical slice spawns you stationary — so
+/// without this there is no way to photograph a cruise plume or a boost plume,
+/// let alone photograph the same one twice.
+///
+/// It pins the *mode*, not the motion: the ship still sits still, which is the
+/// harder case for the emitter and therefore the more useful one to look at.
+fn forced_trail() -> Option<&'static EmitMode> {
+    #[cfg(target_arch = "wasm32")]
+    return None;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static FORCED: std::sync::OnceLock<Option<&'static EmitMode>> = std::sync::OnceLock::new();
+        *FORCED.get_or_init(|| {
+            match std::env::var("SPACESHIPS_FX_TRAIL")
+                .ok()?
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "move" | "cruise" => Some(&EMIT_MOVE),
+                "boost" => Some(&EMIT_BOOST),
+                "brake" => Some(&EMIT_BRAKE),
+                _ => None,
+            }
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -429,7 +605,9 @@ impl Plugin for WeaponsPlugin {
             )
             // Ageing and the rebuild are per *frame*: they are what makes the
             // effects smooth on a display that is not the tick rate.
-            .add_systems(Update, (run_demo, age_effects).chain())
+            // `stage_scene` runs last so the effect it holds still is the one
+            // the frame draws: ageing would move it, and the demo would bury it.
+            .add_systems(Update, (run_demo, age_effects, stage_scene).chain())
             // After transform propagation so the billboards face where the
             // camera actually ended up this frame rather than where it was
             // last frame. `camera::follow` writes the chase pose in
@@ -551,11 +729,43 @@ struct Shell {
     pos: Vec3,
     age: f32,
     life: f32,
-    /// Radius at birth and at death; the JS lerps linearly between them.
+    /// Radius at birth and at death.
     from: f32,
     to: f32,
+    /// Colour at birth and at death.
+    ///
+    /// The JS holds one colour for the whole life, and a fireball that is the
+    /// same shade of orange from ignition to burnout is the single clearest
+    /// tell that an explosion is a texture on a growing quad. A real one starts
+    /// near-white and cools through yellow and orange into a dull red.
     color: LinearRgba,
+    cool: LinearRgba,
     opacity: f32,
+    /// Radius easing, as `t^ease`. Below 1 is fast-then-slow, which is what a
+    /// blast wave does — it dumps its energy immediately and then coasts. The
+    /// JS lerps linearly, so its fireball expands at a constant rate and reads
+    /// like an inflating balloon.
+    ease: f32,
+    /// Alpha falloff, as `(1 - t)^fade`. Above 1 holds the shell bright and
+    /// then drops it, instead of the linear ramp's long grey tail.
+    fade: f32,
+}
+
+impl Default for Shell {
+    fn default() -> Shell {
+        Shell {
+            pos: Vec3::ZERO,
+            age: 0.0,
+            life: 0.5,
+            from: 1.0,
+            to: 2.0,
+            color: LinearRgba::WHITE,
+            cool: LinearRgba::BLACK,
+            opacity: 1.0,
+            ease: 0.5,
+            fade: 1.4,
+        }
+    }
 }
 
 /// A sustained hitscan beam, kept alive for [`BEAM_LIFE`] because
@@ -567,8 +777,11 @@ struct BeamFx {
     color: LinearRgba,
 }
 
-/// One trail or exhaust particle. `trails.js` calls these particles; they do
-/// not move after emission.
+/// One trail, exhaust, smoke, or spark particle.
+///
+/// `trails.js` calls these particles and then does not move them; everything
+/// from [`Mote::vel`] down is what this module adds, and between them they are
+/// the difference between a plume and a row of beads. See [`EmitMode`].
 struct Mote {
     pos: Vec3,
     age: f32,
@@ -576,12 +789,56 @@ struct Mote {
     /// Half-extent at birth, in world units.
     half: f32,
     /// Per-second growth factor applied over the life, as
-    /// `half * (1 + t * grow)`. Zero for engine trails, 2.8 for exhaust.
+    /// `half * (1 + t * grow)`.
     grow: f32,
     /// Shrink factor, as `half * (1 - t * shrink)`. `trails.js` uses 0.45.
     shrink: f32,
+    /// Colour at birth and at death, lerped over the life.
     color: LinearRgba,
+    cool: LinearRgba,
     opacity: f32,
+
+    /// World velocity, integrated every frame. Zero is `trails.js`'s behaviour.
+    vel: Vec3,
+    /// Exponential drag per second, as `vel /= 1 + drag * dt`.
+    drag: f32,
+    /// Seconds of the particle's own motion to smear its quad along. See
+    /// [`MOTE_SMEAR`]; zero draws a round billboard whatever the speed.
+    smear: f32,
+    /// Which brush to draw with. Sparks want the hard-edged one — a spark is a
+    /// glowing fragment, not a haze — and everything else wants the soft one.
+    brush: Brush,
+}
+
+impl Default for Mote {
+    fn default() -> Mote {
+        Mote {
+            pos: Vec3::ZERO,
+            age: 0.0,
+            life: 1.0,
+            half: 0.5,
+            grow: 0.0,
+            shrink: 0.0,
+            color: LinearRgba::WHITE,
+            cool: LinearRgba::BLACK,
+            opacity: 1.0,
+            vel: Vec3::ZERO,
+            drag: 0.0,
+            smear: 0.0,
+            brush: Brush::GLOW,
+        }
+    }
+}
+
+/// Linear interpolation in the working (linear-light) colour space, which is
+/// where a lerp between two emitter colours is physically the average of the
+/// two lights rather than a guess at one.
+fn mix(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
+    LinearRgba::rgb(
+        a.red + (b.red - a.red) * t,
+        a.green + (b.green - a.green) * t,
+        a.blue + (b.blue - a.blue) * t,
+    )
 }
 
 /// Everything this module owns that is not in [`SimFrame`].
@@ -637,6 +894,19 @@ impl Rng {
 
     fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
         xs[(self.next_u32() as usize) % xs.len()]
+    }
+
+    /// A direction drawn uniformly over the sphere.
+    ///
+    /// Sampling `z` uniformly and the azimuth uniformly is the exact
+    /// area-preserving parameterisation — the naive "random angles" version
+    /// clumps at the poles, and a spark burst that clumps at two opposite poles
+    /// reads as two jets rather than as a burst.
+    fn direction(&mut self) -> Vec3 {
+        let z = self.range(-1.0, 1.0);
+        let a = self.range(0.0, std::f32::consts::TAU);
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        Vec3::new(r * a.cos(), r * a.sin(), z)
     }
 }
 
@@ -728,68 +998,34 @@ fn consume_events(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                 // For a beam `dir` is the *endpoint*, not a direction —
                 // `SimEvent::Fired` says so, and it is the one field in this
                 // enum whose meaning changes with a sibling.
-                WeaponKind::Beam => fx.beams.push(BeamFx {
-                    start: to_vec3([origin.x as f32, origin.y as f32, origin.z as f32]),
-                    end: to_vec3([dir.x as f32, dir.y as f32, dir.z as f32]),
-                    age: 0.0,
-                    color: glow(0x88ffd6, 1.6),
-                }),
+                WeaponKind::Beam => push_beam(
+                    &mut fx.beams,
+                    BeamFx {
+                        start: to_vec3([origin.x as f32, origin.y as f32, origin.z as f32]),
+                        end: to_vec3([dir.x as f32, dir.y as f32, dir.z as f32]),
+                        age: 0.0,
+                        color: glow(0x88ffd6, 1.6),
+                    },
+                ),
                 // A muzzle flash. `bullets.js` has none — the bolt spawns at
                 // the muzzle and that reads as one — but the gun fires at
                 // 20 Hz and a single frame of light at the barrel is what
                 // sells it at this brightness.
                 WeaponKind::Bullet | WeaponKind::Missile => {
                     let p = to_vec3([origin.x as f32, origin.y as f32, origin.z as f32]);
-                    fx.shells.push(Shell {
-                        pos: p,
-                        age: 0.0,
-                        life: 0.06,
-                        from: 0.5,
-                        to: 1.4,
-                        color: glow(0xeaffe6, 2.2),
-                        opacity: 0.9,
-                    });
+                    let d = to_vec3([dir.x as f32, dir.y as f32, dir.z as f32]);
+                    muzzle_flash(&mut fx, p, d);
                 }
             },
 
             SimEvent::FlareBurst { origin, .. } => {
                 let p = to_vec3([origin.x as f32, origin.y as f32, origin.z as f32]);
-                push_shells(&mut fx.shells, p, 1.0, FLARE_BURST_SHELLS);
+                spawn_explosion(&mut fx, ExplosionKind::FlareBurst, p, 1.0);
             }
 
             SimEvent::Explosion { pos, scale, kind } => {
                 let p = to_vec3([pos.x as f32, pos.y as f32, pos.z as f32]);
-                let s = scale as f32;
-                match kind {
-                    // `missiles.spawnExplosion`: three concentric shells.
-                    ExplosionKind::MissileHit => {
-                        push_shells(&mut fx.shells, p, s.max(0.6), MISSILE_HIT_SHELLS);
-                    }
-                    ExplosionKind::FlareBurst => {
-                        push_shells(&mut fx.shells, p, s.max(0.6), FLARE_BURST_SHELLS);
-                    }
-                    // `bullets.spawnExplosion`: one shell, `lerp(s*0.4, s*2.6)`
-                    // over 0.55 s. The caller's `scale` is what distinguishes a
-                    // 0.4-unit bullet spark from a 6-unit ship death.
-                    ExplosionKind::Impact
-                    | ExplosionKind::ShipDeath
-                    | ExplosionKind::AsteroidBreak => {
-                        let color = match kind {
-                            ExplosionKind::AsteroidBreak => glow(0xffaa55, 1.5),
-                            ExplosionKind::ShipDeath => glow(0xffcc88, 2.2),
-                            _ => glow(0xffaa55, 1.8),
-                        };
-                        fx.shells.push(Shell {
-                            pos: p,
-                            age: 0.0,
-                            life: 0.55,
-                            from: s * 0.4,
-                            to: s * 2.6,
-                            color,
-                            opacity: 0.95,
-                        });
-                    }
-                }
+                spawn_explosion(&mut fx, kind, p, scale as f32);
             }
 
             _ => {}
@@ -797,31 +1033,362 @@ fn consume_events(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
     }
 }
 
-/// `missiles.spawnExplosion` — flash, fire, smoke. `(hex, intensity, from, to, life)`.
-const MISSILE_HIT_SHELLS: &[(u32, f32, f32, f32, f32)] = &[
-    (0xffffff, 2.6, 0.8, 5.0, 0.30),
-    (0xff9900, 2.0, 1.4, 11.0, 0.52),
-    (0xff3300, 1.4, 2.0, 16.0, 0.70),
-];
-
-/// `spawnFlareBurst` — the same three-shell shape, sharper and smaller.
-const FLARE_BURST_SHELLS: &[(u32, f32, f32, f32, f32)] = &[
-    (0xffffff, 2.8, 0.15, 3.5, 0.18),
-    (0xffee44, 2.2, 0.40, 6.5, 0.26),
-    (0xff8800, 1.6, 0.70, 10.0, 0.32),
-];
-
-fn push_shells(out: &mut Vec<Shell>, pos: Vec3, scale: f32, spec: &[(u32, f32, f32, f32, f32)]) {
-    for &(h, intensity, from, to, life) in spec {
-        out.push(Shell {
-            pos,
-            age: 0.0,
-            life,
-            from: from * scale,
-            to: to * scale,
-            color: glow(h, intensity),
+/// A muzzle flash, as a flash and not as a dot.
+///
+/// `bullets.js` has none — the bolt spawns at the muzzle and that reads as one —
+/// but the gun fires at 20 Hz and a single frame of light at the barrel is what
+/// sells it at this brightness.
+///
+/// It was one soft disc, which is what a *point* light looks like and not what
+/// a gun looks like. A gun throws its flash forward along the barrel, so this is
+/// a short hot streak on the firing axis with a small bloom at its root: two
+/// quads, alive for four frames.
+fn muzzle_flash(fx: &mut Effects, p: Vec3, dir: Vec3) {
+    push_shell(
+        &mut fx.shells,
+        Shell {
+            pos: p + dir * 1.1,
+            life: 0.07,
+            from: 0.55,
+            to: 1.5,
+            color: glow(0xeaffe6, 3.0),
+            cool: glow(0x33ff99, 0.6),
+            opacity: 0.9,
+            ease: 0.55,
+            fade: 1.2,
+            ..default()
+        },
+    );
+    // The forward lance. A `Mote` rather than a `Shell` because only a mote can
+    // carry a direction, and `smear` against a fixed velocity is exactly the
+    // aligned streak this wants.
+    push_mote(
+        &mut fx.motes,
+        Mote {
+            pos: p + dir * 2.0,
+            life: 0.06,
+            half: 0.30,
+            shrink: 0.7,
+            color: glow(0xd9ffe8, 4.0),
+            cool: glow(0x2bff9c, 0.8),
             opacity: 0.95,
-        });
+            vel: dir * 90.0,
+            smear: 0.030,
+            brush: Brush::CORE,
+            ..default()
+        },
+    );
+}
+
+/// Every explosion in the game, in one place.
+///
+/// Factored out of [`consume_events`] so the screenshot harness below can stage
+/// the *same* effect the simulation raises rather than a hand-copied likeness of
+/// it — a before/after pair taken against a second implementation would be
+/// comparing the harness, not the effect.
+///
+/// # Why this is no longer one quad
+///
+/// `bullets.spawnExplosion` is a single additive sphere lerping from `s * 0.4`
+/// to `s * 2.6` over 0.55 s in one flat orange. Ported faithfully, a ship dying
+/// was a symmetrical beige blob that grew and faded — an out-of-focus lamp, with
+/// nothing in it to read as *matter coming apart*. The three things it was
+/// missing, in order of how much each buys:
+///
+/// 1. **Sparks.** A burst throws fragments outward. Radial streaks are what the
+///    eye reads as an explosion; a disc is what it reads as a light. They come
+///    out of the same [`Effects::motes`] pool as the trails, so they cost no new
+///    machinery — only [`Mote::vel`], which the trails needed anyway.
+/// 2. **A flash.** One frame of something much brighter and much smaller than
+///    the fireball, well over the bloom threshold, so the moment of detonation
+///    is distinct from the burning that follows.
+/// 3. **Cooling.** A fireball that goes white → yellow → orange → dull red over
+///    its life, rather than holding one colour and dimming.
+fn spawn_explosion(fx: &mut Effects, kind: ExplosionKind, p: Vec3, s: f32) {
+    let spec = match kind {
+        ExplosionKind::MissileHit => &MISSILE_HIT,
+        ExplosionKind::FlareBurst => &FLARE_BURST,
+        ExplosionKind::AsteroidBreak => &ASTEROID_BREAK,
+        ExplosionKind::ShipDeath => &SHIP_DEATH,
+        ExplosionKind::Impact => &IMPACT,
+    };
+    let scale = s.max(spec.min_scale);
+    push_shells(&mut fx.shells, p, scale, spec.shells);
+    push_sparks(fx, p, scale, spec);
+}
+
+/// One explosion recipe: the shells it draws, and the sparks it throws.
+struct Burst {
+    /// Shells, from the innermost flash outward.
+    shells: &'static [ShellSpec],
+    /// Floor on the caller's scale, so a hit reported at a hair's width is
+    /// still visible.
+    min_scale: f32,
+    /// How many fragments to throw, and how fast in units per second per unit
+    /// of scale.
+    sparks: usize,
+    spark_speed: f32,
+    /// Fragment colours, hot then burnt out.
+    spark_hot: (u32, f32),
+    spark_cool: (u32, f32),
+    /// Fragment lifetime range, in seconds.
+    spark_life: (f32, f32),
+    /// Fragment half-width, in **world units and not units of scale**.
+    ///
+    /// A chip of hull is a chip of hull whether it came off a bullet strike or
+    /// off a ship coming apart; what the blast size changes is how many there
+    /// are and how hard they are thrown, not how big each one is. Scaling the
+    /// width with the burst gave a ship death fragments a metre and a half
+    /// across, which read as a ring of white petals rather than as debris.
+    spark_half: (f32, f32),
+}
+
+/// One shell of a [`Burst`]: `(hot, hot intensity, cool, cool intensity, from,
+/// to, life, opacity)`, with the radii in units of the burst's scale.
+struct ShellSpec {
+    hot: (u32, f32),
+    cool: (u32, f32),
+    from: f32,
+    to: f32,
+    life: f32,
+    opacity: f32,
+}
+
+/// `bullets.spawnExplosion` at a bullet's scale: a bolt striking a hull or a
+/// rock. Small, brief, and mostly sparks — a strike throws chips, it does not
+/// make a fireball.
+const IMPACT: Burst = Burst {
+    shells: &[
+        ShellSpec {
+            hot: (0xffffff, 2.4),
+            cool: (0xffcc66, 0.9),
+            from: 0.35,
+            to: 1.6,
+            life: 0.10,
+            opacity: 1.0,
+        },
+        ShellSpec {
+            hot: (0xffbb66, 1.15),
+            cool: (0x881a00, 0.14),
+            from: 0.5,
+            to: 3.6,
+            life: 0.32,
+            opacity: 0.8,
+        },
+    ],
+    min_scale: 0.8,
+    sparks: 18,
+    spark_speed: 30.0,
+    spark_hot: (0xffe6b0, 2.2),
+    spark_cool: (0xff3b00, 0.22),
+    spark_life: (0.14, 0.36),
+    spark_half: (0.09, 0.19),
+};
+
+/// A ship coming apart. The caller's scale is 6, so the fireball reaches about
+/// 20 units and the fragments carry 90.
+const SHIP_DEATH: Burst = Burst {
+    shells: &[
+        ShellSpec {
+            hot: (0xffffff, 3.0),
+            cool: (0xffddaa, 1.0),
+            from: 0.25,
+            to: 1.1,
+            life: 0.12,
+            opacity: 1.0,
+        },
+        ShellSpec {
+            hot: (0xffd28a, 1.55),
+            cool: (0xff3a00, 0.28),
+            from: 0.35,
+            to: 2.4,
+            life: 0.45,
+            opacity: 0.85,
+        },
+        ShellSpec {
+            hot: (0xff6a1e, 0.60),
+            cool: (0x2a0800, 0.04),
+            from: 0.5,
+            to: 4.0,
+            life: 0.95,
+            opacity: 0.45,
+        },
+    ],
+    min_scale: 1.0,
+    sparks: 46,
+    spark_speed: 16.0,
+    spark_hot: (0xffe0a8, 2.4),
+    spark_cool: (0xff2000, 0.20),
+    spark_life: (0.30, 1.00),
+    spark_half: (0.09, 0.24),
+};
+
+/// A rock breaking. Dimmer and redder than a ship — rock does not burn — and
+/// the fragments outlive the flash because that is the part that reads as
+/// debris.
+const ASTEROID_BREAK: Burst = Burst {
+    shells: &[
+        ShellSpec {
+            hot: (0xffddaa, 1.6),
+            cool: (0xaa4400, 0.4),
+            from: 0.10,
+            to: 0.55,
+            life: 0.14,
+            opacity: 0.9,
+        },
+        ShellSpec {
+            hot: (0xd98a4a, 0.75),
+            cool: (0x3a1400, 0.05),
+            from: 0.16,
+            to: 1.5,
+            life: 0.70,
+            opacity: 0.5,
+        },
+    ],
+    min_scale: 1.0,
+    sparks: 26,
+    spark_speed: 5.0,
+    spark_hot: (0xffc07a, 1.5),
+    spark_cool: (0x501800, 0.08),
+    spark_life: (0.45, 1.20),
+    spark_half: (0.10, 0.30),
+};
+
+/// `missiles.spawnExplosion` — flash, fire, smoke.
+const MISSILE_HIT: Burst = Burst {
+    shells: &[
+        ShellSpec {
+            hot: (0xffffff, 3.0),
+            cool: (0xffdd99, 1.0),
+            from: 0.8,
+            to: 4.2,
+            life: 0.14,
+            opacity: 1.0,
+        },
+        ShellSpec {
+            hot: (0xffc866, 1.5),
+            cool: (0xff3800, 0.26),
+            from: 1.2,
+            to: 10.0,
+            life: 0.46,
+            opacity: 0.85,
+        },
+        ShellSpec {
+            hot: (0xff5511, 0.55),
+            cool: (0x330800, 0.04),
+            from: 1.8,
+            to: 16.0,
+            life: 0.80,
+            opacity: 0.45,
+        },
+    ],
+    min_scale: 0.6,
+    sparks: 34,
+    spark_speed: 48.0,
+    spark_hot: (0xffe0a0, 2.4),
+    spark_cool: (0xff2600, 0.18),
+    spark_life: (0.28, 0.72),
+    spark_half: (0.10, 0.26),
+};
+
+/// `spawnFlareBurst` — the same shape, sharper and smaller, and it stays
+/// yellow-white because a decoy is burning magnesium rather than fuel.
+const FLARE_BURST: Burst = Burst {
+    shells: &[
+        ShellSpec {
+            hot: (0xffffff, 3.2),
+            cool: (0xffee88, 1.2),
+            from: 0.15,
+            to: 3.2,
+            life: 0.16,
+            opacity: 1.0,
+        },
+        ShellSpec {
+            hot: (0xffee44, 1.5),
+            cool: (0xff7700, 0.30),
+            from: 0.40,
+            to: 6.5,
+            life: 0.28,
+            opacity: 0.85,
+        },
+        ShellSpec {
+            hot: (0xff8800, 0.60),
+            cool: (0x441000, 0.05),
+            from: 0.70,
+            to: 10.0,
+            life: 0.40,
+            opacity: 0.45,
+        },
+    ],
+    min_scale: 0.6,
+    sparks: 26,
+    spark_speed: 36.0,
+    spark_hot: (0xffffcc, 2.6),
+    spark_cool: (0xff9900, 0.35),
+    spark_life: (0.18, 0.52),
+    spark_half: (0.07, 0.17),
+};
+
+fn push_shells(out: &mut Vec<Shell>, pos: Vec3, scale: f32, spec: &[ShellSpec]) {
+    for s in spec {
+        push_shell(
+            out,
+            Shell {
+                pos,
+                life: s.life,
+                from: s.from * scale,
+                to: s.to * scale,
+                color: glow(s.hot.0, s.hot.1),
+                cool: glow(s.cool.0, s.cool.1),
+                opacity: s.opacity,
+                ..default()
+            },
+        );
+    }
+}
+
+/// Throws a [`Burst`]'s fragments.
+///
+/// Speed is randomised over a wide range on purpose: a burst where every
+/// fragment leaves at the same speed is a hollow expanding shell of dots, which
+/// is a worse artefact than the disc it replaced. Scattering the speeds fills
+/// the volume.
+fn push_sparks(fx: &mut Effects, pos: Vec3, scale: f32, spec: &Burst) {
+    let hot = glow(spec.spark_hot.0, spec.spark_hot.1);
+    let cool = glow(spec.spark_cool.0, spec.spark_cool.1);
+    for _ in 0..spec.sparks {
+        let dir = fx.rng.direction();
+        // Squared, so most fragments stay in the fireball and a few outrun it.
+        // A uniform draw puts them all in one band and the burst reads as a
+        // ring of petals, which is what the first pass looked like.
+        let u = fx.rng.range(0.16, 1.0);
+        let speed = spec.spark_speed * scale * u * u;
+        let life = fx.rng.range(spec.spark_life.0, spec.spark_life.1);
+        let half = fx.rng.range(spec.spark_half.0, spec.spark_half.1);
+        push_mote(
+            &mut fx.motes,
+            Mote {
+                pos: pos + dir * (scale * 0.3),
+                life,
+                half,
+                shrink: 0.8,
+                color: hot,
+                cool,
+                opacity: 0.9,
+                vel: dir * speed,
+                // Space has no air, but a fragment that flies dead straight for
+                // a second at a constant speed reads as a bug. The drag is a
+                // cheat and it is the one that makes the burst look like it
+                // happened rather than like it is still happening.
+                drag: 1.5,
+                // Well above `MOTE_SMEAR`: a fragment is a *streak*, and a
+                // long thin one is the shape that reads as debris where a
+                // round one reads as a bubble.
+                smear: 0.038,
+                brush: Brush::CORE,
+                ..default()
+            },
+        );
     }
 }
 
@@ -844,7 +1411,9 @@ fn emit_trails(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
         }
 
         let speed = to_vec3(ship.vel).length();
-        let mode = if ship.flags.contains(ShipFlags::BRAKING) {
+        let mode = if let Some(forced) = forced_trail() {
+            forced
+        } else if ship.flags.contains(ShipFlags::BRAKING) {
             &EMIT_BRAKE
         } else if ship.flags.contains(ShipFlags::BOOSTING) {
             &EMIT_BOOST
@@ -867,10 +1436,29 @@ fn emit_trails(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
 
         let quat = rot(ship.quat);
         let base = to_vec3(ship.pos);
+        let vel = to_vec3(ship.vel);
+        let back = quat * Vec3::NEG_Z;
+        let right = quat * Vec3::X;
+        let up = quat * Vec3::Y;
+
+        let hot = glow(mode.hot.0, mode.hot.1);
+        let cool = glow(mode.cool.0, mode.cool.1);
 
         for offset in trail_offsets() {
             let nozzle = base + quat * offset;
-            for _ in 0..n {
+            for i in 0..n {
+                // Emission is a *rate*, but the pose is only sampled once a
+                // tick, so every particle a tick owes would otherwise be
+                // stamped at the same point — the plume comes out in clumps of
+                // one, two, one, two as the debt accumulator beats against the
+                // tick. Walking each particle back along the ship's own motion
+                // to where the ship was when it was due, and starting it that
+                // much aged, spaces them evenly instead. At 105 particles a
+                // second on a 60 Hz tick that is the difference between pairs
+                // and a stream.
+                let slice = (i as f32 + 0.5) / n as f32;
+                let back_dt = dt * (1.0 - slice);
+
                 let j = mode.jitter;
                 let jitter = Vec3::new(
                     fx.rng.range(-j, j),
@@ -879,20 +1467,29 @@ fn emit_trails(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                 );
                 let scale = fx.rng.range(mode.scale.0, mode.scale.1);
                 let life = fx.rng.range(mode.life.0, mode.life.1);
-                let color = fx.rng.pick(mode.colors);
+                // Sideways only: a spread along the exhaust axis would just be
+                // noise on the ejection speed, where across it opens the cone.
+                let spread = right * fx.rng.range(-1.0, 1.0) * mode.spread
+                    + up * fx.rng.range(-1.0, 1.0) * mode.spread;
+
                 push_mote(
                     &mut fx.motes,
                     Mote {
-                        pos: nozzle + jitter,
-                        age: 0.0,
+                        pos: nozzle + jitter - vel * back_dt,
+                        age: back_dt,
                         life,
                         // `trails.js` geometry is a radius-0.5 sphere scaled by
                         // `scale`, so the world half-extent is half of it.
                         half: scale * 0.5,
-                        grow: 0.0,
+                        grow: mode.grow,
                         shrink: 0.45,
-                        color: glow(color, 1.4),
-                        opacity: 0.85,
+                        color: hot,
+                        cool,
+                        opacity: mode.alpha,
+                        vel: vel * mode.inherit + back * mode.eject + spread,
+                        drag: mode.drag,
+                        smear: MOTE_SMEAR,
+                        ..default()
                     },
                 );
             }
@@ -953,7 +1550,13 @@ fn emit_damage(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
         // One wing, picked off the id and therefore stable for the life of the
         // ship. Both wings at once reads as an aura; one reads as a hit.
         let anchor = anchors[(ship.id.unsigned_abs() % 2) as usize];
-        let nozzle = to_vec3(ship.pos) + rot(ship.quat) * anchor;
+        let quat = rot(ship.quat);
+        let nozzle = to_vec3(ship.pos) + quat * anchor;
+        let vel = to_vec3(ship.vel);
+        let back = quat * Vec3::NEG_Z;
+        // Outboard, away from the fuselage, so the plume clears the wing it is
+        // anchored under instead of being drawn inside it.
+        let out = quat * Vec3::X * anchor.x.signum();
 
         for _ in 0..owed[0] {
             let j = SMOKE_JITTER;
@@ -962,28 +1565,47 @@ fn emit_damage(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                 fx.rng.range(-j, j),
                 fx.rng.range(-j, j),
             );
-            let scale = fx.rng.range(1.1, 2.1);
-            let life = fx.rng.range(1.00, 1.70);
+            let scale = fx.rng.range(1.1, 2.3);
+            let life = fx.rng.range(0.9, 1.6);
+            // Drawn before the push, for the borrow reason the flame loop below
+            // documents: `fx.rng` and `fx.damage` are siblings and the checker
+            // sees one `&mut fx` through the call.
+            // A ship that is not moving still has to *stream*, or a damaged
+            // hull holding station is a warm smudge welded to one wing. The
+            // outboard component is what carries the plume clear of the wing it
+            // is anchored under rather than leaving it drawn inside the skin.
+            let drift = back * fx.rng.range(3.0, 9.0) + out * fx.rng.range(0.8, 3.2);
             push_damage(
                 &mut fx.damage,
                 Mote {
                     pos: nozzle + jitter,
-                    age: 0.0,
                     life,
                     half: scale * 0.5,
                     // Grows and does not shrink: a puff of smoke expands as it
                     // is left behind, which is what turns a string of particles
                     // into a widening plume rather than a dotted line.
-                    grow: 2.4,
+                    grow: 2.8,
                     shrink: 0.0,
-                    color: SMOKE,
+                    // Lit at birth by the fire it came out of and dead by the
+                    // end, which is the only handle additive blending gives on
+                    // "this is matter, not a lamp": the *near* end of the plume
+                    // glows and the far end does not.
+                    color: SMOKE_HOT,
+                    cool: SMOKE_COLD,
                     // Deliberately low, and it is the *count* that carries the
                     // effect rather than this number. Additive blending means a
                     // single puff contributes almost nothing over an unlit sky,
                     // so a plume is made of overlap — and pushing alpha instead
                     // of density is what turned an early pass into a small sun
                     // the moment three of them landed on the same pixel.
-                    opacity: 0.15 + 0.15 * ramp(hull, SMOKE_AT),
+                    opacity: 0.13 + 0.13 * ramp(hull, SMOKE_AT),
+                    // Smoke keeps most of the ship's momentum and bleeds it —
+                    // it hangs at the wing, slides aft, and stalls in place,
+                    // which is what draws the plume out into a streak behind a
+                    // moving ship instead of dumping it all on one point.
+                    vel: vel * 0.86 + drift,
+                    drag: 0.8,
+                    ..default()
                 },
             );
         }
@@ -995,26 +1617,38 @@ fn emit_damage(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                 fx.rng.range(-j, j),
                 fx.rng.range(-j, j),
             );
-            let scale = fx.rng.range(0.45, 0.95);
+            let scale = fx.rng.range(0.5, 1.15);
             // Short-lived, so the flame stays *on* the wing while the smoke
             // trails away from it. The two lifetimes are what separates them.
-            let life = fx.rng.range(0.10, 0.20);
+            let life = fx.rng.range(0.13, 0.26);
             // Drawn before the push: `fx.rng` and `fx.damage` are sibling
             // fields, and the borrow checker sees one `&mut fx` through the
             // call rather than two disjoint borrows — the same shape
             // `age_effects` documents for the exhaust debt.
             let color = fx.rng.pick(&FIRE_COLORS);
+            let flick = fx.rng.range(0.6, 1.0);
+            let stream = back * fx.rng.range(4.0, 12.0) + out * fx.rng.range(0.0, 1.2);
             push_damage(
                 &mut fx.damage,
                 Mote {
                     pos: nozzle + jitter,
-                    age: 0.0,
                     life,
                     half: scale * 0.5,
-                    grow: 0.5,
-                    shrink: 0.5,
+                    grow: 1.1,
+                    shrink: 0.45,
                     color,
-                    opacity: 0.95,
+                    // Every flame ends the same deep red however it started, so
+                    // the burning wing has a hot root and a dull tail rather
+                    // than being one uniform orange smear.
+                    cool: FIRE_EMBER,
+                    opacity: 0.85 * flick,
+                    // Nearly all of it: a flame is anchored to the airframe and
+                    // only streams a little, which is what separates it from
+                    // the smoke coming off the same point.
+                    vel: vel * 0.95 + stream,
+                    drag: 1.2,
+                    smear: MOTE_SMEAR,
+                    ..default()
                 },
             );
         }
@@ -1029,14 +1663,15 @@ fn ramp(hull: f32, at: f32) -> f32 {
 /// Position jitter on a smoke puff, and on a flame. The flame is much tighter
 /// because it is attached to a place on the airframe and the smoke is not.
 ///
-/// The smoke's is deliberately large. A particle does not move after release,
-/// so a *stationary* damaged ship emits every puff into the same cubic metre —
-/// and thirty additive quads stacked on one point is not a plume, it is a small
-/// sun, which is precisely what a tight jitter produced. Scattering them over a
-/// couple of units gives the volume a moving ship gets for free from its own
-/// velocity.
-const SMOKE_JITTER: f32 = 1.20;
-const FIRE_JITTER: f32 = 0.30;
+/// The smoke's used to be much larger — 1.2 units — for a reason that no longer
+/// holds: a particle did not move after release, so a *stationary* damaged ship
+/// emitted every puff into the same cubic metre, and thirty additive quads
+/// stacked on one point is not a plume but a small sun. Scattering them was the
+/// only volume available. Now that a puff carries the ship's momentum and drifts
+/// aft under drag, the plume gets its volume from the motion, and a jitter this
+/// wide only made the source of the damage vague.
+const SMOKE_JITTER: f32 = 0.45;
+const FIRE_JITTER: f32 = 0.26;
 
 /// Pushes a damage particle, dropping the oldest when its own cap is reached.
 fn push_damage(damage: &mut Vec<Mote>, mote: Mote) {
@@ -1058,6 +1693,46 @@ fn push_mote(motes: &mut Vec<Mote>, mote: Mote) {
     motes.push(mote);
 }
 
+/// Pushes a shell, dropping the oldest when the cap is reached.
+fn push_shell(shells: &mut Vec<Shell>, shell: Shell) {
+    if shells.len() >= MAX_SHELLS {
+        shells.remove(0);
+    }
+    shells.push(shell);
+}
+
+/// Pushes a beam, dropping the oldest when the cap is reached.
+fn push_beam(beams: &mut Vec<BeamFx>, beam: BeamFx) {
+    if beams.len() >= MAX_BEAMS {
+        beams.remove(0);
+    }
+    beams.push(beam);
+}
+
+/// Ages every particle by `dt`, moves it, and drops it when its life runs out.
+///
+/// The integration is semi-implicit — drag first, then the step — because a
+/// spark leaves an explosion at 90 units a second and an explicit step at a
+/// 60 Hz frame would carry it a unit and a half before the drag it is supposed
+/// to have felt is applied at all.
+fn advance(motes: &mut Vec<Mote>, dt: f32) {
+    for m in motes.iter_mut() {
+        step(m, dt);
+    }
+    motes.retain(|m| m.age < m.life);
+}
+
+/// One particle, one step. Split out so the screenshot harness can wind a
+/// single particle forward to a chosen point in its life without also ageing
+/// the frame around it.
+fn step(m: &mut Mote, dt: f32) {
+    m.age += dt;
+    if m.drag > 0.0 {
+        m.vel /= 1.0 + m.drag * dt;
+    }
+    m.pos += m.vel * dt;
+}
+
 /// Ages every effect and drops the dead ones. Per *frame*, on real time, which
 /// is what makes a 0.18 s beam fade smoothly on a 144 Hz display.
 fn age_effects(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
@@ -1073,15 +1748,8 @@ fn age_effects(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
     }
     fx.beams.retain(|b| b.age < BEAM_LIFE);
 
-    for m in &mut fx.motes {
-        m.age += dt;
-    }
-    fx.motes.retain(|m| m.age < m.life);
-
-    for m in &mut fx.damage {
-        m.age += dt;
-    }
-    fx.damage.retain(|m| m.age < m.life);
+    advance(&mut fx.motes, dt);
+    advance(&mut fx.damage, dt);
 
     // Missile exhaust. Emitted here rather than in `emit_trails` because the
     // 0.028 s interval is finer than a 16.7 ms tick and the missiles it hangs
@@ -1108,23 +1776,39 @@ fn age_effects(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
             *debt -= n * MISSILE_EXHAUST_INTERVAL;
             n as u32
         };
-        for _ in 0..puffs {
+        for i in 0..puffs {
             let dir = to_vec3(m.dir);
             let nozzle = to_vec3(m.pos) + dir * MISSILE_NOZZLE_Z;
+            // Same sub-frame spread the engine trails use: a missile at
+            // `missile_speed` covers a couple of units between puffs, and
+            // stamping every puff a frame owes on one point beads the exhaust.
+            let back = dt * (1.0 - (i as f32 + 0.5) / puffs as f32);
             let scale = fx.rng.range(0.45, 1.10);
-            let life = fx.rng.range(0.30, 0.42);
+            let life = fx.rng.range(0.30, 0.46);
+            let speed = RULES.weapons.missile_speed as f32;
             push_mote(
                 &mut fx.motes,
                 Mote {
-                    pos: nozzle,
-                    age: 0.0,
+                    pos: nozzle - dir * speed * back,
+                    age: back,
                     life,
                     half: scale * 0.5,
                     // `missiles.js`: `initScale * (1 + t * 2.8)`.
                     grow: 2.8,
                     shrink: 0.0,
-                    color: glow(0xff7700, 1.8),
+                    // A rocket plume is white at the throat and soot-red by the
+                    // time it is a body-length behind; one flat orange for the
+                    // whole life is the flag that says "billboard".
+                    color: glow(0xffd9a0, 2.6),
+                    cool: glow(0xcc2200, 0.30),
                     opacity: 0.72,
+                    // Most of the missile's own momentum, so the plume hangs at
+                    // the nozzle rather than being abandoned a body-length back
+                    // the instant it is born.
+                    vel: dir * speed * 0.55,
+                    drag: 2.4,
+                    smear: MOTE_SMEAR,
+                    ..default()
                 },
             );
         }
@@ -1401,6 +2085,11 @@ fn build_surface(
     }
 
     // ── beams ────────────────────────────────────────────────────────────
+    //
+    // Core inside halo, the same two-quad idiom as a bolt. One quad on its own
+    // is a flat ribbon of colour with a hard edge; the wider, dimmer pass under
+    // it is what gives the beam a glow to sit in, and it is what `beams.js`'s
+    // lit cylinder gets for free from its own shading.
     for b in &fx.beams {
         let seg = b.end - b.start;
         let len = seg.length();
@@ -1408,14 +2097,27 @@ fn build_surface(
             continue;
         }
         let fade = 1.0 - b.age / BEAM_LIFE;
+        // The bolt fades by *thinning* as well as dimming, which reads as the
+        // channel closing rather than as the image being turned down.
+        let taper = 0.35 + 0.65 * fade;
         build.streak(
             b.start + seg * 0.5,
             seg / len,
             len * 0.5,
-            BEAM_HALF_W,
+            BEAM_HALF_W * 3.2 * taper,
+            cam_fwd,
+            Brush::GLOW,
+            b.color,
+            fade * BEAM_OPACITY * 0.45,
+        );
+        build.streak(
+            b.start + seg * 0.5,
+            seg / len,
+            len * 0.5,
+            BEAM_HALF_W * taper,
             cam_fwd,
             Brush::CORE,
-            b.color,
+            BEAM_CORE,
             fade * BEAM_OPACITY,
         );
     }
@@ -1423,7 +2125,10 @@ fn build_surface(
     // ── explosion shells ─────────────────────────────────────────────────
     for s in &fx.shells {
         let t = (s.age / s.life).clamp(0.0, 1.0);
-        let r = s.from + (s.to - s.from) * t;
+        // Fast then slow, and hot then cold. See `Shell::ease` and `Shell::cool`
+        // for why either matters; between them they are most of the difference
+        // between a fireball and an inflating orange balloon.
+        let r = s.from + (s.to - s.from) * t.powf(s.ease);
         build.puff(
             s.pos,
             r,
@@ -1431,8 +2136,8 @@ fn build_surface(
             cam_up,
             cam_fwd,
             Brush::GLOW,
-            s.color,
-            (1.0 - t) * s.opacity,
+            mix(s.color, s.cool, t),
+            (1.0 - t).powf(s.fade) * s.opacity,
         );
     }
 
@@ -1444,16 +2149,29 @@ fn build_surface(
     for m in fx.damage.iter().chain(fx.motes.iter()) {
         let t = (m.age / m.life).clamp(0.0, 1.0);
         let r = m.half * (1.0 + t * m.grow) * (1.0 - t * m.shrink);
-        build.puff(
-            m.pos,
-            r,
-            cam_right,
-            cam_up,
-            cam_fwd,
-            Brush::GLOW,
-            m.color,
-            (1.0 - t) * m.opacity,
-        );
+        let color = mix(m.color, m.cool, t);
+        let alpha = (1.0 - t) * m.opacity;
+
+        // A particle moving several of its own diameters per frame is a bead on
+        // a string however many of them there are, so it is drawn smeared along
+        // its own velocity instead — see `MOTE_SMEAR`. The threshold is what
+        // keeps a slow puff a puff: below it the streak would be shorter than
+        // the quad is wide and the branch would only cost a normalise.
+        let smear = m.vel.length() * m.smear;
+        if smear > r * 0.4 {
+            build.streak(
+                m.pos,
+                m.vel / m.vel.length(),
+                r + smear,
+                r,
+                cam_fwd,
+                m.brush,
+                color,
+                alpha,
+            );
+        } else {
+            build.puff(m.pos, r, cam_right, cam_up, cam_fwd, m.brush, color, alpha);
+        }
     }
 
     // An empty vertex buffer is a zero-byte allocation, which wgpu rejects.
@@ -1471,10 +2189,27 @@ fn build_surface(
     // Padding with degenerate triangles keeps the allocation stable: they are
     // zero-area so the rasteriser discards them, and zero-alpha so an additive
     // blend contributes nothing even if one survived.
+    //
+    // Overflow is *dropped whole quads*, not truncated buffers. `resize` down
+    // would cut the vertices and the indices independently, and an index left
+    // pointing past the shortened vertex array is a read out of bounds on the
+    // GPU — a much worse failure than the missing effects, and one that only
+    // appears in the frame that overruns. `debug_assert` catches it in a test
+    // run; this catches it in a shipped one.
     let cap_verts = MESH_VERTEX_CAPACITY;
     let cap_indices = MESH_INDEX_CAPACITY;
     debug_assert!(build.pos.len() <= cap_verts, "vertex budget exceeded");
     debug_assert!(build.index.len() <= cap_indices, "index budget exceeded");
+    if build.pos.len() > cap_verts {
+        warn_once!("effects mesh overran its {MESH_QUAD_CAPACITY}-quad budget");
+        build.pos.truncate(cap_verts);
+        build.normal.truncate(cap_verts);
+        build.uv.truncate(cap_verts);
+        build.color.truncate(cap_verts);
+        // Six indices to a quad, four vertices to a quad: keep only the
+        // triangles whose vertices all survived.
+        build.index.truncate(cap_verts / 4 * 6);
+    }
     build.pos.resize(cap_verts, [0.0; 3]);
     build.normal.resize(cap_verts, [0.0, 0.0, 1.0]);
     build.uv.resize(cap_verts, [0.0; 2]);
@@ -1508,10 +2243,21 @@ static FLARE_CORE: LinearRgba = LinearRgba::rgb(5.10, 5.10, 5.10);
 /// `missiles.js` flare glow `0xffcc22`.
 static FLARE_GLOW: LinearRgba = LinearRgba::rgb(3.40, 2.02, 0.11);
 
-/// Damage smoke: a warm grey haze, held **under** `camera.rs`'s 0.9 bloom
-/// prefilter threshold on every channel so it does not glow. See the note above
-/// [`SMOKE_AT`] on why it cannot simply be dark.
-static SMOKE: LinearRgba = LinearRgba::rgb(0.22, 0.20, 0.18);
+/// The beam's own core, hotter and whiter than the halo around it so the two
+/// passes read as one lit channel rather than as two ribbons.
+static BEAM_CORE: LinearRgba = LinearRgba::rgb(4.20, 6.00, 5.20);
+
+/// Damage smoke at birth and at death, both held **under** `camera.rs`'s 0.9
+/// bloom prefilter threshold on every channel so neither glows. See the note
+/// above [`SMOKE_AT`] on why they cannot simply be dark.
+///
+/// Two colours rather than one because additive blending gives this effect
+/// exactly one lever and this is it: a puff leaving a burning wing is lit by the
+/// fire and a puff a second downstream is not, so the plume has a warm root and
+/// a cold tail. Held one flat grey — which is what it was — a plume has no depth
+/// cue at all and reads as a smudge on the lens.
+static SMOKE_HOT: LinearRgba = LinearRgba::rgb(0.42, 0.28, 0.18);
+static SMOKE_COLD: LinearRgba = LinearRgba::rgb(0.10, 0.11, 0.14);
 
 /// Fire, well over the bloom threshold and picked from per flame so a burning
 /// wing flickers between yellow and deep orange instead of pulsing as one.
@@ -1521,20 +2267,28 @@ static FIRE_COLORS: [LinearRgba; 3] = [
     LinearRgba::rgb(6.00, 3.40, 0.70),
 ];
 
+/// What every flame cools to. Under the bloom threshold on purpose: the tail of
+/// a flame is soot, not light.
+static FIRE_EMBER: LinearRgba = LinearRgba::rgb(0.55, 0.06, 0.02);
+
 // ---------------------------------------------------------------------------
 // The stress harness
 // ---------------------------------------------------------------------------
 
 /// Synthetic projectiles, for measuring against a busy scene.
 ///
-/// `sim_bridge::tick` does not call `sim::bullets` or `sim::missiles` yet, so
-/// `Frame::bullets`, `::missiles`, and `::flares` are empty in this build and
-/// the renderer above has nothing to draw. Rather than fake data inside the
-/// simulation — which would put render scaffolding on the wrong side of the
-/// boundary — these records are synthesised here and *chained* onto the frame's
-/// own slices at every read site. When the projectile phases land in the
-/// bridge, this becomes dead weight and deletes cleanly; nothing else in the
-/// module knows it exists.
+/// This was written when `sim_bridge::tick` ran no weapons at all and
+/// `Frame::bullets` was therefore always empty. It does now — the bridge calls
+/// `sim::tick::tick`, and a held trigger puts real bolts in the frame — so the
+/// harness is no longer the *only* way to see a projectile. It is still the way
+/// to see three hundred at once, which is the question it was built for: how a
+/// scene far busier than a real match costs, against the draw-call budget the
+/// module header sets out.
+///
+/// Rather than fake data inside the simulation — which would put render
+/// scaffolding on the wrong side of the boundary — these records are
+/// synthesised here and *chained* onto the frame's own slices at every read
+/// site. Nothing else in the module knows it exists.
 #[derive(Default)]
 struct Demo {
     bullets: Vec<ProjView>,
@@ -1647,28 +2401,153 @@ fn run_demo(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
             ExplosionKind::AsteroidBreak => 14.0,
             _ => 1.0,
         };
-        match kind {
-            ExplosionKind::MissileHit => push_shells(&mut fx.shells, p, 1.0, MISSILE_HIT_SHELLS),
-            ExplosionKind::FlareBurst => push_shells(&mut fx.shells, p, 1.0, FLARE_BURST_SHELLS),
-            _ => fx.shells.push(Shell {
-                pos: p,
-                age: 0.0,
-                life: 0.55,
-                from: scale * 0.4,
-                to: scale * 2.6,
-                color: glow(0xffaa55, 1.8),
-                opacity: 0.95,
-            }),
-        }
+        spawn_explosion(&mut fx, kind, p, scale);
 
-        fx.beams.push(BeamFx {
-            start: anchor + Vec3::new(a.sin() * 12.0, -4.0, a.cos() * 12.0),
-            end: p,
-            age: 0.0,
-            color: glow(0x88ffd6, 1.6),
-        });
+        push_beam(
+            &mut fx.beams,
+            BeamFx {
+                start: anchor + Vec3::new(a.sin() * 12.0, -4.0, a.cos() * 12.0),
+                end: p,
+                age: 0.0,
+                color: glow(0x88ffd6, 1.6),
+            },
+        );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The screenshot harness
+// ---------------------------------------------------------------------------
+
+/// `SPACESHIPS_FX_SCENE=impact@0.35`: holds one effect, at one age, in shot.
+///
+/// [`Demo`] above answers "what does a busy frame cost"; this answers "what does
+/// *this* effect look like", which is a different question and the one a
+/// before/after pair needs. An explosion lives for half a second, so catching
+/// the same moment of the same effect twice by hand is not a thing that happens
+/// — and a comparison of two different moments says nothing about the change.
+///
+/// So the scene is **restaged every frame**: the shell list is cleared, the
+/// named effect is pushed, and every shell in it is aged to a fixed fraction of
+/// its life. The result is a still image that does not move, which is exactly
+/// what a screenshot wants.
+///
+/// Names are [`ExplosionKind`]'s, plus `muzzle` and `beam` for the two effects
+/// that are not explosions. `@t` sets the life fraction and defaults to 0.35 —
+/// far enough in for a shell to have expanded, early enough that it has not
+/// faded out.
+#[derive(Clone, Copy)]
+struct Scene {
+    what: SceneKind,
+    at: f32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SceneKind {
+    Explosion(ExplosionKind),
+    Muzzle,
+    Beam,
+}
+
+fn fx_scene() -> Option<Scene> {
+    #[cfg(target_arch = "wasm32")]
+    return None;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static SCENE: std::sync::OnceLock<Option<Scene>> = std::sync::OnceLock::new();
+        *SCENE.get_or_init(|| {
+            let raw = std::env::var("SPACESHIPS_FX_SCENE").ok()?;
+            let (name, at) = match raw.split_once('@') {
+                Some((n, t)) => (n, t.trim().parse::<f32>().unwrap_or(0.35)),
+                None => (raw.as_str(), 0.35),
+            };
+            let what = match name.trim().to_ascii_lowercase().as_str() {
+                "impact" => SceneKind::Explosion(ExplosionKind::Impact),
+                "death" | "shipdeath" => SceneKind::Explosion(ExplosionKind::ShipDeath),
+                "asteroid" => SceneKind::Explosion(ExplosionKind::AsteroidBreak),
+                "missile" => SceneKind::Explosion(ExplosionKind::MissileHit),
+                "flare" => SceneKind::Explosion(ExplosionKind::FlareBurst),
+                "muzzle" => SceneKind::Muzzle,
+                "beam" => SceneKind::Beam,
+                other => {
+                    warn!("SPACESHIPS_FX_SCENE={other} is not an effect this module draws");
+                    return None;
+                }
+            };
+            Some(Scene {
+                what,
+                at: at.clamp(0.0, 0.99),
+            })
+        })
+    }
+}
+
+/// How far ahead of the ship the staged effect sits, and how far above it.
+///
+/// Far enough that the hull does not cover it, near enough that a 1-unit impact
+/// spark is still more than a pixel. The lift clears the nose so the chase
+/// camera, which looks slightly down, does not put the effect behind the ship.
+const SCENE_AHEAD: f32 = 34.0;
+const SCENE_LIFT: f32 = 2.0;
+
+fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
+    let Some(scene) = fx_scene() else {
+        return;
+    };
+    let Some(ship) = frame.0.ships.iter().find(|s| s.id == crate::LOCAL_ID) else {
+        return;
+    };
+
+    let quat = rot(ship.quat);
+    let fwd = quat * Vec3::Z;
+    let at = to_vec3(ship.pos) + fwd * SCENE_AHEAD + quat * Vec3::Y * SCENE_LIFT;
+
+    // Every pool the staged effect writes into, including the shared mote pool
+    // the sparks come out of. Without the last one a scene restaged 100 times a
+    // second buries itself in its own fragments.
+    fx.shells.clear();
+    fx.beams.clear();
+    fx.motes.clear();
+
+    match scene.what {
+        SceneKind::Explosion(kind) => {
+            let scale = match kind {
+                ExplosionKind::ShipDeath => 6.0,
+                ExplosionKind::AsteroidBreak => 14.0,
+                _ => 1.0,
+            };
+            spawn_explosion(&mut fx, kind, at, scale);
+        }
+        SceneKind::Muzzle => muzzle_flash(&mut fx, at, fwd),
+        SceneKind::Beam => fx.beams.push(BeamFx {
+            start: at - fwd * 30.0 + quat * Vec3::X * 3.0,
+            end: at + fwd * 30.0,
+            age: BEAM_LIFE * scene.at,
+            color: glow(0x88ffd6, 1.6),
+        }),
+    }
+
+    // Hold everything the stage just pushed at one moment of its life, so the
+    // frame is reproducible rather than whatever the clock happened to be.
+    for s in &mut fx.shells {
+        s.age = s.life * scene.at;
+    }
+    // A particle has to be *flown* to that moment rather than have its age
+    // written, or every spark would sit on the detonation point. Substepped
+    // because the drag makes the path curved and a single jump of a third of a
+    // second would land in the wrong place.
+    for m in &mut fx.motes {
+        let dt = m.life * scene.at / SCENE_SUBSTEPS as f32;
+        for _ in 0..SCENE_SUBSTEPS {
+            step(m, dt);
+        }
+    }
+}
+
+/// How finely the harness integrates a staged particle to its held age. Sixty
+/// is a frame-rate's worth, which is the accuracy the live effect gets.
+const SCENE_SUBSTEPS: u32 = 60;
 
 // ---------------------------------------------------------------------------
 // Draw-call probe
@@ -1985,19 +2864,176 @@ mod tests {
             fx.motes.len()
         );
 
-        // Every one of them sits at a nozzle, not at the hull origin.
+        // Every one of them sits at a nozzle, not at the hull origin. The
+        // tolerance carries the sub-tick spread as well as the jitter: a
+        // particle is born back where the ship was when it was due, which at
+        // 90 u/s is up to a tick's travel behind the pose the emitter sampled.
+        let spread = 90.0 * sim::world::TICK_DT as f32;
         for m in &fx.motes {
             let d = trail_offsets()
                 .iter()
                 .map(|o| m.pos.distance(*o))
                 .fold(f32::INFINITY, f32::min);
             assert!(
-                d < EMIT_BOOST.jitter * 2.0,
+                d < EMIT_BOOST.jitter * 2.0 + spread,
                 "mote at {:?} is {d} from the nearest nozzle",
                 m.pos
             );
             assert!(m.half > 0.0 && m.life > 0.0);
         }
+    }
+
+    /// The fix for the beading, asserted rather than eyeballed: a particle
+    /// leaves the nozzle carrying most of the ship's momentum, so it recedes
+    /// slowly instead of being abandoned in place.
+    #[test]
+    fn exhaust_carries_the_ship_with_it_instead_of_being_left_behind() {
+        let ship_speed = 90.0;
+        // One tick only banks the debt, so this runs several.
+        let mut app = App::new();
+        app.init_resource::<SimFrame>()
+            .init_resource::<Effects>()
+            .add_systems(Update, emit_trails);
+        app.world_mut()
+            .resource_mut::<SimFrame>()
+            .0
+            .ships
+            .push(sim::world::ShipView {
+                id: 1,
+                flags: ShipFlags::ALIVE.with(ShipFlags::BOOSTING),
+                quat: [0.0, 0.0, 0.0, 1.0],
+                vel: [0.0, 0.0, ship_speed],
+                ..Default::default()
+            });
+        for _ in 0..4 {
+            app.update();
+        }
+        let fx = app.world_mut().remove_resource::<Effects>().unwrap();
+        assert!(!fx.motes.is_empty(), "four ticks should emit something");
+
+        for m in &fx.motes {
+            // Downrange, and slower than the ship: that pair is the effect.
+            assert!(m.vel.z > 0.0, "exhaust flying backwards: {:?}", m.vel);
+            assert!(
+                m.vel.z < ship_speed,
+                "exhaust keeping up with the ship: {:?}",
+                m.vel
+            );
+            // And it drags, or the cone never opens.
+            assert!(m.drag > 0.0);
+        }
+    }
+
+    /// A particle moves, slows, and is dropped when its life runs out.
+    #[test]
+    fn a_particle_flies_and_drags_and_dies() {
+        let mut motes = vec![Mote {
+            pos: Vec3::ZERO,
+            life: 1.0,
+            vel: Vec3::new(100.0, 0.0, 0.0),
+            drag: 4.0,
+            ..default()
+        }];
+
+        advance(&mut motes, 0.1);
+        let after_one = motes[0].pos.x;
+        assert!(after_one > 0.0, "the particle did not move");
+        // Semi-implicit: the drag is applied *before* the step, so a tenth of a
+        // second at drag 4 moves it by 100 / 1.4 * 0.1, not by 10.
+        assert!(
+            after_one < 10.0,
+            "drag was not applied to the step: {after_one}"
+        );
+
+        advance(&mut motes, 0.1);
+        let step_two = motes[0].pos.x - after_one;
+        assert!(step_two < after_one, "the particle is not slowing down");
+
+        advance(&mut motes, 1.0);
+        assert!(motes.is_empty(), "a particle past its life must be dropped");
+    }
+
+    /// Colour is a ramp, not a constant — the thing that makes exhaust and fire
+    /// look like they are cooling rather than being turned down.
+    #[test]
+    fn colour_runs_from_hot_to_cold_over_a_life() {
+        let hot = LinearRgba::rgb(4.0, 2.0, 0.0);
+        let cold = LinearRgba::rgb(0.0, 0.0, 1.0);
+        assert_eq!(mix(hot, cold, 0.0).red, 4.0);
+        assert_eq!(mix(hot, cold, 1.0).blue, 1.0);
+        let half = mix(hot, cold, 0.5);
+        assert!((half.red - 2.0).abs() < 1e-6);
+        assert!((half.blue - 0.5).abs() < 1e-6);
+
+        // And every emitter actually uses it: no mode ships the same colour at
+        // both ends, which would be the old flat-colour behaviour wearing the
+        // new field.
+        for mode in [&EMIT_MOVE, &EMIT_BOOST, &EMIT_BRAKE] {
+            assert_ne!(
+                glow(mode.hot.0, mode.hot.1).blue,
+                glow(mode.cool.0, mode.cool.1).blue
+            );
+        }
+    }
+
+    /// An explosion is a burst, not a disc: it throws fragments, it flashes
+    /// before it burns, and the flash is the brightest thing in it.
+    #[test]
+    fn an_explosion_flashes_then_burns_then_throws_sparks() {
+        let mut fx = Effects::default();
+        spawn_explosion(&mut fx, ExplosionKind::ShipDeath, Vec3::ZERO, 6.0);
+
+        assert_eq!(fx.shells.len(), SHIP_DEATH.shells.len());
+        assert_eq!(fx.motes.len(), SHIP_DEATH.sparks);
+
+        // The flash is the first shell, and it is both the brightest and the
+        // shortest — that ordering is what separates a detonation from a glow.
+        let peak = |c: LinearRgba| c.red.max(c.green).max(c.blue);
+        for pair in fx.shells.windows(2) {
+            assert!(
+                peak(pair[0].color) > peak(pair[1].color),
+                "shells must cool outward"
+            );
+            assert!(pair[0].life < pair[1].life, "shells must outlive inward");
+        }
+        // Every shell cools over its own life, too.
+        for s in &fx.shells {
+            assert!(peak(s.cool) < peak(s.color), "a shell that does not cool");
+        }
+
+        // Fragments fly outward from the centre, at a spread of speeds.
+        let speeds: Vec<f32> = fx.motes.iter().map(|m| m.vel.length()).collect();
+        assert!(
+            speeds.iter().all(|s| *s > 0.0),
+            "a spark that does not move"
+        );
+        let lo = speeds.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = speeds.iter().copied().fold(0.0, f32::max);
+        assert!(
+            hi > lo * 1.5,
+            "every spark left at the same speed: {lo}..{hi}"
+        );
+        for m in &fx.motes {
+            assert!(m.vel.dot(m.pos) > 0.0, "a spark flying inward");
+        }
+    }
+
+    /// The shell's radius eases out and its alpha holds then drops, rather than
+    /// both running linearly the way the JS's single sphere does.
+    #[test]
+    fn a_shell_expands_fast_and_then_coasts() {
+        let s = Shell {
+            from: 0.0,
+            to: 10.0,
+            life: 1.0,
+            ease: 0.5,
+            ..default()
+        };
+        let radius = |t: f32| s.from + (s.to - s.from) * t.powf(s.ease);
+        // Half the life is well past half the radius.
+        assert!(radius(0.5) > 6.5, "{}", radius(0.5));
+        // And the second half covers less ground than the first.
+        assert!(radius(1.0) - radius(0.5) < radius(0.5) - radius(0.0));
     }
 
     /// `main.js` picks brake over boost over move, in that order, and emits
@@ -2014,12 +3050,25 @@ mod tests {
             ShipFlags::BRAKING.with(ShipFlags::BOOSTING),
             [0.0, 0.0, 90.0],
         );
-        let debt = fx.trail_debt.get(&1).copied().unwrap();
+        // The debt now only holds the *fraction* a tick owes, because the rates
+        // are high enough to clear whole particles every tick — so what says
+        // which mode won is the colour of what came out. Brake is retro-thrust
+        // and warm; boost is afterburner and cool.
         let tick = sim::world::TICK_DT as f32;
+        let debt = fx.trail_debt.get(&1).copied().unwrap();
         assert!(
-            (debt - EMIT_BRAKE.rate * tick).abs() < 1e-4,
+            (debt - (EMIT_BRAKE.rate * tick).fract()).abs() < 1e-4,
             "brake rate should win over boost: {debt}"
         );
+        let owed = (EMIT_BRAKE.rate * tick).floor() as usize * 2;
+        assert_eq!(fx.motes.len(), owed, "two nozzles at the brake rate");
+        for m in &fx.motes {
+            assert!(
+                m.color.red > m.color.blue,
+                "brake exhaust should be warm, got {:?}",
+                m.color
+            );
+        }
 
         // A boss hitbox is never drawn, so it never smokes either.
         let fx = emit_one_tick(ShipFlags::BOSS_HITBOX.with(ShipFlags::BOOSTING), [0.0; 3]);
@@ -2037,13 +3086,11 @@ mod tests {
                 &mut motes,
                 Mote {
                     pos: Vec3::splat(i as f32),
-                    age: 0.0,
-                    life: 1.0,
                     half: 0.2,
-                    grow: 0.0,
                     shrink: 0.45,
                     color: BOLT_CORE,
                     opacity: 0.85,
+                    ..default()
                 },
             );
         }
@@ -2193,10 +3240,23 @@ mod tests {
     #[test]
     fn smoke_stays_under_the_bloom_floor_and_fire_clears_it() {
         let peak = |c: LinearRgba| c.red.max(c.green).max(c.blue);
-        assert!(peak(SMOKE) < 0.9, "smoke peaks at {}", peak(SMOKE));
+        for (name, c) in [("hot", SMOKE_HOT), ("cold", SMOKE_COLD)] {
+            assert!(peak(c) < 0.9, "{name} smoke peaks at {}", peak(c));
+        }
+        // And it cools as it goes, which is the only depth cue an additive
+        // plume has: lit at the wing, dead downstream.
+        assert!(peak(SMOKE_COLD) < peak(SMOKE_HOT));
+
         for c in FIRE_COLORS {
             assert!(peak(c) > 0.9, "fire colour peaks at {}", peak(c));
         }
+        // The ember every flame ends on is under the floor: the tail of a flame
+        // is soot, not light.
+        assert!(
+            peak(FIRE_EMBER) < 0.9,
+            "ember peaks at {}",
+            peak(FIRE_EMBER)
+        );
     }
 
     /// The ramp is continuous, so the plume grows into view rather than
