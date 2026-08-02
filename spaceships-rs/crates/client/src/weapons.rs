@@ -172,6 +172,11 @@
 //! opposite: they hold **one** effect still, in front of the camera, so a
 //! before-and-after pair is a pair of the same thing. See [`fx_scene`] and
 //! [`forced_trail`].
+//!
+//! One value of the first is not an effect and does not take an age:
+//! `SPACESHIPS_FX_SCENE=rocket@<units>` parks a flight of missile *bodies* at a
+//! range, because a body does not age and the question about it is how it reads
+//! at 10 units against how it reads at 60. See [`stage_rockets`].
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
