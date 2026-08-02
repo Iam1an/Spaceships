@@ -77,7 +77,10 @@ mod ui;
 mod warp;
 mod weapons;
 
+use core::time::Duration;
+
 use bevy::asset::AssetPlugin;
+use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use bevy::window::{Window, WindowPlugin};
 
@@ -179,7 +182,12 @@ fn main() {
         ui::UiPlugin,
         warp::WarpPlugin,
     ))
-    .add_systems(Update, report_frame_time);
+    .init_resource::<FrameCost>()
+    // `First` opens the window and `Last` closes it, so `busy` is the main
+    // world's own work and nothing else. The readout goes in `Last` too, so it
+    // reports the window it just closed rather than the previous one.
+    .add_systems(First, open_frame)
+    .add_systems(Last, report_frame_time);
 
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(Update, screenshot_on_f12);
@@ -254,26 +262,101 @@ fn window_resolution() -> bevy::window::WindowResolution {
     }
 }
 
+/// Where a frame's time went, split into the part this client controls and the
+/// part the monitor does.
+///
+/// Two numbers, because on a vsync'd surface they answer different questions
+/// and only one of them is about the game.
+///
+/// `Time::delta` is the *interval between frames*, and that is a property of
+/// the display. `WindowPlugin` above explains why `SPACESHIPS_NO_VSYNC` cannot
+/// change it here — wgpu has no immediate present mode on macOS/Metal, so
+/// `AutoNoVsync` falls back to Fifo — and the consequence is that the interval
+/// quantises to the refresh period. A ProMotion panel stepping from 110 Hz to
+/// 60 Hz reads as `9.09 ms` becoming `16.67 ms`: the client apparently losing
+/// nearly half its frame rate while doing exactly the same work. Reported once
+/// a second over a long match, that is indistinguishable from something
+/// accumulating — which is what it was mistaken for. Note that 16.67 is not
+/// twice 9.09: a frame that genuinely overran its budget would land on a
+/// *multiple* of the old interval, and one that lands on a different interval
+/// entirely is the panel changing rate.
+///
+/// `busy` is the wall clock spent in the main world, `First` to `Last`, and
+/// nothing quantises it. It is the number to watch when the question is
+/// "is the client getting slower": when the reported fps falls and `busy` does
+/// not, the game did not get slower.
+///
+/// Neither number covers the render world, which runs on its own thread. For
+/// that, `SPACESHIPS_DRAWCALLS=1` (see `weapons.rs`) counts batched draw calls
+/// once a second, and `SPACESHIPS_RES` shrinks the target to answer whether a
+/// cost is fill-rate bound.
+#[derive(Resource)]
+struct FrameCost {
+    /// When this frame's main-world work began.
+    ///
+    /// `bevy::platform`'s `Instant` rather than `std`'s: `std::time::Instant`
+    /// panics on `wasm32-unknown-unknown`, which is a target this crate builds
+    /// for.
+    opened: Instant,
+    /// Main-world time over the reporting window, and the worst single frame
+    /// in it.
+    busy: Duration,
+    worst_busy: Duration,
+    /// Wall clock over the window, the frames in it, and the worst interval —
+    /// the display's side of the same second.
+    elapsed: f32,
+    frames: u32,
+    worst: f32,
+}
+
+impl Default for FrameCost {
+    fn default() -> FrameCost {
+        FrameCost {
+            opened: Instant::now(),
+            busy: Duration::ZERO,
+            worst_busy: Duration::ZERO,
+            elapsed: 0.0,
+            frames: 0,
+            worst: 0.0,
+        }
+    }
+}
+
+fn open_frame(mut cost: ResMut<FrameCost>) {
+    cost.opened = Instant::now();
+}
+
 /// Rolling frame-time readout, once a second.
 ///
 /// Hand-rolled rather than `FrameTimeDiagnosticsPlugin`, which would pull in
 /// `bevy_diagnostic` and its dependents for a number this prints once a second.
-fn report_frame_time(time: Res<Time>, mut acc: Local<(f32, u32, f32)>) {
-    let (elapsed, frames, worst) = &mut *acc;
-    let dt = time.delta_secs();
-    *elapsed += dt;
-    *frames += 1;
-    *worst = worst.max(dt);
+fn report_frame_time(time: Res<Time>, mut cost: ResMut<FrameCost>) {
+    let busy = cost.opened.elapsed();
+    cost.busy += busy;
+    cost.worst_busy = cost.worst_busy.max(busy);
 
-    if *elapsed >= 1.0 {
-        info!(
-            "{:.2} ms/frame avg ({:.0} fps), {:.2} ms worst",
-            *elapsed * 1000.0 / *frames as f32,
-            *frames as f32 / *elapsed,
-            *worst * 1000.0,
-        );
-        *elapsed = 0.0;
-        *frames = 0;
-        *worst = 0.0;
+    let dt = time.delta_secs();
+    cost.elapsed += dt;
+    cost.frames += 1;
+    cost.worst = cost.worst.max(dt);
+
+    if cost.elapsed < 1.0 {
+        return;
     }
+
+    let frames = cost.frames.max(1) as f32;
+    info!(
+        "{:.2} ms/frame avg ({:.0} fps), {:.2} ms worst; cpu {:.2} ms avg, {:.2} ms worst",
+        cost.elapsed * 1000.0 / frames,
+        frames / cost.elapsed,
+        cost.worst * 1000.0,
+        cost.busy.as_secs_f32() * 1000.0 / frames,
+        cost.worst_busy.as_secs_f32() * 1000.0,
+    );
+    // `opened` is not reset: `open_frame` writes it at the top of every frame.
+    cost.busy = Duration::ZERO;
+    cost.worst_busy = Duration::ZERO;
+    cost.elapsed = 0.0;
+    cost.frames = 0;
+    cost.worst = 0.0;
 }
