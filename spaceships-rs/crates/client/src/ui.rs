@@ -157,6 +157,8 @@ impl Plugin for UiPlugin {
             .init_resource::<PreviewSkin>()
             .insert_resource(LobbyData::placeholder())
             .add_message::<LaunchRequest>()
+            .add_message::<ReturnToLobby>()
+            .add_systems(Update, reopen_menu)
             .init_resource::<LobbyOpen>()
             .add_plugins(UiMaterialPlugin::<Crt>::default())
             // Chained: the shader has to exist before the material that names
@@ -1880,6 +1882,28 @@ fn mirror_cockpit_flag(
         menu.flags[i] = view.first_person;
     }
     *last = Some(menu.flags[i]);
+}
+
+/// Reopens the menu from outside this module.
+///
+/// The inverse of [`LaunchRequest`], and deliberately the same shape of thing:
+/// [`Menu`] stays private, and the only way in is a message. `hud.rs` sends
+/// this when a finished match has had its result on screen long enough — the
+/// clock used to reach zero and simply sit there, because nothing anywhere
+/// consumed `SimEvent::MatchEnded`.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct ReturnToLobby;
+
+fn reopen_menu(mut requests: MessageReader<ReturnToLobby>, mut menu: ResMut<Menu>) {
+    if requests.read().next().is_none() {
+        return;
+    }
+    requests.clear();
+    // Same state `Escape` produces (`toggle_menu`), so there is one definition
+    // of "the menu is up" and returning from a match cannot drift from it.
+    if !menu.open {
+        menu.open = true;
+    }
 }
 
 #[derive(Message, Debug, Clone)]

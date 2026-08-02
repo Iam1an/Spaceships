@@ -582,6 +582,10 @@ pub fn tick_timers(ship: &mut Ship, rules: &Rules, dt: f64) -> TimerStep {
         out.invuln_expired = ship.invuln_timer == 0.0;
     }
 
+    if ship.asteroid_damage_cooldown > 0.0 {
+        ship.asteroid_damage_cooldown = (ship.asteroid_damage_cooldown - dt).max(0.0);
+    }
+
     if !ship.alive && ship.respawn_timer > 0.0 {
         ship.respawn_timer -= dt;
         if ship.respawn_timer <= 0.0 {
@@ -764,6 +768,9 @@ pub fn respawn(ship: &mut Ship, pos: Vec3, quat: Quat, rules: &Rules) {
     ship.touching_asteroids.clear();
     ship.touching_moon = false;
     ship.touching_ground = false;
+    // A respawn is a clean slate: the first rock after coming back should cost
+    // what any first rock costs.
+    ship.asteroid_damage_cooldown = 0.0;
 
     ship.brake_charge = 0.0;
     ship.brake_boost_timer = 0.0;
@@ -968,6 +975,7 @@ pub fn resolve_world_collisions(
     // `touching_asteroids` is rebuilt from scratch each step; an id that was in
     // it last step and is not now has been left behind, and re-entering charges
     // again.
+    let mut charged = false;
     let mut still_touching: Vec<u32> = Vec::new();
     for a in geom.asteroids {
         if resolve_sphere(
@@ -983,13 +991,22 @@ pub fn resolve_world_collisions(
             if !ship.touching_asteroids.contains(&a.id) {
                 report.asteroid_impacts += 1;
                 let dmg = roll_asteroid_collision_damage(rules, rng);
-                if takes_damage {
-                    report.self_damage += dmg;
+                // Rate limited — see
+                // `CombatRules::asteroid_collision_damage_cooldown`. The roll
+                // still happens either way so the random stream advances
+                // identically whether or not the charge lands, which keeps the
+                // cooldown from changing every subsequent draw in the match.
+                if takes_damage && ship.asteroid_damage_cooldown <= 0.0 {
+                    report.self_damage = report.self_damage.max(dmg);
+                    charged = true;
                 }
             }
         }
     }
     ship.touching_asteroids = still_touching;
+    if charged {
+        ship.asteroid_damage_cooldown = rules.combat.asteroid_collision_damage_cooldown;
+    }
 
     // -- Obstacles (the moon). `main.js:2222`–`:2248`. ------------------------
     let mut moon_contact = false;
@@ -1329,8 +1346,9 @@ fn resolve_tunnelled(
             }
             report.asteroid_impacts += 1;
             let dmg = roll_asteroid_collision_damage(rules, rng);
-            if takes_damage {
+            if takes_damage && ship.asteroid_damage_cooldown <= 0.0 {
                 report.self_damage += dmg;
+                ship.asteroid_damage_cooldown = rules.combat.asteroid_collision_damage_cooldown;
             }
         }
         SweptBody::Obstacle(i) => {

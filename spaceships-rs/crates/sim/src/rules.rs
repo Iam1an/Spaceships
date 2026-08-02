@@ -824,6 +824,22 @@ pub struct CombatRules {
     /// the JS expression yields 15..=29, never 30.
     pub asteroid_collision_damage_max: i32,
 
+    /// Least time between two asteroid collision charges, in seconds.
+    ///
+    /// **Not in the JS**, which charges on every rising edge of contact
+    /// (`main.js:2215`). That reads fine for one clean hit and badly for
+    /// everything else: `collision_restitution` bounces you off a rock and the
+    /// throttle carries you straight back into it, so each bounce is a fresh
+    /// rising edge and a fresh 15..=29. Rocks overlap freely — nothing in
+    /// `asteroids::populate` separates them — so a knot of them charges once
+    /// per rock as well. Measured at 49 of 100 hit points for one pass through
+    /// four stacked rocks, and lethal for a denser knot, which is why flying
+    /// into an asteroid field read as an instant death rather than as a dent.
+    ///
+    /// One second bounds it to one charge per second however the contact
+    /// behaves, leaving a clean single impact exactly as it was.
+    pub asteroid_collision_damage_cooldown: f64,
+
     /// Restitution when a ship is pushed out of a sphere (asteroid or moon).
     /// `main.js:2209` and `bot.js:228`, both the literal `1.3`. Greater than 1,
     /// so a collision adds energy — that is intentional, it makes rocks feel
@@ -860,6 +876,7 @@ impl CombatRules {
         asteroid_damage_per_hit: 1,
         asteroid_collision_damage_min: 15,
         asteroid_collision_damage_max: 29,
+        asteroid_collision_damage_cooldown: 1.0,
 
         collision_restitution: 1.3,
         box_collision_restitution: 1.4,
@@ -1817,6 +1834,11 @@ impl Rules {
             self.combat.asteroid_collision_damage_min <= self.combat.asteroid_collision_damage_max,
             "combat.asteroid_collision_damage_min",
             "exceeds asteroid_collision_damage_max",
+        )?;
+        check(
+            self.combat.asteroid_collision_damage_cooldown >= 0.0,
+            "combat.asteroid_collision_damage_cooldown",
+            "must not be negative; zero restores the JS's charge-every-edge",
         )?;
 
         let field = &self.world.asteroid_field;

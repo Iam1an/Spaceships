@@ -498,6 +498,9 @@ pub struct Ship {
     /// is a `Vec` rather than a set because it holds at most a handful of ids
     /// and because a `HashSet` iteration order is a determinism hazard.
     pub touching_asteroids: Vec<u32>,
+    /// Time left before another asteroid collision can be charged. See
+    /// [`crate::rules::CombatRules::asteroid_collision_damage_cooldown`].
+    pub asteroid_damage_cooldown: f64,
     /// Whether the ship was touching the moon last tick — same edge trigger,
     /// but the moon kills outright. `main.js:2222`.
     pub touching_moon: bool,
@@ -566,6 +569,7 @@ impl Ship {
             hit_radius_override: None,
 
             touching_asteroids: Vec::new(),
+            asteroid_damage_cooldown: 0.0,
             touching_moon: false,
             touching_ground: false,
             hit_flash: 0.0,

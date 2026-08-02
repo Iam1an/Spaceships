@@ -1157,3 +1157,97 @@ fn aim_assist_solves_against_the_start_of_step_poses() {
         world.aim_assist.target_dir
     );
 }
+
+// ---------------------------------------------------------------------------
+// Asteroid collisions
+// ---------------------------------------------------------------------------
+
+/// Flying into a rock costs 15..=29 hit points, once — not your life.
+///
+/// `main.js:2215` charges on the *rising edge* of contact, so resting against a
+/// rock is free and re-entering charges again. The report is that a rock kills
+/// outright, which would mean either the edge is not being detected or the
+/// charge is landing every tick.
+#[test]
+fn a_rock_costs_one_hit_not_the_ship() {
+    let mut world = bare_world(0x4D0C, Mode::Skirmish);
+    let idx = push_ship(&mut world, 1, Team::Zero, Vec3::new(0.0, 0.0, -40.0));
+    world.local_id = Some(1);
+    world.ships[idx].throttle = 80.0;
+    world.ships[idx].vel = Vec3::new(0.0, 0.0, 80.0);
+    world.asteroids.push(spaceships_sim::world::Asteroid {
+        id: 0,
+        pos: Vec3::ZERO,
+        size: 10.0 / world.rules.world.asteroid_field.collision_radius_scale,
+        radius: 10.0,
+        hp: 5,
+        tier: spaceships_sim::world::AsteroidTier::Medium,
+        variant: 0,
+        rot: Vec3::ZERO,
+        spin: Vec3::ZERO,
+        hit_flash: 0.0,
+    });
+
+    let start = hp_of(&world, 1);
+    for _ in 0..240 {
+        tick(&mut world, &[hold_forward(1)], &[], TICK_DT);
+    }
+    let lost = start - hp_of(&world, 1);
+    assert!(
+        lost <= world.rules.combat.asteroid_collision_damage_max,
+        "one rock took {lost} hp over four seconds of contact",
+    );
+    assert!(
+        world.ship(1).expect("ship").alive,
+        "the rock killed the pilot"
+    );
+}
+
+/// A cluster bills once, not once per rock.
+///
+/// `asteroids::populate` runs no separation test, so overlapping rocks are
+/// normal rather than exotic, and `main.js:2215` bills inside the per-asteroid
+/// loop: four stacked rocks cost 49 of 100 hit points in a single pass and a
+/// denser knot killed outright. One impact, one charge.
+#[test]
+fn a_cluster_of_rocks_bills_once() {
+    let mut world = bare_world(0x4D0D, Mode::Skirmish);
+    push_ship(&mut world, 1, Team::Zero, Vec3::new(0.0, 0.0, -40.0));
+    world.local_id = Some(1);
+    world.ships[0].vel = Vec3::new(0.0, 0.0, 80.0);
+    // Four rocks on top of each other, which the generator can and does make.
+    for id in 0..4u32 {
+        world.asteroids.push(spaceships_sim::world::Asteroid {
+            id,
+            pos: Vec3::new(f64::from(id) * 2.0, 0.0, 0.0),
+            size: 10.0 / world.rules.world.asteroid_field.collision_radius_scale,
+            radius: 10.0,
+            hp: 5,
+            tier: spaceships_sim::world::AsteroidTier::Medium,
+            variant: 0,
+            rot: Vec3::ZERO,
+            spin: Vec3::ZERO,
+            hit_flash: 0.0,
+        });
+    }
+
+    let start = hp_of(&world, 1);
+    for _ in 0..240 {
+        tick(&mut world, &[hold_forward(1)], &[], TICK_DT);
+    }
+    let lost = start - hp_of(&world, 1);
+    assert!(
+        lost <= world.rules.combat.asteroid_collision_damage_max,
+        "four stacked rocks billed {lost} hp; one impact is one charge",
+    );
+    assert!(lost > 0, "and it still costs something");
+    assert!(world.ship(1).expect("ship").alive);
+}
+
+fn hold_forward(id: i32) -> Input {
+    Input {
+        id,
+        throttle_axis: 1.0,
+        ..Input::default()
+    }
+}

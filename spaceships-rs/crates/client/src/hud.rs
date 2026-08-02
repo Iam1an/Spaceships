@@ -129,6 +129,7 @@ impl Plugin for HudPlugin {
             .init_resource::<AppliedMarkers>()
             .init_resource::<KillFeed>()
             .init_resource::<TargetLock>()
+            .init_resource::<MatchResult>()
             .add_systems(Startup, spawn_hud)
             // `SimSet` lives in `FixedUpdate` and this is `Update`, so the
             // ordering is nominal — the point is documentary, matching
@@ -140,7 +141,10 @@ impl Plugin for HudPlugin {
             // Read in `Update` it would double-count a kill whenever the
             // display beats the tick rate and miss one whenever it does not,
             // so it is read where it is published: once per tick.
-            .add_systems(FixedUpdate, collect_kills.after(SimSet))
+            // `MatchEnded` is an event too, and for the same reason it is read
+            // per tick rather than per frame — read in `Update` a slow frame
+            // would miss the only tick it is ever published on.
+            .add_systems(FixedUpdate, (collect_kills, watch_match_end).after(SimSet))
             // The world-space markers need the *interpolated* ship poses and
             // the chase camera's settled transform, neither of which exists
             // before transform propagation — see [`sync_world_markers`].
@@ -496,6 +500,13 @@ struct HudModel {
     /// `#killfeed`, newest row first.
     kills: [KillRowModel; KILLFEED_ROWS],
 
+    /// `#matchresult`: the finished match's outcome, or `None` mid-match.
+    ///
+    /// Outside the `present` early-out's protection on purpose — a match can
+    /// end while the local ship is dead or gone, and the card still has to
+    /// show.
+    result: Option<Outcome>,
+
     /// Whether [`HudNodes::cockpit_hidden`] is hidden — true while seated.
     ///
     /// Phrased as *hidden* rather than *shown* so `Default` can stay derived:
@@ -643,7 +654,14 @@ const VIGNETTE_HEALTHY_GAIN: f32 = 0.45;
 /// `locked` comes from [`TargetLock`] rather than from the frame: whether the
 /// player's aim is on someone is a question about *projection*, and only
 /// [`sync_world_markers`] can answer it.
-fn model(frame: &Frame, time: f32, seated: bool, locked: bool, feed: &KillFeed) -> HudModel {
+fn model(
+    frame: &Frame,
+    time: f32,
+    seated: bool,
+    locked: bool,
+    feed: &KillFeed,
+    result: Option<Outcome>,
+) -> HudModel {
     // Seated in the cockpit the 3D panel replaces the *bars*, and only the
     // bars. This used to return `HudModel::default()` and stand the whole
     // overlay down, which also took the reticle with it — so the cockpit had no
@@ -667,7 +685,13 @@ fn model(frame: &Frame, time: f32, seated: bool, locked: bool, feed: &KillFeed) 
         .iter()
         .find(|s| s.flags.contains(ShipFlags::LOCAL))
     else {
-        return HudModel::default();
+        // The result card is the one thing that outlives the ship: a match can
+        // end with the local pilot destroyed and awaiting respawn, and "you
+        // lost" is exactly the moment you need to be told.
+        return HudModel {
+            result,
+            ..HudModel::default()
+        };
     };
 
     let hud: &HudState = &frame.hud;
@@ -720,6 +744,7 @@ fn model(frame: &Frame, time: f32, seated: bool, locked: bool, feed: &KillFeed) 
         alive,
 
         bars_hidden: seated,
+        result,
 
         hp: if seated { 0 } else { hud.hp.max(0) },
         hp_mil: if seated { 0 } else { mil(hp01) },
@@ -870,6 +895,9 @@ struct HudNodes {
     lock_warning: Entity,
     vignette: Entity,
     death_banner: Entity,
+    /// `#matchresult`. One line of text, recoloured per outcome.
+    result_banner: Entity,
+    result_text: Entity,
 
     match_panel: Entity,
     team0: Entity,
@@ -975,6 +1003,8 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
     let mut lock_warning = Entity::PLACEHOLDER;
     let mut vignette = Entity::PLACEHOLDER;
     let mut death_banner = Entity::PLACEHOLDER;
+    let mut result_banner = Entity::PLACEHOLDER;
+    let mut result_text = Entity::PLACEHOLDER;
     let mut match_panel = Entity::PLACEHOLDER;
     let mut team0 = Entity::PLACEHOLDER;
     let mut team1 = Entity::PLACEHOLDER;
@@ -1306,6 +1336,39 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
                     .id();
             });
 
+            // -- #matchresult -----------------------------------------------
+            // Above the death banner's line, because a match can perfectly
+            // well end while you are dead and the two would otherwise overlap.
+            result_banner = hud
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0),
+                        right: px(0),
+                        top: percent(26),
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    },
+                    Visibility::Hidden,
+                ))
+                .with_children(|row| {
+                    result_text = row
+                        .spawn((
+                            Node {
+                                padding: UiRect::axes(px(48), px(12)),
+                                border_radius: BorderRadius::all(px(16)),
+                                ..default()
+                            },
+                            BackgroundColor(rgba(0, 0, 0, 0.55)),
+                            Text::new(Outcome::Draw.text()),
+                            hud_font(&font, 64.0, 800),
+                            TextColor(Color::WHITE),
+                            LetterSpacing::Px(12.0),
+                        ))
+                        .id();
+                })
+                .id();
+
             // -- #hit-vignette ----------------------------------------------
             vignette = hud
                 .spawn((
@@ -1422,6 +1485,8 @@ fn spawn_hud(mut commands: Commands, assets: Res<AssetServer>) {
         lock_warning,
         vignette,
         death_banner,
+        result_banner,
+        result_text,
         match_panel,
         team0,
         team1,
@@ -1956,6 +2021,11 @@ struct HudWrite<'w, 's> {
 /// acquiring a single `Mut` if it matches. Everything after the early-out is
 /// guarded by its own field comparison, so the cost of a frame is proportional
 /// to what moved rather than to how many nodes exist.
+// Eleven, against clippy's ten. Every one is a distinct resource the model is
+// built from, and the writes are already grouped into `HudWrite` for this exact
+// reason — grouping the reads as well would put a second indirection between
+// this system and the values `model` takes, for no gain.
+#[allow(clippy::too_many_arguments)]
 fn sync_hud(
     frame: Res<SimFrame>,
     time: Res<Time>,
@@ -1965,6 +2035,7 @@ fn sync_hud(
     roster: Res<Roster>,
     feed: Res<KillFeed>,
     lock: Res<TargetLock>,
+    result: Res<MatchResult>,
     mut applied: ResMut<AppliedHud>,
     mut w: HudWrite,
 ) {
@@ -1974,7 +2045,14 @@ fn sync_hud(
     // for the same reason it stands down in the cockpit: something else is
     // already the interface.
     let hidden = view.seated || lobby.is_some_and(|l| l.0);
-    let next = model(&frame.0, time.elapsed_secs(), hidden, lock.0, &feed);
+    let next = model(
+        &frame.0,
+        time.elapsed_secs(),
+        hidden,
+        lock.0,
+        &feed,
+        result.outcome,
+    );
     let prev = applied.0;
 
     // The early-out. On a frame where nothing the player can see has changed —
@@ -1995,9 +2073,34 @@ fn sync_hud(
     }
 
     // -- master visibility --------------------------------------------------
-    if moved!(present) {
-        set_visible(&mut w.vis, nodes.root, next.present);
+    // `result` counts here as well as `present`: the card hangs off this root,
+    // so a match that ends while the local ship is gone would otherwise hide
+    // the very thing it just put up.
+    if moved!(present, result) {
+        set_visible(
+            &mut w.vis,
+            nodes.root,
+            next.present || next.result.is_some(),
+        );
     }
+
+    // -- #matchresult -------------------------------------------------------
+    // Before the `present` early-out, because the card has to survive the local
+    // ship: a match can end while you are dead.
+    if moved!(result) {
+        set_visible(&mut w.vis, nodes.result_banner, next.result.is_some());
+        if let Some(outcome) = next.result {
+            set_text(&mut w.text, nodes.result_text, || {
+                outcome.text().to_string()
+            });
+            set(
+                &mut w.text_colour,
+                nodes.result_text,
+                TextColor(outcome.colour()),
+            );
+        }
+    }
+
     if !next.present {
         // Nothing below is meaningful without a ship, and leaving the tree
         // untouched means a HUD that is off costs one comparison a frame.
@@ -2248,6 +2351,109 @@ fn sync_hud(
 // ---------------------------------------------------------------------------
 // The world-space layer
 // ---------------------------------------------------------------------------
+
+/// How long the result card stays up before the menu comes back.
+///
+/// `main.js` leaves `#matchresult` up until the player dismisses it; a card
+/// that waits for a click needs a pointer, and the pointer is grabbed in
+/// flight. Timed instead, and long enough to read the score twice.
+const MATCH_RESULT_SECS: f32 = 6.0;
+
+/// The finished match, until the menu takes over.
+///
+/// The clock reaching zero used to do nothing at all: `tick.rs` emits
+/// [`SimEvent::MatchEnded`] and no system in this client read it, so the HUD
+/// sat at `0:00` with the bots still fighting.
+#[derive(Resource, Default)]
+struct MatchResult {
+    /// What to print, or `None` when a match is in progress.
+    outcome: Option<Outcome>,
+    /// `Frame::time` when the match ended. `f64`, as `Frame::time` is.
+    at: f64,
+    /// Whether [`crate::ui::ReturnToLobby`] has been sent, so it is sent once
+    /// rather than every frame of the wait.
+    returned: bool,
+}
+
+/// The three things the card can say.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Outcome {
+    #[default]
+    Draw,
+    Victory,
+    Defeat,
+}
+
+impl Outcome {
+    fn text(self) -> &'static str {
+        match self {
+            Outcome::Draw => "DRAW",
+            Outcome::Victory => "VICTORY",
+            Outcome::Defeat => "DEFEAT",
+        }
+    }
+
+    fn colour(self) -> Color {
+        match self {
+            Outcome::Draw => Color::WHITE,
+            Outcome::Victory => rgb(0x66, 0xff, 0x88),
+            Outcome::Defeat => rgb(0xff, 0x55, 0x66),
+        }
+    }
+}
+
+/// Watches for the end of the match, and hands back to the menu.
+fn watch_match_end(
+    frame: Res<SimFrame>,
+    mut result: ResMut<MatchResult>,
+    mut back: MessageWriter<crate::ui::ReturnToLobby>,
+) {
+    // A fresh match puts time back on the clock, which is the signal that this
+    // card belongs to a match that is over rather than the one being played.
+    if result.outcome.is_some() && frame.0.hud.match_timer > 1.0 {
+        *result = MatchResult::default();
+    }
+
+    if result.outcome.is_none() {
+        for event in &frame.0.events {
+            let SimEvent::MatchEnded { winner } = *event else {
+                continue;
+            };
+            // `winner` is the winning *team*; whether that is a victory depends
+            // on which side the local pilot is on. A match with no local ship
+            // — spectating a finished match, or a mode with no teams — reads as
+            // a draw rather than inventing a defeat.
+            // `ShipView::team` is `Team::index()` with `-1` for "no team"
+            // (`tick.rs:1093`), so an unteamed pilot reads as a draw rather
+            // than losing to a side they were never on.
+            let mine = frame
+                .0
+                .ships
+                .iter()
+                .find(|s| s.flags.contains(ShipFlags::LOCAL))
+                .map(|s| s.team)
+                .filter(|t| *t >= 0);
+            result.outcome = Some(match (winner, mine) {
+                (None, _) | (_, None) => Outcome::Draw,
+                (Some(w), Some(mine)) => {
+                    if w.index() as i32 == mine {
+                        Outcome::Victory
+                    } else {
+                        Outcome::Defeat
+                    }
+                }
+            });
+            result.at = frame.0.time;
+            result.returned = false;
+        }
+        return;
+    }
+
+    if !result.returned && frame.0.time - result.at >= f64::from(MATCH_RESULT_SECS) {
+        result.returned = true;
+        back.write(crate::ui::ReturnToLobby);
+    }
+}
 
 /// Records a kill for the feed. One tick's events, once.
 ///
@@ -2843,10 +3049,10 @@ mod tests {
     use super::*;
     use sim::world::ShipView;
 
-    /// [`model`] with the two out-of-frame inputs at rest — no target lock, no
-    /// killfeed. The cases that care about either pass their own.
+    /// [`model`] with the out-of-frame inputs at rest — no target lock, no
+    /// killfeed, match still running. The cases that care pass their own.
     fn model(frame: &Frame, time: f32, seated: bool) -> HudModel {
-        super::model(frame, time, seated, false, &KillFeed::default())
+        super::model(frame, time, seated, false, &KillFeed::default(), None)
     }
 
     /// A frame with one live local ship and a given HUD state.
@@ -3297,18 +3503,18 @@ mod tests {
             ..healthy()
         });
         assert!(
-            !super::model(&held, 0.0, false, false, &KillFeed::default()).reticle_locked,
+            !super::model(&held, 0.0, false, false, &KillFeed::default(), None).reticle_locked,
             "the assist holding a target is not a lock"
         );
         assert!(
-            super::model(&held, 0.0, false, true, &KillFeed::default()).reticle_locked,
+            super::model(&held, 0.0, false, true, &KillFeed::default(), None).reticle_locked,
             "being lined up on one is"
         );
 
         // And a corpse never locks, however well aimed.
         let mut dead = frame(healthy());
         dead.ships[0].flags = ShipFlags::LOCAL;
-        assert!(!super::model(&dead, 0.0, false, true, &KillFeed::default()).reticle_locked);
+        assert!(!super::model(&dead, 0.0, false, true, &KillFeed::default(), None).reticle_locked);
     }
 
     /// A kill lands on top and scrolls the rest down, and the ones that did not
@@ -3368,11 +3574,11 @@ mod tests {
         let f = frame(healthy());
         let mut feed = KillFeed::default();
 
-        let quiet = super::model(&f, 0.0, false, false, &feed);
-        assert_eq!(quiet, super::model(&f, 5.0, false, false, &feed));
+        let quiet = super::model(&f, 0.0, false, false, &feed, None);
+        assert_eq!(quiet, super::model(&f, 5.0, false, false, &feed, None));
 
         feed.push(2, 3, 0.0);
-        let loud = super::model(&f, 0.0, false, false, &feed);
+        let loud = super::model(&f, 0.0, false, false, &feed, None);
         assert_ne!(quiet, loud);
         assert_eq!(
             HudModel {
