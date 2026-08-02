@@ -664,6 +664,7 @@ fn log_match(setup: &MatchSetup, world: &SimWorldState) {
 }
 
 /// Runs one fixed simulation step and republishes [`SimFrame`] and [`Roster`].
+#[allow(clippy::too_many_arguments)]
 fn fixed_tick(
     mut world: ResMut<SimWorld>,
     setup: Res<MatchSetup>,
@@ -671,6 +672,7 @@ fn fixed_tick(
     mut latch: ResMut<EdgeLatch>,
     mut frame: ResMut<SimFrame>,
     mut roster: ResMut<Roster>,
+    mut inbox: ResMut<crate::net::NetInbox>,
     lobby: Option<Res<crate::ui::LobbyOpen>>,
 ) {
     // The lobby is not an overlay on a running game: while it is up, the match
@@ -689,10 +691,13 @@ fn fixed_tick(
     let mut player = input.0;
     latch.drain_into(&mut player);
 
-    // No `NetEvent`s: solo is `Authority::Local` and resolves its own damage.
-    // The multiplayer path is an inbox of `NetEvent`s from `net.rs` in place of
-    // the empty slice, and nothing else about this call changes.
-    frame.0 = tick(&mut world.0, &[player], &[], TICK_DT);
+    // Solo is `Authority::Local` and resolves its own damage, so this is empty
+    // and the call is exactly what it always was. In multiplayer `net.rs` fills
+    // it in `PreUpdate` from the server's frames, and draining it here — rather
+    // than reading it — is what makes a rendered frame that runs three fixed
+    // steps apply each event once.
+    let events = std::mem::take(&mut inbox.0);
+    frame.0 = tick(&mut world.0, &[player], &events, TICK_DT);
 
     step_modes(&mut world.0, &mut frame.0, &mut roster, &setup, TICK_DT);
     roster.sync(&world.0);
@@ -1417,8 +1422,15 @@ mod tests {
     }
 
     /// A point well inside the moon (radius 80 at the origin), which kills
-    /// outright on contact and needs no shooter. Not the centre: `resolve_sphere`
-    /// has no separating direction there and reports no contact at all.
+    /// outright on contact and needs no shooter.
+    ///
+    /// Off the centre on purpose, though no longer because it has to be: this
+    /// used to note that a body's dead centre reported no contact at all, and
+    /// since `1bbd4ef` it does — `sim::ship::sphere_penetration` exits a
+    /// centred overlap along `+x`, an arbitrary but fixed direction, rather
+    /// than giving up the way `main.js:2201`'s `distSq > 0.0001` guard does.
+    /// Kept off-centre anyway so this test exercises the ordinary path and not
+    /// that one special case.
     const MOON_INTERIOR: SimVec3 = SimVec3::new(0.0, 0.0, 40.0);
 
     /// Hands off the controls but keeps the local ship *flown*.

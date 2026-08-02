@@ -139,8 +139,12 @@ use spaceships_sim as sim;
 
 use sim::world::{MapKind, Mode};
 
+use spaceships_protocol::ClientMessage;
+
 use crate::cockpit::ViewMode;
-use crate::net::{ConnState, NetStatus};
+use crate::net::{
+    wire_map, ConnState, NetCommand, NetConfig, NetSession, NetStatus, Phase, ToServer,
+};
 use crate::sim_bridge::{MatchSetup, PlayerInput};
 
 // ---------------------------------------------------------------------------
@@ -160,6 +164,10 @@ impl Plugin for UiPlugin {
             .add_message::<ReturnToLobby>()
             .add_systems(Update, reopen_menu)
             .init_resource::<LobbyOpen>()
+            // Before `read_input`, so a page opened by the server this frame is
+            // the page the keyboard acts on.
+            .add_systems(Update, follow_session.before(read_input))
+            .add_systems(Startup, forced_room)
             .add_plugins(UiMaterialPlugin::<Crt>::default())
             // Chained: the shader has to exist before the material that names
             // it, and the material before the node that draws it.
@@ -1075,10 +1083,22 @@ impl Screen {
             }
             Screen::Trials | Screen::Campaign => Screen::Solo,
             Screen::Create | Screen::Browser => Screen::Net,
-            Screen::Waiting => Screen::Browser,
+            Screen::Waiting => Screen::Net,
             Screen::Livery => Screen::Armory,
             Screen::Standings => Screen::Record,
         })
+    }
+
+    /// Whether this page needs a socket.
+    ///
+    /// The four pages of the network rail, which is also the set
+    /// [`Menu::setup`] answers [`Mode::Multiplayer`] for — so the two cannot
+    /// disagree about what "in the lobby's network half" means.
+    fn is_network(self) -> bool {
+        matches!(
+            self,
+            Screen::Net | Screen::Create | Screen::Browser | Screen::Waiting
+        )
     }
 
     /// `SPACESHIPS_UI=<name>`.
@@ -1209,7 +1229,83 @@ struct Menu {
     /// still reads as a change to the model.
     notice: &'static str,
     notice_rev: u16,
+
+    /// What the socket last reported. See [`NetView`].
+    net: NetView,
+    /// A request that is waiting for the socket to finish opening.
+    ///
+    /// `flush_outbox` **drops** anything written while the socket is not open,
+    /// exactly as the JS `readyState` guard does — so "press CREATE SORTIE"
+    /// cannot simply write a `create` and hope. The handshake takes a round
+    /// trip; this is the one frame of state that spans it, and
+    /// [`follow_session`] sends it the moment [`Phase::Idle`] is reached.
+    pending: Option<Pending>,
 }
+
+/// A lobby request that could not go out yet. See [`Menu::pending`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pending {
+    /// `list-rooms`.
+    List,
+    /// `create`, with whatever access and complement is armed when it goes.
+    Create,
+    /// `join`, by room code.
+    Join(String),
+}
+
+/// The part of [`NetSession`] the pages colour themselves from.
+///
+/// A `Copy`/`Eq` mirror rather than a borrow of the resource, for the reason
+/// the whole module is built around: [`model`] reduces the screen to one value
+/// and compares it whole, and a `Vec<PlayerInfo>` cannot go in that value. The
+/// counter can, and [`NetSession::rev`] moves whenever any of those rows does.
+///
+/// It is a *mirror*, not a second source of truth — [`follow_session`] is the
+/// only writer and copies it wholesale. Anything that needs the rows themselves
+/// (the browser's text, the crew room's seats) reads the resource directly, in
+/// [`drive_menu`], behind this counter's comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NetView {
+    /// [`NetSession::rev`].
+    rev: u32,
+    /// [`Phase`] as an index, so the model stays integers.
+    phase: u8,
+    /// Rows in the browser.
+    rooms: u8,
+    /// Seats in the crew room.
+    seats: u8,
+    /// Whether this client may press launch.
+    host: bool,
+}
+
+impl NetView {
+    fn of(session: &NetSession) -> NetView {
+        NetView {
+            rev: session.rev,
+            phase: match session.phase {
+                Phase::Offline => 0,
+                Phase::Idle => 1,
+                Phase::Room => 2,
+                Phase::Playing => 3,
+            },
+            #[allow(clippy::cast_possible_truncation)]
+            rooms: session.rooms.len().min(SORTIE_ROWS) as u8,
+            #[allow(clippy::cast_possible_truncation)]
+            seats: session.players.len().min(SEAT_ROWS) as u8,
+            host: session.host,
+        }
+    }
+}
+
+/// Rows the room browser draws. The server lists every open, unstarted room and
+/// the JS browser scrolls; this one is a fixed pool, because a page built once
+/// cannot grow and a scroll view on a CRT is the wrong instrument. Six is more
+/// than the live server has ever had open at once.
+const SORTIE_ROWS: usize = 6;
+
+/// Seats the crew room draws. `server/index.js` has no cap, but a room is two
+/// teams of five in every mode the game offers.
+const SEAT_ROWS: usize = 10;
 
 impl Default for Menu {
     fn default() -> Self {
@@ -1242,6 +1338,8 @@ impl Default for Menu {
             volume: [6, 8],
             notice: "READY",
             notice_rev: 0,
+            net: NetView::default(),
+            pending: None,
         }
     }
 }
@@ -1262,7 +1360,8 @@ impl Menu {
         }
         self.screen = screen;
         self.say(match screen {
-            Screen::Browser | Screen::Standings => "CACHED - NO DATA LINK",
+            Screen::Standings => "CACHED - NO DATA LINK",
+            Screen::Browser => "REQUESTING ORDERS",
             Screen::Waiting => "AWAITING FLIGHT LEAD",
             _ => "READY",
         });
@@ -1281,7 +1380,7 @@ impl Menu {
         setup.mode = match self.screen {
             Screen::Trials => Mode::Trials(self.trial + 1),
             Screen::Campaign => Mode::Campaign(self.mission + 1),
-            Screen::Net | Screen::Create | Screen::Browser | Screen::Waiting => Mode::Multiplayer,
+            s if s.is_network() => Mode::Multiplayer,
             _ => match self.solo {
                 SoloPick::Tutorial => Mode::Tutorial,
                 SoloPick::Train => Mode::Training,
@@ -1388,24 +1487,11 @@ struct Standing {
     you: bool,
 }
 
-/// One row of [`Screen::Browser`]. The `rooms-list` server message.
-#[derive(Debug, Clone, Copy)]
-struct Sortie {
-    code: &'static str,
-    host: &'static str,
-    map: &'static str,
-    players: u8,
-    capacity: u8,
-    state: &'static str,
-}
-
-/// One seat in [`Screen::Waiting`]. The `players` server message.
-#[derive(Debug, Clone, Copy)]
-struct Seat {
-    callsign: &'static str,
-    team: i8,
-    host: bool,
-}
+// The room browser's rows and the crew room's seats were once here too, as
+// placeholder tables. They are gone: both are live now and come straight off
+// the socket as `spaceships_protocol::RoomSummary` and `PlayerInfo` — see
+// [`NetSession`], which is the *second* data seam this module reads and the
+// only one that is not placeholder.
 
 /// Everything the pages read that this client does not simulate.
 ///
@@ -1420,9 +1506,6 @@ struct LobbyData {
     source: DataSource,
     pilot: PilotRecord,
     standings: Vec<Standing>,
-    sorties: Vec<Sortie>,
-    /// Code, private, roster.
-    room: Option<(&'static str, bool, Vec<Seat>)>,
 }
 
 impl LobbyData {
@@ -1435,7 +1518,12 @@ impl LobbyData {
         LobbyData {
             source: DataSource::Placeholder,
             pilot: PilotRecord {
-                callsign: "PILOT".to_owned(),
+                // The one placeholder field that is not decoration: it is the
+                // name that goes out with `name` and that every other pilot in
+                // the room reads off a target box. `sim_bridge::MatchSetup`
+                // already takes it from here, so a callsign set once names the
+                // pilot in a solo scoreboard and in a networked room alike.
+                callsign: MatchSetup::from_env().callsign,
                 rank: "FLIGHT LIEUTENANT",
                 service_no: "SR-4471-K",
                 enlisted: "2026-03-11",
@@ -1514,74 +1602,6 @@ impl LobbyData {
                     you: false,
                 },
             ],
-            sorties: vec![
-                Sortie {
-                    code: "KILO",
-                    host: "HALCYON",
-                    map: "SPACE",
-                    players: 4,
-                    capacity: 10,
-                    state: "FORMING",
-                },
-                Sortie {
-                    code: "TANGO",
-                    host: "NOMAD",
-                    map: "SIERRAS",
-                    players: 8,
-                    capacity: 10,
-                    state: "FORMING",
-                },
-                Sortie {
-                    code: "ZULU",
-                    host: "SABLE",
-                    map: "SPACE",
-                    players: 2,
-                    capacity: 10,
-                    state: "FORMING",
-                },
-                Sortie {
-                    code: "ECHO",
-                    host: "IRONSIDE",
-                    map: "SIERRAS",
-                    players: 10,
-                    capacity: 10,
-                    state: "FULL",
-                },
-                Sortie {
-                    code: "OSCAR",
-                    host: "MERIDIAN",
-                    map: "SPACE",
-                    players: 6,
-                    capacity: 10,
-                    state: "IN PLAY",
-                },
-            ],
-            room: Some((
-                "KILO",
-                false,
-                vec![
-                    Seat {
-                        callsign: "HALCYON",
-                        team: 0,
-                        host: true,
-                    },
-                    Seat {
-                        callsign: "PILOT",
-                        team: 0,
-                        host: false,
-                    },
-                    Seat {
-                        callsign: "NOMAD",
-                        team: 1,
-                        host: false,
-                    },
-                    Seat {
-                        callsign: "TALLY-HO",
-                        team: 1,
-                        host: false,
-                    },
-                ],
-            )),
         }
     }
 }
@@ -1963,11 +1983,8 @@ pub struct LaunchRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Go(Screen),
-    Back,
     /// Leave the display and fly.
     Execute,
-    /// The control is a readout, or the thing behind it is server-side.
-    Inert(&'static str),
 
     SetSolo(SoloPick),
     SetTrial(u8),
@@ -1985,6 +2002,25 @@ enum Action {
     /// Channel 0 = music, 1 = effects.
     Volume(u8),
     Requisition,
+
+    // -- network ------------------------------------------------------------
+    //
+    // Seven actions, one per thing the server can be asked. They are separate
+    // variants rather than one `Net(ClientMessage)` because `Action` is `Copy`
+    // and `Eq` — [`control_state`] matches on it and [`MenuNodes::applied`]
+    // compares the result — and `ClientMessage` is neither.
+    /// Step [`crate::net::ENDPOINTS`] and reconnect.
+    CycleEndpoint,
+    /// `create`: open a room with the armed access and complement.
+    Transmit,
+    /// `list-rooms`: refresh the browser.
+    Refresh,
+    /// `join`: enter the room under the cursor.
+    JoinSortie,
+    /// `start`: host only, and the last thing the lobby does before flight.
+    LaunchNet,
+    /// `leave`: give the seat up without closing the socket.
+    LeaveRoom,
 }
 
 /// One focusable row, and the entities whose colour expresses its state.
@@ -2067,6 +2103,15 @@ struct MenuModel {
     clock: u32,
     /// Footer message generation.
     notice: u16,
+    /// What the socket last reported. **Zeroed when closed**, for the same
+    /// reason `sweep` and `clock` are: a `players` broadcast landing every
+    /// second would otherwise make the model differ on every frame of a live
+    /// match and defeat the early-out this whole module is shaped around.
+    net: NetView,
+    /// Frames in and out, summed. **Zero unless the `DATA LINK` panel is on
+    /// screen**, which is the only thing that draws it — it moves at 20 Hz
+    /// while a match runs and belongs to no other page.
+    frames: u32,
 }
 
 /// The model [`drive_menu`] last wrote. `None` until the first frame, which is
@@ -2174,6 +2219,14 @@ fn model(m: &Menu, data: &LobbyData, net: &NetStatus, now: f32) -> MenuModel {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         clock: up as u32,
         notice: m.notice_rev,
+        net: m.net,
+        frames: if m.screen == Screen::Net {
+            #[allow(clippy::cast_possible_truncation)]
+            let total = net.sent.saturating_add(net.received) as u32;
+            total
+        } else {
+            0
+        },
     }
 }
 
@@ -2216,9 +2269,64 @@ struct MenuNodes {
     brief: [Entity; 3],
     /// [`Screen::Armory`]'s detail: name, cost, class + status, blurb.
     detail: [Entity; 4],
+    /// Everything the four network pages write. See [`NetNodes`].
+    net: NetNodes,
     controls: Vec<ControlDef>,
     /// Last-applied state byte per control.
     applied: Vec<u8>,
+}
+
+/// The handles the four network pages hand back.
+///
+/// One struct rather than seven more out-parameters on [`build_pages`], which
+/// already carries four.
+#[derive(Debug, Clone, Copy)]
+struct NetNodes {
+    /// [`Screen::Net`]'s `DATA LINK` values: endpoint, identity, frames.
+    link_values: [Entity; 3],
+    /// [`Screen::Waiting`]'s room code and access line.
+    room_code: Entity,
+    room_access: Entity,
+    /// [`Screen::Waiting`]'s seat pool.
+    seats: [SeatNodes; SEAT_ROWS],
+    /// Control indices for the rows whose *text* is live, so [`drive_menu`] does
+    /// not have to search [`MenuNodes::controls`] for them by action.
+    sortie_rows: [usize; SORTIE_ROWS],
+    launch_row: usize,
+    endpoint_row: usize,
+}
+
+impl NetNodes {
+    const EMPTY: NetNodes = NetNodes {
+        link_values: [Entity::PLACEHOLDER; 3],
+        room_code: Entity::PLACEHOLDER,
+        room_access: Entity::PLACEHOLDER,
+        seats: [SeatNodes::EMPTY; SEAT_ROWS],
+        sortie_rows: [usize::MAX; SORTIE_ROWS],
+        launch_row: usize::MAX,
+        endpoint_row: usize::MAX,
+    };
+}
+
+/// One crew-room seat's writable parts.
+#[derive(Debug, Clone, Copy)]
+struct SeatNodes {
+    /// The row itself, hidden with `Display::None` when the seat is empty.
+    root: Entity,
+    /// The 2 px team stripe: cyan for team 0, red for team 1.
+    tick: Entity,
+    name: Entity,
+    /// `LEAD` on the host's row, blank on everyone else's.
+    lead: Entity,
+}
+
+impl SeatNodes {
+    const EMPTY: SeatNodes = SeatNodes {
+        root: Entity::PLACEHOLDER,
+        tick: Entity::PLACEHOLDER,
+        name: Entity::PLACEHOLDER,
+        lead: Entity::PLACEHOLDER,
+    };
 }
 
 /// The annunciator strip: three lamps, not a grid of six.
@@ -2444,7 +2552,13 @@ fn control_row(
 }
 
 /// A label/value line. No box, no rule — two columns and a gap.
-fn kv(parent: &mut ChildSpawnerCommands, f: &Fonts, k: &str, v: &str, colour: Color) {
+///
+/// Returns the value's entity, for the handful of lines that are live and are
+/// rewritten by [`drive_menu`]. Most callers drop it: a line whose value never
+/// changes needs no handle, and keeping one would put it in [`MenuNodes`] where
+/// it would read as something that does.
+fn kv(parent: &mut ChildSpawnerCommands, f: &Fonts, k: &str, v: &str, colour: Color) -> Entity {
+    let mut value = Entity::PLACEHOLDER;
     parent
         .spawn(Node {
             width: percent(100),
@@ -2456,8 +2570,9 @@ fn kv(parent: &mut ChildSpawnerCommands, f: &Fonts, k: &str, v: &str, colour: Co
         })
         .with_children(|r| {
             r.spawn(caption(f, k, 8.0, dim(0.5)));
-            r.spawn(readout(f, v, 11.0, colour));
+            value = r.spawn(readout(f, v, 11.0, colour)).id();
         });
+    value
 }
 
 /// `1234567` as `1,234,567`. `format!` has no grouping flag.
@@ -2650,6 +2765,7 @@ fn build_menu(
     let mut volume = [Entity::PLACEHOLDER; 2];
     let mut brief = [Entity::PLACEHOLDER; 3];
     let mut detail = [Entity::PLACEHOLDER; 4];
+    let mut net_nodes = NetNodes::EMPTY;
 
     // -- the menu itself, rendered into the target --------------------------
     let root = commands
@@ -2909,6 +3025,7 @@ fn build_menu(
                                 &mut volume,
                                 &mut brief,
                                 &mut detail,
+                                &mut net_nodes,
                                 &menu,
                                 &data,
                             );
@@ -3000,6 +3117,7 @@ fn build_menu(
         volume,
         brief,
         detail,
+        net: net_nodes,
         controls,
         applied,
     });
@@ -3126,6 +3244,12 @@ fn build_scope(parent: &mut ChildSpawnerCommands) -> Entity {
               by side is the point; the JS spreads the same twelve across \
               index.html and five modules in lobby/."
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one out-parameter per group of handles the pages hand back. The \
+              network four are already collapsed into `NetNodes`; collapsing \
+              the rest would be a struct per page for no reader's benefit."
+)]
 fn build_pages(
     stack: &mut ChildSpawnerCommands,
     ui: &mut Ui,
@@ -3135,6 +3259,7 @@ fn build_pages(
     volume: &mut [Entity; 2],
     brief: &mut [Entity; 3],
     detail: &mut [Entity; 4],
+    net: &mut NetNodes,
     menu: &Menu,
     data: &LobbyData,
 ) {
@@ -3331,27 +3456,27 @@ fn build_pages(
                     None,
                     18.0,
                 );
+                c.spawn(gap(30.0));
+                // The no-environment-variable escape hatch. A packaged build
+                // dials the live game; this is how the machine that is *running*
+                // a server reaches it, and how a LAN game is arranged by
+                // someone who will never see a shell.
                 control_row(
                     c,
                     ui,
                     Screen::Net,
-                    Action::Inert("DIRECT JOIN NEEDS A DATA LINK"),
-                    "DIRECT JOIN",
+                    Action::CycleEndpoint,
+                    "SERVER",
                     Some("- - - -"),
-                    18.0,
+                    15.0,
                 );
+                net.endpoint_row = ui.controls.len() - 1;
             });
             p.spawn(page_col(38.0)).with_children(|c| {
                 section(c, f, "DATA LINK");
-                kv(
-                    c,
-                    f,
-                    "ENDPOINT",
-                    "127.0.0.1:4000",
-                    pal::rgba(0xea_f6_ff, 0.8),
-                );
-                kv(c, f, "IDENTITY", "GUEST", pal::AMBER);
-                kv(c, f, "FRAMES", "0 OUT   0 IN", pal::rgba(0xea_f6_ff, 0.8));
+                net.link_values[0] = kv(c, f, "ENDPOINT", "- - - -", pal::rgba(0xea_f6_ff, 0.8));
+                net.link_values[1] = kv(c, f, "IDENTITY", "GUEST", pal::AMBER);
+                net.link_values[2] = kv(c, f, "FRAMES", "0 OUT   0 IN", pal::rgba(0xea_f6_ff, 0.8));
             });
         })
         .id();
@@ -3405,7 +3530,7 @@ fn build_pages(
                     c,
                     ui,
                     Screen::Create,
-                    Action::Inert("TRANSMIT NEEDS A DATA LINK"),
+                    Action::Transmit,
                     "TRANSMIT",
                     None,
                     15.0,
@@ -3415,31 +3540,43 @@ fn build_pages(
         .id();
 
     // ---- BROWSER ----------------------------------------------------------
+    //
+    // A fixed pool of rows, written from `NetSession` rather than built from
+    // it: the whole tree is built once (see the module docs) and a browser that
+    // rebuilt itself on every `rooms-list` would be the per-frame relayout this
+    // module exists to avoid, at the worst possible moment.
     pages[Screen::Browser.index()] = stack
         .spawn(page(on(Screen::Browser)))
         .with_children(|p| {
             p.spawn(page_col(88.0)).with_children(|c| {
-                for (i, s) in data.sorties.iter().enumerate() {
+                for i in 0..SORTIE_ROWS {
                     #[allow(clippy::cast_possible_truncation)]
                     control_row(
                         c,
                         ui,
                         Screen::Browser,
                         Action::SetSortie(i as u8),
-                        s.code,
-                        Some(&format!(
-                            "{:<10} {:<8} {}/{}  {}",
-                            s.host, s.map, s.players, s.capacity, s.state
-                        )),
+                        "- - - -",
+                        Some(" "),
                         16.0,
                     );
+                    net.sortie_rows[i] = ui.controls.len() - 1;
                 }
-                c.spawn(gap(44.0));
+                c.spawn(gap(30.0));
                 control_row(
                     c,
                     ui,
                     Screen::Browser,
-                    Action::Go(Screen::Waiting),
+                    Action::Refresh,
+                    "REFRESH",
+                    None,
+                    15.0,
+                );
+                control_row(
+                    c,
+                    ui,
+                    Screen::Browser,
+                    Action::JoinSortie,
                     "JOIN",
                     None,
                     15.0,
@@ -3453,54 +3590,77 @@ fn build_pages(
         .spawn(page(on(Screen::Waiting)))
         .with_children(|p| {
             p.spawn(page_col(60.0)).with_children(|c| {
-                let (code, private, seats) = data
-                    .room
-                    .as_ref()
-                    .map_or(("----", false, &[] as &[Seat]), |(c, p, s)| {
-                        (*c, *p, s.as_slice())
-                    });
-                c.spawn(tracked(f, code, 44.0, pal::PHOSPHOR, 16.0));
-                c.spawn(readout(
-                    f,
-                    if private { "PRIVATE" } else { "OPEN" },
-                    9.0,
-                    dim(0.5),
-                ));
+                net.room_code = c
+                    .spawn(tracked(f, "- - - -", 44.0, pal::PHOSPHOR, 16.0))
+                    .id();
+                net.room_access = c.spawn(readout(f, "OPEN", 9.0, dim(0.5))).id();
                 c.spawn(gap(50.0));
-                for s in seats {
-                    c.spawn(row(12.0)).with_children(|r| {
-                        r.spawn((
-                            Node {
-                                width: px(2),
-                                height: px(15),
-                                ..default()
-                            },
-                            BackgroundColor(if s.team == 0 { pal::CYAN } else { pal::RED }),
-                        ));
-                        r.spawn((
-                            caption(f, s.callsign, 14.0, pal::WHITE),
-                            Node {
-                                flex_grow: 1.0,
-                                ..default()
-                            },
-                        ));
-                        if s.host {
-                            r.spawn(readout(f, "LEAD", 9.0, pal::AMBER));
-                        }
-                    });
-                    c.spawn(gap(6.0));
+                for seat in 0..SEAT_ROWS {
+                    let mut tick = Entity::PLACEHOLDER;
+                    let mut name = Entity::PLACEHOLDER;
+                    let mut lead = Entity::PLACEHOLDER;
+                    let root = c
+                        .spawn(Node {
+                            // `row(12.0)` plus a height and a starting state.
+                            // Spelled out rather than spread over two bundle
+                            // members: two `Node`s in one bundle is a
+                            // duplicate-component panic at spawn time.
+                            min_height: px(21),
+                            display: Display::None,
+                            ..row(12.0)
+                        })
+                        .with_children(|r| {
+                            tick = r
+                                .spawn((
+                                    Node {
+                                        width: px(2),
+                                        min_width: px(2),
+                                        height: px(15),
+                                        ..default()
+                                    },
+                                    BackgroundColor(pal::CYAN),
+                                ))
+                                .id();
+                            name = r
+                                .spawn((
+                                    caption(f, "", 14.0, pal::WHITE),
+                                    Node {
+                                        flex_grow: 1.0,
+                                        min_width: px(0),
+                                        ..default()
+                                    },
+                                ))
+                                .id();
+                            lead = r.spawn(readout(f, "", 9.0, pal::AMBER)).id();
+                        })
+                        .id();
+                    net.seats[seat] = SeatNodes {
+                        root,
+                        tick,
+                        name,
+                        lead,
+                    };
                 }
                 c.spawn(gap(40.0));
                 control_row(
                     c,
                     ui,
                     Screen::Waiting,
-                    Action::Inert("THE FLIGHT LEAD LAUNCHES"),
+                    Action::LaunchNet,
                     "STANDBY",
                     None,
                     15.0,
                 );
-                control_row(c, ui, Screen::Waiting, Action::Back, "LEAVE", None, 15.0);
+                net.launch_row = ui.controls.len() - 1;
+                control_row(
+                    c,
+                    ui,
+                    Screen::Waiting,
+                    Action::LeaveRoom,
+                    "LEAVE",
+                    None,
+                    15.0,
+                );
             });
         })
         .id();
@@ -4019,14 +4179,24 @@ impl Pointer<'_, '_> {
 }
 
 /// Keyboard and pointer. Moves the cursor, fires actions, nothing else.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one resource per thing an action can touch. `apply` takes them as \
+              two borrows and a collector precisely so that the list stops \
+              growing here."
+)]
 fn read_input(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     nodes: Option<Res<MenuNodes>>,
+    session: Res<NetSession>,
+    mut config: ResMut<NetConfig>,
     mut menu: ResMut<Menu>,
     mut data: ResMut<LobbyData>,
     mut setup: ResMut<MatchSetup>,
     mut launch: MessageWriter<LaunchRequest>,
+    mut outbox: MessageWriter<ToServer>,
+    mut commands: MessageWriter<NetCommand>,
     mut pointer: Pointer,
     mut audio: ResMut<crate::audio::AudioCommands>,
 ) {
@@ -4115,6 +4285,12 @@ fn read_input(
         &mut menu,
     );
 
+    let was = menu.screen;
+    // Cloned rather than borrowed: `apply` takes `&mut LobbyData` (a purchase
+    // moves the balance) and the callsign lives inside it.
+    let callsign = data.pilot.callsign.clone();
+    let mut ops = NetOps::new(&session, &mut config, &callsign);
+
     if keys.just_pressed(KeyCode::Escape) && !menu.pinned {
         audio.play(crate::audio::Sfx::UiBack);
         match menu.screen.back() {
@@ -4124,6 +4300,8 @@ fn read_input(
             None if menu.resumable => menu.open = false,
             None => menu.say("NO PAGE BELOW"),
         }
+        on_screen_change(was, &mut menu, &mut ops);
+        ops.drain(&mut outbox, &mut commands);
         return;
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter) {
@@ -4131,8 +4309,116 @@ fn read_input(
         fire = Some(nodes.controls[list[next as usize] as usize].action);
     }
 
-    let Some(action) = fire else { return };
-    apply(action, &mut menu, &mut data, &mut setup, &mut launch);
+    if let Some(action) = fire {
+        apply(
+            action,
+            &mut menu,
+            &mut data,
+            &mut setup,
+            &mut launch,
+            &mut ops,
+        );
+        on_screen_change(was, &mut menu, &mut ops);
+    }
+    ops.drain(&mut outbox, &mut commands);
+}
+
+/// What a page change costs the socket.
+///
+/// Every route onto a page runs through here — a click, `ENTER`, `ESC`, and
+/// [`follow_session`]'s own moves — so there is exactly one place that knows
+/// "opening the network page means opening a socket" and it cannot be bypassed
+/// by adding a fourth way to change page.
+fn on_screen_change(was: Screen, menu: &mut Menu, ops: &mut NetOps) {
+    if menu.screen == was {
+        return;
+    }
+    match menu.screen {
+        // The `DATA LINK` panel is only honest if there is a link, and every
+        // page below this one needs one anyway.
+        Screen::Net => ops.open_link(),
+        // A cached room list is a list of rooms that have since filled up.
+        Screen::Browser => {
+            ops.open_link();
+            menu.pending = Some(Pending::List);
+        }
+        _ => {}
+    }
+
+    // Giving the seat up.
+    //
+    // `server/index.js` answers `leave` with **nothing at all** — it just drops
+    // the socket out of `room.players` — so the client has to decide for itself
+    // when it is no longer in a room, and this is where. Two cases, and the
+    // second is the one that bites:
+    //
+    // - Walking off the network rail with a seat booked leaves a ghost in
+    //   somebody else's crew room until the socket closes.
+    // - **Coming back to the network page after a match.** The room stays on
+    //   the server with `started` set, so a client that did not say `leave`
+    //   sits in [`Phase::Playing`] forever, and every later `create` or `join`
+    //   is queued behind a phase that will never reach [`Phase::Idle`]. That
+    //   read as "the CREATE SORTIE button stopped working after one match".
+    let booked = matches!(ops.session.phase, Phase::Room | Phase::Playing);
+    let left_the_rail = was.is_network() && !menu.screen.is_network();
+    let back_at_the_top = menu.screen == Screen::Net && was != Screen::Net;
+    if booked && (left_the_rail || back_at_the_top) {
+        ops.send(ClientMessage::Leave);
+    }
+}
+
+/// The side effects an [`Action`] can have on the socket.
+///
+/// Collected rather than written directly. [`apply`] is called from
+/// [`read_input`] *and* from this module's tests, and a `MessageWriter` cannot
+/// be built without a `World` — so the actions push onto these two vectors and
+/// the caller drains them. It also keeps the ordering obvious: every frame's
+/// commands go out after every frame's decisions, never interleaved with them.
+struct NetOps<'a> {
+    session: &'a NetSession,
+    config: &'a mut NetConfig,
+    /// What the socket should announce. Mirrored onto [`NetConfig::callsign`]
+    /// so it is in place before the handshake finishes.
+    callsign: &'a str,
+    send: Vec<ClientMessage>,
+    commands: Vec<NetCommand>,
+}
+
+impl<'a> NetOps<'a> {
+    fn new(session: &'a NetSession, config: &'a mut NetConfig, callsign: &'a str) -> NetOps<'a> {
+        NetOps {
+            session,
+            config,
+            callsign,
+            send: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
+
+    fn send(&mut self, msg: ClientMessage) {
+        self.send.push(msg);
+    }
+
+    /// Asks for a socket, and makes sure the name that goes out with it is the
+    /// pilot's.
+    ///
+    /// `Connect` is idempotent — `run_commands` ignores it when a socket
+    /// already exists — so this is safe to call on every visit to the page.
+    fn open_link(&mut self) {
+        if self.config.callsign != self.callsign {
+            self.config.callsign = self.callsign.to_owned();
+        }
+        self.commands.push(NetCommand::Connect);
+    }
+
+    fn drain(self, out: &mut MessageWriter<ToServer>, cmds: &mut MessageWriter<NetCommand>) {
+        for cmd in self.commands {
+            cmds.write(cmd);
+        }
+        for msg in self.send {
+            out.write(ToServer(msg));
+        }
+    }
 }
 
 /// Moves the selection a control stands for, without the side effects of
@@ -4161,14 +4447,57 @@ fn apply(
     data: &mut LobbyData,
     setup: &mut MatchSetup,
     launch: &mut MessageWriter<LaunchRequest>,
+    ops: &mut NetOps,
 ) {
     match action {
-        Action::Go(s) => menu.go(s),
-        Action::Back => match menu.screen.back() {
-            Some(s) => menu.go(s),
-            None => menu.say("NO PAGE BELOW"),
+        // -- network --------------------------------------------------------
+        //
+        // None of these writes a frame straight out. `flush_outbox` drops
+        // anything sent while the socket is not open, so the ones that need a
+        // live link go through [`Menu::pending`] and [`follow_session`] posts
+        // them the moment there is one. `start` and `leave` are the exceptions:
+        // both are only reachable from the crew room, which cannot be on screen
+        // without a socket.
+        Action::CycleEndpoint => {
+            if ops.config.cycle_endpoint() {
+                ops.commands.push(NetCommand::Reconnect);
+                menu.say("SERVER CHANGED");
+            } else {
+                menu.say("SERVER IS THIS PAGE");
+            }
+        }
+        Action::Transmit => {
+            ops.open_link();
+            menu.pending = Some(Pending::Create);
+            menu.say("TRANSMITTING");
+        }
+        Action::Refresh => {
+            ops.open_link();
+            menu.pending = Some(Pending::List);
+            menu.say("REQUESTING ORDERS");
+        }
+        Action::JoinSortie => match ops.session.rooms.get(usize::from(menu.sortie)) {
+            Some(room) => {
+                ops.open_link();
+                menu.pending = Some(Pending::Join(room.code.clone()));
+                menu.say("JOINING");
+            }
+            None => menu.say("NO SUCH SORTIE"),
         },
-        Action::Inert(msg) => menu.say(msg),
+        Action::LaunchNet => {
+            if ops.session.host {
+                ops.send(ClientMessage::Start);
+                menu.say("LAUNCHING");
+            } else {
+                menu.say("THE FLIGHT LEAD LAUNCHES");
+            }
+        }
+        Action::LeaveRoom => {
+            ops.send(ClientMessage::Leave);
+            menu.go(Screen::Net);
+        }
+
+        Action::Go(s) => menu.go(s),
         // The three tasking rows *are* the launch. Choosing a mode used to arm
         // a preference and leave the pilot to find `EXECUTE` on another page,
         // which is the complaint this shape answers: a row that names a match
@@ -4307,6 +4636,126 @@ fn mission_locked(m: u8) -> bool {
     m >= 2
 }
 
+/// `SPACESHIPS_ROOM`: open straight into a networked room.
+///
+/// The same idea as [`forced_screen`] and for the same reason — a check that
+/// needs two clients in one match should not need somebody sitting at both
+/// keyboards.
+///
+/// - `SPACESHIPS_ROOM=ABCD` — connect and join that code.
+/// - `SPACESHIPS_ROOM=new` — connect and create a room with whatever the
+///   `CREATE SORTIE` page defaults to (open, space, auto-fill on).
+///
+/// It goes through exactly the same [`Menu::pending`] path a button press does,
+/// so it exercises the shipped flow rather than a test-only shortcut. The one
+/// thing it adds is the [`NetCommand::Connect`] the page visit would have sent.
+fn forced_room(mut menu: ResMut<Menu>, mut commands: MessageWriter<NetCommand>) {
+    let Some(code) = forced_room_code() else {
+        return;
+    };
+    menu.screen = Screen::Net;
+    menu.pending = Some(if code.eq_ignore_ascii_case("new") {
+        Pending::Create
+    } else {
+        Pending::Join(code.to_uppercase())
+    });
+    menu.say("OPENING DATA LINK");
+    commands.write(NetCommand::Connect);
+}
+
+/// `std::env::var` on `wasm32-unknown-unknown` always returns `Err`, so this
+/// needs no `cfg` — the same trick `MatchSetup::from_env` uses.
+fn forced_room_code() -> Option<String> {
+    std::env::var("SPACESHIPS_ROOM")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Follows the socket: mirrors [`NetSession`] onto [`Menu`], posts whatever was
+/// waiting for a link, and moves the page when the *server* decides something.
+///
+/// Three things happen on this side of a lobby that the player did not ask for,
+/// and all three are here:
+///
+/// - **The room reply.** `create` and `join` are both answered with `room`, so
+///   "did it work" is a message, not a return value. When the phase reaches
+///   [`Phase::Room`] the crew room comes up, whichever page asked for it.
+/// - **The host pressing start.** Every other client learns the match has begun
+///   from a `start` frame. The menu has to get out of the way, and it must be
+///   the *menu* that closes rather than the match that starts, because
+///   `sim_bridge::fixed_tick` freezes the world while this is up — a lobby left
+///   open over a live match is a player sitting still while everyone shoots at
+///   them.
+/// - **Losing the room.** A dropped socket, a `leave`, or a host who left takes
+///   the crew room with it, and a page listing four pilots who are no longer
+///   there is worse than an empty one.
+///
+/// Each of the three is guarded on the page it applies to rather than on the
+/// phase alone, which is what stops the second one fighting `ESC`: pausing a
+/// networked match reopens the menu on [`Screen::Main`], the phase is still
+/// [`Phase::Playing`], and without that guard this would slam it shut again on
+/// the very next frame.
+fn follow_session(
+    mut session: ResMut<NetSession>,
+    data: Res<LobbyData>,
+    mut config: ResMut<NetConfig>,
+    mut menu: ResMut<Menu>,
+    mut outbox: MessageWriter<ToServer>,
+) {
+    if config.callsign != data.pilot.callsign {
+        config.callsign.clone_from(&data.pilot.callsign);
+    }
+
+    let view = NetView::of(&session);
+    if menu.net != view {
+        menu.net = view;
+    }
+
+    // The server's own words, as one of this module's static strings. The
+    // footer is `&'static str` by design — a `String` there would allocate on
+    // every notice — and there are exactly two errors `server/index.js` emits.
+    if let Some(message) = session.take_notice() {
+        menu.say(match message.as_str() {
+            "Room not found" => "NO SUCH SORTIE",
+            "Game already started" => "SORTIE ALREADY UNDERWAY",
+            _ => "SERVER REFUSED",
+        });
+        menu.pending = None;
+    }
+
+    if session.phase == Phase::Idle {
+        if let Some(pending) = menu.pending.take() {
+            outbox.write(ToServer(match pending {
+                Pending::List => ClientMessage::ListRooms,
+                Pending::Create => ClientMessage::Create {
+                    private: menu.private,
+                    map: wire_map(menu.map),
+                    allow_bot: menu.auto_bot,
+                },
+                Pending::Join(code) => ClientMessage::Join { code },
+            }));
+        }
+    }
+
+    match session.phase {
+        Phase::Room if matches!(menu.screen, Screen::Create | Screen::Browser | Screen::Net) => {
+            menu.go(Screen::Waiting);
+        }
+        Phase::Playing if menu.open && menu.screen.is_network() => {
+            menu.open = false;
+            // The match is behind the menu now, so `ESC` means "resume" rather
+            // than "there is no page below".
+            menu.resumable = true;
+            menu.say("EXECUTING");
+        }
+        Phase::Offline | Phase::Idle if menu.screen == Screen::Waiting => {
+            menu.go(Screen::Net);
+        }
+        _ => {}
+    }
+}
+
 /// Advances the self test, and steps off it when it finishes.
 fn advance_boot(time: Res<Time>, mut menu: ResMut<Menu>) {
     if !menu.open || menu.screen != Screen::Boot || menu.pinned {
@@ -4432,6 +4881,8 @@ fn drive_menu(
     menu: Res<Menu>,
     data: Res<LobbyData>,
     net: Res<NetStatus>,
+    session: Res<NetSession>,
+    config: Res<NetConfig>,
     nodes: Option<ResMut<MenuNodes>>,
     mut applied: ResMut<Applied>,
     mut q_node: Query<&mut Node>,
@@ -4478,12 +4929,24 @@ fn drive_menu(
     }
 
     // -- page ---------------------------------------------------------------
-    if moved!(screen) {
-        if let Some(p) = prev {
-            set_display(&mut q_node, nodes.pages[p.screen as usize], false);
-        } else {
-            for i in 0..nodes.pages.len() {
-                set_display(&mut q_node, nodes.pages[i], false);
+    //
+    // `moved!(screen, open)`, and the previous page is only trusted when the
+    // menu was *open* to draw it. A closed menu's model is a constant — that is
+    // the early-out this module is built around — so `prev.screen` is `Boot`
+    // for the whole of a match however the menu looked when it closed. Hiding
+    // that one on the way back in left the page that was actually on screen
+    // still displayed underneath the new one, which read as two pages printed
+    // over each other. It took a networked match to make it obvious, because
+    // that is the first flow that closes the menu from a page other than the
+    // one it reopens on — but launching a skirmish from `SOLO OPERATIONS` and
+    // pressing `ESC` did it too.
+    if moved!(screen, open) {
+        match page_to_hide(prev) {
+            Some(page) => set_display(&mut q_node, nodes.pages[page], false),
+            None => {
+                for i in 0..nodes.pages.len() {
+                    set_display(&mut q_node, nodes.pages[i], false);
+                }
             }
         }
         set_display(&mut q_node, nodes.pages[next.screen as usize], true);
@@ -4557,6 +5020,27 @@ fn drive_menu(
             set_text(&mut q_text, nodes.lamp_values[i], || label.to_owned());
             set(&mut q_colour, nodes.lamp_values[i], TextColor(colour));
         }
+    }
+
+    // -- the network pages --------------------------------------------------
+    //
+    // One guard for all four: `NetView::rev` moves whenever any row does, and
+    // `screen` covers walking onto a page whose rows have not changed since it
+    // was last looked at.
+    if moved!(net, screen) {
+        write_network_pages(
+            &nodes,
+            &session,
+            &config,
+            &mut q_node,
+            &mut q_text,
+            &mut q_bg,
+        );
+    }
+    if moved!(frames) {
+        set_text(&mut q_text, nodes.net.link_values[2], || {
+            format!("{} OUT   {} IN", net.sent, net.received)
+        });
     }
 
     // -- footer -------------------------------------------------------------
@@ -4694,6 +5178,149 @@ fn drive_menu(
     }
 }
 
+/// Which page the last applied model left on screen, if it can be named.
+///
+/// `None` means "no idea — hide them all", and it is the answer whenever the
+/// previous model had the menu **closed**, because a closed menu's model is a
+/// constant and its `screen` field says [`Screen::Boot`] no matter what was
+/// showing when it closed.
+///
+/// # The bug this is
+///
+/// Hiding `prev.screen` unconditionally hid `Boot`, so the page that was
+/// actually displayed when the menu closed stayed displayed, *underneath* the
+/// one that came up on the way back in. Two pages printed over each other, and
+/// the leftover was usually the boot self test or the crew room — which reads
+/// exactly like "the client is stuck on the starting screen".
+///
+/// It also explains a pointer that locks with a menu apparently on screen:
+/// `input.rs`'s `grab_cursor` keys off [`LobbyOpen`], which correctly says the
+/// lobby is *closed*, so a click in flight takes the pointer lock as it should
+/// — while a stale page is still drawn over the game.
+///
+/// The networked flow made it obvious because it is the first one that closes
+/// the menu from a page other than the one it reopens on, but launching a
+/// skirmish from `SOLO OPERATIONS` and pressing `ESC` did it too.
+fn page_to_hide(prev: Option<MenuModel>) -> Option<usize> {
+    match prev {
+        Some(p) if p.open => Some(p.screen as usize),
+        _ => None,
+    }
+}
+
+/// Writes the four network pages from [`NetSession`].
+///
+/// Split out of [`drive_menu`] because it is the one block that reads a
+/// non-`Copy` resource, and because it is long: a room browser, a crew room and
+/// a link panel is three pages' worth of text behind one comparison.
+///
+/// Every write goes through [`set_text`]/[`set`], which take the `Mut` only
+/// when the value actually differs — so walking onto the crew room with nothing
+/// changed but the page costs a handful of comparisons rather than thirty
+/// component writes.
+fn write_network_pages(
+    nodes: &MenuNodes,
+    session: &NetSession,
+    config: &NetConfig,
+    q_node: &mut Query<&mut Node>,
+    q_text: &mut Query<&mut Text>,
+    q_bg: &mut Query<&mut BackgroundColor>,
+) {
+    let net = &nodes.net;
+
+    // -- the link panel and the endpoint row --------------------------------
+    set_text(q_text, net.link_values[0], || {
+        config.endpoint_label().to_ascii_uppercase()
+    });
+    set_text(q_text, net.link_values[1], || {
+        // "Guest" is what the server calls a connection with no token, and it
+        // is the only identity this client has until the REST half lands.
+        let who = config.callsign.to_ascii_uppercase();
+        if config.token.is_some() {
+            format!("{who}  AUTH")
+        } else {
+            format!("{who}  GUEST")
+        }
+    });
+    if net.endpoint_row != usize::MAX {
+        set_text(q_text, nodes.controls[net.endpoint_row].value, || {
+            config.endpoint_label().to_ascii_uppercase()
+        });
+    }
+
+    // -- the room browser ---------------------------------------------------
+    for (i, &row) in net.sortie_rows.iter().enumerate() {
+        if row == usize::MAX {
+            continue;
+        }
+        let def = &nodes.controls[row];
+        match session.rooms.get(i) {
+            Some(room) => {
+                set_text(q_text, def.label, || room.code.to_ascii_uppercase());
+                set_text(q_text, def.value, || {
+                    format!(
+                        "{:<16} {}/{}",
+                        room.host_name.to_ascii_uppercase(),
+                        room.player_count,
+                        SEAT_ROWS
+                    )
+                });
+            }
+            None => {
+                set_text(q_text, def.label, || "- - - -".to_owned());
+                set_text(q_text, def.value, String::new);
+            }
+        }
+    }
+
+    // -- the crew room ------------------------------------------------------
+    set_text(q_text, net.room_code, || {
+        if session.code.is_empty() {
+            "- - - -".to_owned()
+        } else {
+            session.code.clone()
+        }
+    });
+    set_text(q_text, net.room_access, || {
+        if session.private { "PRIVATE" } else { "OPEN" }.to_owned()
+    });
+    for (i, seat) in net.seats.iter().enumerate() {
+        let row = session.players.get(i);
+        set_display(q_node, seat.root, row.is_some());
+        let Some(p) = row else { continue };
+        set_text(q_text, seat.name, || {
+            let mut name = p.name.to_ascii_uppercase();
+            if p.is_bot {
+                name.push_str("  [AI]");
+            }
+            name
+        });
+        set_text(q_text, seat.lead, || {
+            if p.host { "LEAD" } else { "" }.to_owned()
+        });
+        // Teams are `null` until the host presses start, and an unassigned seat
+        // reads as neither colour rather than defaulting to team 0's.
+        set(
+            q_bg,
+            seat.tick,
+            BackgroundColor(match p.team {
+                Some(0) => pal::CYAN,
+                Some(_) => pal::RED,
+                None => pal::rgba(pal::GRID, 0.8),
+            }),
+        );
+    }
+
+    // The one row whose *label* changes: the flight lead launches, everyone
+    // else stands by, and the row says which of the two you are before it is
+    // pressed rather than after.
+    if net.launch_row != usize::MAX {
+        set_text(q_text, nodes.controls[net.launch_row].label, || {
+            if session.host { "LAUNCH" } else { "STANDBY" }.to_owned()
+        });
+    }
+}
+
 /// Whether a control reads as selected, unavailable, or already held.
 fn control_state(def: &ControlDef, menu: &Menu, data: &LobbyData) -> (bool, bool, bool) {
     match def.action {
@@ -4716,7 +5343,17 @@ fn control_state(def: &ControlDef, menu: &Menu, data: &LobbyData) -> (bool, bool
         Action::SetPrivate(v) => (menu.private == v, false, false),
         Action::SetAutoBot(v) => (menu.auto_bot == v, false, false),
         Action::SetScheme(s) => (menu.scheme == s, false, false),
-        Action::SetSortie(s) => (menu.sortie == s, false, false),
+        // A row past the end of the list is an empty slot: it reads dead and
+        // `JOIN` refuses it. That is why the browser can be a fixed pool
+        // without ever offering a room that is not there.
+        Action::SetSortie(s) => (menu.sortie == s, s >= menu.net.rooms, false),
+        // Only the flight lead may launch, and the row says so either way — see
+        // the label swap in `drive_menu`.
+        Action::LaunchNet => (false, !menu.net.host, false),
+        Action::JoinSortie => (false, menu.net.rooms == 0, false),
+        Action::CycleEndpoint | Action::Transmit | Action::Refresh | Action::LeaveRoom => {
+            (false, false, false)
+        }
         Action::SetHull(i) => (menu.hull == i, false, false),
         Action::SetAccent(i) => (menu.accent == i, false, false),
         Action::SetTrail(i) => (menu.trail == i, false, false),
@@ -4734,8 +5371,7 @@ fn control_state(def: &ControlDef, menu: &Menu, data: &LobbyData) -> (bool, bool
             let st = stock(usize::from(menu.item), data);
             (false, st != Stock::Available, false)
         }
-        Action::Inert(_) => (false, true, false),
-        Action::Execute | Action::Back | Action::Volume(_) => (false, false, false),
+        Action::Execute | Action::Volume(_) => (false, false, false),
     }
 }
 
@@ -5704,6 +6340,21 @@ mod tests {
     /// Runs one activation against a real `MessageWriter`, and reports what
     /// `sim_bridge.rs` would have been handed.
     fn activate(action: Action, menu: &mut Menu) -> (MatchSetup, Vec<LaunchRequest>) {
+        activate_online(action, menu, &NetSession::default()).0
+    }
+
+    /// The same, plus the frames and commands the socket would have been
+    /// handed. `apply` collects those into [`NetOps`] rather than writing them,
+    /// precisely so a test can read them without a running app.
+    fn activate_online(
+        action: Action,
+        menu: &mut Menu,
+        session: &NetSession,
+    ) -> (
+        (MatchSetup, Vec<LaunchRequest>),
+        Vec<ClientMessage>,
+        Vec<NetCommand>,
+    ) {
         use bevy::ecs::message::Messages;
         use bevy::ecs::system::SystemState;
 
@@ -5712,16 +6363,19 @@ mod tests {
         let mut state: SystemState<MessageWriter<LaunchRequest>> = SystemState::new(&mut world);
         let mut data = LobbyData::placeholder();
         let mut setup = MatchSetup::default();
+        let mut config = NetConfig::default();
+        let callsign = data.pilot.callsign.clone();
+        let mut ops = NetOps::new(session, &mut config, &callsign);
         {
             let mut launch = state.get_mut(&mut world).expect("the writer validates");
-            apply(action, menu, &mut data, &mut setup, &mut launch);
+            apply(action, menu, &mut data, &mut setup, &mut launch, &mut ops);
         }
         state.apply(&mut world);
         let sent = world
             .resource_mut::<Messages<LaunchRequest>>()
             .drain()
             .collect();
-        (setup, sent)
+        ((setup, sent), ops.send, ops.commands)
     }
 
     /// The complaint, as a test: choosing a mode has to *be* the launch.
@@ -5802,5 +6456,266 @@ mod tests {
             assert!(!trial_locked(t));
         }
         assert!(!mission_locked(0) && !mission_locked(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // The network flow
+    // -----------------------------------------------------------------------
+
+    fn room(code: &str, host: &str, players: u32) -> spaceships_protocol::RoomSummary {
+        spaceships_protocol::RoomSummary {
+            code: code.to_owned(),
+            player_count: players,
+            host_name: host.to_owned(),
+        }
+    }
+
+    fn in_room(host: bool) -> NetSession {
+        NetSession {
+            phase: Phase::Room,
+            code: "ABCD".to_owned(),
+            host,
+            you: Some(1),
+            ..NetSession::default()
+        }
+    }
+
+    /// Nothing goes out before the handshake finishes.
+    ///
+    /// `flush_outbox` drops a frame written while the socket is opening —
+    /// exactly as the JS `readyState` guard does — so a `create` written
+    /// straight from the button press is a button that does nothing on the
+    /// first press and works on the second. This is why `Menu::pending` exists.
+    #[test]
+    fn a_lobby_request_waits_for_the_socket() {
+        for (action, want) in [
+            (Action::Transmit, Pending::Create),
+            (Action::Refresh, Pending::List),
+        ] {
+            let mut menu = Menu {
+                open: true,
+                screen: Screen::Create,
+                ..Menu::default()
+            };
+            let (_, sent, cmds) = activate_online(action, &mut menu, &NetSession::default());
+            assert!(sent.is_empty(), "{action:?} wrote a frame too early");
+            assert_eq!(
+                cmds,
+                vec![NetCommand::Connect],
+                "{action:?} asked for no link"
+            );
+            assert_eq!(menu.pending, Some(want));
+        }
+    }
+
+    /// ...and `JOIN` carries the code of the row under the cursor, not the
+    /// index — the browser is a fixed pool and its rows move under it.
+    #[test]
+    fn joining_takes_the_selected_rooms_code() {
+        let session = NetSession {
+            rooms: vec![room("KILO", "HALCYON", 4), room("ZULU", "SABLE", 2)],
+            ..NetSession::default()
+        };
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Browser,
+            sortie: 1,
+            ..Menu::default()
+        };
+        let (_, sent, _) = activate_online(Action::JoinSortie, &mut menu, &session);
+        assert!(sent.is_empty(), "join must wait for the link");
+        assert_eq!(menu.pending, Some(Pending::Join("ZULU".to_owned())));
+
+        // An empty slot refuses instead of joining whatever is at that index.
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Browser,
+            sortie: 4,
+            ..Menu::default()
+        };
+        let (_, sent, _) = activate_online(Action::JoinSortie, &mut menu, &session);
+        assert!(sent.is_empty());
+        assert_eq!(menu.pending, None);
+        assert_eq!(menu.notice, "NO SUCH SORTIE");
+    }
+
+    /// Only the flight lead may start, and the server ignores a `start` from
+    /// anyone else — so the row must too, rather than appearing to work.
+    #[test]
+    fn only_the_flight_lead_launches() {
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Waiting,
+            ..Menu::default()
+        };
+        let (_, sent, _) = activate_online(Action::LaunchNet, &mut menu, &in_room(true));
+        assert_eq!(sent, vec![ClientMessage::Start]);
+
+        let (_, sent, _) = activate_online(Action::LaunchNet, &mut menu, &in_room(false));
+        assert!(sent.is_empty());
+        assert_eq!(menu.notice, "THE FLIGHT LEAD LAUNCHES");
+    }
+
+    /// Walking out of the crew room gives the seat up. Without this the server
+    /// keeps the player in `room.players` until the socket closes, and everyone
+    /// else sees a pilot who is not there.
+    #[test]
+    fn leaving_the_crew_room_gives_the_seat_up() {
+        // The `LEAVE` row.
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Waiting,
+            ..Menu::default()
+        };
+        let (_, sent, _) = activate_online(Action::LeaveRoom, &mut menu, &in_room(false));
+        assert_eq!(sent, vec![ClientMessage::Leave]);
+        assert_eq!(menu.screen, Screen::Net);
+
+        // ...and so does `ESC`, which does not go through an `Action` at all.
+        let session = in_room(false);
+        let mut config = NetConfig::default();
+        let mut menu = Menu {
+            open: true,
+            screen: Screen::Main,
+            ..Menu::default()
+        };
+        let mut ops = NetOps::new(&session, &mut config, "PILOT");
+        on_screen_change(Screen::Waiting, &mut menu, &mut ops);
+        assert_eq!(ops.send, vec![ClientMessage::Leave]);
+    }
+
+    /// Opening the network rail opens a socket, and the browser asks for a
+    /// fresh list rather than showing whatever was cached when it was last
+    /// looked at.
+    #[test]
+    fn the_network_pages_open_the_link() {
+        let session = NetSession::default();
+        let mut config = NetConfig::default();
+
+        let mut menu = Menu {
+            screen: Screen::Net,
+            ..Menu::default()
+        };
+        let mut ops = NetOps::new(&session, &mut config, "MAVERICK");
+        on_screen_change(Screen::Main, &mut menu, &mut ops);
+        assert_eq!(ops.commands, vec![NetCommand::Connect]);
+        // The callsign has to be in place *before* the handshake: `net.rs`
+        // sends `name` from the open, not from here.
+        assert_eq!(ops.config.callsign, "MAVERICK");
+
+        let mut menu = Menu {
+            screen: Screen::Browser,
+            ..Menu::default()
+        };
+        let mut ops = NetOps::new(&session, &mut config, "MAVERICK");
+        on_screen_change(Screen::Net, &mut menu, &mut ops);
+        assert_eq!(menu.pending, Some(Pending::List));
+    }
+
+    /// A row past the end of the live list reads dead, so the fixed pool never
+    /// offers a sortie that is not there.
+    #[test]
+    fn empty_browser_rows_read_dead() {
+        let mut menu = Menu::default();
+        menu.net.rooms = 2;
+        let def = |action| ControlDef {
+            screen: Screen::Browser,
+            action,
+            root: Entity::PLACEHOLDER,
+            tick: Entity::PLACEHOLDER,
+            label: Entity::PLACEHOLDER,
+            value: Entity::PLACEHOLDER,
+        };
+        let data = LobbyData::placeholder();
+        for i in 0..SORTIE_ROWS as u8 {
+            let (_, disabled, _) = control_state(&def(Action::SetSortie(i)), &menu, &data);
+            assert_eq!(disabled, i >= 2, "row {i}");
+        }
+        // ...and `JOIN` itself is dead while there is nothing to join.
+        let (_, disabled, _) = control_state(&def(Action::JoinSortie), &menu, &data);
+        assert!(!disabled);
+        menu.net.rooms = 0;
+        let (_, disabled, _) = control_state(&def(Action::JoinSortie), &menu, &data);
+        assert!(disabled);
+    }
+
+    /// The performance rule, extended to the socket.
+    ///
+    /// A live match bumps `NetSession::rev` on every `players` broadcast and
+    /// every second of `match-state`. If that reached the model while the menu
+    /// was closed, `drive_menu` would take a `Mut` on the whole tree once a
+    /// second through an entire match — which is the per-frame relayout this
+    /// module exists to avoid, arriving by a new route.
+    #[test]
+    fn the_socket_cannot_wake_a_closed_menu() {
+        let (mut menu, data, net) = quiet();
+        menu.open = false;
+        let before = model(&menu, &data, &net, 0.0);
+
+        menu.net = NetView {
+            rev: 4_211,
+            phase: 3,
+            rooms: 5,
+            seats: 8,
+            host: true,
+        };
+        assert_eq!(before, model(&menu, &data, &net, 0.0));
+
+        // Open it and the same change does move the model, or the pages would
+        // never repaint at all.
+        menu.open = true;
+        let closed_view = Menu {
+            net: NetView::default(),
+            ..Menu::default()
+        };
+        assert_ne!(
+            model(&menu, &data, &net, 0.0),
+            model(
+                &Menu {
+                    open: true,
+                    screen: menu.screen,
+                    pinned: menu.pinned,
+                    ..closed_view
+                },
+                &data,
+                &net,
+                0.0
+            )
+        );
+    }
+
+    /// The page that was on screen when the menu closed has to be hidden when
+    /// it opens again — and a closed menu's model cannot say which one that
+    /// was, because it is a constant.
+    ///
+    /// Getting this wrong left two pages printed over each other: the one the
+    /// menu reopened on, and whatever was showing when it closed. It reads as
+    /// the client being stuck on the page it started from, and it puts a dead
+    /// page over a live match — where the pointer is correctly locked, because
+    /// as far as `LobbyOpen` is concerned the lobby is shut.
+    #[test]
+    fn reopening_the_menu_hides_whatever_was_left_on_screen() {
+        // First frame ever: nothing is known, so everything is hidden.
+        assert_eq!(page_to_hide(None), None);
+
+        // Menu open, page changes: hide just the one being left.
+        let open_on = |screen: Screen| MenuModel {
+            open: true,
+            screen: screen.index() as u8,
+            ..MenuModel::default()
+        };
+        assert_eq!(
+            page_to_hide(Some(open_on(Screen::Waiting))),
+            Some(Screen::Waiting.index())
+        );
+
+        // Menu closed: the model says `Boot` whatever was really showing, so
+        // the only safe answer is all of them.
+        let closed = MenuModel {
+            open: false,
+            ..MenuModel::default()
+        };
+        assert_eq!(closed.screen, 0, "a closed model reports the first page");
+        assert_eq!(page_to_hide(Some(closed)), None);
     }
 }
