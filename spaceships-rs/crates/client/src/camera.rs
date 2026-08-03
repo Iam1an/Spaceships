@@ -189,12 +189,23 @@ pub fn spawn_camera(mut commands: Commands) {
 /// on scene brightness. `Core3dSystems::PostProcess` still runs before
 /// `upscaling`, so this is the last thing to touch the image.
 ///
-/// # Three uniform members, not seven
+/// # It also carries the warp lens
+///
+/// `BACKLOG.md` §9 asks for the warp-in's radial bend to live "in that same node
+/// rather than a second pass", and this is that node: it is already the last
+/// thing to touch the image, it already has the screen texture bound, and a
+/// second fullscreen pass would be a second full-resolution round trip through
+/// memory for one frame in fifty. [`WarpLens`] is what [`crate::warp`] writes
+/// into it; at rest every lane is zero and the displacement is exactly the
+/// identity, so the idle cost is a handful of ALU on a pass that is already
+/// bandwidth-bound.
+///
+/// # Four uniform members, not eleven
 ///
 /// WebGL2 requires every uniform struct member to be 16-byte aligned, so the
 /// scalars ride in the `w` lanes of the vectors they belong with rather than
 /// as their own fields — the same packing, and the same reason, as `scene.rs`'s
-/// `DamageFlash`. It also keeps the buffer at 48 bytes with no padding to get
+/// `DamageFlash`. It also keeps the buffer at 64 bytes with no padding to get
 /// wrong.
 ///
 /// # Not ported
@@ -215,6 +226,60 @@ pub struct FilmGrade {
     gain: Vec4,
     /// `x`: `uGrain`. `y`: `uTime`, in seconds. `zw`: unused padding.
     grain: Vec4,
+    /// [`WarpLens`], lane for lane. Not in `GradeShader` — see the type docs.
+    warp: Vec4,
+}
+
+/// The warp-in's screen-space distortion, as the grade pass sees it.
+///
+/// Two displacements over one radial direction from the centre of frame, which
+/// is where the local player's warp axis points by construction — the arrival
+/// streams down the camera's own forward, so the vanishing point is the middle
+/// of the screen and needs no uniform of its own.
+///
+/// Distances are in *aspect-corrected* screen radii: 0.5 is half the frame
+/// height, and the corner of a 16:9 frame is at about 0.98. That keeps the bend
+/// circular on a wide window instead of an ellipse.
+#[derive(Clone, Copy, Default)]
+pub struct WarpLens {
+    /// The lens itself: how far, as a fraction of frame height, the sample
+    /// point moves at the very edge. Grows with r², so the centre of frame is
+    /// untouched and only the periphery bows — a lens, not a zoom.
+    ///
+    /// **Negative magnifies.** A positive value samples *further* from the
+    /// centre than the pixel being shaded, which contracts the image toward the
+    /// middle and pulls in texels from beyond the edge of the screen texture —
+    /// where there are none, and the clamp smears the border. Negative samples
+    /// inward, magnifying the periphery, which is both the fisheye direction
+    /// and the one that cannot reveal anything undefined.
+    pub bend: f32,
+    /// Where the shockwave ring is, as a screen radius.
+    pub ring_radius: f32,
+    /// How wide the ring's influence is. Zero disables it.
+    pub ring_width: f32,
+    /// How hard the ring drags what it passes over. `BACKLOG.md` §9 asks for
+    /// "the ring itself distorting what it passes over", and this is that: the
+    /// displacement straddles the ring, outward ahead of it and inward behind,
+    /// which is what makes it read as a wave rather than as a painted circle.
+    pub ring_gain: f32,
+}
+
+impl WarpLens {
+    /// The identity. Every lane zero, and the shader's displacement is then
+    /// exactly zero rather than nearly zero.
+    pub const NONE: WarpLens = WarpLens {
+        bend: 0.0,
+        ring_radius: 0.0,
+        ring_width: 0.0,
+        ring_gain: 0.0,
+    };
+}
+
+impl FilmGrade {
+    /// Points the grade pass's lens. See [`WarpLens`].
+    pub fn set_lens(&mut self, lens: WarpLens) {
+        self.warp = Vec4::new(lens.bend, lens.ring_radius, lens.ring_width, lens.ring_gain);
+    }
 }
 
 impl Default for FilmGrade {
@@ -230,6 +295,7 @@ impl Default for FilmGrade {
             lift: Vec4::new(0.004, 0.006, 0.016, 1.14),
             gain: Vec4::new(1.00, 0.995, 1.025, 1.05),
             grain: Vec4::new(0.009, 0.0, 0.0, 0.0),
+            warp: Vec4::ZERO,
         }
     }
 }
@@ -263,6 +329,16 @@ const GRADE_SHADER: Handle<Shader> = uuid_handle!("0d3f2a41-6c8e-4b52-9f17-2d4a8
 /// clamped to 0..1, and the sRGB encode happens in the blit to the swapchain.
 /// That is the same space `GradeShader` grades in — its own `pow(1/2.4)` encode
 /// is the last thing it does, after all of this.
+///
+/// The aspect ratio comes from `textureDimensions` rather than from a uniform:
+/// it is `textureSize` in ESSL 3.0 and therefore fine on WebGL2, and a uniform
+/// would be one more thing that can be stale by a frame on a window resize.
+///
+/// The lens samples with a displaced UV, and that UV is clamped: the
+/// displacement reaches past the edge of the screen texture by design, and the
+/// fullscreen pass's sampler is not guaranteed to clamp for us. Note the
+/// `textureSample` stays outside every branch — WGSL requires uniform control
+/// flow around it, and naga will reject a sample inside an `if`.
 const GRADE_WGSL: &str = r#"
 struct FullscreenVertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -276,6 +352,8 @@ struct FilmGrade {
     gain: vec4<f32>,
     // x: grain amount. y: time.
     grain: vec4<f32>,
+    // x: bend.  y: ring radius.  z: ring width.  w: ring gain.
+    warp: vec4<f32>,
 }
 
 @group(0) @binding(0) var screen: texture_2d<f32>;
@@ -284,7 +362,29 @@ struct FilmGrade {
 
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
-    var col = textureSample(screen, screen_sampler, in.uv).rgb;
+    // The warp lens. Radial from the centre of frame, in units of frame
+    // height, so it stays circular on a wide window.
+    let dim = vec2<f32>(textureDimensions(screen));
+    let aspect = dim.x / max(dim.y, 1.0);
+    var offset = in.uv - vec2<f32>(0.5, 0.5);
+    offset.x = offset.x * aspect;
+    let r = length(offset);
+    let radial = offset / max(r, 1e-5);
+
+    // Space bending: nothing at the centre, growing with r², bowing the edges.
+    var push = grade.warp.x * r * r;
+    // The shockwave, as the derivative of a Gaussian straddling the ring —
+    // outward just outside it, inward just inside, zero everywhere else.
+    let band = (r - grade.warp.y) / max(grade.warp.z, 1e-4);
+    push = push + grade.warp.w * band * exp(-band * band);
+
+    let bent = clamp(
+        in.uv + vec2<f32>(radial.x / aspect, radial.y) * push,
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+    );
+
+    var col = textureSample(screen, screen_sampler, bent).rgb;
 
     col = col * grade.gain.rgb + grade.lift.rgb;
 

@@ -1,22 +1,55 @@
-//! Warp-in on spawn — the star tunnel and the FOV punch, on every spawn.
+//! Warp-in on spawn — the sky bends, holds, and snaps back, on every spawn.
 //!
-//! A port of `public/src/warp.js`, which in the JS client fires only on a
-//! campaign respawn. Two things change and nothing else does: it fires on
-//! **every** spawn, and remote ships get one of their own.
+//! Built on a port of `public/src/warp.js`, which in the JS client fires only on
+//! a campaign respawn and is only a star tunnel. `BACKLOG.md` §9 is the
+//! specification, and the reference it names is Star Wars: **the sky bends
+//! around the ship and then snaps**.
 //!
-//! # What it is
+//! # The four things happening at once
 //!
-//! Streaking stars past the camera, and a field of view that starts at 175° and
-//! decelerates into the camera's resting angle over 1.5 s. The punch does most
-//! of the work — `1 - (1 - progress)^6` spends three quarters of it in the
-//! first quarter of the time, which is what reads as falling out of warp rather
-//! than as a zoom.
+//! 1. **The stars stretch, and the world does not.** The streaking belongs to
+//!    the *skybox*: [`skybox::Starfield`] hands over the same stars the cubemap
+//!    was baked from, and [`draw_sky`] redraws them as lines running radially
+//!    away from the point dead ahead while the cubemap itself dims out from
+//!    under them. Ships, rocks and terrain stay sharp, because nothing touches
+//!    them. A full-screen version of this is motion blur, which is a different
+//!    effect.
+//! 2. **The near streaks**, which is `warp.js`'s tunnel, converging inward on
+//!    the axis as it goes rather than merely streaming past — arriving, not
+//!    travelling.
+//! 3. **The field of view**, opening slowly to 175° and then decelerating back
+//!    into the camera's resting angle. `1 - (1 - p)^6` spends three quarters of
+//!    the punch in the first quarter of the time, which is what reads as
+//!    falling out of warp rather than as a zoom. It is the part of `warp.js`
+//!    worth keeping, and all that changed is where on the timeline it sits.
+//! 4. **The lens**: a radial bend in screen space, a chromatic split on the same
+//!    curve, and an expanding shockwave ring that distorts what it passes over.
+//!    All three ride in `camera.rs`'s grade pass — see [`camera::WarpLens`] —
+//!    because it is already the last node to touch the image.
 //!
-//! Every number here is `warp.js`'s: 3 000 stars, a 10–210 unit annulus, a
-//! 1 000 unit tunnel, velocities of 2 000–5 000 scaled by a `2.0 → 0.05`
-//! multiplier, streak length `speed × 0.5 + 20`, and the opacity envelope that
-//! fades in over the first 20 % and out over the last 0.8 s. Where something
-//! deviates it says so at the constant.
+//! # The snap is the moment
+//!
+//! The timeline is deliberately **asymmetric**, which is the second thing §9
+//! says is easy to get wrong: the collapse from lines back to points has to be
+//! far faster than the build-up, or the whole thing reads as a dissolve rather
+//! than as an arrival.
+//!
+//! ```text
+//!   0                 BEND_IN        SNAP_AT  ARRIVAL              DURATION
+//!   |--- bend in -------|-- hold ------|-snap-|---- relax ------------|
+//!   0.00               0.55           0.80   0.90                   1.50
+//! ```
+//!
+//! Everything opens together over 0.9 s and shuts in a tenth of one. In numbers:
+//! the FOV takes 0.71 s to travel half its range on the way out and 0.07 s to
+//! travel it back. `the_snap_is_faster_than_the_bend` below pins that ratio,
+//! because it is the difference between a warp and a fade.
+//!
+//! `warp.js`'s own envelope — in over the first 20 %, out over the last 0.8 s —
+//! was exactly the symmetric shape §9 warns about, and is gone. Everything else
+//! of the JS survives: 10–210 unit annulus, 1 000 unit tunnel, velocities of
+//! 2 000–5 000 scaled by a `2.0 → 0.05` multiplier, streak length
+//! `speed × 0.5 + 20`. Where something deviates it says so at the constant.
 //!
 //! # What fires it
 //!
@@ -44,8 +77,20 @@
 //! position is worth more than having it appear, so a remote arrival gets the
 //! same tunnel — same geometry, same curves — anchored to *that ship* and
 //! scaled down to its own length scale, streaming along its nose. Nothing
-//! screen-space: the FOV punch is the local player's alone, because a remote
-//! ship arriving must not move the camera it is being watched through.
+//! screen-space: the FOV punch, the sky stretch and the lens are the local
+//! player's alone, because a remote ship arriving must not move the camera it is
+//! being watched through, and the sky is not bending around *it*.
+//!
+//! # An arrival is a ship's, not the player's
+//!
+//! [`Warps::begin`] takes a ship id and a pose. Nothing in this module knows or
+//! cares whether that ship is the one on this machine beyond one boolean, which
+//! is what `BACKLOG.md` §13 needs: warping a whole flight in at match start is
+//! this same call in a loop, and [`Warps::begin_after`] already carries the
+//! per-ship delay that turns a simultaneous set of arrivals into a formation
+//! rippling down the flight. What §13 still needs and this cannot supply is a
+//! *shared* clock — the stagger has to come off the `start` frame's spawn list
+//! so eight clients agree — and a camera that is not the chase camera.
 //!
 //! # Draw cost
 //!
@@ -68,25 +113,41 @@
 //! local/everyone because the local tunnel fills frame and would hide the
 //! remote one entirely.
 //!
+//! `SPACESHIPS_WARP_FREEZE=<secs>` pins every live arrival at that age and
+//! never retires it. This is a *motion* effect and a still of a random frame
+//! says nothing about whether the snap reads; freezing the clock is what makes
+//! "the build-up", "peak stretch", "the instant of collapse" and "settled" four
+//! comparable screenshots rather than four lucky ones.
+//!
 //! # Not done here
 //!
 //! `BACKLOG.md` also asks for a rising whoosh that cuts hard at arrival. Audio
 //! lives in `audio.rs`, which is not this module's file; the trigger it would
-//! need is [`Warps::live`], which is already public to this crate.
+//! need is [`Warps::live`], which is already public to this crate, and the beat
+//! it should cut on is [`ARRIVAL`].
+//!
+//! **The Sierras map still warps you in**, minus the sky stretch, because there
+//! is no starfield there to stretch — so what is left is a tunnel of white
+//! streaks over a blue sky and a runway, which is not right. Suppressing it
+//! would put that map's spawn back to nothing at all, and §13 has the actual
+//! answer: terrain gets a take-off roll instead of an arrival. This is a
+//! placeholder either way, and the better one of the two.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::image::{ImageSampler, ImageSamplerDescriptor};
-use bevy::light::NotShadowCaster;
+use bevy::light::{NotShadowCaster, Skybox};
 use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::post_process::effect_stack::ChromaticAberration;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use sim::world::{EntityId, Frame, ShipFlags, SimEvent};
 use spaceships_sim as sim;
 
-use crate::camera::BASE_FOV;
+use crate::camera::{FilmGrade, FlightCamera, WarpLens, BASE_FOV};
 use crate::sim_bridge::{pos as to_vec3, rot, SimFrame, SimSet, LOCAL_ID};
+use crate::skybox::{SkyStar, Starfield, TEXEL_RADIANS};
 
 /// The rules, so the invulnerability window below is *derived* rather than
 /// guessed at — same reasoning as `scene.rs` and `weapons.rs`.
@@ -106,15 +167,69 @@ pub const DURATION: f32 = 1.5;
 /// not something anyone would connect back to a number in this file.
 const _: () = assert!((DURATION as f64) <= RULES.combat.spawn_invuln);
 
-/// `starCount`.
-const STAR_COUNT: u32 = 3000;
+/// How long the sky takes to bend, in seconds.
+///
+/// The slow end of the asymmetry. Long enough to read as space folding rather
+/// than as a flicker, and it is the number to raise if the effect ever feels
+/// like it starts mid-way.
+const BEND_IN: f32 = 0.55;
+
+/// When the lines start collapsing back to points.
+///
+/// The gap between here and [`BEND_IN`] is the *hold* — a quarter second at
+/// full stretch. Without it the stretch reverses the instant it peaks, and a
+/// triangle wave reads as a wobble; the hold is what makes the collapse feel
+/// like something that was interrupted.
+const SNAP_AT: f32 = 0.80;
+
+/// How long the collapse takes. A tenth of a second against 0.9 of build-up.
+const SNAP_TIME: f32 = 0.10;
+
+/// The arrival instant: the moment the lines finish collapsing.
+///
+/// Everything punctuating the arrival hangs off this — the flash, the shockwave,
+/// the peak of the lens, and the start of the FOV's deceleration.
+pub const ARRIVAL: f32 = SNAP_AT + SNAP_TIME;
+
+/// What is left afterwards for the lens to relax and the FOV to settle through.
+///
+/// `BACKLOG.md` §9 asks for the bend to relax "on an ease-out over roughly
+/// 0.6 s", and this is 0.6 s exactly — [`DURATION`] and [`ARRIVAL`] were chosen
+/// to make it so rather than the other way round.
+const RELAX: f32 = DURATION - ARRIVAL;
+
+/// The phases have to tile the arrival in order, or a curve would be evaluated
+/// on a segment that does not exist.
+const _: () = assert!(0.0 < BEND_IN && BEND_IN <= SNAP_AT && ARRIVAL < DURATION);
+
+/// How far apart consecutive ships arrive when a whole roster appears at once.
+///
+/// `BACKLOG.md` §13's "half-second ripple", divided across a nine-ship flight
+/// rather than spent between each pair — nine times half a second would leave
+/// the last ship arriving four seconds into the match. Only match start ever
+/// sees this: a respawn is one ship and has nothing to be staggered against.
+const STAGGER: f32 = 0.055;
+
+/// `starCount`, halved.
+///
+/// `warp.js` draws 3 000 because the tunnel is its *entire* effect. Here it is
+/// the near-field layer over a sky of 1 200 stretched stars, and the count that
+/// mattered when it was alone is just fill and vertex bandwidth once something
+/// else is drawing the lines. The mesh below pads to a fixed size every frame
+/// whatever is happening, so this is 1 600 quads of upload on every frame of the
+/// game, not only on the frames that warp — which is what makes it worth
+/// halving rather than leaving alone.
+const STAR_COUNT: u32 = 1400;
 
 /// Fixed vertex and index budget for the warp mesh.
 ///
 /// Rebuilt every frame, and it **must not change size** doing so — see the
-/// padding in the rebuild. One local tunnel plus a flash quad is the worst
-/// case; remote tunnels are far smaller and share the budget.
-const MESH_QUAD_CAPACITY: usize = STAR_COUNT as usize + 64;
+/// padding in the rebuild.
+///
+/// The worst case is a match-start arrival for a full ten-ship room
+/// (`BACKLOG.md` §13): the local tunnel and its sky, plus nine remote tunnels,
+/// plus a flash and a shockwave each.
+const MESH_QUAD_CAPACITY: usize = 4352;
 const MESH_VERTEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 4;
 const MESH_INDEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 6;
 
@@ -155,14 +270,6 @@ const LENGTH_PER_SPEED: f32 = 0.5;
 /// only at 60 fps.
 const REF_DT: f32 = 1.0 / 60.0;
 
-/// `progress < 0.2 ? progress / 0.2 : 1.0`: the fade in, as a fraction of the
-/// whole arrival.
-const FADE_IN: f32 = 0.2;
-
-/// `warpTimer < 0.8 ? warpTimer / 0.8`: the fade out, in seconds of remaining
-/// time.
-const FADE_OUT: f32 = 0.8;
-
 /// `maxFov`, in radians. Decelerating out of 175° is the "poosh", and it is the
 /// part of the effect that does most of the work.
 const MAX_FOV: f32 = 175.0 * std::f32::consts::PI / 180.0;
@@ -186,18 +293,149 @@ const STAR_HALF_WIDTH: f32 = 0.2;
 /// the authored 0.4 wherever that is already more than this.
 const STAR_MIN_HALF_PX: f32 = 0.85;
 
+/// How far the near streaks funnel inward at full stretch.
+///
+/// `BACKLOG.md` §9 wants the existing streaks "collapsing inward to a point
+/// rather than streaming past. Arriving, not travelling." The tunnel's motion
+/// along its axis is `warp.js`'s and stays; what this adds is the annulus
+/// closing on that axis as the bend builds, so the streaks converge on the
+/// vanishing point instead of running parallel to it. Not 1.0: at zero radius
+/// every streak is the same line and the tunnel stops having a shape.
+const CONVERGE: f32 = 0.62;
+
 // -- the parts that are not in warp.js --------------------------------------
 
 /// How long the arrival flash lasts, in seconds.
 ///
 /// Not in `warp.js`, which is a *transition* — it cuts from one scene to
-/// another and has no instant to punctuate. A spawn does, and the tunnel's
-/// opacity envelope deliberately starts at zero, so without this the first
-/// 0.3 s of an arrival is nothing at all.
+/// another and has no instant to punctuate. A spawn does: [`ARRIVAL`] is the
+/// beat the whole timeline is built around, and it needs something on it.
 const FLASH_TIME: f32 = 0.20;
 
-/// The flash's radius at its widest, in world units. About a ship's length.
+/// The flash's radius at its widest, in world units. About a ship's length, and
+/// used for *remote* arrivals only — see [`draw_flash`].
 const FLASH_RADIUS: f32 = 9.0;
+
+/// The local flash's radius at its widest, as a screen radius (0.5 is half the
+/// frame height). Past the corner, so the arrival instant is a wash rather than
+/// a bright blob with the old frame still visible around it.
+const FLASH_SCREEN: f32 = 1.05;
+
+/// How long the shockwave ring takes to run out, in seconds.
+///
+/// Comfortably inside [`RELAX`] so the wave has left frame before the arrival
+/// is over — a ring still crawling outward when the HUD comes back reads as a
+/// stuck sprite.
+const RING_TIME: f32 = 0.42;
+
+/// The world-space shockwave's radius at full expansion, in world units.
+///
+/// About six ship lengths, which from the chase camera's 11 units is most of the
+/// frame. It exists so a *remote* arrival gets a shockwave too — the lens is the
+/// local player's alone, and without this an enemy folding into existence would
+/// have a flash and nothing expanding away from it.
+const RING_RADIUS: f32 = 62.0;
+
+/// The lens ring's radius at full expansion, in aspect-corrected screen radii.
+///
+/// Past the corner of a 16:9 frame (0.98), so the wave leaves rather than
+/// stopping at the edge. Deliberately *not* derived by projecting [`RING_RADIUS`]
+/// — at 175° a 62-unit circle 11 units from the eye does not project to anything
+/// resembling a circle, and the two are tuned to move together by eye instead.
+const RING_SCREEN: f32 = 1.20;
+
+/// How hard the shockwave drags the image it crosses. See [`WarpLens::ring_gain`].
+const RING_LENS_GAIN: f32 = 0.055;
+
+/// The width of the lens ring's influence, in screen radii.
+const RING_LENS_WIDTH: f32 = 0.16;
+
+/// Where in its cell the [`Brush::RING`] annulus peaks, as a fraction of the
+/// quad's half-size. The quad has to be a little larger than the ring it draws
+/// or the annulus would be clipped by its own edge; this is the conversion.
+const RING_BRUSH_PEAK: f32 = 0.85;
+
+/// The shockwave's colour, cooler and much dimmer than the flash.
+///
+/// It is a lensing artefact rather than a light source: a ring authored as
+/// bright as the flash reads as a smoke ring painted over the scene, which is
+/// what the first pass at this looked like.
+const RING_TINT: LinearRgba = LinearRgba::rgb(0.55, 0.78, 1.0);
+
+/// How far the frame's edge bows at the peak of the bend, as a fraction of
+/// frame height. **Negative magnifies** — see [`WarpLens::bend`], where the sign
+/// is the difference between a lens and a smeared border.
+///
+/// Small on purpose. This is the term that sells "space folding" and it is also
+/// the one that turns into a fisheye joke if it is generous: 6 % of frame height
+/// at the very edge is plainly visible in motion and nearly invisible as a
+/// still, which is the correct amount for something that lasts a fifth of a
+/// second.
+const LENS_BEND: f32 = -0.06;
+
+/// How much the chromatic split grows at the peak of the bend, as a multiple of
+/// the camera's resting aberration.
+///
+/// `BACKLOG.md` §9: "`ChromaticAberration` is already there — animate its
+/// intensity on the same curve. Real lensing splits colour; a static value
+/// cannot."
+///
+/// 2.5× of `camera.rs`'s 0.006 is 0.015, near Bevy's own default of 0.02 and
+/// about as far as this can go. The effect's brightest objects are one-pixel
+/// stars, and the split is a *displacement*: at 6× every star in the sky became
+/// a thirty-pixel rainbow dash, which is a different and much worse effect.
+const LENS_ABERRATION: f32 = 2.5;
+
+// -- the sky ----------------------------------------------------------------
+
+/// How far out the stretched starfield is drawn, in world units.
+///
+/// Behind everything any map contains — the moon is 80 across at the origin, the
+/// motherships sit at Z = ±600, the asteroid field reaches 400 — and well inside
+/// the camera's 20 000 unit far plane. Depth testing is on for the additive
+/// material even though depth *writing* is not, so a stretched star behind the
+/// moon is correctly hidden by the moon. That is the whole argument for doing
+/// this as geometry: a full-screen pass could not know.
+const SKY_RADIUS: f32 = 6000.0;
+
+/// How far the sky is dragged along the warp axis at full stretch.
+///
+/// `d' = normalize(d - k·axis)` is the exact apparent motion of a star field
+/// when the viewer travels `k` times the stars' distance along `axis`, and it is
+/// what draws every line radially away from the point dead ahead — the vanishing
+/// point the reference puts them on. Stars near the axis barely move; stars
+/// abeam sweep most of a right angle.
+///
+/// It must stay under 1: at exactly 1 a star sitting on the axis has nowhere to
+/// go, and the normalise flips it to the opposite pole of the sky.
+const SKY_STRETCH_K: f32 = 0.86;
+
+/// How much of the cubemap is taken away at full stretch.
+///
+/// The stars are being redrawn as lines, so the points they came from have to
+/// leave or every star is drawn twice. Dimming the whole sky rather than hiding
+/// only the stars takes the nebula with it, which is right: a folded sky is
+/// streaks on black, and the nebula coming back at the snap is part of what
+/// arrives.
+///
+/// Not 1.0 — a sky that goes fully black for a quarter second reads as a dropped
+/// frame.
+const SKY_DIM: f32 = 0.88;
+
+/// How far past 1.0 a stretched sky star is authored.
+///
+/// The cubemap version of the same star goes through [`skybox::SKY_BRIGHTNESS`]
+/// and the tone mapper; this one is an unlit additive vertex colour, so there is
+/// no shared scale between them and this is matched by eye against a sky at rest.
+/// Held down rather than pushed up: a thousand additive lines saturate to a
+/// sheet of white long before any one of them is individually bright, and the
+/// effect is lines, not glare.
+const SKY_STAR_GLOW: f32 = 2.4;
+
+/// The narrowest a stretched sky star may get on screen, as a half-width in
+/// pixels. The same argument as [`STAR_MIN_HALF_PX`], and it matters more here:
+/// at 175° a one-texel star is a fifth of a pixel.
+const SKY_MIN_HALF_PX: f32 = 0.7;
 
 /// How much of a remote ship's tunnel fits inside the local one.
 ///
@@ -208,8 +446,10 @@ const FLASH_RADIUS: f32 = 9.0;
 const REMOTE_SCALE: f32 = 0.16;
 
 /// Stars in a remote ship's tunnel. Fewer than [`STAR_COUNT`] in proportion to
-/// the volume they fill, so the density matches.
-const REMOTE_STARS: u32 = 260;
+/// the volume they fill, so the density matches — and trimmed again to keep ten
+/// simultaneous arrivals inside [`MESH_QUAD_CAPACITY`]. A tunnel seen from
+/// across the map is a few dozen pixels wide.
+const REMOTE_STARS: u32 = 160;
 
 // ---------------------------------------------------------------------------
 // Curves
@@ -223,8 +463,8 @@ const REMOTE_STARS: u32 = 260;
 /// and a permanent change to how the game looks.
 pub mod curves {
     use super::{
-        DURATION, FADE_IN, FADE_OUT, FLASH_TIME, LENGTH_BASE, LENGTH_PER_SPEED, MAX_FOV, REF_DT,
-        SPEED_MULT_END, SPEED_MULT_START,
+        ARRIVAL, BEND_IN, DURATION, FLASH_TIME, LENGTH_BASE, LENGTH_PER_SPEED, MAX_FOV, REF_DT,
+        RELAX, RING_TIME, SNAP_AT, SNAP_TIME, SPEED_MULT_END, SPEED_MULT_START,
     };
 
     /// How far through the arrival, clamped to `0..=1`.
@@ -237,23 +477,78 @@ pub mod curves {
         }
     }
 
-    /// `warp.js`'s opacity envelope: in over the first [`FADE_IN`] of the
-    /// arrival, out over the last [`FADE_OUT`] seconds, full in between.
+    /// How folded the sky is: 0 at rest, 1 at full stretch.
     ///
-    /// It starts at **zero**, which is the JS's shape and is kept: the tunnel
-    /// arriving already at full brightness is the version that looks like a
-    /// cut.
+    /// The shape of the whole effect, and the one place its asymmetry is
+    /// written down. Smoothstep in over [`BEND_IN`], hold to [`SNAP_AT`], then
+    /// a **cubic fall** over [`SNAP_TIME`] — which loses half the stretch in
+    /// the first fifth of an already short window. That is the snap.
+    ///
+    /// This replaces `warp.js`'s opacity envelope, which faded in over the
+    /// first 20 % and out over the last 0.8 s of 1.5. Symmetric ends are
+    /// exactly what `BACKLOG.md` §9 says makes a warp look like a dissolve, and
+    /// the JS has that shape because it is a scene *transition* with nothing on
+    /// either side of it to arrive at.
     #[must_use]
-    pub fn opacity01(age: f32) -> f32 {
-        let timer = (DURATION - age).max(0.0);
-        let progress = progress(age);
-        if timer < FADE_OUT {
-            (timer / FADE_OUT).clamp(0.0, 1.0)
-        } else if progress < FADE_IN {
-            progress / FADE_IN
-        } else {
+    pub fn stretch01(age: f32) -> f32 {
+        if age <= 0.0 {
+            0.0
+        } else if age < BEND_IN {
+            let t = age / BEND_IN;
+            // Smoothstep, so it leaves rest and reaches the hold without a
+            // corner at either end.
+            t * t * (3.0 - 2.0 * t)
+        } else if age < SNAP_AT {
             1.0
+        } else if age < ARRIVAL {
+            let q = 1.0 - (age - SNAP_AT) / SNAP_TIME;
+            q * q * q
+        } else {
+            0.0
         }
+    }
+
+    /// The screen-space bend: 0 at rest, 1 at [`ARRIVAL`].
+    ///
+    /// Cubed on the way in so it stays out of the way while the sky is doing
+    /// the work and arrives all at once, and a quadratic ease-out over
+    /// [`RELAX`] afterwards — §9's "strongest at the arrival instant and
+    /// relaxing on an ease-out over roughly 0.6 s".
+    #[must_use]
+    pub fn bend01(age: f32) -> f32 {
+        if age <= 0.0 || age >= DURATION {
+            0.0
+        } else if age < ARRIVAL {
+            let t = age / ARRIVAL;
+            t * t * t
+        } else {
+            let q = 1.0 - (age - ARRIVAL) / RELAX;
+            q * q
+        }
+    }
+
+    /// How far the shockwave has run, `0..=1`, from [`ARRIVAL`].
+    ///
+    /// Decelerating, because a wave loses energy: `1 - (1 - t)^3` puts most of
+    /// the travel in the first third and lets the tail drift.
+    #[must_use]
+    pub fn ring01(age: f32) -> f32 {
+        if age < ARRIVAL || RING_TIME <= 0.0 {
+            return 0.0;
+        }
+        let t = ((age - ARRIVAL) / RING_TIME).clamp(0.0, 1.0);
+        let q = 1.0 - t;
+        1.0 - q * q * q
+    }
+
+    /// How bright the shockwave is, `0..=1`. Fades as it expands.
+    #[must_use]
+    pub fn ring_fade(age: f32) -> f32 {
+        if age < ARRIVAL || RING_TIME <= 0.0 {
+            return 0.0;
+        }
+        let q = 1.0 - ((age - ARRIVAL) / RING_TIME).clamp(0.0, 1.0);
+        q * q
     }
 
     /// `speedMult = lerp(2.0, 0.05, progress)`.
@@ -285,35 +580,59 @@ pub mod curves {
         (per_frame * LENGTH_PER_SPEED + LENGTH_BASE * scale).max(scale)
     }
 
-    /// The arrival flash: 1 at t=0, 0 at [`FLASH_TIME`], cubic decay.
+    /// The arrival flash: 1 at [`ARRIVAL`], 0 [`FLASH_TIME`] later, cubic decay.
     ///
     /// Cubic rather than quadratic so it is gone rather than lingering as a
     /// haze: its whole job is to punctuate one instant, and anything still
     /// visible a fifth of a second later is drawing attention to itself.
     #[must_use]
     pub fn flash01(age: f32) -> f32 {
-        if FLASH_TIME <= 0.0 {
+        if FLASH_TIME <= 0.0 || age < ARRIVAL {
             return 0.0;
         }
-        let q = 1.0 - (age / FLASH_TIME).clamp(0.0, 1.0);
+        let q = 1.0 - ((age - ARRIVAL) / FLASH_TIME).clamp(0.0, 1.0);
         q * q * q
     }
 
-    /// The FOV punch, in radians: [`MAX_FOV`] at t=0, `base` at [`DURATION`].
+    /// The field of view, in radians: `base` at t=0, [`MAX_FOV`] at
+    /// [`ARRIVAL`], `base` again at [`DURATION`].
     ///
-    /// `warp.js:59` — `fovProgress = 1 - (1 - progress)^6`, i.e. nearly all of
-    /// the punch is spent in the first third and the last of it crawls in. That
-    /// asymmetry is the whole trick: a linear ramp reads as a zoom, and this
-    /// reads as deceleration.
+    /// Two curves meeting at the snap, and the asymmetry between them is the
+    /// point:
+    ///
+    /// - **Out**, over 0.9 s: a quintic ease-in. Slow to start, so the first
+    ///   half second is a bend you feel rather than a zoom you notice, and
+    ///   steepest right as the lines collapse. Quintic and not cubic because
+    ///   the last 20° of the opening are severe — the world compresses to a
+    ///   spot in the middle of the frame — and the fifth power confines that to
+    ///   the 80 ms either side of the snap where it belongs. A cube left the
+    ///   scene unreadable for a quarter of a second.
+    /// - **Back**, over 0.6 s: `warp.js:59`'s `1 - (1 - p)^6`, which spends
+    ///   three quarters of the travel in the first quarter of the time. This is
+    ///   the "poosh", and it is the part of the JS effect worth keeping. All
+    ///   that moved is where on the timeline it sits: in `warp.js` it runs from
+    ///   the first frame, because there the warp *is* the transition and there
+    ///   is no arrival instant to hang it on.
+    ///
+    /// Halfway out takes 0.71 s and halfway back takes 0.07 s.
     #[must_use]
     pub fn fov(age: f32, base: f32) -> f32 {
-        let q = 1.0 - progress(age);
-        let punch = 1.0 - q * q * q * q * q * q;
-        // The precise form of a lerp, not `a + (b - a) * t`: this one is
-        // *exactly* `MAX_FOV` at 0 and *exactly* `base` at 1, and landing back
-        // on the resting angle bit for bit is what stops a warp from leaving
-        // the camera a rounding error away from where it found it.
-        MAX_FOV * (1.0 - punch) + base * punch
+        // The precise form of a lerp in both branches, not `a + (b - a) * t`:
+        // these are *exactly* `base` at the ends and *exactly* `MAX_FOV` at the
+        // snap, and landing back on the resting angle bit for bit is what stops
+        // a warp from leaving the camera a rounding error away from where it
+        // found it.
+        if age <= 0.0 || age >= DURATION {
+            base
+        } else if age < ARRIVAL {
+            let t = age / ARRIVAL;
+            let open = t * t * t * t * t;
+            base * (1.0 - open) + MAX_FOV * open
+        } else {
+            let q = 1.0 - (age - ARRIVAL) / RELAX;
+            let punch = 1.0 - q * q * q * q * q * q;
+            MAX_FOV * (1.0 - punch) + base * punch
+        }
     }
 }
 
@@ -333,7 +652,11 @@ pub struct Arrival {
     /// tunnel streams along. The local tunnel uses the camera's instead, as
     /// `warp.js` does.
     pub dir: Vec3,
-    /// Seconds since the arrival instant.
+    /// Seconds since the arrival began. **May be negative**, and that is how a
+    /// staggered arrival waits its turn: every curve in [`curves`] reads zero
+    /// below zero, so a not-yet-started arrival draws nothing and holds the
+    /// camera at its resting FOV without needing a state of its own. See
+    /// [`Warps::begin_after`].
     pub age: f32,
     /// Whether this is the player on this machine, and therefore whether the
     /// FOV punch runs.
@@ -362,6 +685,13 @@ pub struct Warps {
     /// The FOV to put back when the local arrival finishes, captured when it
     /// starts. See [`drive_fov`].
     base_fov: Option<f32>,
+    /// The same trick for the sky's brightness and the camera's resting
+    /// chromatic split, which the arrival also drives and also has to hand back
+    /// untouched. Captured rather than read from a constant for the reason
+    /// [`drive_fov`] gives about `cockpit.rs`: another module may have moved it,
+    /// and `terrain::apply_map` moves the sky's.
+    base_sky: Option<f32>,
+    base_aberration: Option<f32>,
     /// Counter folded into each [`Arrival::seed`].
     next_seed: u32,
 }
@@ -388,6 +718,17 @@ impl Warps {
             }
         }
 
+        // The stagger. One ship appearing is a respawn and goes now; a whole
+        // roster appearing is a match start, and `BACKLOG.md` §13 is explicit
+        // that "a half-second ripple down each flight reads as a formation
+        // arriving, where a single instant reads as a glitch".
+        //
+        // The order is `Frame::ships`, which is the simulation's and therefore
+        // the same on every client that ran the same tick — which is the
+        // property §13 asks for when it says the arrival has to be driven from
+        // something everyone agrees on. The local player is always first: you
+        // do not watch other people arrive before you do.
+        let mut nth = 0u32;
         for ship in &frame.ships {
             // Boss hitboxes are ships so that one damage path can serve the
             // capital ship. They are never drawn, so they never arrive.
@@ -395,7 +736,13 @@ impl Warps {
                 continue;
             }
             if !self.seen.contains(&ship.id) {
-                self.begin(ship.id, to_vec3(ship.pos), rot(ship.quat) * Vec3::Z);
+                let delay = if ship.id == LOCAL_ID {
+                    0.0
+                } else {
+                    nth += 1;
+                    STAGGER * nth as f32
+                };
+                self.begin_after(ship.id, to_vec3(ship.pos), rot(ship.quat) * Vec3::Z, delay);
             }
         }
 
@@ -409,12 +756,26 @@ impl Warps {
     /// quick succession should restart its warp, not run two of them at
     /// different ages and double every additive quad it draws.
     pub fn begin(&mut self, id: EntityId, pos: Vec3, dir: Vec3) {
+        self.begin_after(id, pos, dir, 0.0);
+    }
+
+    /// The same, `delay` seconds from now.
+    ///
+    /// Nothing calls this with a non-zero delay yet. It is here because
+    /// `BACKLOG.md` §13 turns on exactly one thing this module does not
+    /// otherwise express — "staged rather than simultaneous — a half-second
+    /// ripple down each flight reads as a formation arriving, where a single
+    /// instant reads as a glitch" — and the cost of expressing it is a negative
+    /// starting age. What §13 still has to supply is the *ordering*, which has
+    /// to come off the `start` frame's spawn list rather than from anything
+    /// local, or eight clients would each ripple their own way.
+    pub fn begin_after(&mut self, id: EntityId, pos: Vec3, dir: Vec3, delay: f32) {
         self.next_seed = self.next_seed.wrapping_add(0x9E37_79B9);
         let arrival = Arrival {
             id,
             pos,
             dir: dir.normalize_or(Vec3::Z),
-            age: 0.0,
+            age: -delay.max(0.0),
             local: id == LOCAL_ID,
             seed: self.next_seed ^ (id as u32),
         };
@@ -469,9 +830,16 @@ impl Plugin for WarpPlugin {
             // the camera actually ended up this frame rather than to where it
             // was last frame. `camera::follow` writes the chase pose in
             // `PostUpdate` before `Propagate`.
+            //
+            // `drive_fov` before `build_surface`, and not merely beside it: the
+            // mesh sizes its streaks against the live projection, and reading a
+            // FOV one frame stale during a punch that moves it by a factor of
+            // four is a visible pop in the streak widths.
             .add_systems(
                 PostUpdate,
-                (drive_fov, build_surface).after(TransformSystems::Propagate),
+                (drive_fov, drive_sky, drive_lens, build_surface)
+                    .chain()
+                    .after(TransformSystems::Propagate),
             );
     }
 }
@@ -481,9 +849,32 @@ fn watch_spawns(frame: Res<SimFrame>, mut warps: ResMut<Warps>) {
     warps.observe(&frame.0);
 }
 
-/// Ages every arrival.
-fn advance(time: Res<Time>, mut warps: ResMut<Warps>) {
-    warps.advance(time.delta_secs());
+/// Ages every arrival, or pins them all if `SPACESHIPS_WARP_FREEZE` is set.
+///
+/// The freeze is how this effect gets looked at. It is 1.5 s of continuous
+/// motion whose whole quality is *when* things happen relative to each other,
+/// and a screenshot lands wherever the three-second timer lands; pinning the
+/// clock turns "take a picture of the snap" from luck into an argument.
+fn advance(time: Res<Time>, mut warps: ResMut<Warps>, mut freeze: Local<Option<Option<f32>>>) {
+    let freeze = *freeze.get_or_insert_with(|| {
+        let at = times("SPACESHIPS_WARP_FREEZE").first().copied();
+        if let Some(at) = at {
+            info!("warp frozen at age {at}s");
+        }
+        at
+    });
+
+    match freeze {
+        // Clamped below `DURATION` so `advance` cannot retire what it just
+        // pinned, and a request for the very end still shows the last frame.
+        Some(at) => {
+            let at = at.min(DURATION - 1e-4);
+            for a in &mut warps.live {
+                a.age = at;
+            }
+        }
+        None => warps.advance(time.delta_secs()),
+    }
 }
 
 /// `SPACESHIPS_WARP` / `SPACESHIPS_WARP_ALL`: fire an arrival on cue.
@@ -581,6 +972,16 @@ fn ship_pos(frame: &Frame, id: EntityId) -> Option<Vec3> {
 
 /// Drives the FOV punch, for the local player's arrival only.
 ///
+/// # `FlightCamera`, and why this did nothing at all
+///
+/// This used to ask for `single_mut()` over `With<Camera3d>`. `ui.rs` runs a
+/// second `Camera3d` for the menu's ship preview, and a `single` over two
+/// matches does not pick one — it returns `Err`, which the `let ... else` above
+/// swallows. So the FOV punch, the loudest part of the whole effect, had been
+/// silently switched off since the day the preview landed; `cockpit.rs` records
+/// being caught by the identical bug and is why [`FlightCamera`] exists. Every
+/// camera query in this module filters on it now.
+///
 /// # The FOV, and `cockpit.rs`
 ///
 /// The resting FOV is captured when the arrival starts and written back when it
@@ -592,7 +993,7 @@ fn ship_pos(frame: &Frame, id: EntityId) -> Option<Vec3> {
 /// arrival, which would snapshot a punched FOV as the third-person one; a 1.5 s
 /// window that also happens to be spawn protection is not where anyone changes
 /// seats.
-fn drive_fov(mut warps: ResMut<Warps>, mut cam: Query<&mut Projection, With<Camera3d>>) {
+fn drive_fov(mut warps: ResMut<Warps>, mut cam: Query<&mut Projection, With<FlightCamera>>) {
     let Ok(mut projection) = cam.single_mut() else {
         return;
     };
@@ -629,6 +1030,71 @@ fn set_fov(projection: &mut Projection, fov: f32) {
         // edit to it deserves a guard rather than a crash.
         p.fov = fov.clamp(0.01, std::f32::consts::PI - 0.01);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The sky, and the lens
+// ---------------------------------------------------------------------------
+
+/// Dims the cubemap while its stars are being drawn as lines.
+///
+/// [`draw_sky`] redraws the starfield stretched; without this the points would
+/// still be sitting under the lines they came from, which reads as a double
+/// exposure rather than as motion. The same capture-and-restore shape as
+/// [`drive_fov`], and for the same reason — `terrain::apply_map` swaps this
+/// component out when the map changes, so the value to put back is whatever was
+/// there rather than [`skybox::SKY_BRIGHTNESS`].
+///
+/// On the Sierras map there is no [`Skybox`] on the camera at all, and the query
+/// simply finds nothing: no starfield, no stretch, and the daylight sky is left
+/// alone. That is the right answer there — `BACKLOG.md` §13 gives terrain its
+/// own entrance, a take-off roll, rather than a warp.
+fn drive_sky(mut warps: ResMut<Warps>, mut cam: Query<&mut Skybox, With<FlightCamera>>) {
+    let Ok(mut sky) = cam.single_mut() else {
+        return;
+    };
+
+    let Some(age) = warps.local().map(|a| a.age) else {
+        if let Some(base) = warps.base_sky.take() {
+            sky.brightness = base;
+        }
+        return;
+    };
+
+    let base = *warps.base_sky.get_or_insert(sky.brightness);
+    sky.brightness = base * (1.0 - SKY_DIM * curves::stretch01(age));
+}
+
+/// Drives the grade pass's lens and the camera's chromatic split.
+///
+/// Both ride [`curves::bend01`], which is `BACKLOG.md` §9's "animate its
+/// intensity on the same curve": a lens that bends the image without splitting
+/// its colour is a lens made of nothing.
+fn drive_lens(
+    mut warps: ResMut<Warps>,
+    mut cam: Query<(&mut FilmGrade, &mut ChromaticAberration), With<FlightCamera>>,
+) {
+    let Ok((mut grade, mut aberration)) = cam.single_mut() else {
+        return;
+    };
+
+    let Some(age) = warps.local().map(|a| a.age) else {
+        grade.set_lens(WarpLens::NONE);
+        if let Some(base) = warps.base_aberration.take() {
+            aberration.intensity = base;
+        }
+        return;
+    };
+
+    let base = *warps.base_aberration.get_or_insert(aberration.intensity);
+    let bend = curves::bend01(age);
+    aberration.intensity = base * (1.0 + LENS_ABERRATION * bend);
+    grade.set_lens(WarpLens {
+        bend: LENS_BEND * bend,
+        ring_radius: RING_SCREEN * curves::ring01(age),
+        ring_width: RING_LENS_WIDTH,
+        ring_gain: RING_LENS_GAIN * curves::ring_fade(age),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -672,13 +1138,25 @@ struct Brush {
 
 impl Brush {
     /// A soft radial falloff: the arrival flash.
-    const GLOW: Brush = Brush { u0: 0.0, u1: 0.5 };
+    const GLOW: Brush = Brush { u0: 0.0, u1: CELL };
     /// A near-solid bar with soft ends: a star streak, which in `warp.js` is a
     /// box with a hard edge.
-    const CORE: Brush = Brush { u0: 0.5, u1: 1.0 };
+    const CORE: Brush = Brush {
+        u0: CELL,
+        u1: 2.0 * CELL,
+    };
+    /// A bright annulus with soft edges: the shockwave.
+    const RING: Brush = Brush {
+        u0: 2.0 * CELL,
+        u1: 1.0,
+    };
 }
 
-/// Atlas cell size. Both brushes are smooth ramps magnified far past 1:1.
+/// How many brushes share the atlas, and one cell's width in UV.
+const ATLAS_CELLS: u32 = 3;
+const CELL: f32 = 1.0 / ATLAS_CELLS as f32;
+
+/// Atlas cell size. Every brush is a smooth ramp magnified far past 1:1.
 const ATLAS_CELL: u32 = 64;
 
 fn setup(
@@ -725,14 +1203,14 @@ fn setup(
     commands.insert_resource(WarpAssets { mesh });
 }
 
-/// Bakes the two brushes into one 128×64 RGBA image.
+/// Bakes the three brushes into one 192×64 RGBA image.
 ///
 /// The shape rides entirely in **alpha** with RGB left white: `AlphaMode::Add`
 /// premultiplies in the shader, so a fragment contributes
 /// `vertex_colour.rgb × vertex_colour.a × texture.a` — colour and brightness
 /// from the vertex, silhouette from the texture.
 fn build_brush_atlas() -> Image {
-    let w = ATLAS_CELL * 2;
+    let w = ATLAS_CELL * ATLAS_CELLS;
     let h = ATLAS_CELL;
     let mut data = vec![0u8; (w * h * 4) as usize];
 
@@ -746,10 +1224,18 @@ fn build_brush_atlas() -> Image {
                 // A soft falloff, zero at the cell edge so linear filtering
                 // cannot bleed one brush into the other.
                 (1.0 - r).clamp(0.0, 1.0).powf(2.2)
-            } else {
+            } else if cell == 1 {
                 // A solid disc with a soft rim: as close to the JS's hard-edged
                 // box as a textured quad gets without aliasing.
                 (1.0 - ((r - 0.6) / 0.4)).clamp(0.0, 1.0)
+            } else {
+                // A narrow annulus at `RING_BRUSH_PEAK`, dying to zero at the
+                // rim and hollow inside — the shockwave. Cubed so it is a thin
+                // bright line with a soft skirt rather than a fat band: this is
+                // meant to be the *edge* of a wave, and the wave itself is the
+                // distortion the lens is doing on either side of it.
+                let band = ((r - RING_BRUSH_PEAK) / 0.11).abs();
+                (1.0 - band).clamp(0.0, 1.0).powi(3)
             };
             let i = ((y * w + x) * 4) as usize;
             data[i] = 255;
@@ -850,6 +1336,39 @@ impl MeshBuild {
         }
         self.quad(c, along * half_len, side * half_w, brush, tint, alpha);
     }
+
+    /// A billboarded bar between two points.
+    ///
+    /// [`Self::bar`] in the form a stretched star wants it: the sky knows where
+    /// the line starts and ends, not where its middle is and how long it is.
+    /// A degenerate segment — an unstretched star, or one on the axis that has
+    /// nowhere to go — still draws, as a round dot of `half_w`, which is what it
+    /// should look like.
+    #[allow(clippy::too_many_arguments)]
+    fn segment(
+        &mut self,
+        p0: Vec3,
+        p1: Vec3,
+        half_w: f32,
+        eye: Vec3,
+        brush: Brush,
+        tint: LinearRgba,
+        alpha: f32,
+    ) {
+        let mid = (p0 + p1) * 0.5;
+        let span = p1 - p0;
+        let half_len = span.length() * 0.5;
+        if half_len <= half_w {
+            // Shorter than it is wide: `bar` would pick a width axis off a
+            // near-zero direction and give up. A square quad is the same
+            // silhouette and cannot degenerate.
+            let to_eye = (eye - mid).normalize_or(Vec3::Z);
+            let (right, up) = to_eye.any_orthonormal_pair();
+            self.quad(mid, right * half_w, up * half_w, brush, tint, alpha);
+            return;
+        }
+        self.bar(mid, span, half_len, half_w, eye, brush, tint, alpha);
+    }
 }
 
 /// One star tunnel's frame: where it is, which way it streams, and how big.
@@ -873,10 +1392,11 @@ fn build_surface(
     mut meshes: ResMut<Assets<Mesh>>,
     assets: Res<WarpAssets>,
     warps: Res<Warps>,
-    cameras: Query<(&GlobalTransform, &Camera, &Projection), With<Camera3d>>,
+    stars: Option<Res<Starfield>>,
+    cameras: Query<(&GlobalTransform, &Camera, &Projection, Has<Skybox>), With<FlightCamera>>,
     mut build: Local<MeshBuild>,
 ) {
-    let Some((cam, camera, projection)) = cameras.iter().next() else {
+    let Ok((cam, camera, projection, has_sky)) = cameras.single() else {
         return;
     };
     let Some(mut mesh) = meshes.get_mut(&assets.mesh) else {
@@ -886,10 +1406,19 @@ fn build_surface(
     build.clear();
 
     let cam_fwd = cam.forward().as_vec3();
+    let (angle_per_px, tan_half_fov) = view_scales(camera, projection);
     let view = View {
         eye: cam.translation(),
-        min_half_angle: min_half_angle(camera, projection),
+        angle_per_px,
+        tan_half_fov,
     };
+
+    // The sky stretch is the local player's alone and only where there *is* a
+    // sky: the Sierras camera has no `Skybox`, and stretching a starfield over
+    // green hills at noon would be nonsense.
+    if let (Some(stars), Some(arrival), true) = (stars.as_deref(), warps.local(), has_sky) {
+        draw_sky(&mut build, arrival, &stars.stars, cam, &view);
+    }
 
     for arrival in &warps.live {
         // `warp.js`: `instancedMesh.position.copy(camera.position)` and
@@ -920,7 +1449,8 @@ fn build_surface(
         };
 
         draw_tunnel(&mut build, arrival, &tunnel, &view);
-        draw_flash(&mut build, arrival, cam);
+        draw_flash(&mut build, arrival, cam, &view);
+        draw_shockwave(&mut build, arrival, cam, &view);
     }
 
     // Pad to a fixed size rather than submitting a shorter list on a quiet
@@ -935,6 +1465,17 @@ fn build_surface(
     // twice a frame for an entire session. The padding is degenerate triangles:
     // zero-area, so the rasteriser discards them, and zero-alpha, so the
     // additive blend would contribute nothing even if one survived.
+    //
+    // Overflow is dropped whole quads rather than truncated buffers, the shape
+    // `weapons.rs` settled on: a `resize` down mid-quad would leave indices
+    // pointing past the end of the vertex list.
+    if build.pos.len() > MESH_VERTEX_CAPACITY {
+        warn_once!("warp mesh overran its {MESH_QUAD_CAPACITY}-quad budget");
+        build.pos.truncate(MESH_VERTEX_CAPACITY);
+        build.uv.truncate(MESH_VERTEX_CAPACITY);
+        build.color.truncate(MESH_VERTEX_CAPACITY);
+        build.idx.truncate(MESH_INDEX_CAPACITY);
+    }
     build.pos.resize(MESH_VERTEX_CAPACITY, [0.0; 3]);
     build.uv.resize(MESH_VERTEX_CAPACITY, [0.0; 2]);
     build.color.resize(MESH_VERTEX_CAPACITY, [0.0; 4]);
@@ -950,41 +1491,81 @@ fn build_surface(
 /// billboard itself and to hold the screen-space width floor.
 struct View {
     eye: Vec3,
-    /// Half of one [`STAR_MIN_HALF_PX`]-wide pixel, in radians.
-    min_half_angle: f32,
+    /// How many radians one screen pixel subtends vertically.
+    angle_per_px: f32,
+    /// `tan(fov / 2)`, the exact projection of a billboard at the centre of
+    /// frame. See [`View::half_height_at`].
+    tan_half_fov: f32,
 }
 
-/// How many radians [`STAR_MIN_HALF_PX`] pixels subtend on this camera.
+impl View {
+    /// The world-space half-width that covers `px` pixels at `dist`.
+    ///
+    /// The small-angle approximation, which is what a *width* floor wants: it
+    /// is applied to things a pixel or two across, where the two agree.
+    fn px_at(&self, dist: f32, px: f32) -> f32 {
+        dist * self.angle_per_px * px
+    }
+
+    /// How much world half of the frame's height covers, `dist` in front.
+    ///
+    /// The exact `tan`, not the small-angle form, because this one is asked
+    /// about things that fill the screen at a field of view of 175°, where the
+    /// two differ by a factor of *twenty-three*. Reading the flash's size off
+    /// the linear approximation is why it was a speck at the moment it was
+    /// meant to be everything.
+    fn half_height_at(&self, dist: f32) -> f32 {
+        dist * self.tan_half_fov
+    }
+
+    /// A billboard half-size, in world units, that covers `lens` — the same
+    /// aspect-corrected screen radius [`WarpLens`] measures in, where 0.5 is
+    /// half the frame height. This is what puts the drawn shockwave on top of
+    /// the one the lens is bending.
+    fn lens_radius_at(&self, dist: f32, lens: f32) -> f32 {
+        2.0 * self.half_height_at(dist) * lens
+    }
+}
+
+/// How many radians one pixel subtends on this camera, and `tan(fov / 2)`.
 ///
 /// Read from the live projection rather than from a constant because the FOV
 /// punch moves it by a factor of four over the arrival: at 175° a pixel is four
 /// times the angle it is at 45°, and a floor derived from the resting FOV would
 /// be four times too thin at the moment there is most to see.
-fn min_half_angle(camera: &Camera, projection: &Projection) -> f32 {
+fn view_scales(camera: &Camera, projection: &Projection) -> (f32, f32) {
     let Projection::Perspective(p) = projection else {
-        return 0.0;
+        return (0.0, 1.0);
     };
     let height = camera
         .physical_viewport_size()
         .map_or(0.0, |s| s.y as f32)
         .max(1.0);
-    p.fov / height * STAR_MIN_HALF_PX
+    // `set_fov` already clamps to `PI - 0.01`, so the tangent cannot run away.
+    (p.fov / height, (p.fov * 0.5).tan())
 }
 
 /// The star tunnel: `warp.js`'s update loop, in closed form.
+///
+/// Two things are not the JS's. The envelope is [`curves::stretch01`], so the
+/// tunnel dies with the snap instead of dissolving over the last 0.8 s. And the
+/// annulus closes on the axis as the bend builds ([`CONVERGE`]), so the streaks
+/// converge on the vanishing point rather than running parallel past it — §9's
+/// "arriving, not travelling".
 fn draw_tunnel(build: &mut MeshBuild, a: &Arrival, t: &Tunnel, view: &View) {
-    let opacity = curves::opacity01(a.age);
-    if opacity <= 0.0 {
+    let stretch = curves::stretch01(a.age);
+    if stretch <= 0.0 {
         return;
     }
     let travelled = curves::travel(a.age);
     let depth = TUNNEL_DEPTH * t.scale;
     let ahead = WRAP_AHEAD * t.scale;
     let authored_half_w = STAR_HALF_WIDTH * t.scale;
+    let converge = 1.0 - CONVERGE * stretch;
 
     for i in 0..t.count {
         let angle = hash01(a.seed, i, 1) * std::f32::consts::TAU;
-        let radius = (RADIUS_MIN + RADIUS_SPAN * hash01(a.seed, i, 2)) * t.scale;
+        let radius = (RADIUS_MIN + RADIUS_SPAN * hash01(a.seed, i, 2)) * t.scale * converge;
         let z0 = (hash01(a.seed, i, 3) - 0.5) * depth;
         let velocity = (VEL_MIN + VEL_SPAN * hash01(a.seed, i, 4)) * t.scale;
 
@@ -997,7 +1578,7 @@ fn draw_tunnel(build: &mut MeshBuild, a: &Arrival, t: &Tunnel, view: &View) {
             + t.axis * z;
         // The width floor, in world units at *this* star's distance. See
         // `STAR_MIN_HALF_PX`.
-        let half_w = authored_half_w.max(centre.distance(view.eye) * view.min_half_angle);
+        let half_w = authored_half_w.max(view.px_at(centre.distance(view.eye), STAR_MIN_HALF_PX));
         build.bar(
             centre,
             t.axis,
@@ -1006,9 +1587,101 @@ fn draw_tunnel(build: &mut MeshBuild, a: &Arrival, t: &Tunnel, view: &View) {
             view.eye,
             Brush::CORE,
             STAR_TINT,
-            opacity,
+            stretch,
         );
     }
+}
+
+/// The starfield, stretched into lines toward the vanishing point.
+///
+/// The headline of `BACKLOG.md` §9 and the thing that makes the effect read as
+/// Star Wars rather than as a particle system. Each star of the cubemap is
+/// redrawn as the segment between where it is at rest and where a viewer
+/// travelling `k` star-distances along the warp axis would see it:
+///
+/// ```text
+///     d' = normalize(d - k · axis)
+/// ```
+///
+/// which leaves a star dead ahead alone, sweeps a star abeam most of a right
+/// angle, and draws every line on a great circle radiating from the point the
+/// ship is pointing at. [`drive_sky`] takes the cubemap down underneath by the
+/// same amount, so what the player sees is one starfield changing shape rather
+/// than two starfields.
+///
+/// Local arrivals only, and the caller enforces that: the sky bends around the
+/// viewer, not around a ship a kilometre away.
+fn draw_sky(
+    build: &mut MeshBuild,
+    a: &Arrival,
+    stars: &[SkyStar],
+    cam: &GlobalTransform,
+    view: &View,
+) {
+    let stretch = curves::stretch01(a.age);
+    if stretch <= 0.0 {
+        return;
+    }
+    let axis = cam.forward().as_vec3();
+    let k = SKY_STRETCH_K * stretch;
+    let eye = view.eye;
+    // Every star sits on the same shell, so the pixel floor is one divide for
+    // the whole layer rather than one per star.
+    let floor = view.px_at(SKY_RADIUS, SKY_MIN_HALF_PX);
+
+    for star in stars {
+        let rest = star.dir;
+        // `k < 1` is guaranteed by `SKY_STRETCH_K`, which is what keeps this
+        // normalise from flipping a star on the axis to the far pole.
+        let moved = (rest - axis * k).normalize_or(rest);
+        let p0 = eye + rest * SKY_RADIUS;
+        let p1 = eye + moved * SKY_RADIUS;
+
+        let half_w = floor.max(SKY_RADIUS * star.radius_px * TEXEL_RADIANS);
+        let tint = LinearRgba::rgb(
+            star.color.red * SKY_STAR_GLOW,
+            star.color.green * SKY_STAR_GLOW,
+            star.color.blue * SKY_STAR_GLOW,
+        );
+        build.segment(p0, p1, half_w, eye, Brush::CORE, tint, 1.0);
+    }
+}
+
+/// The shockwave: a ring expanding away from the point the ship came in at.
+///
+/// Two sizes again, on the same argument as [`draw_flash`], and here the local
+/// one is not merely legible but *load bearing*: [`drive_lens`] is bending the
+/// image in a band at `RING_SCREEN × ring01`, and this is the visible ring that
+/// band is supposed to belong to. Sizing it through [`View::lens_radius_at`] is
+/// what puts the two on top of each other rather than near each other, which is
+/// the difference between a shockwave and a painted circle next to a bulge.
+///
+/// The atlas draws its annulus at [`RING_BRUSH_PEAK`] of the quad's half-size,
+/// so the quad is that much larger than the ring it draws.
+///
+/// A remote arrival keeps world units, and is the only part of the punctuation
+/// anyone else can see.
+fn draw_shockwave(build: &mut MeshBuild, a: &Arrival, cam: &GlobalTransform, view: &View) {
+    let fade = curves::ring_fade(a.age);
+    if fade <= 0.0 {
+        return;
+    }
+    let expand = curves::ring01(a.age) / RING_BRUSH_PEAK;
+    let radius = if a.local {
+        view.lens_radius_at(a.pos.distance(view.eye).max(1.0), RING_SCREEN * expand)
+    } else {
+        RING_RADIUS * expand
+    };
+    let right = cam.right().as_vec3();
+    let up = cam.up().as_vec3();
+    build.quad(
+        a.pos,
+        right * radius,
+        up * radius,
+        Brush::RING,
+        RING_TINT,
+        fade,
+    );
 }
 
 /// `if (posZ[i] > 100) posZ[i] -= 1000`, for a star that may have lapped the
@@ -1025,10 +1698,18 @@ fn wrap_z(z: f32, ahead: f32, depth: f32) -> f32 {
 
 /// The arrival flash: a hot core and a soft halo at the point the ship came in.
 ///
-/// Two quads. It is not in `warp.js` — see [`FLASH_TIME`] — and it is kept
-/// small on purpose: its whole job is to punctuate the instant the tunnel's
-/// opacity envelope is still ramping up from zero through.
-fn draw_flash(build: &mut MeshBuild, a: &Arrival, cam: &GlobalTransform) {
+/// Two quads, and not in `warp.js` — see [`FLASH_TIME`].
+///
+/// # Two sizes, for the same reason the tunnel has two
+///
+/// A remote arrival is an event happening over *there*, and gets a world-space
+/// flash a ship's length across. The local one is an event happening to the
+/// *viewer*, at a field of view of 175° where world sizes stop meaning anything:
+/// [`FLASH_RADIUS`] eleven units from the eye at that angle is four pixels, so
+/// the loudest instant of the whole effect was reading as the screen going dark.
+/// Sized against the frame instead, through [`View::lens_radius_at`], it is the
+/// white wash an arrival is supposed to be.
+fn draw_flash(build: &mut MeshBuild, a: &Arrival, cam: &GlobalTransform, view: &View) {
     let flash = curves::flash01(a.age);
     if flash <= 0.0 {
         return;
@@ -1036,8 +1717,15 @@ fn draw_flash(build: &mut MeshBuild, a: &Arrival, cam: &GlobalTransform) {
     let right = cam.right().as_vec3();
     let up = cam.up().as_vec3();
     // Opening outward as it fades, so it reads as a burst and not as a lamp
-    // being turned down.
-    let radius = FLASH_RADIUS * (0.35 + 0.65 * (1.0 - flash));
+    // being turned down. It starts at a bit over half rather than at a third:
+    // the brightest instant is also the first one, and a wash that has to grow
+    // into covering the frame spends that instant not covering it.
+    let grow = 0.55 + 0.45 * (1.0 - flash);
+    let radius = if a.local {
+        view.lens_radius_at(a.pos.distance(view.eye).max(1.0), FLASH_SCREEN) * grow
+    } else {
+        FLASH_RADIUS * grow
+    };
     build.quad(
         a.pos,
         right * radius,
@@ -1109,17 +1797,22 @@ mod tests {
         // Every sub-phase is inside the arrival, or a stray quad would outlive
         // the effect that owns it. Const blocks because clippy is right that
         // these are decided at compile time — which is the point.
-        const { assert!(FLASH_TIME <= DURATION) };
-        const { assert!(FADE_OUT <= DURATION) };
+        const { assert!(ARRIVAL + FLASH_TIME <= DURATION) };
+        const { assert!(ARRIVAL + RING_TIME <= DURATION) };
+        const { assert!(ARRIVAL + RELAX <= DURATION) };
     }
 
     // -- the FOV punch ------------------------------------------------------
 
     #[test]
-    fn the_fov_punches_from_175_and_lands_on_the_base() {
-        assert_eq!(curves::fov(0.0, BASE_FOV), MAX_FOV);
+    fn the_fov_opens_to_175_at_the_snap_and_lands_on_the_base() {
+        assert_eq!(curves::fov(0.0, BASE_FOV), BASE_FOV);
+        assert_eq!(curves::fov(ARRIVAL, BASE_FOV), MAX_FOV);
         assert_eq!(curves::fov(DURATION, BASE_FOV), BASE_FOV);
         assert_eq!(curves::fov(9.0, BASE_FOV), BASE_FOV);
+        // A staggered arrival waits at a negative age, and must not move the
+        // camera while it does. See `Warps::begin_after`.
+        assert_eq!(curves::fov(-0.4, BASE_FOV), BASE_FOV);
 
         // 175 degrees, to the precision the constant is written to.
         assert!((MAX_FOV.to_degrees() - 175.0).abs() < 1e-3);
@@ -1127,22 +1820,73 @@ mod tests {
         // `cockpit.rs` swaps the projection out from under it.
         let seated = 1.0;
         assert_eq!(curves::fov(DURATION, seated), seated);
+        assert_eq!(curves::fov(0.0, seated), seated);
     }
 
     #[test]
-    fn the_fov_decelerates_rather_than_ramping() {
+    fn the_fov_opens_then_decelerates_back() {
+        // Monotone out to the snap, monotone back after it, and never outside
+        // the two angles it runs between.
+        let sample = |t: f32| curves::fov(t, BASE_FOV);
+        let mut prev = -f32::INFINITY;
+        for step in 0..=60 {
+            let v = sample(step as f32 / 60.0 * ARRIVAL);
+            assert!(v >= prev - 1e-6, "the bend reversed at step {step}");
+            assert!((BASE_FOV..=MAX_FOV).contains(&v));
+            prev = v;
+        }
         let mut prev = f32::INFINITY;
         for step in 0..=60 {
-            let v = curves::fov(step as f32 / 60.0 * DURATION, BASE_FOV);
+            let v = sample(ARRIVAL + step as f32 / 60.0 * RELAX);
             assert!(v <= prev + 1e-6, "the punch reversed at step {step}");
             assert!((BASE_FOV..=MAX_FOV).contains(&v));
             prev = v;
         }
+
         // `1 - (1 - p)^6` puts three quarters of the punch in the first
-        // quarter of the time. That asymmetry is what reads as deceleration.
-        let quarter = curves::fov(DURATION * 0.25, BASE_FOV);
+        // quarter of the time. That asymmetry is what reads as deceleration
+        // rather than as a zoom, and it is `warp.js:59`'s.
+        let quarter = sample(ARRIVAL + RELAX * 0.25);
         let travelled = (MAX_FOV - quarter) / (MAX_FOV - BASE_FOV);
         assert!(travelled > 0.75, "only {travelled} of the punch by t/4");
+    }
+
+    /// The headline of `BACKLOG.md` §9's second bullet: "the collapse from lines
+    /// back to points wants to be much faster than the build-up ... easing both
+    /// ends symmetrically is what makes a warp look like a dissolve."
+    ///
+    /// Measured on the two curves that carry the whole effect — how long each
+    /// takes to travel half its range, out and back.
+    #[test]
+    fn the_snap_is_faster_than_the_bend() {
+        let half = |f: &dyn Fn(f32) -> f32, from: f32, to: f32, target: f32| {
+            let steps = 20_000;
+            for i in 0..=steps {
+                let t = from + (to - from) * i as f32 / steps as f32;
+                if f(t) >= target {
+                    return t - from;
+                }
+            }
+            to - from
+        };
+
+        // The field of view, base to halfway and back.
+        let mid_fov = (BASE_FOV + MAX_FOV) * 0.5;
+        let out = half(&|t| curves::fov(t, BASE_FOV), 0.0, ARRIVAL, mid_fov);
+        let back = half(&|t| -curves::fov(t, BASE_FOV), ARRIVAL, DURATION, -mid_fov);
+        assert!(out > 0.6, "the bend takes only {out}s, which is a jolt");
+        assert!(
+            back * 5.0 < out,
+            "{back}s back against {out}s out is not a snap"
+        );
+
+        // And the stretch itself, which is what actually collapses.
+        let up = half(&curves::stretch01, 0.0, SNAP_AT, 0.5);
+        let down = half(&|t| -curves::stretch01(t), SNAP_AT, DURATION, -0.5);
+        assert!(
+            down * 10.0 < up,
+            "the sky unbends in {down}s against {up}s bending, which is a fade"
+        );
     }
 
     /// The FOV must be a legal one for glam's perspective matrix at every point
@@ -1157,24 +1901,59 @@ mod tests {
 
     // -- warp.js's envelope and motion --------------------------------------
 
-    /// The opacity envelope, transcribed from `warp.js:56`: in over the first
-    /// 20 %, out over the last 0.8 s, and nothing left at the end.
+    /// The envelope, phase by phase: nothing at rest, full across the hold,
+    /// nothing again the moment the snap finishes.
     #[test]
-    fn the_opacity_envelope_matches_the_js() {
-        assert_eq!(curves::opacity01(0.0), 0.0);
-        assert_eq!(curves::opacity01(DURATION * FADE_IN), 1.0);
-        assert_eq!(curves::opacity01(DURATION - FADE_OUT), 1.0);
-        assert_eq!(curves::opacity01(DURATION), 0.0);
-        assert_eq!(curves::opacity01(9.0), 0.0);
+    fn the_stretch_bends_in_holds_and_snaps_out() {
+        assert_eq!(curves::stretch01(-1.0), 0.0);
+        assert_eq!(curves::stretch01(0.0), 0.0);
+        assert_eq!(curves::stretch01(BEND_IN), 1.0);
+        assert_eq!(curves::stretch01(SNAP_AT), 1.0);
+        assert_eq!(curves::stretch01(ARRIVAL), 0.0);
+        assert_eq!(curves::stretch01(DURATION), 0.0);
+        assert_eq!(curves::stretch01(9.0), 0.0);
 
-        // Half way through the fade in and the fade out.
-        assert!((curves::opacity01(DURATION * FADE_IN * 0.5) - 0.5).abs() < 1e-5);
-        assert!((curves::opacity01(DURATION - FADE_OUT * 0.5) - 0.5).abs() < 1e-5);
+        // Smoothstep is symmetric about its midpoint.
+        assert!((curves::stretch01(BEND_IN * 0.5) - 0.5).abs() < 1e-5);
 
         for step in 0..=200 {
-            let v = curves::opacity01(step as f32 / 100.0);
-            assert!((0.0..=1.0).contains(&v), "opacity left 0..1: {v}");
+            let v = curves::stretch01(step as f32 / 100.0);
+            assert!((0.0..=1.0).contains(&v), "stretch left 0..1: {v}");
         }
+
+        // The hold is real — a triangle wave here would read as a wobble.
+        const { assert!(SNAP_AT - BEND_IN > 0.15) };
+    }
+
+    /// The lens peaks *on* the collapse and eases out over §9's 0.6 s, and the
+    /// shockwave leaves with it.
+    #[test]
+    fn the_lens_peaks_at_the_arrival_instant() {
+        assert_eq!(curves::bend01(0.0), 0.0);
+        assert_eq!(curves::bend01(ARRIVAL), 1.0);
+        assert_eq!(curves::bend01(DURATION), 0.0);
+        assert!((RELAX - 0.6).abs() < 1e-5, "§9 asks for roughly 0.6 s");
+
+        // Continuous across the seam, or the bend would jump on the one frame
+        // everything else is jumping on and read as a glitch.
+        let before = curves::bend01(ARRIVAL - 1e-4);
+        assert!((before - 1.0).abs() < 1e-2, "the lens jumps at the snap");
+
+        // Nothing before the arrival, everything after it, gone by the end.
+        assert_eq!(curves::ring01(ARRIVAL - 0.01), 0.0);
+        assert_eq!(curves::ring_fade(ARRIVAL), 1.0);
+        assert_eq!(curves::ring01(ARRIVAL + RING_TIME), 1.0);
+        // Not `== 0.0`: `1 - (age - ARRIVAL) / RING_TIME` is a difference of
+        // sums that lands a couple of ulps off zero, and squaring it leaves
+        // 1e-22. That is nothing, and asking for a bit-exact zero here would be
+        // asking the wrong question — the ring is invisible either way.
+        assert!(curves::ring_fade(ARRIVAL + RING_TIME) < 1e-9);
+        // The wave decelerates: half the travel well inside half the time.
+        assert!(curves::ring01(ARRIVAL + RING_TIME * 0.5) > 0.8);
+
+        assert_eq!(curves::flash01(ARRIVAL - 0.01), 0.0);
+        assert_eq!(curves::flash01(ARRIVAL), 1.0);
+        assert!(curves::flash01(ARRIVAL + FLASH_TIME) < 1e-9);
     }
 
     /// `speedMult = lerp(2.0, 0.05, progress)`, and the tunnel therefore comes
@@ -1184,7 +1963,26 @@ mod tests {
         assert_eq!(curves::speed_mult(0.0), SPEED_MULT_START);
         assert_eq!(curves::speed_mult(DURATION), SPEED_MULT_END);
         assert!(curves::speed_mult(DURATION * 0.5) < SPEED_MULT_START);
-        assert!(curves::flash01(0.0) == 1.0 && curves::flash01(FLASH_TIME) == 0.0);
+    }
+
+    /// The mesh pads to a fixed size every frame, so the budget has to cover
+    /// the worst case rather than the usual one — `BACKLOG.md` §13's ten-ship
+    /// match start, where every ship in the room arrives at once.
+    #[test]
+    fn the_mesh_budget_covers_a_full_rooms_arrival() {
+        // The local player: a tunnel, the whole stretched sky, two flash quads
+        // and a shockwave. `skybox::SHELL_MIN_ALPHA` keeps about 40 % of 2 532
+        // stars plus 60 bright cores — a shade over a thousand, and 1 200 here
+        // for headroom. `attach_sky` logs the real figure at startup.
+        let sky = 1200;
+        let local = STAR_COUNT as usize + sky + 3;
+        // Nine others, each a tunnel plus a flash and a shockwave.
+        let remote = 9 * (REMOTE_STARS as usize + 3);
+        assert!(
+            local + remote <= MESH_QUAD_CAPACITY,
+            "{} quads against a {MESH_QUAD_CAPACITY} budget",
+            local + remote
+        );
     }
 
     /// The closed-form travel has to match what `warp.js`'s per-frame loop
@@ -1316,6 +2114,55 @@ mod tests {
         assert_eq!(warps.live[0].pos, Vec3::new(4.0, 5.0, 6.0));
     }
 
+    /// A whole roster appearing at once is a match start, and ripples;
+    /// the local player never waits for it.
+    #[test]
+    fn a_match_start_ripples_down_the_flight() {
+        let mut warps = Warps::default();
+        let mut frame = Frame::new();
+        frame.ships = vec![ship(2, 0.0), ship(LOCAL_ID, 10.0), ship(3, 20.0)];
+        warps.observe(&frame);
+
+        let age = |id| warps.live.iter().find(|a| a.id == id).unwrap().age;
+        assert_eq!(age(LOCAL_ID), 0.0, "you do not queue behind your own team");
+        // In `Frame::ships` order, which every client shares, and not in the
+        // order they happen to be found.
+        assert_eq!(age(2), -STAGGER);
+        assert_eq!(age(3), -2.0 * STAGGER);
+        // The last of them still fits inside spawn protection, arrival and all.
+        let last = 2.0 * STAGGER + DURATION;
+        assert!(f64::from(last) <= RULES.combat.spawn_invuln * 2.0);
+    }
+
+    /// A respawn is one ship, and one ship has nothing to be staggered against.
+    #[test]
+    fn a_lone_respawn_does_not_wait() {
+        let mut warps = Warps::default();
+        let mut frame = Frame::new();
+        frame.ships = vec![ship(LOCAL_ID, 0.0), ship(2, 0.0)];
+        warps.observe(&frame);
+        warps.advance(DURATION);
+
+        frame.events = vec![SimEvent::ShipRespawned {
+            id: 2,
+            pos: sim::math::Vec3::new(0.0, 0.0, 0.0),
+        }];
+        warps.observe(&frame);
+        assert_eq!(warps.live[0].age, 0.0);
+    }
+
+    /// A staggered arrival is inert until its turn: it draws nothing and, above
+    /// all, does not move the camera.
+    #[test]
+    fn a_waiting_arrival_changes_nothing() {
+        assert_eq!(curves::stretch01(-0.3), 0.0);
+        assert_eq!(curves::bend01(-0.3), 0.0);
+        assert_eq!(curves::flash01(-0.3), 0.0);
+        assert_eq!(curves::ring01(-0.3), 0.0);
+        assert_eq!(curves::ring_fade(-0.3), 0.0);
+        assert_eq!(curves::fov(-0.3, BASE_FOV), BASE_FOV);
+    }
+
     /// Boss hitboxes are ships. They are never drawn and must never warp in.
     #[test]
     fn boss_hitboxes_do_not_warp_in() {
@@ -1371,8 +2218,14 @@ mod tests {
             assert!((0.0..1.0).contains(&v), "hash01 left 0..1: {v}");
             buckets[(v * 8.0) as usize] += 1;
         }
+        // Within a fifth of an even eighth. A tighter bound is a test of this
+        // particular hash's luck rather than of whether the stars are spread.
+        let even = STAR_COUNT / 8;
         for (b, n) in buckets.iter().enumerate() {
-            assert!(*n > 250, "bucket {b} holds only {n} of {STAR_COUNT}");
+            assert!(
+                *n > even * 4 / 5,
+                "bucket {b} holds only {n} of {STAR_COUNT}"
+            );
         }
     }
 }

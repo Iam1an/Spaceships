@@ -18,6 +18,13 @@
 //!
 //! Generating it beats shipping it: six 1024² PNGs would be a megabyte of
 //! payload on a build whose entire problem is payload.
+//!
+//! # The stars also leave here as geometry
+//!
+//! A cubemap is a fixed image and cannot stretch, so [`Starfield`] hands the
+//! brighter half of the star list to [`crate::warp`] as directions — see
+//! [`SkyStar`]. That is `BACKLOG.md` §9's first rule about the warp-in, and the
+//! reason it lives in this file rather than in a post-process.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
@@ -35,6 +42,15 @@ use spaceships_sim::rng::Rng;
 /// nebula lobes are smooth by construction and the stars are 1–2 px either way.
 const FACE: u32 = 512;
 
+/// How much sky one cubemap texel covers, in radians.
+///
+/// A cube face spans 90° across [`FACE`] texels — near the middle of the face,
+/// at least; the corners are foreshortened and this ignores that, which is worth
+/// a fraction of a pixel on a star. [`crate::warp`] needs it to draw a
+/// [`SkyStar`] at the angular size it has in the cubemap, so the stretched
+/// version starts exactly as big as the point it replaces.
+pub const TEXEL_RADIANS: f32 = std::f32::consts::FRAC_PI_2 / FACE as f32;
+
 /// Linear resolution divisor for the fBm field. `graphics.js`'s `FIELD_DIV`,
 /// and for the same reason: the field is smooth, so evaluating it at a quarter
 /// rate and interpolating is indistinguishable and 16x less work. Stars are
@@ -43,6 +59,16 @@ const FIELD_DIV: u32 = 4;
 
 /// Fixed, so the sky is the same sky on every client and every run.
 const SKY_SEED: u64 = 0x5C1_5EED;
+
+/// The [`Skybox`] scale factor, in cd/m².
+///
+/// Public because [`crate::warp`] dims the sky while the stars are stretched
+/// into lines and has to put this back afterwards — and because a value that is
+/// written in two places drifts. `terrain::apply_map` still carries its own
+/// copy for the sky it re-attaches when the lobby returns to space; that one is
+/// out of reach from here and the warp restores a *captured* value rather than
+/// this constant precisely so it cannot be caught out by the difference.
+pub const SKY_BRIGHTNESS: f32 = 3000.0;
 
 /// A nebula lobe: a direction, a colour, a half-angle, and a gain.
 ///
@@ -94,6 +120,47 @@ const NEBULAE: [Nebula; 4] = [
 #[derive(Resource)]
 pub struct NebulaCubemap(pub Handle<Image>);
 
+/// One star from the cubemap, as something that can be moved.
+///
+/// The warp-in stretches the starfield into lines and snaps it back
+/// (`BACKLOG.md` §9), and it has to stretch *these* stars: a fresh scatter would
+/// draw its lines somewhere other than where the points are, and the collapse
+/// would land on a different sky than the one it started from.
+#[derive(Clone, Copy)]
+pub struct SkyStar {
+    /// Unit direction in world space — [`cube_dir`] for the texel it was drawn
+    /// at, normalised.
+    pub dir: Vec3,
+    /// The radius it was drawn at, in cubemap texels. A face spans 90° across
+    /// [`FACE`] texels, so a texel is 0.176° and a screen pixel at the resting
+    /// FOV is 0.104°: near enough that [`crate::warp`] treats this as a pixel
+    /// radius and scales it by one constant.
+    pub radius_px: f32,
+    /// Colour, linear, already multiplied by the alpha it was composited at —
+    /// the stretched star is drawn additively, where coverage and brightness
+    /// are the same thing.
+    pub color: LinearRgba,
+}
+
+/// The stars of [`NebulaCubemap`], for anything that needs them as geometry.
+///
+/// Only the brighter ones: see [`SHELL_MIN_ALPHA`].
+#[derive(Resource, Default)]
+pub struct Starfield {
+    pub stars: Vec<SkyStar>,
+}
+
+/// How faint a star may be and still be handed over as geometry.
+///
+/// `draw_stars` weights brightness by `pow(random, 2.6)`, so the field is mostly
+/// stars at the very bottom of the ramp — about half of them sit under this.
+/// They are a quarter-pixel of 25 % alpha; stretched into a line they are
+/// invisible, and the only thing keeping them would buy is 1 300 quads a frame
+/// in a mesh that pads to a fixed size. The cubemap still draws them, and the
+/// warp only dims the cubemap rather than hiding it, so what actually happens to
+/// a star under this threshold is that it fades slightly and stays put.
+const SHELL_MIN_ALPHA: f32 = 0.45;
+
 pub struct SkyboxPlugin;
 
 impl Plugin for SkyboxPlugin {
@@ -121,8 +188,13 @@ fn attach_sky(
     mut images: ResMut<Assets<Image>>,
     cameras: Query<(Entity, Option<&RenderTarget>), With<Camera3d>>,
 ) {
-    let handle = images.add(nebula_cubemap());
+    let (cubemap, stars) = nebula_cubemap();
+    // `warp.rs` sizes a fixed mesh budget against this count and can only
+    // estimate it from the distribution, so say what it actually came to.
+    info!("{} sky stars kept as geometry", stars.len());
+    let handle = images.add(cubemap);
     commands.insert_resource(NebulaCubemap(handle.clone()));
+    commands.insert_resource(Starfield { stars });
     for (cam, target) in &cameras {
         // `RenderTarget` is a separate component in 0.19, and absent means the
         // default — the primary window. Only an explicit `Image` target is the
@@ -140,7 +212,7 @@ fn attach_sky(
                 // it needs a real exposure to survive ACES next to a 9000 lux
                 // key light. Scaling the whole cubemap preserves the
                 // dust/star/core relationship the texture already encodes.
-                brightness: 3000.0,
+                brightness: SKY_BRIGHTNESS,
                 ..default()
             },
             // `applyEnvironment`: PMREM the cubemap and hang it on
@@ -162,21 +234,29 @@ fn attach_sky(
     }
 }
 
-/// Builds the six-layer RGBA image [`Skybox`] wants.
-fn nebula_cubemap() -> Image {
+/// Builds the six-layer RGBA image [`Skybox`] wants, and the star list beside
+/// it.
+///
+/// The two come out of one pass on purpose: the stars are drawn from a seeded
+/// [`Rng`] whose draw order *is* the sky, so the only way to know where a star
+/// ended up is to record it as it is drawn. Re-deriving the list in a second
+/// pass would mean a second RNG walk that has to stay in lockstep with this one
+/// forever.
+fn nebula_cubemap() -> (Image, Vec<SkyStar>) {
     let mut rng = Rng::new(SKY_SEED);
     let px = (FACE * FACE) as usize;
     let mut data = Vec::with_capacity(px * 6 * 4);
+    let mut stars = Vec::new();
 
     for face in 0..6u32 {
         let mut buf = vec![0u8; px * 4];
         draw_field(&mut buf, face);
-        draw_stars(&mut buf, &mut rng);
-        draw_bright_cores(&mut buf, &mut rng);
+        draw_stars(&mut buf, &mut rng, face, &mut stars);
+        draw_bright_cores(&mut buf, &mut rng, face, &mut stars);
         data.extend_from_slice(&buf);
     }
 
-    Image {
+    let image = Image {
         // Without this the six layers are a 2D array, not a cube, and the
         // skybox pipeline fails at bind-group creation with a wgpu validation
         // error rather than anything that mentions skyboxes.
@@ -196,7 +276,41 @@ fn nebula_cubemap() -> Image {
             // The CPU copy is dead weight after upload — 6 MB of it on wasm.
             RenderAssetUsages::RENDER_WORLD,
         )
+    };
+    (image, stars)
+}
+
+/// Records a star that has just been drawn into face `face` at texel `(x, y)`.
+///
+/// Faint ones are dropped here rather than at the point of use, so the list a
+/// caller receives is already the list worth drawing. See [`SHELL_MIN_ALPHA`].
+fn record_star(
+    out: &mut Vec<SkyStar>,
+    face: u32,
+    x: f32,
+    y: f32,
+    radius_px: f32,
+    col: [f32; 3],
+    alpha: f32,
+) {
+    if alpha < SHELL_MIN_ALPHA {
+        return;
     }
+    // Texel centre to face coordinates, the same mapping `draw_field` samples
+    // the fBm at — `s` from the column, `t` from the row.
+    let s = (x / FACE as f32) * 2.0 - 1.0;
+    let t = (y / FACE as f32) * 2.0 - 1.0;
+    let d = cube_dir(face, s, t);
+    let dir = Vec3::new(d[0], d[1], d[2]).normalize_or(Vec3::Z);
+    // `col` is 0–255 sRGB, which is the space it was composited into the
+    // cubemap in; the geometry version is shaded in linear.
+    let srgb = Color::srgb(col[0] / 255.0, col[1] / 255.0, col[2] / 255.0);
+    let lin = srgb.to_linear();
+    out.push(SkyStar {
+        dir,
+        radius_px,
+        color: LinearRgba::rgb(lin.red * alpha, lin.green * alpha, lin.blue * alpha),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +402,7 @@ fn split(f: f32, n: u32) -> (u32, f32) {
 
 /// The dense star field. `starCount = size² / 620` — about 420 stars per face
 /// at 512, weighted hard toward dim by `pow(random, 2.6)`.
-fn draw_stars(buf: &mut [u8], rng: &mut Rng) {
+fn draw_stars(buf: &mut [u8], rng: &mut Rng, face: u32, out: &mut Vec<SkyStar>) {
     let count = (FACE * FACE) / 620;
     for _ in 0..count {
         let x = rng.next_f64() as f32 * FACE as f32;
@@ -305,6 +419,7 @@ fn draw_stars(buf: &mut [u8], rng: &mut Rng) {
             [255.0, 225.0 - temp * 40.0, 190.0 - temp * 60.0]
         };
         disc(buf, x, y, rad, col, alpha);
+        record_star(out, face, x, y, rad, col, alpha);
     }
 }
 
@@ -312,7 +427,7 @@ fn draw_stars(buf: &mut [u8], rng: &mut Rng) {
 /// past the bloom threshold and bleed — the reason `camera.rs` keeps the
 /// prefilter threshold near Ultra's 0.92 instead of running thresholdless
 /// bloom.
-fn draw_bright_cores(buf: &mut [u8], rng: &mut Rng) {
+fn draw_bright_cores(buf: &mut [u8], rng: &mut Rng, face: u32, out: &mut Vec<SkyStar>) {
     for _ in 0..10 {
         let x = rng.next_f64() as f32 * FACE as f32;
         let y = rng.next_f64() as f32 * FACE as f32;
@@ -344,14 +459,12 @@ fn draw_bright_cores(buf: &mut [u8], rng: &mut Rng) {
         }
 
         // The white core itself.
-        disc(
-            buf,
-            x,
-            y,
-            1.3 + rng.next_f64() as f32,
-            [255.0, 255.0, 255.0],
-            1.0,
-        );
+        let core = 1.3 + rng.next_f64() as f32;
+        disc(buf, x, y, core, [255.0, 255.0, 255.0], 1.0);
+        // Only the core, not the halo: a stretched halo would be a smear rather
+        // than a line, and the halo is a bloom cue that the post pass recreates
+        // from the core anyway.
+        record_star(out, face, x, y, core, [255.0, 255.0, 255.0], 1.0);
     }
 }
 
