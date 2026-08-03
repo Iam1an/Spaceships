@@ -1,0 +1,13 @@
+# Leave the machine usable while it builds.
+#
+# This is a ten-core Mac with four performance cores, and a release build of
+# the client is fat LTO with `codegen-units = 1` — cargo will happily take
+# every core it can see, which is what turns a routine rebuild into a machine
+# nobody can type on. Several agents share this target directory, so the
+# arithmetic is worse than one build's worth.
+#
+# Six leaves four cores for whoever is actually using the computer. Build
+# wall-clock goes up; interactive latency stops being a lottery. Raise it or
+# delete the file when nobody is sitting here.
+[build]
+jobs = 6
