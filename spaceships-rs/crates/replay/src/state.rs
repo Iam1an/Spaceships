@@ -217,6 +217,10 @@ wire_struct!(Ship {
     health_idle_shot,
     health_regen_tick,
     coarse_aim,
+    // The EMP's two: a keyframe restored without them would put a blinded
+    // pilot's instruments back on mid-pulse, and hand everyone a full charge.
+    emp_charge,
+    emp_blind,
     hit_radius_override,
     touching_asteroids,
     asteroid_damage_cooldown,

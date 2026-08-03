@@ -282,6 +282,15 @@ impl Wire for NetEvent {
                 11u8.put(e);
                 id.put(e);
             }
+            // The burst carries its centre and its firer, not a list of who it
+            // caught — every client re-detonates the identical sphere against
+            // the poses it already has, which is why this replays correctly
+            // from two fields.
+            NetEvent::EmpBurst { id, pos } => {
+                12u8.put(e);
+                id.put(e);
+                pos.put(e);
+            }
         }
     }
 
@@ -339,6 +348,10 @@ impl Wire for NetEvent {
             10 => NetEvent::AsteroidDestroyed { id: u32::get(d)? },
             11 => NetEvent::Disconnect {
                 id: EntityId::get(d)?,
+            },
+            12 => NetEvent::EmpBurst {
+                id: EntityId::get(d)?,
+                pos: Vec3::get(d)?,
             },
             tag => {
                 return Err(Error::BadTag {
