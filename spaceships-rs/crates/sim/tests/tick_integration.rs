@@ -114,6 +114,11 @@ fn scripted_match(seed: u64) -> World {
         &rules,
     );
     player.team = Some(Team::Zero);
+    // Armed at the start, so the script below actually sets a pulse off inside
+    // fifteen seconds rather than spending the whole replay charging. This is
+    // the only way the EMP — the charge meter, the blindness clock, and the
+    // widened bot aim that follows it — gets into the determinism replay at all.
+    player.emp_charge = 1.0;
     world.ships.push(player);
     world.local_id = Some(1);
 
@@ -145,6 +150,10 @@ fn scripted_input(step: u64) -> Input {
         braking: step % 29 < 3,
         fire_missile: step % 197 == 40,
         deploy_flare: step % 211 == 90,
+        // Twice in fifteen seconds: the first press fires, the second finds a
+        // meter that has had six seconds of a sixty-second charge and does
+        // nothing. Both paths are therefore in the replay.
+        fire_emp: step % 401 == 120,
         ..Input::default()
     }
 }
@@ -169,6 +178,8 @@ fn state_bits(world: &World) -> Vec<u64> {
         bits.push(s.throttle.to_bits());
         bits.push(s.ammo.to_bits());
         bits.push(s.boost_meter.to_bits());
+        bits.push(s.emp_charge.to_bits());
+        bits.push(s.emp_blind.to_bits());
         bits.push(s.hp as u64);
     }
     for b in &world.bullets {
@@ -454,6 +465,264 @@ fn a_flare_burst_survives_the_loop_and_can_seduce_a_missile() {
         world.flares.is_empty(),
         "flares must burn out through the loop, not accumulate"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The EMP, end to end
+// ---------------------------------------------------------------------------
+
+/// The whole weapon in one press: the meter empties, the sphere goes off, the
+/// pilot inside it loses their instruments and keeps everything else.
+#[test]
+fn an_emp_blinds_the_bandit_through_the_tick_and_costs_it_no_hit_points() {
+    let rules = Rules::DEFAULT;
+    let mut world = duel(100.0);
+    world.ship_mut(1).expect("me").emp_charge = 1.0;
+
+    let bandit_before = world.ship(2).expect("bandit").clone();
+    let press = Input {
+        id: 1,
+        fire_emp: true,
+        ..Input::default()
+    };
+    let events = tick(&mut world, &[press], &[], TICK_DT).events;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SimEvent::EmpBurst { owner: 1, .. })),
+        "the burst has to reach the renderer, or nothing is drawn or heard"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, SimEvent::Fired { .. })),
+        "an EMP is not a shot and must not raise one — that would give it a \
+         muzzle flash and a gun report"
+    );
+
+    let bandit = world.ship(2).expect("bandit");
+    assert_eq!(bandit.emp_blind, rules.emp.blind_duration);
+    assert_eq!(bandit.hp, bandit_before.hp, "this weapon does no damage");
+    assert_eq!(bandit.ammo, bandit_before.ammo, "and takes no ammunition");
+    assert_eq!(
+        bandit.missiles_left, bandit_before.missiles_left,
+        "and empties no stores"
+    );
+    assert_eq!(
+        world.ship(1).expect("me").emp_charge,
+        0.0,
+        "one press, one meter"
+    );
+    assert_eq!(
+        world.ship(1).expect("me").emp_blind,
+        0.0,
+        "the pilot who fired can still see"
+    );
+
+    // And it wears off through the loop rather than needing anything to clear
+    // it. One extra tick, because the burst landed after this step's clocks.
+    let ticks = (rules.emp.blind_duration / TICK_DT).ceil() as u32 + 1;
+    run(&mut world, &[idle(1)], ticks);
+    assert_eq!(world.ship(2).expect("bandit").emp_blind, 0.0);
+}
+
+/// The half of §2 that is a promise rather than an effect: a blinded pilot flies
+/// and shoots exactly as before. Only the aids go.
+#[test]
+fn a_blinded_pilot_keeps_the_stick_and_the_gun_and_loses_the_aids() {
+    let mut world = duel(300.0);
+    // The blinded pilot is the *local* one, so aim assist and the missile
+    // launcher are both being asked about the ship the EMP caught.
+    world.ship_mut(1).expect("me").emp_blind = 4.0;
+
+    // Short, because the gun is held down and the bandit is only 300 units
+    // away: long enough for rounds to arrive and not long enough to kill it.
+    let fighting = Input {
+        id: 1,
+        throttle_axis: 1.0,
+        fire: true,
+        fire_missile: true,
+        ..Input::default()
+    };
+    let start = world.ship(1).expect("me").pos;
+    let events = run(&mut world, &[fighting], 30);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SimEvent::Fired {
+                owner: 1,
+                weapon: WeaponKind::Bullet,
+                ..
+            }
+        )),
+        "the gun still fires: they lost the crosshair, not the trigger"
+    );
+    assert!(!world.bullets.is_empty(), "and the rounds are really there");
+    assert_eq!(
+        world.ship(1).expect("me").missiles_left,
+        Rules::DEFAULT.weapons.missile_max,
+        "no lock, so the round stays on the rail and is not wasted"
+    );
+    assert!(world.missiles.is_empty());
+    assert!(
+        !world.aim_assist.has_target,
+        "no cone, no pull, and therefore no lead marker"
+    );
+    assert_eq!(
+        world.aim_assist.strength_smoothed, 0.0,
+        "the assist releases rather than freezing at its last strength"
+    );
+
+    // Trigger off, throttle still forward: the airframe accelerates exactly as
+    // it always did while its panel is dark.
+    let cruising = Input {
+        id: 1,
+        throttle_axis: 1.0,
+        ..Input::default()
+    };
+    run(&mut world, &[cruising], 60);
+    let me = world.ship(1).expect("me");
+    assert!(me.throttle > 0.0 && me.vel.length() > 0.0);
+    assert!(
+        me.pos.distance(start) > 1.0,
+        "flight controls are not the EMP's business"
+    );
+
+    // The moment it clears, everything comes back — the assist without having
+    // to reacquire from cold, and the missile off the rail.
+    world.ship_mut(1).expect("me").emp_blind = 0.0;
+    run(&mut world, &[cruising], 10);
+    assert!(world.aim_assist.has_target, "systems restored");
+    let relaunch = Input {
+        id: 1,
+        fire_missile: true,
+        ..Input::default()
+    };
+    tick(&mut world, &[relaunch], &[], TICK_DT);
+    assert_eq!(
+        world.ship(1).expect("me").missiles_left,
+        Rules::DEFAULT.weapons.missile_max - 1,
+        "and the launcher works again"
+    );
+}
+
+/// A blinded pilot's *lock warning* goes out too, because the receiver is part
+/// of the panel — even though the missile chasing them is still very real.
+#[test]
+fn the_missile_lock_warning_dies_with_the_rest_of_the_avionics() {
+    let mut world = duel(300.0);
+    // Ship 2 shoots at ship 1, so the local pilot is the one being tracked.
+    let launch = Input {
+        id: 2,
+        fire_missile: true,
+        ..Input::default()
+    };
+    tick(&mut world, &[idle(1), launch], &[], TICK_DT);
+    let frame = tick(&mut world, &[idle(1)], &[], TICK_DT);
+    assert!(
+        frame.hud.missile_lock_warning,
+        "the test needs a live missile tracking the local ship"
+    );
+
+    world.ship_mut(1).expect("me").emp_blind = 4.0;
+    let frame = tick(&mut world, &[idle(1)], &[], TICK_DT);
+    assert!(!frame.hud.missile_lock_warning, "the receiver is dark");
+    assert!(
+        !world.missiles.is_empty(),
+        "and the missile is still coming, which is the entire point"
+    );
+    assert!(frame.hud.emp_blind > 0.0, "the HUD says why instead");
+}
+
+/// A blinded bot loses the same two things a blinded human does — the seeker and
+/// the threat receiver — and keeps its gun with a much worse aim.
+#[test]
+fn a_blinded_bot_stops_launching_and_starts_missing() {
+    let rules = Rules::DEFAULT;
+    let mut world = bare_world(0xB11D, Mode::Skirmish);
+    push_ship(&mut world, 1, Team::Zero, Vec3::new(0.0, 0.0, 0.0));
+    world.local_id = Some(1);
+
+    let mut bandit = Ship::spawn(
+        2,
+        ShipKind::Bot,
+        Vec3::new(0.0, 0.0, 400.0),
+        Quat::FLIP_Y,
+        &rules,
+    );
+    bandit.team = Some(Team::One);
+    bandit.invuln_timer = 0.0;
+    bot::init(&mut bandit, false, false, &rules, &mut world.rng.bots);
+    bandit.bot.missile_timer = 0.0;
+    bandit.emp_blind = 4.0;
+    world.ships.push(bandit);
+
+    run(&mut world, &[idle(1)], 120);
+    assert_eq!(
+        world.ship(2).expect("bandit").bot.missiles_left,
+        rules.bot.missile_max_for(false),
+        "a blinded bot has nothing to lock with, so it launches nothing"
+    );
+    assert!(world.missiles.is_empty());
+
+    // And once it can see again the same bot does launch, which is what makes
+    // the assertion above about the EMP rather than about the fixture.
+    world.ship_mut(2).expect("bandit").emp_blind = 0.0;
+    run(&mut world, &[idle(1)], 240);
+    assert!(
+        world.ship(2).expect("bandit").bot.missiles_left < rules.bot.missile_max_for(false),
+        "systems restored"
+    );
+}
+
+/// The multiplayer contract, both directions: firing raises a message, and
+/// receiving one detonates locally without spending anything.
+#[test]
+fn an_emp_crosses_the_wire_as_a_centre_and_is_re_detonated_on_arrival() {
+    use spaceships_sim::world::{NetEvent, NetIntent};
+
+    let mut world = bare_world(0xE111, Mode::Multiplayer);
+    push_ship(&mut world, 1, Team::Zero, Vec3::ZERO);
+    push_ship(&mut world, 2, Team::One, Vec3::new(0.0, 0.0, 60.0));
+    world.local_id = Some(1);
+    world.ships[1].kind = ShipKind::Remote;
+    world.ship_mut(1).expect("me").emp_charge = 1.0;
+
+    let press = Input {
+        id: 1,
+        fire_emp: true,
+        ..Input::default()
+    };
+    let out = tick(&mut world, &[press], &[], TICK_DT).net_out;
+    assert!(
+        out.iter()
+            .any(|i| matches!(i, NetIntent::Emp { pos } if *pos == Vec3::ZERO)),
+        "the centre is what goes out; who it caught is each peer's own answer"
+    );
+
+    // Now the other direction. A pulse the *remote* pilot set off, reported
+    // back as an event: it must blind this client's ship and must not touch
+    // this client's meter, which belongs to a different aircraft.
+    world.ship_mut(1).expect("me").emp_charge = 0.4;
+    world.ship_mut(1).expect("me").emp_blind = 0.0;
+    let inbound = NetEvent::EmpBurst {
+        id: 2,
+        pos: Vec3::new(0.0, 0.0, 60.0),
+    };
+    let frame = tick(&mut world, &[idle(1)], &[inbound], TICK_DT);
+    assert!(
+        world.ship(1).expect("me").emp_blind > 0.0,
+        "a pulse from somebody else has to reach this cockpit"
+    );
+    assert_eq!(
+        world.ship(1).expect("me").emp_charge,
+        0.4 + TICK_DT / Rules::DEFAULT.emp.charge_time,
+        "and must cost this ship nothing but the tick's ordinary charging"
+    );
+    assert!(frame
+        .events
+        .iter()
+        .any(|e| matches!(e, SimEvent::EmpBurst { owner: 2, .. })));
 }
 
 // ---------------------------------------------------------------------------

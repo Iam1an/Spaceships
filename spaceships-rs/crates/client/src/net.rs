@@ -106,7 +106,6 @@ use std::collections::BTreeMap;
 
 use crate::sim_bridge::{MatchSetup, Roster, SimFrame, SimWorld, LOCAL_ID};
 use sim::math::{Quat as SimQuat, Vec3 as SimVec3};
-use sim::rules::Rules;
 use sim::world::{
     Asteroid, AsteroidTier, EntityId, Frame, MapKind, Mode, NetEvent, NetIntent, Score, Ship,
     ShipKind, Team, WeaponKind, World as SimWorldState,
@@ -765,6 +764,12 @@ fn encode_intent(intent: NetIntent, ids: IdSwap) -> ClientMessage {
             pos: wire_vec(pos),
             quat: wire_quat(quat),
         },
+        // The one frame the Node server drops on the floor. Sent anyway, because
+        // the Rust server relays it and because a client that decided at runtime
+        // which server it was talking to would be guessing; see
+        // `spaceships_protocol::ClientMessage::Emp` for why sending it is inert
+        // rather than harmful.
+        NetIntent::Emp { pos } => ClientMessage::Emp { pos: wire_vec(pos) },
         NetIntent::Hit {
             target,
             weapon,
@@ -1204,6 +1209,10 @@ fn as_net_event(msg: &ServerMessage, ids: IdSwap) -> Option<NetEvent> {
             pos: sim_vec(*pos),
             quat: sim_quat(*quat),
         },
+        ServerMessage::Emp { id, pos } => NetEvent::EmpBurst {
+            id: ids.to_entity(*id)?,
+            pos: sim_vec(*pos),
+        },
         ServerMessage::Disconnect { id } => NetEvent::Disconnect {
             id: ids.to_entity(*id)?,
         },
@@ -1290,7 +1299,9 @@ fn build_online_world(
     seed: u64,
     session: &NetSession,
 ) -> (SimWorldState, Roster) {
-    let rules = Rules::DEFAULT;
+    // `match_rules`, not `Rules::DEFAULT`, so a hooked run behaves the same
+    // online as it does solo. See `sim_bridge::match_rules`.
+    let rules = crate::sim_bridge::match_rules();
     let mut world = SimWorldState::new(seed, rules, Mode::Multiplayer, map);
 
     if asteroids.is_empty() {
@@ -2065,6 +2076,10 @@ fn describe_js(value: wasm_bindgen::JsValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests read the rule table directly now; the world builder goes
+    // through `sim_bridge::match_rules` so a screenshot hook reaches a networked
+    // match as well as a solo one.
+    use sim::rules::Rules;
 
     #[test]
     fn a_guest_url_carries_no_query() {
@@ -2333,6 +2348,14 @@ mod tests {
             }),
             r#"{"type":"flare","pos":[0.0,0.0,0.0],"quat":[0.0,0.0,0.0,1.0]}"#
         );
+        // A centre and nothing else: no facing, because a sphere has none, and
+        // no radius, because that is a rule both ends already hold.
+        assert_eq!(
+            json(NetIntent::Emp {
+                pos: SimVec3::new(0.0, 12.0, -30.0),
+            }),
+            r#"{"type":"emp","pos":[0.0,12.0,-30.0]}"#
+        );
     }
 
     // -- inbound: ServerMessage -> NetEvent ---------------------------------
@@ -2413,6 +2436,19 @@ mod tests {
             vec![NetEvent::Death {
                 id: 5,
                 killer: Some(2)
+            }]
+        );
+    }
+
+    /// An inbound EMP has to reach the simulation, which is what detonates it
+    /// against this client's own poses.
+    #[test]
+    fn an_inbound_emp_becomes_a_burst_at_the_centre_it_names() {
+        assert_eq!(
+            decode(r#"{"type":"emp","id":4,"pos":[0,12,-30]}"#),
+            vec![NetEvent::EmpBurst {
+                id: 4,
+                pos: SimVec3::new(0.0, 12.0, -30.0),
             }]
         );
     }

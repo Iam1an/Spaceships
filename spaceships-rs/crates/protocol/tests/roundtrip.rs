@@ -218,6 +218,19 @@ fn client_flare() {
 }
 
 #[test]
+fn client_emp() {
+    // No JS call site: the browser game has no EMP. See the crate docs'
+    // "Messages the JS does not have".
+    let m = client(r#"{"type":"emp","pos":[12.5,0.0,-88.25]}"#);
+    assert_eq!(
+        m,
+        ClientMessage::Emp {
+            pos: [12.5, 0.0, -88.25]
+        }
+    );
+}
+
+#[test]
 fn client_hit_plain() {
     // main.js bullet/beam hit: { type: 'hit', targetId, kind }
     let m = client(r#"{"type":"hit","targetId":4,"kind":"bullet"}"#);
@@ -584,6 +597,57 @@ fn server_flare() {
         ServerMessage::Flare { id, .. } => assert_eq!(id, 2),
         other => panic!("wrong variant: {other:?}"),
     }
+}
+
+#[test]
+fn server_emp() {
+    let m = server(r#"{"type":"emp","id":2,"pos":[12.5,0.0,-88.25]}"#);
+    assert_eq!(
+        m,
+        ServerMessage::Emp {
+            id: 2,
+            pos: [12.5, 0.0, -88.25]
+        }
+    );
+}
+
+/// The safety property that makes an EMP frame legal to send to the Node server:
+/// the tag is one the JS has never heard of, so it falls off the end of
+/// `handleConnection`'s `if` chain rather than matching something else by
+/// accident.
+#[test]
+fn the_emp_tag_collides_with_nothing_the_js_dispatches() {
+    // Every `msg.type === '...'` arm in `server/index.js`, in source order.
+    const JS_TAGS: [&str; 16] = [
+        "name",
+        "list-rooms",
+        "create",
+        "join",
+        "start",
+        "bot-state",
+        "bot-fire",
+        "asteroid-hit",
+        "colors",
+        "ship-model",
+        "fire",
+        "flare",
+        "self-damage",
+        "hit",
+        "leave",
+        "state",
+    ];
+    let tag = serde_json::to_value(ClientMessage::Emp {
+        pos: [0.0, 0.0, 0.0],
+    })
+    .expect("serialize")["type"]
+        .as_str()
+        .expect("a string tag")
+        .to_owned();
+    assert_eq!(tag, "emp");
+    assert!(
+        !JS_TAGS.contains(&tag.as_str()),
+        "an EMP frame must be inert to the Node server, not mistaken for {tag}"
+    );
 }
 
 #[test]

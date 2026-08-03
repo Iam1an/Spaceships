@@ -350,9 +350,18 @@ pub fn has_line_of_sight(world: &World, from: Vec3, to: Vec3) -> bool {
 ///
 /// Ties go to the earlier ship in [`World::ships`], matching the JS's
 /// `if (d >= closestDist) continue` over a `Map` in insertion order.
+///
+/// **A blinded shooter locks nothing.** An EMP takes the seeker head with the
+/// rest of the avionics ([`crate::emp`]), and because [`crate::tick`]'s launcher
+/// keeps the round on the rail when there is no lock, that is also what stops a
+/// blinded pilot launching. The round is not spent and the missile count does not
+/// move — the same non-event as pressing `E` with nothing in front of you.
 #[must_use]
 pub fn acquire_lock(world: &World, shooter: EntityId) -> Option<EntityId> {
     let shooter_ship = world.ship(shooter)?;
+    if crate::emp::is_blind(shooter_ship) {
+        return None;
+    }
     let origin = shooter_ship.pos;
     let shooter_team = shooter_ship.team;
 

@@ -12,10 +12,11 @@
 //! ```text
 //!   0  inbound authority   apply every NetEvent, in the order given
 //!   1  pre-race hold       a running trials countdown skips the whole step
-//!   2  clocks              cooldowns, invulnerability, respawn, regeneration
+//!   2  clocks              cooldowns, invulnerability, respawn, regeneration,
+//!                          EMP charge and blindness
 //!   3  projectiles         bullets, then missiles + flares      <-- before movers
 //!   4  movers              player flight, aim assist, remotes, bots, capital ship
-//!   5  weapons             triggers, launches, countermeasures  <-- after movers
+//!   5  weapons             triggers, launches, countermeasures, EMP <-- after movers
 //!   6  field               asteroid spin and flash decay
 //!   7  match clock         countdown and end-of-match
 //!   8  outbound            time advances, then the periodic NetIntents
@@ -103,6 +104,7 @@ use crate::bot::{self, TerrainHeight};
 use crate::bullets::{self, BulletOutput, BulletSpawn, HullPart, HullVolumes, ShipBasis};
 use crate::campaign;
 use crate::collision::Aabb;
+use crate::emp;
 use crate::math::{self, det, Vec3};
 use crate::missiles::{self, Detonation, DetonationCause, Volume};
 use crate::rules::Rules;
@@ -252,6 +254,18 @@ fn apply_net_event(world: &mut World, event: NetEvent, out: &mut Out) {
         } => ingest_remote_shot(world, id, weapon, origin, dir, target, out),
         NetEvent::FlareBurst { id, .. } => {
             missiles::deploy_flares(world, id, &mut out.events);
+        }
+        NetEvent::EmpBurst { id, pos } => {
+            // Re-detonated locally rather than trusted as a list of victims: the
+            // sender says where, this machine decides who. Nothing is spent —
+            // the charge belongs to the shooter's own copy of their ship, which
+            // is not this one.
+            emp::detonate(world, id, pos);
+            out.events.push(SimEvent::EmpBurst {
+                owner: id,
+                origin: pos,
+                radius: world.rules.emp.radius,
+            });
         }
         NetEvent::PlayerRow {
             id,
@@ -424,6 +438,10 @@ fn advance_clocks(world: &mut World, dt: f64, out: &mut Out) {
         let due = {
             let s = &mut world.ships[i];
             bullets::tick_weapon_cooldown(s, dt);
+            // Before the weapon phase, so a pulse set off later in this same
+            // step keeps its full duration rather than losing a tick of it the
+            // instant it goes off.
+            emp::tick_clocks(s, &rules, dt);
             ship::tick_timers(s, &rules, dt).respawn_due
         };
         if due {
@@ -930,6 +948,9 @@ fn fire_weapons(
         if input.fire_missile {
             launch_missile(world, id, out);
         }
+        if input.fire_emp {
+            launch_emp(world, id, out);
+        }
         if input.deploy_flare && missiles::deploy_flares(world, id, &mut out.events) > 0 {
             let s = &world.ships[i];
             let (pos, quat) = (s.pos, s.quat);
@@ -979,6 +1000,37 @@ fn launch_missile(world: &mut World, id: EntityId, out: &mut Out) {
             target: Some(target),
             from_bot: None,
         });
+    }
+}
+
+/// The EMP key: spend the meter, blind the sphere, tell everyone.
+///
+/// Shaped exactly like [`launch_missile`] and for the same reason —
+/// [`crate::emp::fire`] is silent so that any future caller (a bot, a scripted
+/// mission) goes through the identical launcher — but with two differences worth
+/// naming:
+///
+/// - **There is no [`SimEvent::Fired`].** An EMP is not a shot: it has no
+///   muzzle, no direction and no projectile, and reporting it as one would give
+///   it a gun report and a muzzle flash in `weapons.rs` and a `shoot.mp3` in
+///   `audio.rs`. It gets [`SimEvent::EmpBurst`], which those modules read
+///   instead.
+/// - **The outbound message goes out under [`Authority::Server`] only**, like
+///   every other intent, and see [`crate::emp`] for what happens to it when the
+///   server on the other end is the Node one.
+fn launch_emp(world: &mut World, id: EntityId, out: &mut Out) {
+    let Some(origin) = emp::fire(world, id) else {
+        // Not charged, or not alive. No cost, no event, no message — the same
+        // non-event as pressing `E` with no lock.
+        return;
+    };
+    out.events.push(SimEvent::EmpBurst {
+        owner: id,
+        origin,
+        radius: world.rules.emp.radius,
+    });
+    if world.authority == Authority::Server && world.local_id == Some(id) {
+        out.net.push(NetIntent::Emp { pos: origin });
     }
 }
 
@@ -1198,9 +1250,17 @@ fn hud_state(world: &World, flights: &[(EntityId, FlightStep)]) -> HudState {
         .clamp(0.0, 1.0) as f32;
     hud.missiles = local.missiles_left;
     hud.flares = local.flares_left;
+    hud.emp_charge01 = local.emp_charge as f32;
+    hud.emp_blind = local.emp_blind as f32;
     hud.gun_mode = local.gun_mode;
     hud.invuln = local.invuln_timer > 0.0;
-    hud.missile_lock_warning = missiles::is_targeting(world, local.id);
+    // The lock warning is the one HUD field the EMP switches off *here* rather
+    // than in the renderer, because it is not a readout of ship state — it is a
+    // readout of the missile-approach receiver, and the receiver is part of the
+    // avionics the pulse killed. Everything else on this struct stays live and
+    // true while blind; `hud.rs` decides what a dark glass draws, which keeps
+    // "what is happening" and "what is displayed" separable.
+    hud.missile_lock_warning = !emp::is_blind(local) && missiles::is_targeting(world, local.id);
     if let Some((_, step)) = flights.iter().find(|(id, _)| *id == local.id) {
         hud.steer = [step.steer[0] as f32, step.steer[1] as f32];
     }

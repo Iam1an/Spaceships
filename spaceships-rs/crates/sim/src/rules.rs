@@ -755,6 +755,123 @@ impl WeaponRules {
 }
 
 // ---------------------------------------------------------------------------
+// EMP
+// ---------------------------------------------------------------------------
+
+/// The electromagnetic pulse: the weapon that takes information instead of hit
+/// points.
+///
+/// `BACKLOG.md` §2 in one sentence — *"blind them instead of killing them"*. It
+/// is the only weapon here that deals no damage at all, so none of the numbers
+/// below can be compared against a gun's; what they are balanced against is how
+/// long a pilot can hold a fight together on the outside view alone.
+///
+/// # The three decisions the numbers encode
+///
+/// **It is a bubble around the firing ship, not a shot.** There is no aim, no
+/// travel time, no lead. §2 says the attacker "spends a charged resource and
+/// picks a moment", and a moment is all this weapon asks for — which is what
+/// makes it a different skill from every other trigger in the game rather than a
+/// slower missile. It also makes [`Self::friendly_blind`] mean something: a
+/// pulse you fire *around yourself* is one your wingman is standing in.
+///
+/// **The emitter is hardened, so the pilot who fires it can still see.** See
+/// [`Self::blinds_owner`] — a weapon that blinds its user is not a weapon.
+///
+/// **The meter is the whole cost.** There is no ammunition, no cooldown after
+/// the shot and no reload; there is only [`Self::charge_time`], and it does not
+/// reset on death. §2 is explicit that the timing is the skill.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmpRules {
+    /// Seconds of flying to fill the meter from empty.
+    ///
+    /// Sixty against a 300-second match, and a ship spawns with the meter at
+    /// zero, so a pilot who survives the whole match gets four pulses and a
+    /// pilot who keeps dying gets fewer. That is the intended shape: §2 asks
+    /// that it "cannot be spammed and cannot be respawn-cycled", and the second
+    /// half of that is enforced by [`crate::ship::respawn`] deliberately not
+    /// touching [`crate::world::Ship::emp_charge`] — dying neither refunds the
+    /// meter nor fills it.
+    ///
+    /// Zero is legal and means "always charged". Nothing in a match sets it, but
+    /// the client's `SPACESHIPS_EMP` screenshot hook does, and
+    /// [`crate::emp::charge`] handles it without dividing.
+    pub charge_time: f64,
+
+    /// Radius of the pulse, in world units, measured from the firing ship.
+    ///
+    /// Three hundred is deliberately short of every other number a pilot
+    /// already has a feel for — the missile reaches ~1280, the gun ~1560, aim
+    /// assist and the target brackets both stop at 1000. Nothing is blinded at
+    /// the range things are usually shot at, so using this means closing to
+    /// knife range first, which is the risk half of the trade.
+    pub radius: f64,
+
+    /// Seconds a caught pilot flies blind.
+    ///
+    /// Four, which is the value the cockpit's own dev hook was tuned at by eye
+    /// before the weapon existed (`client/src/cockpit.rs`). It is long enough
+    /// that a dogfight goes somewhere while it runs and short enough that being
+    /// caught is not a death sentence — a blinded ship keeps its full flight
+    /// model and its guns, so four seconds is four seconds of harder flying, not
+    /// four seconds of waiting.
+    pub blind_duration: f64,
+
+    /// Whether the pulse blinds the firing pilot's own team.
+    ///
+    /// **True**, which is §2's own recommendation: *"'everyone's cockpit going
+    /// dark' is the more interesting version — it makes an EMP genuinely risky
+    /// to fire inside a furball and self-limiting without a balance patch. Worth
+    /// trying friendly blinding first."*
+    ///
+    /// It is also the only version that needs no extra rule to stop being
+    /// oppressive. A pulse that spared allies would be strictly good to fire the
+    /// instant it charged; this one has to be *timed*, because your wingman is
+    /// inside [`Self::radius`] far more often than an enemy is.
+    pub friendly_blind: bool,
+
+    /// Whether the pulse blinds the pilot who fired it.
+    ///
+    /// **False.** Every other clause of this weapon is about making it risky;
+    /// this one is not, because a weapon that disables its user has no use case
+    /// at all — there is no moment worth picking. The fiction is a hardened
+    /// emitter on your own airframe, and it is the same fiction as a missile
+    /// that does not lock its launcher.
+    ///
+    /// Kept as a rule rather than hardcoded for one reason beyond documenting
+    /// the decision: the client's `SPACESHIPS_EMP` hook flips it, which is how
+    /// the blinded cockpit can be photographed without a second aircraft.
+    pub blinds_owner: bool,
+
+    /// How much wider a blinded bot's aim error gets.
+    ///
+    /// A bot has no cockpit to darken and no HUD to switch off, so "blind" has
+    /// to be expressed in the one currency it has: [`BotRules::aim_offset_max`]
+    /// is its deliberate inaccuracy, and this multiplies the range scaling
+    /// applied to it ([`crate::bot`]'s `error_scale`). Six turns a bot that
+    /// lands most of its bursts into one that sprays around the target — which
+    /// is the same thing that happens to a human who loses the lead marker, in
+    /// the only terms a bot understands.
+    ///
+    /// It is *not* a firing ban. A blinded human can still pull the trigger and
+    /// hit something by eye, and a bot that simply stopped shooting would be
+    /// getting a harsher EMP than a player does.
+    pub bot_aim_error_scale: f64,
+}
+
+impl EmpRules {
+    /// The frozen default.
+    pub const DEFAULT: Self = Self {
+        charge_time: 60.0,
+        radius: 300.0,
+        blind_duration: 4.0,
+        friendly_blind: true,
+        blinds_owner: false,
+        bot_aim_error_scale: 6.0,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Damage, death, respawn
 // ---------------------------------------------------------------------------
 
@@ -1899,6 +2016,8 @@ pub struct Rules {
     pub ship: ShipRules,
     /// Guns, missiles, flares.
     pub weapons: WeaponRules,
+    /// The EMP: charge, radius, and how long a caught pilot flies blind.
+    pub emp: EmpRules,
     /// Damage, death, respawn, regeneration.
     pub combat: CombatRules,
     /// Static world geometry and asteroid field generation.
@@ -1935,6 +2054,7 @@ impl Rules {
     pub const DEFAULT: Self = Self {
         ship: ShipRules::DEFAULT,
         weapons: WeaponRules::DEFAULT,
+        emp: EmpRules::DEFAULT,
         combat: CombatRules::DEFAULT,
         world: WorldRules::DEFAULT,
         spawn: SpawnRules::DEFAULT,
@@ -2052,6 +2172,27 @@ impl Rules {
             self.weapons.boss_hitbox_radius > 0.0,
             "weapons.boss_hitbox_radius",
             "must be positive",
+        )?;
+
+        check(
+            self.emp.charge_time >= 0.0,
+            "emp.charge_time",
+            "must not be negative; zero means the meter is always full",
+        )?;
+        check(
+            self.emp.radius >= 0.0,
+            "emp.radius",
+            "must not be negative; zero means the pulse catches nobody",
+        )?;
+        check(
+            self.emp.blind_duration >= 0.0,
+            "emp.blind_duration",
+            "must not be negative; zero means the pulse does nothing",
+        )?;
+        check(
+            self.emp.bot_aim_error_scale >= 1.0,
+            "emp.bot_aim_error_scale",
+            "must be at least 1.0: a pulse may not improve a bot's aim",
         )?;
 
         check(

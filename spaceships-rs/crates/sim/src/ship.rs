@@ -789,6 +789,14 @@ pub fn respawn(ship: &mut Ship, pos: Vec3, quat: Quat, rules: &Rules) {
 
     ship.missiles_left = rules.weapons.missile_max;
     ship.flares_left = rules.weapons.flare_max;
+    // `emp_charge` is **deliberately not** in that list. Missiles and flares are
+    // stores and a fresh airframe carries a full load of both; the EMP meter is
+    // a clock, and `BACKLOG.md` §2 requires that dying neither refunds a spent
+    // one nor arms an empty one. See `Ship::emp_charge`. `emp_blind` is left
+    // alone for the opposite reason: `emp::tick_clocks` runs it down whether or
+    // not the ship is alive, so a pilot who was blinded and then killed comes
+    // back with whatever is genuinely left of it — normally nothing, since the
+    // respawn delay and the blackout are within half a second of each other.
 
     // The JS leaves these stale across a death, because the code that clears
     // them is gated on being alive; they happen to be recomputed on the first

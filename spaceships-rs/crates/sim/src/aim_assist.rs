@@ -116,6 +116,7 @@ pub fn update(world: &mut World, steer_mag: f64, dt: f64) {
     };
     let profile = ship.aim_profile();
     let alive = ship.alive;
+    let blind = crate::emp::is_blind(ship);
     let self_pos = ship.pos;
     let fwd = forward(ship.quat);
 
@@ -133,9 +134,21 @@ pub fn update(world: &mut World, steer_mag: f64, dt: f64) {
         world.aim_assist.has_target = false;
         return;
     }
-    if !alive {
+    if !alive || blind {
         // `main.js:2055`. The held target id survives, so respawning next to
         // whoever killed you reacquires them rather than starting cold.
+        //
+        // An EMP takes the same exit, and this is the single largest thing the
+        // weapon does: `BACKLOG.md` §2's "aim assist entirely — no cone, no
+        // pull, no lead marker" is all three at once, because the cone and the
+        // pull are this function and the lead marker is drawn from
+        // `AimAssistState::has_target`. The held id survives here too, so the
+        // moment the systems come back the assist snaps to whoever the pilot was
+        // already fighting rather than picking afresh.
+        //
+        // Note what is *not* here: the ship's orientation is untouched on this
+        // path, so a blinded pilot steers exactly as they did a second ago. §2
+        // is emphatic that flight controls are not the EMP's business.
         world.aim_assist.strength_smoothed = 0.0;
         world.aim_assist.has_target = false;
         return;
