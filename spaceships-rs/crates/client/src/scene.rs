@@ -1113,14 +1113,14 @@ struct RemotePaint(HashMap<sim::world::EntityId, ShipPaint>);
 /// message, and a paint job is not simulation state — it must not go through
 /// [`crate::net::NetInbox`], which is the queue the fixed tick consumes.
 ///
-/// # The one thing borrowed from `net.rs`
+/// # Wire ids
 ///
 /// The wire numbers players differently from the simulation: `IdSwap` trades
 /// this connection's server id with [`LOCAL_ID`] so that "me" is the same id in
-/// every module. That swap is private to `net.rs`, so [`to_entity`] below
-/// reproduces it from [`NetSession::you`], which is public. It is self-inverse
-/// and it is four lines, but it is still a second copy of a bijection — if
-/// `IdSwap::to_entity` is ever made `pub`, this should call it instead.
+/// every module. This calls `net.rs`'s own `IdSwap::to_entity` rather than
+/// keeping a copy of the arithmetic — a bijection with two implementations is
+/// one edit away from two different bijections, and this codebase has already
+/// paid for that class of mistake more than once.
 fn read_remote_paint(
     mut incoming: MessageReader<FromServer>,
     session: Res<NetSession>,
@@ -1158,20 +1158,12 @@ fn read_remote_paint(
     }
 }
 
-/// A wire player id as an entity id. `net::IdSwap::apply`, from the outside.
+/// A wire player id as an entity id, through the one swap that defines it.
 fn to_entity(
     session: &NetSession,
     id: spaceships_protocol::PlayerId,
 ) -> Option<sim::world::EntityId> {
-    let id = sim::world::EntityId::try_from(id).ok()?;
-    let mine = session
-        .you
-        .and_then(|you| sim::world::EntityId::try_from(you).ok());
-    Some(match mine {
-        Some(mine) if id == mine => LOCAL_ID,
-        Some(mine) if id == LOCAL_ID => mine,
-        _ => id,
-    })
+    session.ids().to_entity(id)
 }
 
 /// Tells the room what colours this pilot is flying in.

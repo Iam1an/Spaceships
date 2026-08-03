@@ -717,7 +717,7 @@ fn publish_intents(
     mut outbox: MessageWriter<ToServer>,
 ) {
     for intent in &frame.0.net_out {
-        outbox.write(ToServer(encode_intent(*intent, session.ids)));
+        outbox.write(ToServer(encode_intent(*intent, session.ids())));
     }
 }
 
@@ -902,8 +902,7 @@ pub struct NetSession {
     pub host: bool,
     /// The id the server assigned this connection.
     pub you: Option<PlayerId>,
-    /// The wire id <-> entity id exchange for this connection. See [`IdSwap`].
-    pub ids: IdSwap,
+
     /// The roster, bots included, newest `players` broadcast.
     pub players: Vec<PlayerInfo>,
     /// The room browser, newest `rooms-list` reply.
@@ -919,6 +918,17 @@ pub struct NetSession {
 }
 
 impl NetSession {
+    /// The wire id <-> entity id exchange for this connection.
+    ///
+    /// **Derived from [`NetSession::you`], never stored.** It used to be a
+    /// second field assigned on the same line, which is one edit away from two
+    /// fields describing different connections — and a test that set `you`
+    /// alone got the identity swap and silently painted the wrong aircraft.
+    /// One fact, one home.
+    pub fn ids(&self) -> IdSwap {
+        IdSwap::new(self.you)
+    }
+
     /// Marks the session changed. Every write goes through here.
     fn bump(&mut self) {
         self.rev = self.rev.wrapping_add(1);
@@ -1028,7 +1038,6 @@ fn ingest(
                 session.code.clone_from(code);
                 session.host = *host;
                 session.you = Some(*you);
-                session.ids = IdSwap::new(Some(*you));
                 session.private = *private;
                 session.phase = Phase::Room;
                 session.notice = None;
@@ -1040,7 +1049,7 @@ fn ingest(
                 session.bump();
                 // The roster is names, which `sim` deliberately does not carry.
                 for p in players {
-                    if let Some(id) = session.ids.to_entity(p.id) {
+                    if let Some(id) = session.ids().to_entity(p.id) {
                         roster.name(id, p.name.clone());
                     }
                 }
@@ -1048,7 +1057,7 @@ fn ingest(
                 // tick, one row at a time — `NetEvent` is `Copy` by contract.
                 if session.phase == Phase::Playing {
                     for p in players {
-                        let Some(id) = session.ids.to_entity(p.id) else {
+                        let Some(id) = session.ids().to_entity(p.id) else {
                             continue;
                         };
                         inbox.0.push(NetEvent::PlayerRow {
@@ -1139,7 +1148,7 @@ fn ingest(
             // these two carry no `NetEvent` and are dropped rather than
             // half-applied.
             ServerMessage::Colors { .. } | ServerMessage::ShipModel { .. } => {}
-            other => push_events(other, session.ids, &mut inbox.0),
+            other => push_events(other, session.ids(), &mut inbox.0),
         }
     }
 }
@@ -1310,7 +1319,7 @@ fn build_online_world(
 
     let mut roster = Roster::default();
     for (&wire_id, spawn) in spawns {
-        let Some(id) = session.ids.to_entity(wire_id) else {
+        let Some(id) = session.ids().to_entity(wire_id) else {
             warn!("net: spawn for id {wire_id}, which is not an entity id");
             continue;
         };
@@ -1429,7 +1438,7 @@ impl IdSwap {
     /// counter; [`EntityId`] is `i32`. Every id the live server has ever issued
     /// fits, and one that does not is dropped rather than wrapped into somebody
     /// else's ship.
-    fn to_entity(self, id: PlayerId) -> Option<EntityId> {
+    pub(crate) fn to_entity(self, id: PlayerId) -> Option<EntityId> {
         EntityId::try_from(id).ok().map(|e| self.apply(e))
     }
 
@@ -2557,7 +2566,6 @@ mod tests {
             host: true,
             callsign: "RUSTY".to_owned(),
             you: Some(1),
-            ids: IdSwap::new(Some(1)),
             ..NetSession::default()
         };
 
@@ -2634,7 +2642,6 @@ mod tests {
         }];
         let guest = NetSession {
             you: Some(2),
-            ids: IdSwap::new(Some(2)),
             ..NetSession::default()
         };
         let (world, _) = build_online_world(
@@ -2657,7 +2664,6 @@ mod tests {
     fn a_seeded_start_generates_its_own_field() {
         let session = NetSession {
             you: Some(1),
-            ids: IdSwap::new(Some(1)),
             ..NetSession::default()
         };
         let (with_rocks, _) =
@@ -3047,7 +3053,6 @@ mod tests {
         let session = NetSession {
             phase: Phase::Playing,
             you: Some(guest_id),
-            ids,
             host: false,
             players,
             callsign: "RustPilot".to_owned(),
