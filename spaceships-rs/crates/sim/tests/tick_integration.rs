@@ -1309,11 +1309,19 @@ fn bots_can_fly_the_terrain_map() {
             moved = moved.max(s.pos.distance(start[i]));
         }
 
+        // Against the bot's own floor, not against the kill plane. Clearing
+        // the kill plane by a hair is what the old numbers did — the floor was
+        // set to the same 5 as the clearance, so a bot on the clamp sat exactly
+        // on the altitude that kills it and passed only because the test is a
+        // strict `<`. The floor has to be a real gap for this to mean anything.
         assert!(
-            lowest > rules.world.terrain_kill_clearance,
-            "seed {seed}: a bot closed to {lowest:.1} of the ground, inside the \
-             {:.1} kill clearance",
-            rules.world.terrain_kill_clearance,
+            lowest >= rules.bot.terrain_min_clearance,
+            "seed {seed}: a bot closed to {lowest:.1}, under its own {:.1} floor",
+            rules.bot.terrain_min_clearance,
+        );
+        assert!(
+            rules.bot.terrain_min_clearance > rules.world.terrain_kill_clearance,
+            "the bot's floor must sit above the plane that kills it",
         );
         // And they were actually flying, not parked in a corner: a fixture that
         // never moves would pass the clearance check trivially.
@@ -1322,4 +1330,55 @@ fn bots_can_fly_the_terrain_map() {
             "seed {seed}: the bots barely moved ({moved:.0})"
         );
     }
+}
+
+/// **A bot leaves its runway on a climb-out, not on a launch.**
+///
+/// `bot.js:205` adds `pull * 6` to an already-normalised heading's `y`, which is
+/// not a bounded operation. Sitting on its own pad a bot has 40 units of
+/// clearance against a margin of 180, and that arithmetic commands 79° nose-up
+/// — held for two and a half seconds, by every bot in the match at once,
+/// climbing to 400 units and staying there. It reads as a rocket launch, which
+/// is what it is.
+///
+/// One bot and one distant enemy at the same altitude, so the aim vector is
+/// horizontal and the only thing steering vertically is the terrain rule. A
+/// dogfight adds its own climbing — bots chase each other upward, which is
+/// pursuit working correctly — so it is deliberately not in this fixture.
+#[test]
+fn a_bot_climbs_off_its_pad_rather_than_launching() {
+    let rules = Rules::DEFAULT;
+    let mut w = World::new(3, rules, Mode::Skirmish, MapKind::Terrain);
+    let pad = Vec3::new(0.0, rules.spawn.terrain_y, -rules.spawn.terrain_z);
+    let mut b = Ship::spawn(200, ShipKind::Bot, pad, Quat::IDENTITY, &rules);
+    b.team = Some(Team::Zero);
+    w.ships.push(b);
+    let mut e = Ship::spawn(
+        201,
+        ShipKind::Bot,
+        pad + Vec3::new(0.0, 0.0, 1_800.0),
+        Quat::IDENTITY,
+        &rules,
+    );
+    e.team = Some(Team::One);
+    w.ships.push(e);
+
+    // It starts below the margin, or the fixture proves nothing.
+    let start = pad.y - spaceships_sim::ship::terrain_height(pad.x, pad.z, &rules);
+    assert!(
+        start < rules.bot.terrain_margin,
+        "fixture starts already clear"
+    );
+
+    let mut steepest = 0.0f64;
+    for _ in 0..(5 * 60) {
+        tick(&mut w, &[], &[], TICK_DT);
+        let s = &w.ships[0];
+        steepest = steepest.max(s.vel.y / s.vel.length().max(1e-9));
+    }
+    // sin(climb angle). 0.6 is 37°: a steep departure is fine, vertical is not.
+    assert!(
+        steepest < 0.6,
+        "the bot left the pad at {steepest:+.2} of vertical",
+    );
 }
