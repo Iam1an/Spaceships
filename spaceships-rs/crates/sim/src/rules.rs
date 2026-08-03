@@ -616,14 +616,32 @@ pub struct WeaponRules {
     pub missile_life: f64,
     /// Missile collision radius, added to a target's [`ShipRules::hit_radius`].
     ///
-    /// `missiles.js` adds no projectile radius at all (`:402` compares against
-    /// `HIT_RADIUS` alone), unlike `bullets.js:144` which adds its `RADIUS`.
-    /// Kept at 0.0 to preserve current behaviour.
+    /// **`TODO(verify)` resolved: the JS zero was an oversight, and it is not
+    /// preserved.** `missiles.js:402` compares squared distance against its
+    /// private `HIT_RADIUS` alone and adds nothing for the projectile, where
+    /// `bullets.js:144` adds its `RADIUS` to every reach. Nothing in the JS
+    /// argues for the difference — it is one file that remembered a term and
+    /// one that did not.
     ///
-    // TODO(verify): a missile is a 3.5-long body (`missiles.js:17 BODY_LEN`)
-    // with 0.28 radius, so 0.0 is almost certainly an oversight rather than a
-    // decision. Raising it to ~0.5 would make missiles marginally easier to
-    // land; that is a balance call, not a port call.
+    /// A missile is not a point. `missiles.js:17`–`:22` build it from a
+    /// 3.5-unit body of radius 0.28, a 1.8-unit nose cone, and fins spanning
+    /// 2.0 across, and the Bevy client now draws all of it
+    /// (`client/src/weapons.rs`, `MISSILE_BODY_LEN`), so a round that visibly
+    /// clipped a hull scored nothing.
+    ///
+    /// Set to **0.5** — the value `bullets.js` gives a bolt
+    /// ([`Self::bullet_radius`]) — rather than the fuselage's own 0.28 or the
+    /// fin tips' 1.0. One projectile radius shared by both weapons is easier to
+    /// reason about than two, and it sits between the two honest answers the
+    /// mesh offers.
+    ///
+    /// What it moves: the grazing window against a ship widens from 6.00 to
+    /// 6.50 units of miss distance (+8.3 % in radius, +17.4 % in presented
+    /// area); against the boss's [`Self::boss_hitbox_radius`] from 28.0 to
+    /// 28.5 (+1.8 % / +3.6 %). Homing puts most contacts near the centre, so
+    /// what actually changes hands is the graze — a dumb-fired round, or one
+    /// whose target jinked late. Pinned by
+    /// `the_body_radius_widens_the_grazing_window_by_a_known_amount`.
     pub missile_radius: f64,
     /// Missiles carried. `main.js:1091` (`MISSILE_MAX`).
     pub missile_max: u8,
@@ -695,12 +713,15 @@ pub struct WeaponRules {
     /// usable against the boss (the point of the fix), and the beam loses its
     /// free hull-wide sphere.
     ///
-    // TODO(verify): with the 95-radius proxy gone, weapons must hit one of the
-    // 20 spheres in `BOSS_HITBOX_OFFSETS`. Those are 75 units apart in z
-    // against a diameter of 56, so a shot can pass between rows and miss a
-    // capital ship it is visually inside. That is a hitbox-layout problem, not
-    // a rules problem, but it needs a playtest before this ships — the fix is
-    // more offsets, not a second radius.
+    /// **`TODO(verify)` resolved.** The worry was that with the 95-radius proxy
+    /// gone a shot could thread the 20 spheres — they are 75 apart in z against
+    /// a diameter of 56 — and miss a capital ship it was visually inside. It
+    /// can no longer: [`crate::campaign::sweep_boss_hull`] resolves every
+    /// weapon against four axis-aligned hull boxes, and
+    /// [`BOSS_HITBOX_OFFSETS`] was demoted from the hit test to a set of damage
+    /// zones. This radius survives for the hitbox ships that still carry a
+    /// [`crate::world::Ship::hit_radius_override`], so the two paths agree
+    /// wherever both are consulted.
     pub boss_hitbox_radius: f64,
 }
 
@@ -729,7 +750,7 @@ impl WeaponRules {
         missile_speed: 160.0,
         missile_turn_rate: 1.4,
         missile_life: 8.0,
-        missile_radius: 0.0,
+        missile_radius: 0.5,
         missile_max: 4,
         missile_spawn_offset: 6.0,
         missile_avoid_base_lookahead: 130.0,

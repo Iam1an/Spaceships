@@ -710,24 +710,149 @@ foundation is already in place.
 
 ---
 
-## 12. Known gameplay issues found during the port
+## 12. Known gameplay issues found during the port — **WORKED THROUGH**
 
-Real behaviors in the current game, each verified against the source. Some are
-bugs, some are probably-unintended design. Decide individually.
+> Every row below now carries a verdict. Four moved, four were kept on purpose,
+> and three were never `crates/sim`'s to fix. The ones that moved are pinned by
+> tests that fail without them; the ones that were kept are pinned too, so the
+> next person to read this finds a decision rather than an accident.
 
-| Issue | Where | Note |
+Real behaviors in the game, each verified against the source. Some were bugs,
+some were probably-unintended design, and two had already been settled by the
+port before anyone read the row.
+
+| Issue | Where | Verdict |
 |---|---|---|
-| Aim assist over-leads | `main.js:2047` | Passes `shipVelocity` as shooter velocity, but `bullets.js:44` gives bolts no velocity inheritance. Error grows with your speed. `bot.js:172` does it correctly — the AI aims better than your assist. |
-| Lock-on has no cone and no range | `main.js:1629`+ | Nearest living enemy with line of sight, full stop. You can lock a target directly behind you. There is no range cap even though a missile only reaches ~1280 units. |
-| Missiles do not damage asteroids | `missiles.js` | Only bullets do. Contradicts the `asteroid_damage_per_hit` docs. |
-| Your own flares detonate your own missiles | `missiles.js` | Seduction skips own-owner flares; proximity detonation doesn't. |
-| Missiles have no body radius | `missiles.js:402` | `bullets.js` adds 0.5; missiles add nothing, despite a 3.5-unit body. Confirmed oversight. One-line change in `rules.rs`. |
-| Lock-on through hulls | `missiles.js` | Line of sight ignores `World::boxes`, so you can lock through a mothership. |
-| Boss lockability | `main.js:2738` | `hasTarget = (i === 0)` means a HUD-marker flag makes hitbox 0 the only lockable point on the capital ship. Currently overridden in the Rust port — needs a decision. |
-| Bridge damage zone misplaced | `main.js` | The one off-plane hitbox is ~105 units from the bridge it represents; the offset is added unrotated but the group carries a π yaw. Fixed by the AABB hull, listed for the record. |
-| Server trusts client hit reports | `server/index.js:901`+ | No validation at all. Fine with friends; an open door if the game ever gets strangers. The Rust server should validate against `sim`. |
-| `/spaceships/api/*` vs `/api/*` | `auth.js`, `lobby.js`, `main.js` | Client calls a prefixed path the server doesn't register. Works in production behind a proxy; 404s locally. |
-| `#nameInput` sanitiser is unreachable | `index.html` | Declared `type="button"`, which never fires `input` events, so the profanity/charset filter never runs on it. |
+| ~~Aim assist over-leads~~ | `main.js:2047` | **Was already fixed — row was stale** |
+| Lock-on has no cone and no range | `main.js:1629`+ | **Kept, deliberately** |
+| Missiles do not damage asteroids | `missiles.js` | **Kept** — the row asks for less than it sounds like |
+| ~~Your own flares detonate your own missiles~~ | `missiles.js` | **Fixed** |
+| ~~Missiles have no body radius~~ | `missiles.js:402` | **Fixed** — 0.0 → 0.5 |
+| Lock-on through hulls | `missiles.js` | **Kept for now**, with the real fix written down |
+| ~~Boss lockability~~ | `main.js:2738` | **Decided: all twenty stay lockable** |
+| ~~Bridge damage zone misplaced~~ | `main.js` | **Was already fixed** by the AABB hull |
+| Server trusts client hit reports | `server/index.js:901`+ | **Kept** — a known, accepted risk |
+| `/spaceships/api/*` vs `/api/*` | `auth.js`, `lobby.js`, `main.js` | **Not a bug** — correct behind the proxy |
+| `#nameInput` sanitiser is unreachable | `index.html` | **Still open**, in the JS client |
+
+### What moved
+
+**Missiles have a body radius now.** `missiles.js:402` compared squared
+distance against its hit radius and added nothing for the projectile, where
+`bullets.js` adds its `RADIUS` to every reach — one file remembered the term and
+one did not. A missile is a 3.5-unit body with a 1.8-unit nose cone and fins
+spanning 2.0, and the Bevy client draws all of it, so a round that visibly
+clipped a hull scored nothing. `weapons.missile_radius` is **0.5** now, the same
+radius a bolt gets, chosen over the fuselage's own 0.28 and the fin tips' 1.0
+because one projectile radius shared by both weapons is easier to reason about
+than two.
+
+The grazing window against a ship widens from **6.00 to 6.50** units of miss
+distance: +8.3 % in radius, **+17.4 %** in the area a missile presents to a
+target. Against the boss's 28-unit hitbox it is 28.0 → 28.5, +1.8 % / +3.6 %.
+Homing puts most contacts near the centre, so what actually changes hands is the
+graze — a dumb-fired round, or one whose target jinked late. Two knock-on
+effects, both intended: a missile now detonates half a unit further out from an
+asteroid's shell, and half a unit short of a hull box's face.
+
+**Your own flares no longer detonate your own missiles.** `seduce` has always
+skipped flares released by the missile's own owner — your countermeasures are
+not decoys to your own weapon — but the detonation scan did not, so a missile
+launched a moment before you popped flares flew into your own burst and died on
+it. Two halves of one rule that disagreed; they use the same owner test now.
+Everyone else's flares, including a team-mate's, stop a missile exactly as
+before.
+
+**Boss lockability: all twenty hitboxes stay lockable.** `main.js:2738`'s
+`hasTarget = (i === 0)` let a HUD-marker flag decide which twentieth of a
+200 × 30 × 360 capital ship could be locked — and hitbox 0 is one corner of it,
+so a player lined up on the bridge got no lock at all. The port already
+overrode this; the row asked for the call to be made, and it is made. Three
+reasons: `hasTarget` answers a *network* question ("has a `state` message
+arrived for this ship") that one line of `activateBossPhase` borrowed to thin
+out HUD markers, so the rule it replaces is not a rule; `acquire_lock` takes the
+nearest candidate, so twenty zones means locking the nearest *part* of the
+capital ship, which is the shortest flight and the one least likely to expire;
+and the marker count stays a rendering decision the client owns rather than
+being spent as a targeting rule.
+
+**Aim assist over-leads — was already fixed.** `aim_assist::update` passes
+`Vec3::ZERO` as the shooter velocity, matching `bot.js:172`, and bolts still
+inherit nothing (`bullets.rs`, `vel: dir * spawn.speed`), so the assist and the
+projectile agree. `the_shooters_own_velocity_never_enters_the_intercept_solve`
+fails if anyone puts it back, and it carries its own control so it cannot pass
+vacuously.
+
+**Bridge damage zone — was already fixed** by replacing the 20 spheres with the
+four-box AABB hull in `campaign.rs`. The `TODO(verify)` on
+`weapons.boss_hitbox_radius`, which worried that a shot could thread the sphere
+grid, is stale for the same reason and has been retired.
+
+### What was kept, and why
+
+**Lock-on has no cone and no range.** Both stay. The cone's absence *is* the
+weapon: a missile that hunts something you are not pointing at is the whole
+difference between it and the gun, and the counterplay is the flare — a decision
+the victim makes — not the shooter's facing. The long reversal arc is the price
+the shooter already pays for a shot taken over their shoulder. Note that bots
+give themselves a 0.90 fire-dot and a 130–560 unit band (`bot.missile_fire_dot`,
+`bot.missile_min_range`/`_max_range`): that is the AI being conservative about
+when to spend a round, not a player rule written down somewhere else.
+
+A range cap is not the free win it looks like. `missile_speed * missile_life` is
+1280 units, but that is the reach against a *stationary* target — a head-on
+closer at 1500 units is met in about 6.3 s of an 8 s life, so a hard cap would
+refuse a shot that lands. Making the cap closure-aware fixes that and buys a
+worse problem: the lock blinking on and off as the target manoeuvres across the
+boundary. Neither number appears anywhere in the sources, so either would be
+invented balance. If one is ever wanted it belongs in `rules.rs` beside the
+bot's, and it wants play data rather than arithmetic.
+
+**Missiles do not damage asteroids.** The row reads as a 50-damage weapon
+leaving a 5 HP pebble untouched, but asteroid damage in this game is counted in
+*hits*, not hit points: `asteroid_damage_per_hit` is 1 whatever fired it. So
+"missiles damage asteroids" cashes out as a missile taking one point off a
+five-point rock — a fifth of a pebble for a quarter of your loadout, which is
+not the behaviour the row is reaching for. Separately, in multiplayer the server
+owns rock hit points and hears about them through `asteroid-hit`, which bullets
+raise and a detonation carries no equivalent of, so applying the damage
+client-side alone would drift every client's rock HP away from the server's.
+
+Wanting a missile to *shatter* a rock is a better and more interesting request
+than making it chip one, and it needs a weapon-aware asteroid damage rule plus
+the net intent to go with it. `DetonationCause::Asteroid` already carries the
+rock id for whoever takes that on.
+
+**Lock-on through hulls.** A missile ignores `World::boxes` in *flight* as well
+as in the sensor — the detonation scan never tests them either — so a round
+fired at a target behind a mothership sails through the hull and lands.
+Tightening only the line-of-sight test would refuse a lock on a shot the weapon
+can still take, which is the worse of the two inconsistencies: the player would
+watch a missile pass through a hull they had just been told they could not see
+through.
+
+The coherent fix is to make the boxes solid to missiles in both places, which is
+how bullets already treat them (`bullets::Target::BoxVolume`). It needs a
+`DetonationCause` variant naming the box, and `tick.rs` matches that enum
+exhaustively, so it is a slightly wider change than one module. Left with the
+shape written down rather than half-done.
+
+**Server trusts client hit reports.** Unchanged, and not a defect to file:
+CLAUDE.md lists client-trusted results as a known, accepted risk. The note about
+the Rust server re-validating against `sim` is real but it is a project, not a
+row — it means the server holding authoritative poses, which is a netcode change
+of the size of [§11](#11-netcode-rollback), not a validation function.
+
+### Not `crates/sim`'s to fix
+
+**`/spaceships/api/*` vs `/api/*`** is documented correct behaviour: production
+sits behind a proxy that strips the prefix, and `npm run dev` rewrites it. It
+404s only under a bare `npm start`. Nothing to fix; CLAUDE.md already says so
+under "Known local-only breakage".
+
+**`#nameInput` sanitiser is unreachable** is a live bug, and it is in
+`public/index.html` — the JS client, which the port retires. Left open. If the
+JS client outlives the port by long enough to matter, the fix is one attribute.
 
 ---
 

@@ -32,15 +32,30 @@
 //! [`crate::rules::WeaponRules::boss_hitbox_radius`]. One radius, one function,
 //! no weapon-specific answer.
 //!
-//! **`missiles.js` adds no radius for the missile body — confirmed.** The
-//! `TODO(verify)` on [`crate::rules::WeaponRules::missile_radius`] is correct:
-//! the JS compares squared distance against `HIT_RADIUS` alone, where
-//! `bullets.js` adds its `RADIUS = 0.5` to every reach. A missile is a 3.5-unit
-//! body with a 0.28 radius plus a 1.8-unit nose cone (`BODY_LEN`, `BODY_RAD`,
-//! `NOSE_LEN`), so 0.0 is an oversight rather than a decision — but it *is* the
-//! shipped behaviour, so it is preserved. The value is threaded through every
-//! test in this module as `rules.weapons.missile_radius`, so raising it is a
-//! one-line rules change and nothing here needs to be touched.
+//! **`missiles.js` adds no radius for the missile body — confirmed, and no
+//! longer preserved.** The JS compares squared distance against `HIT_RADIUS`
+//! alone, where `bullets.js` adds its `RADIUS = 0.5` to every reach. A missile
+//! is a 3.5-unit body with a 0.28 radius plus a 1.8-unit nose cone
+//! (`BODY_LEN`, `BODY_RAD`, `NOSE_LEN`) and the Bevy client draws all of it, so
+//! a zero body meant a round that visibly clipped a hull scored nothing.
+//! [`crate::rules::WeaponRules::missile_radius`] is 0.5 now — the same radius a
+//! bolt gets — and that page carries the before/after numbers. Every reach here
+//! already read the rule, so it was a one-line change and nothing in this
+//! module moved.
+//!
+//! # Two more decided here, from `BACKLOG.md` section 12
+//!
+//! **Your own flares no longer detonate your own missiles.** The seduction scan
+//! has always skipped flares released by the missile's own owner — your
+//! countermeasures are not decoys to your own weapon — but the detonation scan
+//! did not, so a missile launched a moment before you popped flares flew into
+//! your own burst and died on it. Two halves of one rule that disagreed; the
+//! contact search now applies the same owner test the seduction scan does.
+//! Everyone else's flares, including a team-mate's, stop a missile exactly as
+//! before.
+//!
+//! **Lock-on still has no cone and no range.** Kept, deliberately; the reasons
+//! are on [`acquire_lock`], which now records why as well as what.
 //!
 //! # Swept detonation
 //!
@@ -279,17 +294,35 @@ pub use crate::math::forward;
 /// (`main.js:849`), which is why solo bots have it forced on at spawn
 /// (`main.js:2477`) and multiplayer bots too (`main.js:2967`).
 ///
-/// **One deliberate deviation.** The campaign sets `hasTarget` on exactly one
-/// of the boss's twenty hitboxes (`main.js:2738`, `r.hasTarget = (i === 0)`),
+/// **One deliberate deviation — and `BACKLOG.md` section 12 asked for it to be
+/// settled, so here is the decision.** The campaign sets `hasTarget` on exactly
+/// one of the boss's twenty hitboxes (`main.js:2738`, `r.hasTarget = (i === 0)`),
 /// because the flag also gates the HUD's target marker and twenty markers on
 /// one capital ship would be unreadable. That makes a *rendering* flag decide
 /// which parts of the boss can be locked, and hitbox 0 sits at
-/// `(-85, 0, -150)` from the hull origin — so the only lockable point on the
-/// capital ship is one corner of it. Here the flag is honoured for
-/// [`ShipKind::Remote`] only, where it means what it says; bots, the local
-/// ship, and boss hitboxes are lockable whenever they are alive. Together with
-/// the hit-radius fix in [`update`], that is what makes missiles work against
-/// the boss at all.
+/// `(-85, 0, -150)` from the hull origin — so the only lockable point on a
+/// 200 × 30 × 360 capital ship is one corner of it, and a player lined up on
+/// the bridge gets no lock at all.
+///
+/// **All twenty stay lockable.** The flag is honoured for [`ShipKind::Remote`]
+/// only, where it means what it says — "a `state` message has arrived for this
+/// ship" — and bots, the local ship and boss hitboxes are lockable whenever
+/// they are alive. Three reasons it is the right way round:
+///
+/// - The rule it replaces is not a rule. `hasTarget` answers a *network*
+///   question, and one line of `activateBossPhase` borrowed it to thin out HUD
+///   markers. Nothing decided that the port stern quarter is the boss's only
+///   soft spot; it fell out of `i === 0`.
+/// - The lock lands where the missile wants to go. [`acquire_lock`] takes the
+///   nearest candidate, so twenty zones means locking the nearest *part* of the
+///   capital ship — the shortest flight, and the one least likely to expire or
+///   be dragged into the hull on the way.
+/// - It costs the HUD nothing. The marker count is a rendering decision the
+///   client still owns; it does not have to be spent as a targeting rule.
+///
+/// Together with the hit-radius fix in [`update`], this is what makes missiles
+/// work against the boss at all. Pinned by
+/// `every_boss_hitbox_is_lockable_not_just_the_one_the_hud_marks`.
 fn is_lockable(target: &Ship) -> bool {
     if !target.alive {
         return false;
@@ -310,7 +343,24 @@ fn is_lockable(target: &Ship) -> bool {
 ///
 /// Note what does *not* occlude: [`World::boxes`]. The JS list holds asteroids
 /// and obstacles only, so a lock can be taken straight through a mothership or
-/// an airfield. Preserved.
+/// an airfield.
+///
+/// **Preserved, and `BACKLOG.md` section 12 lists it — here is why it did not
+/// move.** A missile ignores the boxes in *flight* as well as in the sensor:
+/// the detonation search inside [`update`] never tests them either, so a round
+/// fired at a target on the far side of a mothership sails through the hull and
+/// lands. Tightening
+/// only this function would therefore refuse a lock on a shot the weapon can
+/// still take, which is a worse inconsistency than the one it fixes — the
+/// player would watch a missile pass through a hull they had just been told
+/// they could not see through.
+///
+/// The coherent fix is to make [`World::boxes`] solid to missiles in both
+/// places, which is how bullets already treat them
+/// (`bullets::Target::BoxVolume`). It needs a detonation cause naming the box —
+/// a new [`DetonationCause`] variant — and `tick.rs` matches that enum
+/// exhaustively, so it reaches past this module. Left as a follow-up with the
+/// shape written down rather than half-done.
 #[must_use]
 pub fn has_line_of_sight(world: &World, from: Vec3, to: Vec3) -> bool {
     let motion = to - from;
@@ -344,9 +394,33 @@ pub fn has_line_of_sight(world: &World, from: Vec3, to: Vec3) -> bool {
 ///   units of travel and it expires short of the target.
 ///
 /// The only gate is line of sight, so the rule reads as "the nearest thing you
-/// could actually see", not "the thing you are aiming at". Both gaps are
-/// balance decisions rather than porting ones, so both are preserved; a cone
-/// and a range belong in [`crate::rules`] if they are ever wanted.
+/// could actually see", not "the thing you are aiming at".
+///
+/// # Both are kept — the decision, not the default
+///
+/// `BACKLOG.md` section 12 lists this and it stays, for reasons rather than
+/// inertia. Pinned by `lock_has_no_cone_and_no_range_limit`.
+///
+/// **The cone's absence is the weapon.** A missile that hunts something you are
+/// not pointing at is the whole difference between it and the gun, and the
+/// counterplay is the flare — a decision the victim makes — not the shooter's
+/// facing. The long reversal arc the steering law produces (see the nlerp note
+/// in this module) is the cost the shooter already pays for a shot taken over
+/// their shoulder. Note that
+/// [`crate::rules::BotRules::missile_fire_dot`] gives *bots* a 0.90 cone and a
+/// 130–560 unit band: that is the AI being conservative about when to spend a
+/// round, not a player rule written down somewhere else.
+///
+/// **A range cap is not the free win it looks like.** `missile_speed *
+/// missile_life` is 1280 units, but that is the reach against a *stationary*
+/// target: a head-on closer at 1500 units is met in about 6.3 s of an 8 s life,
+/// so a hard 1280 cap would refuse a shot that lands. A closure-aware cap fixes
+/// that and buys a worse problem — the lock blinking on and off as the target
+/// manoeuvres across the boundary. Neither number appears anywhere in the
+/// sources, so either would be invented balance.
+///
+/// If a cone or a range is ever wanted they belong in [`crate::rules`], beside
+/// the bot's, and they want play data rather than arithmetic.
 ///
 /// Ties go to the earlier ship in [`World::ships`], matching the JS's
 /// `if (d >= closestDist) continue` over a `Map` in insertion order.
@@ -848,9 +922,24 @@ fn steer(heading: Vec3, desired: Vec3, turn_rate: f64, dt: f64) -> Vec3 {
 /// missile chips nothing off a 5 HP rock while a 10-damage bullet takes a point
 /// off it. That reads like an oversight next to
 /// [`crate::rules::CombatRules::asteroid_damage_per_hit`], whose docs assume
-/// every weapon chips a rock, but it is the shipped behaviour and changing it
-/// is a balance call. The [`DetonationCause::Asteroid`] report carries the rock
-/// id, so a caller that wants the other behaviour has what it needs.
+/// every weapon chips a rock.
+///
+/// **`BACKLOG.md` section 12 lists it, and it stays — for two reasons, neither
+/// of them "the JS did it".** First, asteroid damage in this game is counted in
+/// *hits*, not hit points: `asteroid_damage_per_hit` is 1 whatever fired, so
+/// "missiles damage asteroids" cashes out as a missile taking one point off a
+/// five-point pebble — a fifth of a rock for a quarter of your loadout, which
+/// is not the behaviour the row is reaching for. Second, in multiplayer the
+/// server owns rock hit points and learns about them from `asteroid-hit`;
+/// bullets raise that intent from `bullets::apply_impact`, and a detonation
+/// carries no equivalent, so applying the damage here alone would drift every
+/// client's rock HP away from the server's.
+///
+/// Wanting a missile to *shatter* a rock is a different and more interesting
+/// request than making it chip one, and it needs a weapon-aware asteroid damage
+/// rule plus the net intent to go with it. The [`DetonationCause::Asteroid`]
+/// report already carries the rock id, so whoever takes that on has what they
+/// need.
 pub fn update(
     world: &mut World,
     dt: f64,
@@ -976,12 +1065,14 @@ fn first_contact(
         );
     }
 
-    // Flares. Note the JS does *not* skip the missile owner's own flares here,
-    // only in the seduction scan — so your own countermeasures detonate your own
-    // missiles if they drift into one. Preserved.
+    // Flares. The JS skips the missile owner's own flares in the seduction scan
+    // (`missiles.js:321`) and *not* here, so your own countermeasures detonated
+    // your own missiles if either drifted into the other — which is what
+    // happens whenever you launch and then defend within a second or so. The
+    // two halves now use the same owner test; see the module docs.
     let flare_reach = world.rules.ship.hit_radius;
     for (idx, f) in world.flares.iter().enumerate() {
-        if f.life <= 0.0 {
+        if f.life <= 0.0 || f.owner == missile.owner {
             continue;
         }
         let sphere = Sphere::new(f.pos, flare_reach);
@@ -1346,6 +1437,56 @@ mod tests {
         // reach.
         w.ship_mut(2).unwrap().pos = v(0.0, 0.0, 2000.0);
         assert_eq!(acquire_lock(&w, 1), Some(2));
+    }
+
+    #[test]
+    fn every_boss_hitbox_is_lockable_not_just_the_one_the_hud_marks() {
+        // `BACKLOG.md` §12: `main.js:2738`'s `r.hasTarget = (i === 0)` lets a
+        // HUD-marker flag decide which twentieth of a capital ship can be
+        // locked. Here `has_target` is honoured for remote *players* only, so
+        // the lock goes to the nearest zone whatever the flag says.
+        let bow = crate::rules::BOSS_ID_BASE;
+        let amidships = bow + 7;
+
+        let mut w = world();
+        add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
+        let far = add_ship(
+            &mut w,
+            bow,
+            ShipKind::BossHitbox,
+            v(0.0, 0.0, 600.0),
+            Team::One,
+        );
+        let near = add_ship(
+            &mut w,
+            amidships,
+            ShipKind::BossHitbox,
+            v(0.0, 0.0, 300.0),
+            Team::One,
+        );
+        // Neither carries the flag, which is what a boss hitbox looks like:
+        // `activateBossPhase` sets it on hitbox 0 alone, and the port sets it
+        // on none of them.
+        w.ships[far].interp.has_target = false;
+        w.ships[near].interp.has_target = false;
+
+        assert_eq!(
+            acquire_lock(&w, 1),
+            Some(amidships),
+            "the nearest zone takes the lock, not the one the HUD marks"
+        );
+
+        // Remove the near one and the far one is still lockable — the rule is
+        // "any live zone", not "zone 0".
+        w.ships[near].alive = false;
+        assert_eq!(acquire_lock(&w, 1), Some(bow));
+
+        // A remote *player* with no pose stays unlockable: that flag still
+        // means what it says.
+        w.ships[far].alive = false;
+        add_ship(&mut w, 3, ShipKind::Remote, v(0.0, 0.0, 100.0), Team::One);
+        w.ship_mut(3).unwrap().interp.has_target = false;
+        assert_eq!(acquire_lock(&w, 1), None);
     }
 
     #[test]
@@ -1721,6 +1862,41 @@ mod tests {
     }
 
     #[test]
+    fn a_missile_flies_straight_through_its_owners_own_flares() {
+        // `BACKLOG.md` §12: `seduce` skips own-owner flares, the detonation
+        // scan did not, so launching and then defending killed your own round.
+        // The decoy sits squarely on the flight line, dead centre.
+        let mut w = world();
+        add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
+        add_ship(&mut w, 2, ShipKind::Remote, v(0.0, 0.0, 900.0), Team::One);
+        fire_locked(&mut w, 1).unwrap();
+        add_flare(&mut w, v(0.0, 0.0, 120.0), 1);
+
+        let hit = tick_until_detonation(&mut w, 1.0 / 60.0, 500)
+            .expect("the missile should have reached its target");
+        assert!(
+            matches!(hit.cause, DetonationCause::Ship { id: 2, .. }),
+            "your own burst must not stop your own missile: {:?}",
+            hit.cause
+        );
+    }
+
+    #[test]
+    fn someone_elses_flare_on_the_same_spot_still_stops_it() {
+        // The control for the test above. Identical geometry, one field
+        // changed: the decoy belongs to the victim, and it eats the round.
+        let mut w = world();
+        add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
+        add_ship(&mut w, 2, ShipKind::Remote, v(0.0, 0.0, 900.0), Team::One);
+        fire_locked(&mut w, 1).unwrap();
+        let key = add_flare(&mut w, v(0.0, 0.0, 120.0), 2);
+
+        let hit =
+            tick_until_detonation(&mut w, 1.0 / 60.0, 500).expect("the decoy must be reached");
+        assert_eq!(hit.cause, DetonationCause::Flare { key });
+    }
+
+    #[test]
     fn flares_outside_the_seduction_radius_do_nothing() {
         let mut w = world();
         add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
@@ -1865,43 +2041,83 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_missile_body_contributes_no_radius_of_its_own() {
-        // Bug #2, preserved deliberately. The reach is exactly the target's
-        // radius: a missile grazing at 6.0 + epsilon misses, even though the
-        // body is 3.5 units long.
-        assert_eq!(Rules::DEFAULT.weapons.missile_radius, 0.0);
-        let reach = Rules::DEFAULT.ship.hit_radius;
+    /// Whether a dumb-fired missile passing `offset` units to one side of a
+    /// parked ship detonates on it.
+    ///
+    /// Straight down `+z` with no lock, so homing cannot rescue a graze and the
+    /// perpendicular distance at closest approach *is* `offset`.
+    fn grazes_at(offset: f64, body: f64) -> bool {
+        let mut w = world();
+        w.rules.weapons.missile_radius = body;
+        add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
+        add_ship(
+            &mut w,
+            2,
+            ShipKind::Remote,
+            v(offset, 0.0, 200.0),
+            Team::One,
+        );
+        fire(&mut w, 1, None).unwrap();
+        tick_until_detonation(&mut w, 1.0 / 60.0, 120)
+            .is_some_and(|d| matches!(d.cause, DetonationCause::Ship { .. }))
+    }
 
-        for (offset, expect_hit) in [(reach - 0.01, true), (reach + 0.01, false)] {
-            let mut w = world();
-            add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
-            add_ship(
-                &mut w,
-                2,
-                ShipKind::Remote,
-                v(offset, 0.0, 200.0),
-                Team::One,
-            );
-            fire(&mut w, 1, None).unwrap();
-            let hit = tick_until_detonation(&mut w, 1.0 / 60.0, 120)
-                .is_some_and(|d| matches!(d.cause, DetonationCause::Ship { .. }));
-            assert_eq!(hit, expect_hit, "offset {offset}");
-        }
+    #[test]
+    fn the_missile_body_contributes_a_radius_of_its_own() {
+        // `BACKLOG.md` §12: `missiles.js:402` adds nothing for the projectile
+        // where `bullets.js` adds its `RADIUS`, so a 3.5-unit missile was a
+        // point. It is 0.5 now — a bolt's radius — and the reach is the sum.
+        let body = Rules::DEFAULT.weapons.missile_radius;
+        assert!(body > 0.0, "a 3.5-unit missile is not a point");
+        assert_eq!(
+            body,
+            Rules::DEFAULT.weapons.bullet_radius,
+            "one projectile radius, shared"
+        );
+
+        let reach = Rules::DEFAULT.ship.hit_radius + body;
+        assert!(grazes_at(reach - 0.01, body), "inside the reach");
+        assert!(!grazes_at(reach + 0.01, body), "outside it");
+
+        // And the band the fix opened: between the hull radius and the sum, a
+        // graze that used to score nothing now detonates.
+        let opened = Rules::DEFAULT.ship.hit_radius + body * 0.5;
+        assert!(grazes_at(opened, body), "the body must reach this far");
+        assert!(!grazes_at(opened, 0.0), "and the JS zero must not");
+    }
+
+    #[test]
+    fn the_body_radius_widens_the_grazing_window_by_a_known_amount() {
+        // The balance change stated as numbers rather than adjectives. Sweep
+        // lateral offsets on half-hundredths — off the boundary, so neither
+        // reach lands on a sample — and count what lands.
+        let count = |body: f64| {
+            (0..800)
+                .filter(|i| grazes_at((f64::from(*i) + 0.5) * 0.01, body))
+                .count()
+        };
+        let before = count(0.0);
+        let after = count(Rules::DEFAULT.weapons.missile_radius);
+
+        // 6.00 units of miss distance became 6.50: +8.3 % in radius, and
+        // (6.5/6)^2 - 1 = +17.4 % in the area a missile presents to a target.
+        assert_eq!(before, 600, "the JS window is the 6.0 hull radius");
+        assert_eq!(after, 650, "the shipped window is 6.0 + 0.5");
     }
 
     #[test]
     fn the_swept_test_catches_a_grazing_hit_the_js_point_test_drops() {
         // The contact the per-frame point test loses. At the frame cap a
         // missile steps 8 units, so a target placed midway between two sampled
-        // positions and 5 units off the flight line is 6.4 units from both
-        // samples — outside the 6-unit hitbox at every sample — while the
-        // segment between them passes 5 units from the centre, which is a hit.
+        // positions and 5.6 units off the flight line is 6.88 units from both
+        // samples — outside the 6.5-unit reach at every sample — while the
+        // segment between them passes 5.6 units from the centre, which is a
+        // hit.
         let dt = crate::rules::MAX_FRAME_DT;
         let mut w = world();
         let step = w.rules.weapons.missile_speed * dt;
-        let reach = w.rules.ship.hit_radius;
-        let offset = 5.0;
+        let reach = w.rules.ship.hit_radius + w.rules.weapons.missile_radius;
+        let offset = 5.6;
 
         // Straddle a sample pair: the missile spawns at the offset and steps by
         // `step`, so put the target half a step past one of those samples.
@@ -1947,10 +2163,10 @@ mod tests {
         // out in the module docs.
         assert_eq!(w.asteroid(42).unwrap().hp, hp);
 
-        // It went off on the detonation shell — the rock plus the margin — not
-        // on the surface.
+        // It went off on the detonation shell — the rock, plus the margin, plus
+        // the missile's own body — not on the surface.
         let d = hit.pos.distance(v(0.0, 0.0, 60.0));
-        let shell = 10.0 + w.rules.weapons.missile_detonate_margin;
+        let shell = 10.0 + w.rules.weapons.missile_detonate_margin + w.rules.weapons.missile_radius;
         assert!(
             (d - shell).abs() < 1e-9,
             "detonated at {d}, expected {shell}"
@@ -1964,7 +2180,8 @@ mod tests {
         fire(&mut w, 1, None).unwrap();
 
         // The kind of hull the campaign might hand in: a box across the flight
-        // path, plus a sphere nowhere near it.
+        // path, plus a sphere nowhere near it. The box's near face is at
+        // z = 90, and contact is a missile *body* radius short of it.
         let hull = [
             Volume::Sphere(Sphere::new(v(500.0, 0.0, 0.0), 10.0)),
             Volume::Aabb(Aabb::new(v(0.0, 0.0, 120.0), v(60.0, 20.0, 30.0))),
@@ -1979,8 +2196,8 @@ mod tests {
         }
         assert_eq!(dets.len(), 1);
         assert_eq!(dets[0].cause, DetonationCause::Volume { index: 1 });
-        // Contact is on the near face of the box.
-        assert!((dets[0].pos.z - 90.0).abs() < 1e-9, "{:?}", dets[0].pos);
+        let face = 90.0 - w.rules.weapons.missile_radius;
+        assert!((dets[0].pos.z - face).abs() < 1e-9, "{:?}", dets[0].pos);
     }
 
     #[test]
