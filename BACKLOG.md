@@ -656,7 +656,68 @@ bugs, some are probably-unintended design. Decide individually.
 
 ---
 
-## 13. Other ideas
+## 13. Match-start entrances
+
+Every match currently begins with everyone already in the air, motionless, at a
+spawn point. It is the same nothing that [§9](#9-warp-in-on-spawn) describes for
+respawns, except it happens at the moment the player is paying the *most*
+attention — the first three seconds of a sortie, before anyone has taken a shot.
+
+Give each map its own arrival, and make it the thing you see while the match
+clock is still counting in.
+
+### Space — the flight warps in
+
+Every aircraft in the match drops out of warp together: the bend, the streaks,
+the FOV deceleration from §9, but for **all** ships rather than the local one,
+and staged rather than simultaneous — a half-second ripple down each flight
+reads as a formation arriving, where a single instant reads as a glitch.
+
+This is mostly §9's machinery pointed at more than one ship, so build §9 first
+and this is close to free. The two pieces it adds are the *stagger* and the fact
+that remote ships need it too, which means the arrival has to be driven from
+something every client agrees on — the `start` frame's spawn list, not a local
+timer.
+
+### Sierras — the flight takes off
+
+The new terrain map put both teams on a **mesa with a runway**, which is an
+opening the space map cannot do: start the aircraft *on the deck*, rolling, and
+have the match begin as the gear leaves the ground.
+
+That is a much stronger fit than a warp-in here, and it is nearly free
+geometrically — the runway exists, the mesa edge exists, and the ground falling
+away on three sides means the camera gets the reveal for nothing as the flight
+clears the lip.
+
+What it needs that the game does not have: a ship that can sit on the ground
+without dying. `ship::terrain_height` plus `terrain_kill_clearance` means
+contact is death, so a take-off run needs the kill plane suppressed for the
+duration — which is the same exemption a landing would need, and worth designing
+once for both. See §12's note on the tutorial being the only immortal mode.
+
+### Why they belong together
+
+Both are the same feature — "the match has a beginning" — and both want the same
+three things: a camera that is not the chase camera for a few seconds, a way to
+suppress player input without the flight model holding the last stick position
+(`sim_bridge` already does exactly this while the menu is open), and a
+deterministic start so eight clients see the same entrance. Doing one makes the
+other cheap; doing neither leaves the most-watched three seconds of a match
+empty.
+
+### Open questions
+
+- **Skippable?** A cinematic you have watched two hundred times is a loading
+  screen. Any key, and definitely skipped entirely on a respawn.
+- **Does the match clock run during it?** Almost certainly not, which means the
+  server needs to know about it too, not just the clients.
+- **What do spectators and late joiners see?** The JS server lets a client join
+  a room but not a started match, so this may not arise until that changes.
+
+---
+
+## 14. Other ideas
 
 - **Replace the pixel filter with a real post chain.** `PIXEL_SCALE = 3` renders
   to a third-res target and upscales. In Bevy this is a post-processing pass,
