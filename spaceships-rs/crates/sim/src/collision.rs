@@ -142,10 +142,12 @@ impl Sphere {
 
 /// An axis-aligned box, stored as a center and half-extents.
 ///
-/// This is the shape the motherships use: `main.js` builds them as
+/// This is the shape the JS's solid hulls use: `main.js` builds them as
 /// `{ pos, halfSize }` with `MOTHERSHIP_HALF = new THREE.Vector3(45, 18, 35)`,
 /// and both `collideSphereWithBox` (ship push-out) and `clipsAvoidance` in
 /// `asteroids.js:114` (spawn placement rejection) consume that pair directly.
+/// The motherships are gone from this port ([`crate::rules::WorldRules`]); the
+/// airfields are the same pair of numbers in a different place.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Aabb {
     /// Box center.
@@ -317,8 +319,8 @@ pub fn swept_sphere_vs_moving_sphere(
 
 /// Sweeps a moving sphere against an axis-aligned box.
 ///
-/// Needed for the mothership volumes (`MOTHERSHIP_HALF = [45, 18, 35]`) and for
-/// rejecting asteroid spawn positions that clip them.
+/// Needed for the airfield volumes and for rejecting asteroid spawn positions
+/// that clip fixed geometry.
 ///
 /// The test is *exact*, including at edges and corners. The naive version of
 /// this test — grow the box by the radius and cast a ray at it — reports hits
@@ -326,7 +328,7 @@ pub fn swept_sphere_vs_moving_sphere(
 /// (a Minkowski sum) has rounded edges and corners, not square ones. The
 /// difference is up to `radius * (sqrt(3) - 1)` of phantom box, which for a
 /// ship of radius 3.3 is over 2 units of invisible wall on every corner of
-/// every mothership.
+/// every hull.
 ///
 /// The expanded box is still used, as a conservative first pass: it contains
 /// the true swept volume, so missing it means missing the box, and its entry
@@ -434,8 +436,8 @@ pub fn sphere_overlaps_sphere(a: Sphere, b: Sphere) -> bool {
 ///
 /// This is the correct form of the placement rejection in `asteroids.js:114`,
 /// which compares per-axis distances against `halfSize + margin` and therefore
-/// rejects a box-shaped region around each mothership rather than the true
-/// rounded one.
+/// rejects a box-shaped region around each volume rather than the true rounded
+/// one.
 #[inline]
 #[must_use]
 pub fn sphere_overlaps_aabb(sphere: Sphere, aabb: Aabb) -> bool {
@@ -744,8 +746,10 @@ mod tests {
     const BULLET_RADIUS: f64 = 0.5;
     /// The larger `shipHitRadius` `createBullets` is constructed with.
     const SHIP_HIT_RADIUS: f64 = 6.0;
-    /// `MOTHERSHIP_HALF` from `main.js`.
-    const MOTHERSHIP_HALF: Vec3 = Vec3::new(45.0, 18.0, 35.0);
+    /// `MOTHERSHIP_HALF` from `main.js`. The hulls it described are gone from
+    /// the world, but it is still the box these tests are written against —
+    /// three unequal half-extents, none of them degenerate.
+    const HULL_HALF: Vec3 = Vec3::new(45.0, 18.0, 35.0);
 
     fn v(x: f64, y: f64, z: f64) -> Vec3 {
         Vec3::new(x, y, z)
@@ -1010,7 +1014,7 @@ mod tests {
             None
         );
 
-        let box_ = Aabb::new(v(0.0, 0.0, 200.0), MOTHERSHIP_HALF);
+        let box_ = Aabb::new(v(0.0, 0.0, 200.0), HULL_HALF);
         assert_eq!(swept_sphere_aabb(nan, v(1.0, 0.0, 0.0), 3.3, box_), None);
         assert_eq!(swept_sphere_aabb(inf, v(-1.0, 0.0, 0.0), 3.3, box_), None);
         assert_eq!(swept_sphere_aabb(Vec3::ZERO, nan, 3.3, box_), None);
@@ -1086,7 +1090,7 @@ mod tests {
         // The error is proportional to the distance from the origin, which is
         // why match space is centred on the action rather than at some far-off
         // world origin.
-        let box_ = Aabb::new(v(0.0, 0.0, 60.0), MOTHERSHIP_HALF);
+        let box_ = Aabb::new(v(0.0, 0.0, 60.0), HULL_HALF);
         let b0 = swept_sphere_aabb(origin, motion, 3.3, box_).expect("hit");
         let b1 = swept_sphere_aabb(
             origin + d,
@@ -1281,7 +1285,7 @@ mod tests {
         let run = || swept_sphere_sphere(origin, motion, 0.5, target).unwrap();
         assert_eq!(run().to_bits(), run().to_bits());
 
-        let box_ = Aabb::new(v(0.0, 0.0, 20.0), MOTHERSHIP_HALF);
+        let box_ = Aabb::new(v(0.0, 0.0, 20.0), HULL_HALF);
         let run_box = || swept_sphere_aabb(origin, motion, 3.3, box_).unwrap();
         assert_eq!(run_box().to_bits(), run_box().to_bits());
     }
@@ -1400,10 +1404,10 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    fn ship_sweeps_into_a_mothership_face() {
+    fn ship_sweeps_into_a_hull_face() {
         // Ship radius 3.3 (`main.js`: 2.2 * SHIP_SCALE) approaching the +x face
-        // of a mothership from 100 units out.
-        let box_ = Aabb::new(Vec3::ZERO, MOTHERSHIP_HALF);
+        // of a hull from 100 units out.
+        let box_ = Aabb::new(Vec3::ZERO, HULL_HALF);
         let radius = 3.3;
         let origin = v(100.0, 0.0, 0.0);
         let motion = v(-100.0, 0.0, 0.0);
@@ -1417,7 +1421,7 @@ mod tests {
 
     #[test]
     fn a_sphere_starting_inside_the_box_reports_impact_immediately() {
-        let box_ = Aabb::new(Vec3::ZERO, MOTHERSHIP_HALF);
+        let box_ = Aabb::new(Vec3::ZERO, HULL_HALF);
         assert_eq!(
             swept_sphere_aabb(v(1.0, 2.0, 3.0), v(50.0, 0.0, 0.0), 3.3, box_),
             Some(0.0)
@@ -1488,7 +1492,7 @@ mod tests {
 
     #[test]
     fn box_sweep_ignores_a_box_that_is_out_of_reach() {
-        let box_ = Aabb::new(Vec3::ZERO, MOTHERSHIP_HALF);
+        let box_ = Aabb::new(Vec3::ZERO, HULL_HALF);
         // Travelling parallel to the box, well clear of it.
         assert_eq!(
             swept_sphere_aabb(v(0.0, 100.0, -500.0), v(0.0, 0.0, 1000.0), 3.3, box_),
@@ -1505,8 +1509,8 @@ mod tests {
     fn overlaps_aabb_rejects_spawn_positions_the_js_would_accept() {
         // `clipsAvoidance` in asteroids.js compares per-axis distances, which
         // carves out a box, not a rounded box. The corner-adjacent position
-        // below is 20 units clear of the mothership in reality.
-        let box_ = Aabb::new(Vec3::ZERO, MOTHERSHIP_HALF);
+        // below is 20 units clear of the hull in reality.
+        let box_ = Aabb::new(Vec3::ZERO, HULL_HALF);
         let corner_adjacent = v(45.0 + 12.0, 18.0 + 12.0, 35.0 + 12.0);
         assert!(!sphere_overlaps_aabb(
             Sphere::new(corner_adjacent, 8.0),

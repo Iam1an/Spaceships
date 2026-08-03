@@ -318,7 +318,7 @@ pub struct ShipRules {
     pub max_hp: i32,
 
     /// Radius of the ship's collision sphere against asteroids, the moon, and
-    /// mothership boxes.
+    /// the solid boxes ([`crate::world::BoxVolume`]).
     ///
     /// **Divergence resolved.** `main.js:980` derives `2.2 * SHIP_SCALE` = 3.3
     /// for the local player; `bot.js:31` hard-codes `SHIP_RADIUS = 3.5` for
@@ -598,8 +598,56 @@ pub struct WeaponRules {
     /// Bullet collision radius, added to whatever it is testing against.
     /// `bullets.js:8` (`RADIUS`).
     pub bullet_radius: f64,
-    /// Muzzle offset from the ship origin, in ship local space.
-    /// `main.js:1032` (`MUZZLE_OFFSETS`, a single-element array).
+    /// Muzzle offset from the ship origin, in ship-local space — nose is `+z`,
+    /// `+y` is up, `+x` is one wing.
+    ///
+    /// **Which wing `+x` is, since it catches people:** the pilot's *left*.
+    /// [`crate::math::right`] calls it "right", but with the nose at `+z` and up
+    /// at `+y` this frame is left-handed for viewing, and `+x` lands on the left
+    /// of the screen. `cockpit.rs` is the witness — it puts the `TGT`
+    /// annunciator at `+x` and `MSL` at `-x`, and `TGT` is the one on the left.
+    /// Nothing here depends on it; the gun is on the centreline.
+    ///
+    /// **Off the centreline, because the hull is an aeroplane now.** The JS's
+    /// `MUZZLE_OFFSETS` (`main.js:1032`, a single-element array) is
+    /// `(0, 0, 0.6)`: 0.6 units forward, on the axis. On `spaceship.glb` — a
+    /// blob whose origin sits well forward of its body — that was merely inside
+    /// the hull. On `jet.glb` it is inside the *fuselage and level with the
+    /// pilot*, so every round was born 7.4 units **behind** the seat and flew
+    /// forward through the canopy. That is the reported "you can see them in the
+    /// cockpit", and it was not a rendering bug.
+    ///
+    /// # The measurement
+    ///
+    /// `jet.glb`'s 8 069 vertices walked with their node transforms applied,
+    /// rotated by `ship.js`'s -90° yaw and put through `scene::ship_fit` —
+    /// a scale of 2.43 about an origin shifted `(0, 0.20, 1.98)` nose-ward.
+    /// That is *this* space: world units from the ship's own origin, which is
+    /// what [`crate::bullets::muzzle_origin`] adds to `Ship::pos`.
+    ///
+    /// | | x | y | z |
+    /// |---|---|---|---|
+    /// | Whole aircraft | ±5.06 | −1.14 … +2.12 | −2.02 … +11.64 |
+    /// | Canopy glass (`Accent_Cockpit`) | ±0.65 | +0.02 … +0.86 | +6.71 … +9.61 |
+    /// | Radome, its last 1.1 units | ±0.44 | −0.82 … −0.02 | +10.5 … +11.64 |
+    /// | Pilot's eye (`cockpit.rs`'s `JET_PROFILE`) | 0 | +0.78 | +7.97 |
+    ///
+    /// The airframe is 13.65 long, 10.13 across and 3.26 deep. The gun goes
+    /// **ahead of and under the radome**: 0.56 past the nose tip, and 0.3 below
+    /// the underside line the nose is on when it gets there. From the seat that
+    /// leaves the muzzle behind the aircraft's own nose, so the flash is
+    /// occluded and the tracer appears a couple of units out, already clear of
+    /// the airframe — a gunsight view. From the chase camera (11 back, 5.6 up,
+    /// `client/src/camera.rs`) it is a flash off the nose.
+    ///
+    /// # Why it is so far forward
+    ///
+    /// Because the *model* is. The hull reaches 11.64 ahead of the origin while
+    /// [`ShipRules::hit_radius`] is 6.0, so the drawn aeroplane is a good deal
+    /// bigger than the sphere the simulation shoots at. The gun therefore has a
+    /// dead zone of `12.2 - (hit_radius + bullet_radius)` = 5.7 units — entirely
+    /// inside the 6.6 at which two ships have already collided
+    /// ([`ShipRules::collide_radius`]), so nothing shootable lives in it.
     pub muzzle_offset: Vec3,
     /// Maximum beam length. `main.js:1039` (`BEAM_RANGE`).
     pub beam_range: f64,
@@ -645,9 +693,40 @@ pub struct WeaponRules {
     pub missile_radius: f64,
     /// Missiles carried. `main.js:1091` (`MISSILE_MAX`).
     pub missile_max: u8,
-    /// How far ahead of the ship a missile spawns. `main.js:1427` and
-    /// `main.js:2504`, both `addScaledVector(fwd, 6)`.
-    pub missile_spawn_offset: f64,
+    /// One missile station, in ship-local space; the other is its mirror in
+    /// `x`, and consecutive rounds alternate between them.
+    /// [`crate::missiles::hardpoint`] is the one place that decides which.
+    ///
+    /// This is the `+x` station, which is the pilot's **left** wing — see the
+    /// note on [`Self::muzzle_offset`] about which way `+x` actually points.
+    ///
+    /// **Was a scalar `6.0` along the nose** — `main.js:1427` and
+    /// `main.js:2504`, both `addScaledVector(fwd, 6)`. A scalar can only put a
+    /// missile on the centreline, which on this airframe is inside the
+    /// fuselage, level with the pilot's knees. Aeroplanes carry them under the
+    /// wing.
+    ///
+    /// # The measurement
+    ///
+    /// Same survey as [`Self::muzzle_offset`], same space. The wing is a flat
+    /// lower skin running from `|x|` 2.6 out to the 5.06 tip at `y ≈ −0.42`,
+    /// and at `|x| = 3.4` its chord spans `z` −1.7 … +4.2. So:
+    ///
+    /// - `x = ±3.4` — 67 % of semi-span, well outboard of the canted fins
+    ///   (`|x|` 2.0…2.5) and of anything the fuselage occupies.
+    /// - `z = +2.4` — mid-chord, where a pylon hangs, rather than off the
+    ///   trailing edge.
+    /// - `y = −1.5` — 1.08 below the skin, which is what it takes to clear the
+    ///   drawn missile's 1.0-unit fin half-span (`weapons.rs`'s
+    ///   `MISSILE_FIN_SPAN`) instead of launching it through the wing.
+    ///
+    /// # Two stations rather than one
+    ///
+    /// A pair is what the airframe has, and a four-round salvo all leaving the
+    /// same wing reads as a bug. The side is a pure function of rounds
+    /// remaining, so alternating costs no field on [`crate::world::Ship`], no
+    /// entry in the replay format, and nothing to keep in sync across the wire.
+    pub missile_hardpoint: Vec3,
     /// Minimum lookahead distance for missile obstacle avoidance.
     /// `missiles.js:6` (`AVOID_BASE_LOOKAHEAD`).
     pub missile_avoid_base_lookahead: f64,
@@ -743,7 +822,7 @@ impl WeaponRules {
         bullet_speed: 780.0,
         bullet_life: 2.0,
         bullet_radius: 0.5,
-        muzzle_offset: Vec3::new(0.0, 0.0, 0.6),
+        muzzle_offset: Vec3::new(0.0, -0.75, 12.2),
         beam_range: 1000.0,
         beam_forward_offset: 4.0,
 
@@ -752,7 +831,7 @@ impl WeaponRules {
         missile_life: 8.0,
         missile_radius: 0.5,
         missile_max: 4,
-        missile_spawn_offset: 6.0,
+        missile_hardpoint: Vec3::new(3.4, -1.5, 2.4),
         missile_avoid_base_lookahead: 130.0,
         missile_avoid_radius_scale: 3.2,
         missile_avoid_margin: 4.0,
@@ -983,7 +1062,8 @@ pub struct CombatRules {
     /// so a collision adds energy — that is intentional, it makes rocks feel
     /// like they kick.
     pub collision_restitution: f64,
-    /// Restitution when a ship is pushed out of a box (mothership, airfield).
+    /// Restitution when a ship is pushed out of a box — an airfield, now that
+    /// the space map has none.
     /// `main.js:2123` (`collideSphereWithBox`), the literal `1.4`.
     pub box_collision_restitution: f64,
     /// Vertical velocity multiplier when a ship is stopped by terrain.
@@ -1243,7 +1323,27 @@ pub struct AsteroidZone {
     pub y_range: f64,
 }
 
-/// Fixed world geometry: the moon, the two capital platforms, and the terrain.
+/// Fixed world geometry: the moon, the airfields, and the terrain.
+///
+/// # The motherships are gone
+///
+/// `main.js:140`/`:154` parks two 90×36×70 hulls at `z = ±600`, one per team,
+/// and everything on the space map was arranged around them — spawns at the
+/// hangar mouth ([`SpawnRules::space_z`]), a collision box each in
+/// [`crate::world::World::new`], an avoidance volume each in
+/// [`crate::asteroids::avoid_volumes`], and a mesh in `client/src/scene.rs`.
+///
+/// They made sense when a spawn was a teleport: you appeared next to a parked
+/// carrier and flew out of it. Arrivals warp in now, so the fiction they carried
+/// is already told by something else, and what was left was a pair of boxes to
+/// bounce off 600 units from the fight. All four of the above are removed
+/// rather than the mesh being hidden — a hidden mesh is still a wall.
+///
+/// **The JS game keeps them.** `server/index.js` and `public/src/mothership.js`
+/// are untouched, so a browser player in a Node-hosted match still sees, and
+/// still collides with, hulls that are not in this world. See
+/// `crate::asteroids::avoid_volumes` for what that costs in practice, which is
+/// almost nothing: nothing else in the arena depended on them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorldRules {
     /// Moon radius, used both as a collision sphere and as the instant-death
@@ -1256,12 +1356,6 @@ pub struct WorldRules {
     /// Kept as a box because that is the shape `clipsAvoidance` tests.
     pub moon_avoid_half: Vec3,
 
-    /// Mothership box half-extents. `main.js:140` (`MOTHERSHIP_HALF`) and
-    /// `server/index.js:527` — both `(45, 18, 35)`.
-    pub mothership_half: Vec3,
-    /// Mothership z positions, at `±mothership_z`. `main.js:154`/`:157` and
-    /// `server/index.js:527`–`:519` — both ∓600.
-    pub mothership_z: f64,
     /// Airfield box half-extents on the terrain map. `airfield.js:2`
     /// (`AIRFIELD_HALF`).
     pub airfield_half: Vec3,
@@ -1322,8 +1416,6 @@ impl WorldRules {
         moon_pos: Vec3::ZERO,
         moon_avoid_half: Vec3::splat(80.0),
 
-        mothership_half: Vec3::new(45.0, 18.0, 35.0),
-        mothership_z: 600.0,
         airfield_half: Vec3::new(280.0, 4.0, 190.0),
         airfield_z: 1400.0,
         airfield_elevation: 210.0,
@@ -1358,8 +1450,14 @@ impl WorldRules {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpawnRules {
     /// Team spawn z on the space map, at `∓space_z`. `main.js:228`/`:3328` and
-    /// `server/index.js:480`–`:472` — both ∓540, 60 units in front of the
-    /// mothership hull so the ship starts at the hangar mouth.
+    /// `server/index.js:480`–`:472` — both ∓540.
+    ///
+    /// The JS chose 540 because it is 25 units off the front face of a
+    /// mothership hull, so a ship started at the hangar mouth. The hulls are
+    /// gone ([`WorldRules`]) and the number is kept anyway: it is the distance
+    /// the two teams start apart that the match is balanced around, and nothing
+    /// about it depended on there being a hangar to leave. Moving it would
+    /// change every space match's opening; deleting the hangar does not.
     pub space_z: f64,
     /// Team spawn y on the space map. `server/index.js:509` centres on 0.
     pub space_y: f64,
@@ -1370,8 +1468,10 @@ pub struct SpawnRules {
     /// scatters `(60, 20, 60)`, i.e. ±(30, 10, 30) — ten times wider.
     ///
     /// Unified on the **server's `(8, 4, 6)`**: the tight box is the one that
-    /// was tuned against the mothership hangar mouth, and the wide one drops
-    /// solo players outside it, sometimes clipping the hull on frame one.
+    /// was tuned against the mothership hangar mouth, and the wide one dropped
+    /// solo players outside it, sometimes clipping the hull on frame one. There
+    /// is no hull to clip any more, but a formation that arrives together still
+    /// beats one scattered over 60 units.
     pub space_jitter: Vec3,
 
     /// Team spawn z on the terrain map, at `∓terrain_z`.
@@ -1788,6 +1888,14 @@ impl CampaignRules {
 /// is one bullet simulation in this port, using
 /// [`ShipRules::hit_radius`] + [`WeaponRules::bullet_radius`] like everything
 /// else.
+///
+/// Nor is the bot's **muzzle** here any more. `bot.js:304` puts a bot's rounds
+/// 2.5 units ahead of it along the nose, which is a second answer to a question
+/// [`WeaponRules::muzzle_offset`] already answers — and once that offset
+/// described a real gun port on a real airframe, the second answer was a bot
+/// firing out of the middle of its own fuselage while a player fired from under
+/// the nose. Same aircraft, same gun: [`crate::bot`] goes through
+/// [`crate::bullets::muzzle_origin`] like the player does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BotRules {
     /// Cruise speed. `bot.js:15` (`SPEED`).
@@ -1812,8 +1920,6 @@ pub struct BotRules {
     /// Gun cooldown on hard difficulty. `bot.js:19` (the `? 0.05` branch) —
     /// three times the rate of fire, a ratio held across the retune above.
     pub fire_cooldown_hard: f64,
-    /// Muzzle offset ahead of the bot. `bot.js:304`.
-    pub muzzle_offset: f64,
 
     /// Closest range at which a bot will launch a missile. `bot.js:21`
     /// (`MISSILE_MIN_RANGE`).
@@ -1959,7 +2065,6 @@ impl BotRules {
         // than its old absolute value, so "secret hard mode" still means "three
         // times the rate of fire" and not "six times".
         fire_cooldown_hard: 0.10,
-        muzzle_offset: 2.5,
 
         missile_min_range: 130.0,
         missile_max_range: 560.0,

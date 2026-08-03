@@ -939,7 +939,7 @@ fn fire_weapons(
         }
 
         if input.fire {
-            let basis = basis_of(world.ships[i].quat);
+            let basis = ShipBasis::of(world.ships[i].quat);
             // The outcome — cooling, overheated, or a shot — is already
             // reflected in the ship's own state and in `bullet_out`; the HUD
             // reads `ammo01` rather than a per-frame verdict.
@@ -1031,15 +1031,6 @@ fn launch_emp(world: &mut World, id: EntityId, out: &mut Out) {
     });
     if world.authority == Authority::Server && world.local_id == Some(id) {
         out.net.push(NetIntent::Emp { pos: origin });
-    }
-}
-
-/// A ship's local axes in world space, for the muzzle transform.
-fn basis_of(quat: Quat) -> ShipBasis {
-    ShipBasis {
-        right: math::right(quat),
-        up: math::up(quat),
-        forward: math::forward(quat),
     }
 }
 

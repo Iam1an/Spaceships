@@ -134,10 +134,10 @@ const PLACEMENT_EPSILON: f64 = 1.0e-6;
 /// Push-out rounds in `resolve_fallback` before it gives up on axis pushes and
 /// escapes radially.
 ///
-/// A push can only be undone by a *different* volume, so with the shipped
-/// geometry (a moon at the origin and two motherships 1200 units apart, none of
-/// which overlap) one round always suffices. The budget exists for hypothetical
-/// rule sets whose avoidance volumes overlap each other.
+/// A push can only be undone by a *different* volume, and the shipped geometry
+/// is now a single moon at the origin, so one round always suffices. The budget
+/// exists for hypothetical rule sets whose avoidance volumes overlap each
+/// other — as it did when the two motherships were also in the list.
 const PUSH_ROUNDS: u32 = 8;
 
 /// Radial-escape doublings in `resolve_fallback`, the terminator of last resort.
@@ -232,10 +232,29 @@ pub fn tier_hp(tier: AsteroidTier) -> i32 {
 /// damage (`main.js:2215`) and the moon's instant kill (`main.js:2244`).
 ///
 /// It is worth noting how thoroughly dead the server's check is even on its own
-/// terms: the motherships sit at `z = ±600` with a half-depth of 35, and the
-/// field's outer radius is 400, so a candidate can never reach one.
+/// terms: the motherships sat at `z = ±600` with a half-depth of 35, and the
+/// field's outer radius is 400, so a candidate could never reach one.
 /// `clipsMothership` has never rejected a single placement in production. The
 /// only avoidance volume that ever mattered is the one the server does not have.
+///
+/// # Why there are no mothership volumes here at all now
+///
+/// The hulls are gone from the Rust world entirely
+/// ([`crate::rules::WorldRules`]), so the two boxes went with them. What that
+/// changes, exactly:
+///
+/// - **The radial field — deathmatch, trials, tutorial — is bit-identical.**
+///   Its outer radius is 400 and the nearest hull face was 565, so the filter
+///   could not fire and the accept/reject stream is unchanged.
+///   `the_removed_mothership_volumes_were_outside_the_radial_field` pins the
+///   arithmetic.
+/// - **The campaign field changes for some seeds.** Its third slab runs to
+///   `z = 540` ([`crate::rules::CAMPAIGN_ASTEROID_ZONES`]) and a *huge* rock
+///   there carries 61 units of clearance, which did reach past 565 near the
+///   centreline. Those placements were rejected and re-rolled; they are
+///   accepted now. This is the correct outcome — there is no longer anything at
+///   `z = 600` for a rock to be inside of — but it does mean campaign asteroid
+///   layouts differ from the previous build at the same seed.
 ///
 /// The campaign generator is worse still — `genCampaignAsteroids`
 /// (`main.js:237`) performs no avoidance test whatsoever, and its middle zone
@@ -253,8 +272,8 @@ pub fn tier_hp(tier: AsteroidTier) -> i32 {
 /// sphere — because that is what `moonAvoid` is and what `clipsAvoidance` tests.
 /// It is strictly more conservative than the sphere (it contains it), so
 /// clearing the box also clears the moon itself, which is what
-/// `no_generated_asteroid_is_inside_the_moon_or_a_mothership` asserts against
-/// the true sphere.
+/// `no_generated_asteroid_is_inside_the_moon` asserts against the true
+/// sphere.
 ///
 /// The test itself is [`sphere_overlaps_aabb`] rather than the per-axis
 /// comparison the JS uses, because the JS version rejects a *box*-shaped region
@@ -269,17 +288,10 @@ pub fn avoid_volumes(rules: &Rules, map: MapKind) -> Vec<Aabb> {
     if !matches!(map, MapKind::Space) {
         return out;
     }
-    // Moon first: it is the volume that actually rejects placements, so testing
-    // it first rejects earliest. Order does not affect *which* candidates are
-    // accepted, only how quickly.
+    // The moon is now the whole list — see the section above on the two
+    // mothership volumes that used to follow it and never rejected anything.
     if rules.world.asteroid_field.avoid_moon {
         out.push(Aabb::new(rules.world.moon_pos, rules.world.moon_avoid_half));
-    }
-    for z in [-rules.world.mothership_z, rules.world.mothership_z] {
-        out.push(Aabb::new(
-            Vec3::new(0.0, 0.0, z),
-            rules.world.mothership_half,
-        ));
     }
     out
 }
@@ -623,8 +635,8 @@ pub fn generate_radial_field(
 
 /// Generates a campaign field: three boxed slabs along the flight path.
 ///
-/// This is `genCampaignAsteroids` (`main.js:237`), with the moon and mothership
-/// avoidance it never had and without the double spin scaling it did have. Zones
+/// This is `genCampaignAsteroids` (`main.js:237`), with the moon avoidance it
+/// never had and without the double spin scaling it did have. Zones
 /// are filled in [`crate::rules::CampaignRules::asteroid_zones`] order and ids
 /// run from `first_id` upward across all three.
 #[must_use]
@@ -1081,22 +1093,12 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn no_generated_asteroid_is_inside_the_moon_or_a_mothership() {
-        // The server's `clipsMothership` checks only the motherships, so
+    fn no_generated_asteroid_is_inside_the_moon() {
+        // The server's `clipsMothership` checked only the motherships, so
         // multiplayer rocks generate inside the moon, where they eat bullets
-        // invisibly. Every field shape, over many seeds, must now clear both.
+        // invisibly. Every field shape, over many seeds, must now clear it.
         let rules = rules();
         let moon = Sphere::new(rules.world.moon_pos, rules.world.moon_radius);
-        let boxes = [
-            Aabb::new(
-                Vec3::new(0.0, 0.0, -rules.world.mothership_z),
-                rules.world.mothership_half,
-            ),
-            Aabb::new(
-                Vec3::new(0.0, 0.0, rules.world.mothership_z),
-                rules.world.mothership_half,
-            ),
-        ];
 
         let mut checked = 0usize;
         for seed in 0..40u64 {
@@ -1120,14 +1122,6 @@ mod tests {
                         a.pos,
                         a.radius
                     );
-                    for b in &boxes {
-                        assert!(
-                            !sphere_overlaps_aabb(body, *b),
-                            "{mode:?} seed {seed}: rock {} at {:?} clips a mothership",
-                            a.id,
-                            a.pos
-                        );
-                    }
                     checked += 1;
                 }
             }
@@ -1241,25 +1235,32 @@ mod tests {
     fn avoid_volumes_follow_the_map_and_the_rule() {
         let rules = rules();
         let space = avoid_volumes(&rules, MapKind::Space);
-        assert_eq!(space.len(), 3, "moon plus two motherships");
+        assert_eq!(space.len(), 1, "the moon, and nothing else");
         assert_eq!(space[0].half_extents, Vec3::splat(80.0));
         assert!(avoid_volumes(&rules, MapKind::Terrain).is_empty());
 
         // The bug state, reachable only by hand: `Rules::validate` rejects it.
         let mut no_moon = rules;
         no_moon.world.asteroid_field.avoid_moon = false;
-        assert_eq!(avoid_volumes(&no_moon, MapKind::Space).len(), 2);
+        assert!(avoid_volumes(&no_moon, MapKind::Space).is_empty());
         assert!(no_moon.validate().is_err());
     }
 
     #[test]
-    fn the_servers_mothership_filter_never_had_anything_to_reject() {
-        // Worth pinning because it explains why the moon was the only volume
-        // that ever mattered: the motherships sit at |z| = 600 with a half-depth
-        // of 35, and the field's outer radius is 400, so a radial candidate can
-        // never reach one. `clipsMothership` is dead code in production.
+    fn the_removed_mothership_volumes_were_outside_the_radial_field() {
+        // Why deleting the motherships costs the radial field nothing, and why
+        // the server's `clipsMothership` was dead code before that: the hulls
+        // sat at |z| = 600 with a half-depth of 35 — the JS numbers, written out
+        // here because `WorldRules` no longer carries them — so the nearest face
+        // was at 565, and no candidate drawn inside a 400-unit sphere can reach
+        // it. Nothing was ever rejected, so nothing about the accept/reject
+        // stream moves when the volumes go.
+        //
+        // The campaign field is the exception and is *not* covered here: its
+        // third slab runs to z = 540 and a huge rock's clearance did cross 565.
+        // See `avoid_volumes`.
         let rules = rules();
-        let nearest_face = rules.world.mothership_z - rules.world.mothership_half.z;
+        let nearest_face = 600.0 - 35.0;
         assert!(
             rules.world.asteroid_field.radius < nearest_face,
             "field radius {} vs nearest mothership face {nearest_face}",
@@ -1439,8 +1440,8 @@ mod tests {
         // Pinned because it is load-bearing elsewhere: `ship::depenetrate`
         // iterates precisely because a ship can end a step inside two rocks at
         // once, and this is why that is not a hypothetical. Placement is tested
-        // against the moon and the motherships (`avoid_volumes`) and never
-        // against another rock — in all three JS generators, and here.
+        // against the moon (`avoid_volumes`) and never against another rock —
+        // in all three JS generators, and here.
         //
         // Not a bug to be fixed by separating them: a field of touching rocks is
         // what an asteroid field looks like, and it is what the campaign's three

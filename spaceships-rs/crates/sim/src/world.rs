@@ -172,8 +172,8 @@ impl Team {
 // ---------------------------------------------------------------------------
 
 /// Which map a match is played on. Decides gravity-adjacent rules: the space
-/// map has a moon and motherships, the terrain map has ground, airfields, and a
-/// kill plane.
+/// map has a moon and nothing else solid, the terrain map has ground,
+/// airfields, and a kill plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MapKind {
     /// Open space around a moon at the origin. `main.js:102`
@@ -856,9 +856,11 @@ pub struct Obstacle {
     pub radius: f64,
 }
 
-/// An axis-aligned box a ship is pushed out of: a mothership or an airfield.
+/// An axis-aligned box a ship is pushed out of: an airfield.
 ///
-/// `main.js:163` (`motherships`). Ships bounce off these
+/// `main.js:163` (`motherships`) is where the shape came from; the space map's
+/// two hulls are gone (see [`crate::rules::WorldRules`]) and the terrain map's
+/// landing pads are the only boxes left. Ships bounce off these
 /// ([`crate::rules::CombatRules::box_collision_restitution`]) rather than
 /// taking damage.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1213,7 +1215,7 @@ pub struct World {
     pub asteroids: Vec<Asteroid>,
     /// Indestructible spheres — the moon.
     pub obstacles: Vec<Obstacle>,
-    /// Solid boxes — motherships or airfields.
+    /// Solid boxes — the airfields, on the terrain map. Empty in space.
     pub boxes: Vec<BoxVolume>,
 
     /// Match clock and scoring.
@@ -1241,8 +1243,11 @@ impl World {
     /// No ships, no asteroids: those come from a spawn pass and the field
     /// generator, which are other modules' work. What this does own is the
     /// invariant that the moon exists on the space map and nowhere else, and
-    /// that both platform boxes are present with the right half-extents — the
+    /// that the airfield boxes exist on the terrain map and nowhere else — the
     /// facts the asteroid generator needs before it can avoid them.
+    ///
+    /// Space has no boxes at all since the motherships were removed, which is
+    /// why the space arm below builds only the moon.
     #[must_use]
     pub fn new(seed: u64, rules: Rules, mode: Mode, map: MapKind) -> World {
         let mut obstacles = Vec::new();
@@ -1253,12 +1258,8 @@ impl World {
                     pos: rules.world.moon_pos,
                     radius: rules.world.moon_radius,
                 });
-                for z in [-rules.world.mothership_z, rules.world.mothership_z] {
-                    boxes.push(BoxVolume {
-                        pos: Vec3::new(0.0, 0.0, z),
-                        half: rules.world.mothership_half,
-                    });
-                }
+                // No boxes. The two motherships that used to sit at `z = ±600`
+                // are gone; see [`crate::rules::WorldRules`].
             }
             MapKind::Terrain => {
                 // On the mesa, not at sea level: `airfield_elevation` is the
@@ -2338,15 +2339,19 @@ mod tests {
     }
 
     #[test]
-    fn space_world_gets_the_moon_and_both_motherships() {
+    fn the_space_world_is_a_moon_and_nothing_else_solid() {
         let w = world();
         assert_eq!(w.obstacles.len(), 1, "the moon is the only obstacle");
         assert_eq!(w.obstacles[0].radius, 80.0);
         assert_eq!(w.obstacles[0].pos, Vec3::ZERO);
-        assert_eq!(w.boxes.len(), 2);
-        assert_eq!(w.boxes[0].pos.z, -600.0);
-        assert_eq!(w.boxes[1].pos.z, 600.0);
-        assert_eq!(w.boxes[0].half, Vec3::new(45.0, 18.0, 35.0));
+        // The two mothership hulls at z = ±600 were the only boxes space ever
+        // had. Removing them means removing the collision, not hiding a mesh —
+        // this is the assertion that says so.
+        assert!(
+            w.boxes.is_empty(),
+            "no motherships to bounce off: {:?}",
+            w.boxes
+        );
     }
 
     #[test]

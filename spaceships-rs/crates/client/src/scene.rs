@@ -72,7 +72,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::{Shader, ShaderRef};
 use bevy::world_serialization::{WorldAsset, WorldAssetRoot, WorldInstanceReady};
-use std::f32::consts::{FRAC_PI_2, PI};
+use std::f32::consts::FRAC_PI_2;
 
 use spaceships_protocol::{ClientMessage, ServerMessage};
 use spaceships_sim as sim;
@@ -422,12 +422,17 @@ const TELEPORT_DOT: f32 = std::f32::consts::FRAC_1_SQRT_2;
 #[derive(Component)]
 pub struct ShipRoot(pub sim::world::EntityId);
 
-/// A prop that only exists on the space map: the moon and the two motherships.
+/// A prop that only exists on the space map: the moon.
 ///
-/// [`crate::terrain`] hides these rather than despawning them, because their
-/// meshes and materials are built once in [`setup`] and rebuilding them on
-/// every lobby round trip would be work for nothing. Everything marked here is
-/// a root with `Visibility`, so hiding the root hides its children too.
+/// It was the moon *and the two team motherships*, until the motherships were
+/// removed — mesh, collision box, avoidance volume and all. See
+/// [`spaceships_sim::rules::WorldRules`] for why, and note that hiding the mesh
+/// would not have been the fix: the hulls were solid.
+///
+/// [`crate::terrain`] hides what is marked here rather than despawning it,
+/// because the meshes and materials are built once in [`setup`] and rebuilding
+/// them on every lobby round trip would be work for nothing. Everything marked
+/// is a root with `Visibility`, so hiding the root hides its children too.
 #[derive(Component)]
 pub(crate) struct SpaceScenery;
 
@@ -1398,8 +1403,8 @@ fn setup(
             rules.world.moon_pos.z as f32,
         )
         // Stand the moon up. Bevy's UV sphere puts its poles on ±Z, and the
-        // match runs down the Z axis — spawns at ∓540, motherships at ±600 — so
-        // the pole pointed straight down the flight corridor and the face
+        // match runs down the Z axis — the two teams spawn at ∓540 — so the
+        // pole pointed straight down the flight corridor and the face
         // everyone saw was the one part of an equirectangular map with nothing
         // on it. A quarter turn about X sends the pole to +Y and turns the
         // equator, where the maria are, toward the player.
@@ -1413,9 +1418,6 @@ fn setup(
         // is empty on that map.
         SpaceScenery,
     ));
-
-    // -- Motherships ----------------------------------------------------------
-    install_motherships(&mut commands, &mut meshes, &mut materials, &rules);
 
     // -- Shared handles -------------------------------------------------------
     // The rock shader is compiled in rather than loaded; see
@@ -1451,192 +1453,6 @@ fn setup(
             },
         }),
     });
-}
-
-/// The two team hulls from `mothership.js`, at `±mothership_z`.
-///
-/// Every dimension is derived from [`WorldRules::mothership_half`], which is
-/// the box `resolve_world_collisions` already bounces ships off — so the thing
-/// you see and the thing you hit cannot drift apart. It happens to be exactly
-/// the JS's `W = 90, H = 36, L = 70`, which is the point.
-///
-/// Meshes and materials are built once and shared by both ships, so the pair
-/// costs the batch keys of one. The hangar mouth is at local `+z` and the far
-/// mothership is turned to face the middle, matching `main.js:158`.
-///
-/// [`WorldRules::mothership_half`]: sim::rules::WorldRules::mothership_half
-fn install_motherships(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-    rules: &sim::rules::Rules,
-) {
-    let half = rules.world.mothership_half;
-    let (w, h, l) = (
-        half.x as f32 * 2.0,
-        half.y as f32 * 2.0,
-        half.z as f32 * 2.0,
-    );
-
-    // Straight off `mothership.js` — and deliberately *not* the ship's
-    // `0.55 / 0.34`. Ultra's `sweepScene` only passes `metalness`/`roughness`
-    // for the object literally named `Ship`; everything else keeps what it was
-    // authored with and only picks up the anisotropy and env-intensity sweep.
-    let hull = materials.add(StandardMaterial {
-        base_color: hex(0x4a_5366).into(),
-        perceptual_roughness: 0.5,
-        metallic: 0.55,
-        ..default()
-    });
-    let accent = materials.add(StandardMaterial {
-        base_color: hex(0x22_2a36).into(),
-        perceptual_roughness: 0.7,
-        metallic: 0.45,
-        ..default()
-    });
-    let recess = materials.add(StandardMaterial {
-        base_color: hex(0x0a_1220).into(),
-        perceptual_roughness: 0.9,
-        ..default()
-    });
-    // The three `MeshBasicMaterial`s. See [`glow`].
-    let engine_glow = materials.add(glow(hex(0xff_7733), GLOW_BOOST));
-    let door_glow = materials.add(StandardMaterial {
-        // The plane's `opacity: 0.65` folded into the colour, because the
-        // additive blend has no use for an alpha channel and leaving it there
-        // only invites a question about which of the two is doing the work.
-        alpha_mode: AlphaMode::Add,
-        ..glow(hex(0x66_ccff), GLOW_BOOST * 0.65)
-    });
-    let runway = materials.add(glow(hex(0xff_d97a), GLOW_BOOST));
-
-    let hull_mesh = meshes.add(Cuboid::new(w, h, l));
-    let stripe_mesh = meshes.add(Cuboid::new(w * 1.005, 1.6, l * 1.005));
-    let ring_mesh = meshes.add(Cylinder::new(3.5, 2.0));
-    let ring_glow_mesh = meshes.add(Circle::new(3.2));
-
-    // The hangar mouth. `mothership.js:33` onwards, with the depths named so
-    // the shield plane's own z can be *derived* from the two solids it has to
-    // sit in front of rather than transcribed — see `door_z`.
-    let (door_w, door_h) = (32.0f32, 18.0f32);
-    let (frame_z, frame_d) = (l / 2.0 + 0.1, 1.2);
-    let (inset_z, inset_d) = (l / 2.0 - 2.0, 6.0);
-    let frame_mesh = meshes.add(Cuboid::new(door_w + 4.0, door_h + 4.0, frame_d));
-    let inset_mesh = meshes.add(Cuboid::new(door_w, door_h, inset_d));
-    let door_mesh = meshes.add(Rectangle::new(door_w - 1.0, door_h - 1.0));
-    let lamp_mesh = meshes.add(Sphere::new(0.4).mesh().uv(6, 4));
-
-    // **The one number here that is not the JS's.**
-    //
-    // `mothership.js:56` puts the shield plane at `L / 2 + 0.55`, which is
-    // behind *both* solids at the mouth: the frame slab's front face is at
-    // `L / 2 + 0.7` and the recess box's is at `L / 2 + 1.0`, so the plane is
-    // depth-rejected and draws nothing. Confirmed on screen — the blue in the
-    // JS hangar is its point light, and the additive plane it is supposedly
-    // there for has never been visible.
-    //
-    // Derived rather than transcribed so it cannot come loose if either solid
-    // is retuned, and called out because everything else about this hull is a
-    // transcription: a silent 0.65 would be exactly the kind of drift
-    // `rules.rs` exists to prevent.
-    let door_z = (frame_z + frame_d / 2.0).max(inset_z + inset_d / 2.0) + 0.2;
-
-    for z in [-rules.world.mothership_z, rules.world.mothership_z] {
-        let facing = if z > 0.0 {
-            Quat::from_rotation_y(PI)
-        } else {
-            Quat::IDENTITY
-        };
-        commands
-            .spawn((
-                Transform::from_xyz(0.0, 0.0, z as f32).with_rotation(facing),
-                Visibility::default(),
-                // `graphics.js`: big background props stay out of the shadow
-                // pass. A 90-unit box 600 units out contributes nothing a
-                // two-cascade map can resolve.
-                NotShadowCaster,
-                // `main.js:142` swaps these for `createAirfield` on the terrain
-                // map. The collision boxes swap with them in
-                // `sim::world::World::new`, so hiding the mesh is the whole of
-                // the renderer's half.
-                SpaceScenery,
-            ))
-            .with_children(|hull_of| {
-                hull_of.spawn((Mesh3d(hull_mesh.clone()), MeshMaterial3d(hull.clone())));
-
-                for y in [-10.0f32, 10.0] {
-                    hull_of.spawn((
-                        Mesh3d(stripe_mesh.clone()),
-                        MeshMaterial3d(accent.clone()),
-                        Transform::from_xyz(0.0, y, 0.0),
-                    ));
-                }
-
-                // Three engine bells out the back, each with an additive disc
-                // behind it. Bevy's `Cylinder` is Y-up like three's, so the
-                // quarter-turn about X is the same correction.
-                for x in [-22.0f32, 0.0, 22.0] {
-                    hull_of.spawn((
-                        Mesh3d(ring_mesh.clone()),
-                        MeshMaterial3d(accent.clone()),
-                        Transform::from_xyz(x, -2.0, -l / 2.0 - 0.5)
-                            .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
-                    ));
-                    hull_of.spawn((
-                        Mesh3d(ring_glow_mesh.clone()),
-                        MeshMaterial3d(engine_glow.clone()),
-                        Transform::from_xyz(x, -2.0, -l / 2.0 - 1.6)
-                            .with_rotation(Quat::from_rotation_y(PI)),
-                    ));
-                }
-
-                // The hangar mouth: a raised frame, a dark recess, and the
-                // shield plane across it.
-                hull_of.spawn((
-                    Mesh3d(frame_mesh.clone()),
-                    MeshMaterial3d(accent.clone()),
-                    Transform::from_xyz(0.0, 0.0, frame_z),
-                ));
-                hull_of.spawn((
-                    Mesh3d(inset_mesh.clone()),
-                    MeshMaterial3d(recess.clone()),
-                    Transform::from_xyz(0.0, 0.0, inset_z),
-                ));
-                hull_of.spawn((
-                    Mesh3d(door_mesh.clone()),
-                    MeshMaterial3d(door_glow.clone()),
-                    Transform::from_xyz(0.0, 0.0, door_z),
-                    NotShadowCaster,
-                ));
-                hull_of.spawn((
-                    PointLight {
-                        color: hex(0x66_ccff).into(),
-                        intensity: 4.0e6,
-                        range: 100.0,
-                        // 0.19's name for `shadows_enabled`, same as on
-                        // `DirectionalLight` above.
-                        shadow_maps_enabled: false,
-                        ..default()
-                    },
-                    Transform::from_xyz(0.0, 0.0, l / 2.0 + 6.0),
-                ));
-
-                // Approach lights along the lip, six a side.
-                for i in [-3i32, -2, -1, 1, 2, 3] {
-                    for y in [-10.0f32, 10.0] {
-                        hull_of.spawn((
-                            Mesh3d(lamp_mesh.clone()),
-                            MeshMaterial3d(runway.clone()),
-                            Transform::from_xyz(
-                                (i as f32 / 3.0) * (w / 2.0 - 4.0),
-                                y,
-                                l / 2.0 + 0.3,
-                            ),
-                        ));
-                    }
-                }
-            });
-    }
 }
 
 /// A `MeshBasicMaterial` stand-in: unlit, with its colour pushed past 1.0.

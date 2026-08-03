@@ -1090,9 +1090,12 @@ fn a_shot_fired_this_step_is_resolved_on_the_next_one() {
     // `prev_pos == pos`; without it a bullet would sweep backwards through the
     // ship that fired it on its first step.
     let rules = Rules::DEFAULT;
-    // Five units downrange: the muzzle sits 0.6 ahead of the nose, so the bolt
-    // is born already inside the target's 6.5-unit reach.
-    let mut world = duel(5.0);
+    // Fourteen units downrange. The muzzle sits 12.2 ahead of the ship's origin
+    // and 0.75 under it (`WeaponRules::muzzle_offset` — the gun is under the
+    // nose of a 13.65-unit airframe), so the bolt is born 1.95 from the target
+    // and already inside its 6.5-unit reach. The old 5.0 was chosen against a
+    // 0.6 muzzle and now puts the target *behind* the gun.
+    let mut world = duel(14.0);
 
     tick(&mut world, &[hold_trigger(1)], &[], TICK_DT);
     assert_eq!(world.bullets.len(), 1, "the trigger must produce a round");
@@ -1135,13 +1138,21 @@ fn bots_move_before_they_fire() {
     for _ in 0..600 {
         tick(&mut world, &[idle(1)], &[], TICK_DT);
         if let Some(bullet) = world.bullets.iter().find(|b| b.owner == 2) {
-            let bot_pos = world.ship(2).expect("bot").pos;
-            let offset = bullet.prev_pos.distance(bot_pos);
+            let bot = world.ship(2).expect("bot");
+            // The bot fires through the player's launcher, so its round is born
+            // at the player's gun port — `bot.js:304`'s own 2.5-ahead is gone.
+            // A step of movement would move it by at most `speed * TICK_DT`.
+            let want = spaceships_sim::bullets::muzzle_origin(
+                bot.pos,
+                spaceships_sim::bullets::ShipBasis::of(bot.quat),
+                &rules,
+            );
+            let offset = bullet.prev_pos.distance(want);
             assert!(
-                offset < rules.bot.muzzle_offset + 1.0,
-                "the round was born {offset} from the bot; it should sit at the \
-                 muzzle, {} ahead of the post-move pose",
-                rules.bot.muzzle_offset
+                offset < rules.bot.speed * TICK_DT,
+                "the round was born {offset} from the muzzle of the post-move \
+                 pose; a whole step of drift is only {}",
+                rules.bot.speed * TICK_DT
             );
             return;
         }
@@ -1711,9 +1722,17 @@ fn bots_can_fly_the_terrain_map() {
         // set to the same 5 as the clearance, so a bot on the clamp sat exactly
         // on the altitude that kills it and passed only because the test is a
         // strict `<`. The floor has to be a real gap for this to mean anything.
+        //
+        // The tolerance is arithmetic, not slack. `bot::plan_bot` clamps with
+        // `pos.y = height_at(x, z) + clearance` and this recovers the clearance
+        // by subtracting the same height straight back off; over an airfield
+        // mesa at 210 units that round trip loses a few ulps, and a bot sitting
+        // exactly on the clamp reads 17.999999999999968. Asserting on the exact
+        // 18.0 makes the test a lottery on which bot happens to be on the floor.
+        const CLAMP_EPS: f64 = 1e-9;
         assert!(
-            lowest >= rules.bot.terrain_min_clearance,
-            "seed {seed}: a bot closed to {lowest:.1}, under its own {:.1} floor",
+            lowest >= rules.bot.terrain_min_clearance - CLAMP_EPS,
+            "seed {seed}: a bot closed to {lowest}, under its own {:.1} floor",
             rules.bot.terrain_min_clearance,
         );
         assert!(

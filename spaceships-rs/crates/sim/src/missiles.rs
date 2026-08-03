@@ -113,11 +113,13 @@
 //! [`SimEvent::Explosion`] and [`SimEvent::FlareBurst`] and lets the renderer
 //! decide what a detonation looks like.
 
+use crate::bullets::ShipBasis;
 use crate::collision::{
     swept_sphere_aabb, swept_sphere_sphere, swept_sphere_vs_moving_sphere, Aabb, Sphere,
 };
 use crate::math::Vec3;
 use crate::rng::Rng;
+use crate::rules::Rules;
 use crate::world::{
     is_boss_hitbox, EntityId, ExplosionKind, Flare, Missile, MissileTarget, Ship, ShipKind,
     ShooterAim, SimEvent, Team, World,
@@ -469,6 +471,30 @@ pub fn acquire_lock(world: &World, shooter: EntityId) -> Option<EntityId> {
 // Firing
 // ---------------------------------------------------------------------------
 
+/// Which station the next round comes off, in ship-local space.
+///
+/// [`crate::rules::WeaponRules::missile_hardpoint`] is the `+x` one; the other
+/// is its mirror. `rounds_left` is the count **before** the round is spent, so
+/// a full four-round load leaves `-x`, `+x`, `-x`, `+x` — alternating wings,
+/// which is the whole point.
+///
+/// A pure function of the loadout rather than a flip-flop on the ship, which is
+/// what keeps the alternation out of [`crate::world::Ship`], out of the replay
+/// format, and out of the wire — and makes it identical on the server, in a
+/// client's prediction, and in a re-simulated recording without anything having
+/// to be synchronised. The cost is that a bot carrying an odd number of rounds
+/// (`bot.missile_max` is 1, or 3 on hard) starts on the `+x` rail instead of
+/// the `-x` one, which is not a thing anybody can see.
+#[must_use]
+pub fn hardpoint(rules: &Rules, rounds_left: u8) -> Vec3 {
+    let station = rules.weapons.missile_hardpoint;
+    if rounds_left % 2 == 0 {
+        Vec3::new(-station.x, station.y, station.z)
+    } else {
+        station
+    }
+}
+
 /// Launches one missile from `shooter` at `target`, spending a round.
 ///
 /// Returns the new missile's [`Missile::key`], or `None` if the shooter does
@@ -480,21 +506,22 @@ pub fn acquire_lock(world: &World, shooter: EntityId) -> Option<EntityId> {
 /// straight until it expires or hits something, which is also what a missile
 /// does after its target dies (`missiles.js:331`).
 ///
-/// Geometry from `main.js:1426`: the missile appears
-/// [`crate::rules::WeaponRules::missile_spawn_offset`] units ahead of the ship
-/// along its nose, pointing the same way. It inherits no velocity —
-/// `missiles.js:299` sets `vel` to `dir * MISSILE_SPEED` and nothing else — so
-/// firing while boosting does not make a faster missile.
+/// Geometry: the round leaves an underwing station ([`hardpoint`]) pointing
+/// along the nose. `main.js:1426` put it 6 units straight ahead instead, on the
+/// centreline, which on the F-22 hull is inside the fuselage. It inherits no
+/// velocity — `missiles.js:299` sets `vel` to `dir * MISSILE_SPEED` and nothing
+/// else — so firing while boosting does not make a faster missile.
 pub fn fire(world: &mut World, shooter: EntityId, target: Option<EntityId>) -> Option<u64> {
-    let spawn_offset = world.rules.weapons.missile_spawn_offset;
-    let life = world.rules.weapons.missile_life;
+    let rules = world.rules;
+    let life = rules.weapons.missile_life;
 
     let ship = world.ship(shooter)?;
     if !ship.alive || ship.missiles_left == 0 {
         return None;
     }
+    let basis = ShipBasis::of(ship.quat);
     let dir = forward(ship.quat).normalize();
-    let pos = ship.pos.add_scaled(dir, spawn_offset);
+    let pos = ship.pos + basis.transform(hardpoint(&rules, ship.missiles_left));
     let owner_team = ship.team;
 
     let key = world.take_projectile_key();
@@ -1531,18 +1558,21 @@ mod tests {
     }
 
     #[test]
-    fn firing_spawns_ahead_of_the_nose_and_spends_a_round() {
+    fn firing_spawns_on_a_wing_station_and_spends_a_round() {
         let mut w = world();
         add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
         add_ship(&mut w, 2, ShipKind::Remote, v(0.0, 0.0, 400.0), Team::One);
         let loadout = w.ship(1).unwrap().missiles_left;
+        let station = w.rules.weapons.missile_hardpoint;
 
         let key = fire_locked(&mut w, 1).expect("a lock exists");
         assert_eq!(w.ship(1).unwrap().missiles_left, loadout - 1);
         assert_eq!(w.missiles.len(), 1);
         let m = w.missiles[0];
         assert_eq!(m.key, key);
-        assert_eq!(m.pos, v(0.0, 0.0, w.rules.weapons.missile_spawn_offset));
+        // Under a wing, not up the centreline. A full load starts on `-x`.
+        assert_eq!(m.pos, v(-station.x, station.y, station.z));
+        assert!(station.x > 0.0 && station.y < 0.0, "{station:?}");
         assert_eq!(m.dir, Vec3::Z);
         assert_eq!(m.target, Some(MissileTarget::Ship(2)));
         assert_eq!(m.life, w.rules.weapons.missile_life);
@@ -1552,6 +1582,46 @@ mod tests {
         // Empty rails fire nothing.
         w.ship_mut(1).unwrap().missiles_left = 0;
         assert_eq!(fire_locked(&mut w, 1), None);
+    }
+
+    #[test]
+    fn consecutive_rounds_alternate_wings() {
+        let mut w = world();
+        add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
+        add_ship(&mut w, 2, ShipKind::Remote, v(0.0, 0.0, 400.0), Team::One);
+        let station = w.rules.weapons.missile_hardpoint;
+
+        let loadout = w.ship(1).unwrap().missiles_left;
+        assert!(loadout >= 4, "the alternation needs a magazine: {loadout}");
+        for _ in 0..loadout {
+            fire_locked(&mut w, 1).expect("a lock exists");
+        }
+
+        let xs: Vec<f64> = w.missiles.iter().map(|m| m.pos.x).collect();
+        for pair in xs.windows(2) {
+            assert_eq!(pair[0], -pair[1], "the salvo walked one wing: {xs:?}");
+        }
+        assert_eq!(xs[0], -station.x, "a full load starts on the -x wing");
+        // Every round is off the centreline, and none of them moved in y or z.
+        for m in &w.missiles {
+            assert_eq!(m.pos.x.abs(), station.x);
+            assert_eq!(m.pos.y, station.y);
+            assert_eq!(m.pos.z, station.z);
+        }
+    }
+
+    /// [`hardpoint`] is a function of the loadout and nothing else, which is
+    /// what lets the server, a predicting client and a replay agree without
+    /// synchronising a flip-flop.
+    #[test]
+    fn the_station_depends_only_on_the_rounds_remaining() {
+        let rules = Rules::DEFAULT;
+        let station = rules.weapons.missile_hardpoint;
+        assert_eq!(hardpoint(&rules, 4).x, -station.x);
+        assert_eq!(hardpoint(&rules, 3).x, station.x);
+        assert_eq!(hardpoint(&rules, 2).x, -station.x);
+        assert_eq!(hardpoint(&rules, 1).x, station.x);
+        assert_eq!(hardpoint(&rules, 0), hardpoint(&rules, 2));
     }
 
     #[test]
@@ -2054,16 +2124,19 @@ mod tests {
     /// parked ship detonates on it.
     ///
     /// Straight down `+z` with no lock, so homing cannot rescue a graze and the
-    /// perpendicular distance at closest approach *is* `offset`.
+    /// perpendicular distance at closest approach *is* `offset`. The target is
+    /// placed on the *flight line* rather than on the `z` axis: the round leaves
+    /// a wing station now, so those are 3.7 units apart.
     fn grazes_at(offset: f64, body: f64) -> bool {
         let mut w = world();
         w.rules.weapons.missile_radius = body;
+        let line = hardpoint(&w.rules, Rules::DEFAULT.weapons.missile_max);
         add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
         add_ship(
             &mut w,
             2,
             ShipKind::Remote,
-            v(offset, 0.0, 200.0),
+            v(line.x + offset, line.y, 200.0),
             Team::One,
         );
         fire(&mut w, 1, None).unwrap();
@@ -2128,16 +2201,16 @@ mod tests {
         let reach = w.rules.ship.hit_radius + w.rules.weapons.missile_radius;
         let offset = 5.6;
 
-        // Straddle a sample pair: the missile spawns at the offset and steps by
-        // `step`, so put the target half a step past one of those samples.
-        let spawn_z = w.rules.weapons.missile_spawn_offset;
-        let target_z = spawn_z + step * 11.0 + step * 0.5;
-        let target = v(offset, 0.0, target_z);
+        // Straddle a sample pair: the missile spawns on its wing station and
+        // steps by `step` along +z, so put the target half a step past one of
+        // those samples and `offset` to the side of that flight line.
+        let spawn = hardpoint(&w.rules, Rules::DEFAULT.weapons.missile_max);
+        let target = v(spawn.x + offset, spawn.y, spawn.z + step * 11.5);
 
         // Confirm the JS's per-frame point test really would miss.
         let mut nearest_sample = f64::INFINITY;
         for k in 0..40 {
-            let sample = v(0.0, 0.0, spawn_z + step * f64::from(k));
+            let sample = v(spawn.x, spawn.y, spawn.z + step * f64::from(k));
             nearest_sample = nearest_sample.min(sample.distance(target));
         }
         assert!(
@@ -2160,8 +2233,11 @@ mod tests {
     #[test]
     fn a_missile_detonates_on_a_rock_without_damaging_it() {
         let mut w = world();
+        // On the flight line out of the wing station, not on the z axis.
+        let line = hardpoint(&w.rules, Rules::DEFAULT.weapons.missile_max);
+        let rock_at = v(line.x, line.y, 60.0);
         add_ship(&mut w, 1, ShipKind::Local, Vec3::ZERO, Team::Zero);
-        add_rock(&mut w, 42, v(0.0, 0.0, 60.0), 10.0);
+        add_rock(&mut w, 42, rock_at, 10.0);
         let hp = w.asteroid(42).unwrap().hp;
         fire(&mut w, 1, None).unwrap();
 
@@ -2174,7 +2250,7 @@ mod tests {
 
         // It went off on the detonation shell — the rock, plus the margin, plus
         // the missile's own body — not on the surface.
-        let d = hit.pos.distance(v(0.0, 0.0, 60.0));
+        let d = hit.pos.distance(rock_at);
         let shell = 10.0 + w.rules.weapons.missile_detonate_margin + w.rules.weapons.missile_radius;
         assert!(
             (d - shell).abs() < 1e-9,

@@ -191,6 +191,18 @@ fn raw_mouse() -> bool {
     std::env::var_os("SPACESHIPS_MOUSE_RAW").is_some()
 }
 
+/// One-shot latches for the scripted-fire hooks below.
+///
+/// One `Local` holding two flags rather than two `Local<bool>`s, because
+/// `gather_input` is already at clippy's ten-argument line and a Bevy system's
+/// signature is the only place its parameters can live. Both are "has this
+/// fired yet", so they belong together anyway.
+#[derive(Default)]
+struct TestFired {
+    emp: bool,
+    missile: bool,
+}
+
 /// `SPACESHIPS_EMP=<seconds>`: pull the EMP trigger by itself, once, that many
 /// seconds after launch.
 ///
@@ -229,6 +241,59 @@ fn emp_test_fire(_time: &Time, _fired: &mut bool) -> bool {
     false
 }
 
+/// `SPACESHIPS_TRIGGER=<seconds>`: hold the gun down from that moment on.
+///
+/// Same family as [`emp_test_fire`], and it exists for the same reason: the
+/// question "where do the rounds actually leave this aeroplane" is a question
+/// about a still frame, and a still frame of a gun firing cannot be arranged by
+/// hand while also holding a camera. Paired with `SPACESHIPS_SHOT_AT` it puts
+/// the shutter anywhere in the burst, and with `SPACESHIPS_COCKPIT` it answers
+/// the version of the question that actually got reported — whether the tracers
+/// come past the pilot's face.
+///
+/// Held rather than edged, because the gun is
+/// ([`spaceships_sim::rules::WeaponRules::bullet_cooldown`] meters it), so a
+/// bare `SPACESHIPS_TRIGGER=0` is simply "guns from the first frame".
+#[cfg(not(target_arch = "wasm32"))]
+fn gun_test_fire(time: &Time) -> bool {
+    let Ok(spec) = std::env::var("SPACESHIPS_TRIGGER") else {
+        return false;
+    };
+    time.elapsed_secs() >= spec.trim().parse::<f32>().unwrap_or(0.0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn gun_test_fire(_time: &Time) -> bool {
+    false
+}
+
+/// `SPACESHIPS_LAUNCH=<seconds>`: pull the missile trigger once, that many
+/// seconds after launch.
+///
+/// Edged, unlike [`gun_test_fire`], because `E` is edged and because four
+/// rounds off the rails in four frames is not what a launch looks like. Needs
+/// something to lock: `sim::missiles::acquire_lock` wants a living enemy in
+/// line of sight, so `SPACESHIPS_MODE=train` is the quiet way to get one.
+#[cfg(not(target_arch = "wasm32"))]
+fn missile_test_fire(time: &Time, fired: &mut bool) -> bool {
+    if *fired {
+        return false;
+    }
+    let Ok(spec) = std::env::var("SPACESHIPS_LAUNCH") else {
+        return false;
+    };
+    if time.elapsed_secs() < spec.trim().parse::<f32>().unwrap_or(1.0) {
+        return false;
+    }
+    *fired = true;
+    true
+}
+
+#[cfg(target_arch = "wasm32")]
+fn missile_test_fire(_time: &Time, _fired: &mut bool) -> bool {
+    false
+}
+
 fn gather_input(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -239,7 +304,7 @@ fn gather_input(
     lobby: Option<Res<crate::ui::LobbyOpen>>,
     mut virt: ResMut<VirtualCursor>,
     mut out: ResMut<PlayerInput>,
-    mut emp_fired: Local<bool>,
+    mut fired: Local<TestFired>,
 ) {
     let axis = |neg: KeyCode, pos: KeyCode| -> f64 {
         f64::from(keys.pressed(pos)) - f64::from(keys.pressed(neg))
@@ -360,8 +425,11 @@ fn gather_input(
         // complete here so that the day the projectile phases land in the
         // bridge, no input work is left to do — and so the whole binding table
         // is legible in one place rather than half-here and half-pending.
-        fire: keys.pressed(KeyCode::KeyF) || mouse.pressed(MouseButton::Left),
-        fire_missile: keys.just_pressed(KeyCode::KeyE),
+        fire: keys.pressed(KeyCode::KeyF)
+            || mouse.pressed(MouseButton::Left)
+            || gun_test_fire(&time),
+        fire_missile: keys.just_pressed(KeyCode::KeyE)
+            || missile_test_fire(&time, &mut fired.missile),
         deploy_flare: keys.just_pressed(KeyCode::KeyQ),
         // **The one binding that is not in `main.js`'s table**, and the comment
         // above says why an extra key is normally wrong: the muscle memory being
@@ -371,7 +439,7 @@ fn gather_input(
         // by it. `G` because `cockpit.rs`'s dev hook has been the EMP key since
         // before the weapon existed, and because it is the closest unbound key to
         // `E` and `Q`, which are the other two stores.
-        fire_emp: keys.just_pressed(KeyCode::KeyG) || emp_test_fire(&time, &mut emp_fired),
+        fire_emp: keys.just_pressed(KeyCode::KeyG) || emp_test_fire(&time, &mut fired.emp),
         toggle_gun: keys.just_pressed(KeyCode::KeyP),
         // C, not T: `main.js:1385` (`prevKeyC`). T is not bound to anything in
         // the JS at all.

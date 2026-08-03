@@ -63,7 +63,7 @@ use crate::collision::{
     sweep_first_hit, swept_sphere_aabb, swept_sphere_sphere, swept_sphere_vs_moving_sphere, Aabb,
     Sphere,
 };
-use crate::math::Vec3;
+use crate::math::{Quat, Vec3};
 use crate::rules::Rules;
 use crate::world::{
     is_boss_hitbox, Authority, Bullet, EntityId, ExplosionKind, GunMode, NetIntent, Ship, ShipKind,
@@ -84,7 +84,7 @@ use crate::world::{
 /// `bullets.js:146` (`spawnExplosion(pos, 1.0)`).
 pub const EXPLOSION_SCALE_SHIP: f64 = 1.0;
 
-/// Explosion scale for a bullet landing on the moon or a mothership.
+/// Explosion scale for a bullet landing on the moon or an airfield.
 /// `bullets.js:131` (`spawnExplosion(pos, 0.4)`).
 pub const EXPLOSION_SCALE_OBSTACLE: f64 = 0.4;
 
@@ -105,13 +105,13 @@ pub const ASTEROID_IMPACT_SCALE: f64 = 0.25;
 /// `main.js:1467` builds a muzzle as `off.clone().applyQuaternion(q).add(pos)`.
 /// Rotating a vector by a unit quaternion *is* mapping it through the
 /// orthonormal frame that quaternion denotes, so passing the frame is exactly
-/// equivalent and keeps quaternion algebra out of this module —
-/// [`crate::world::Quat`] is deliberately storage-only and [`crate::math`] has no
-/// quaternion type, so there is nowhere to do the rotation without inventing one.
+/// equivalent — and a caller that already has the three axes (the aim-assisted
+/// aim, a bot's post-turn pose) does not have to rebuild them.
 ///
 /// The three axes are expected to be orthonormal and right-handed
 /// (`right × up == forward` in the game's space). Nothing here checks that; a
-/// non-orthonormal basis simply produces a skewed muzzle.
+/// non-orthonormal basis simply produces a skewed muzzle. [`ShipBasis::of`]
+/// builds one from a quaternion and is what every caller in the crate uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShipBasis {
     /// Local `+x` in world space.
@@ -130,18 +130,22 @@ impl ShipBasis {
         forward: Vec3::Z,
     };
 
-    /// A basis in which only `forward` is meaningful.
+    /// The frame a ship's orientation denotes.
     ///
-    /// `right` and `up` are left as the world axes, so this is correct for any
-    /// local offset whose `x` and `y` are zero — which
-    /// [`crate::rules::WeaponRules::muzzle_offset`] is today, at `(0, 0, 0.6)` —
-    /// and wrong for anything else. Use it when the caller has a facing but not a
-    /// full frame; use the struct literal when it has one.
+    /// **This replaces an `along(forward)` constructor that left `right` and
+    /// `up` as the world axes.** That was documented as "correct for any local
+    /// offset whose `x` and `y` are zero — which `muzzle_offset` is today", and
+    /// today ended: the gun hangs under the nose and the missile stations are
+    /// out on the wings, so an offset with no frame to rotate it lands wherever
+    /// the world happens to be pointing. Rolled inverted, a muzzle 0.75 *below*
+    /// the ship would have come out 0.75 above it. There is no half-frame any
+    /// more; a caller with a `quat` has a whole one.
     #[must_use]
-    pub fn along(forward: Vec3) -> ShipBasis {
+    pub fn of(quat: Quat) -> ShipBasis {
         ShipBasis {
-            forward,
-            ..ShipBasis::IDENTITY
+            right: crate::math::right(quat),
+            up: crate::math::up(quat),
+            forward: crate::math::forward(quat),
         }
     }
 
@@ -160,8 +164,14 @@ impl Default for ShipBasis {
 
 /// Where a ship's gun muzzle sits in world space.
 ///
-/// `main.js:1467`. One function, so the bullet, the beam, and the HUD reticle
-/// cast (`main.js:1805`) cannot drift apart the way the JS lets them.
+/// `main.js:1467`. One function, so the bullet, the beam, the HUD reticle cast
+/// (`main.js:1805`) and a bot's rounds cannot drift apart the way the JS lets
+/// them — `bot.js:304` had its own answer, and it is gone.
+///
+/// `basis` must be the ship's real frame, not just its facing:
+/// [`crate::rules::WeaponRules::muzzle_offset`] hangs the gun under the nose, so
+/// `up` is load-bearing and a rolled ship whose `up` was left as the world's
+/// would fire out of the wrong side of itself.
 #[must_use]
 pub fn muzzle_origin(pos: Vec3, basis: ShipBasis, rules: &Rules) -> Vec3 {
     pos + basis.transform(rules.weapons.muzzle_offset)
@@ -378,7 +388,7 @@ pub enum Target {
         /// Position in [`World::obstacles`].
         index: usize,
     },
-    /// A solid box — a mothership or an airfield. Index into [`World::boxes`].
+    /// A solid box — an airfield. Index into [`World::boxes`].
     BoxVolume {
         /// Position in [`World::boxes`].
         index: usize,
@@ -489,13 +499,12 @@ pub fn resolve_impact(world: &World, sweep: &Sweep, hulls: HullVolumes<'_>) -> O
         }
     }
 
-    // 3. Boxes — motherships and airfields.
+    // 3. Boxes — the airfields.
     //
     // New: `main.js:1644` hands `bullets.update` the *sphere* obstacle list and
-    // nothing else, so in the JS a bullet flies straight through a mothership
-    // hull. The box sweep is exact at edges and corners, so this does not put a
-    // shell of phantom wall around each platform the way a grown-box ray test
-    // would.
+    // nothing else, so in the JS a bullet flies straight through a solid hull.
+    // The box sweep is exact at edges and corners, so this does not put a shell
+    // of phantom wall around each platform the way a grown-box ray test would.
     for (i, b) in world.boxes.iter().enumerate() {
         let aabb = Aabb::new(b.pos, b.half);
         if let Some(t) = swept_sphere_aabb(sweep.origin, sweep.motion, sweep.radius, aabb) {
@@ -1471,11 +1480,20 @@ mod tests {
     }
 
     #[test]
-    fn a_mothership_hull_stops_a_bullet() {
+    fn a_solid_hull_stops_a_bullet() {
         // New behaviour: `main.js:1644` hands `bullets.update` only the sphere
-        // obstacle list, so JS bullets fly through mothership hulls.
+        // obstacle list, so JS bullets fly through solid hulls.
+        //
+        // The space map has no boxes since the motherships were removed, so the
+        // hull is placed by hand — which is also the honest shape of the test,
+        // since what is being pinned is `World::boxes` stopping a round rather
+        // than any particular map having one.
         let mut w = World::new(1, Rules::DEFAULT, Mode::Skirmish, MapKind::Space);
         w.obstacles.clear();
+        w.boxes.push(crate::world::BoxVolume {
+            pos: v(0.0, 0.0, -600.0),
+            half: v(45.0, 18.0, 35.0),
+        });
         ship(&mut w, 1, Some(Team::Zero), v(0.0, 0.0, -700.0));
         ship(&mut w, 2, Some(Team::One), v(0.0, 0.0, -500.0));
         let mut out = BulletOutput::new();
@@ -2136,12 +2154,13 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    fn the_muzzle_sits_ahead_of_the_ship_along_its_own_forward() {
+    fn the_muzzle_sits_under_and_ahead_of_the_nose_in_the_ships_own_frame() {
         let rules = Rules::DEFAULT;
-        let off = rules.weapons.muzzle_offset.z;
+        let off = rules.weapons.muzzle_offset;
+        assert!(off.y < 0.0, "the gun hangs under the nose");
         assert_eq!(
             muzzle_origin(v(1.0, 2.0, 3.0), ShipBasis::IDENTITY, &rules),
-            v(1.0, 2.0, 3.0 + off)
+            v(1.0, 2.0 + off.y, 3.0 + off.z)
         );
         // Turned around: the muzzle follows.
         let flipped = ShipBasis {
@@ -2151,12 +2170,24 @@ mod tests {
         };
         assert_eq!(
             muzzle_origin(Vec3::ZERO, flipped, &rules),
-            v(0.0, 0.0, -off)
+            v(0.0, off.y, -off.z)
         );
-        assert_eq!(
-            muzzle_origin(Vec3::ZERO, ShipBasis::along(Vec3::Y), &rules),
-            v(0.0, off, 0.0)
-        );
+    }
+
+    /// The reason `ShipBasis::along` is gone. Rolled inverted, the gun must end
+    /// up *above* the ship in world terms — a half-frame that left `up` as the
+    /// world's `+y` would have kept it below, firing out of the wrong side of an
+    /// aeroplane that is upside down.
+    #[test]
+    fn rolling_inverted_takes_the_muzzle_with_the_aircraft() {
+        let rules = Rules::DEFAULT;
+        let off = rules.weapons.muzzle_offset;
+        // 180° about +z, written exactly rather than through a trig call.
+        let inverted = ShipBasis::of(Quat::new(0.0, 0.0, 1.0, 0.0));
+        let at = muzzle_origin(Vec3::ZERO, inverted, &rules);
+        assert!(at.y > 0.0, "inverted, the gun is on top: {at:?}");
+        assert!((at.y + off.y).abs() < 1e-12, "mirrored exactly: {at:?}");
+        assert!((at.z - off.z).abs() < 1e-12, "still ahead: {at:?}");
     }
 
     #[test]

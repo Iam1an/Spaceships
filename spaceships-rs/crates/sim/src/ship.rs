@@ -876,7 +876,7 @@ pub struct WorldGeometry<'a> {
     pub asteroids: &'a [Asteroid],
     /// Indestructible spheres — the moon. Contact is fatal.
     pub obstacles: &'a [Obstacle],
-    /// Solid boxes — motherships or airfields. Contact only bounces.
+    /// Solid boxes — the airfields. Contact only bounces.
     pub boxes: &'a [BoxVolume],
     /// Which map, which decides whether the terrain kill plane exists.
     pub map: MapKind,
@@ -901,8 +901,8 @@ pub struct CollisionReport {
     pub moon_impact: bool,
     /// The terrain kill plane was newly crossed. Also worth full hit points.
     pub terrain_impact: bool,
-    /// A mothership or airfield hull was touched. Costs nothing; reported for
-    /// the impact sound.
+    /// An airfield hull was touched. Costs nothing; reported for the impact
+    /// sound.
     pub box_impact: bool,
     /// The step was resolved by the swept pass rather than the static one — the
     /// ship would have tunnelled clean through under the JS's end-of-frame point
@@ -939,8 +939,8 @@ pub struct CollisionReport {
 ///
 /// Phase 2 is the fix for getting stuck in a knot of rocks.
 /// [`crate::asteroids::populate`] runs **no separation test** — `asteroids.js`
-/// and `server/index.js` both test a placement against the moon and the
-/// motherships and never against another rock — so a generated field is full of
+/// and `server/index.js` both test a placement against fixed geometry and never
+/// against another rock — so a generated field is full of
 /// rocks that interpenetrate, and a ship that ended a step inside two of them
 /// was resolved by pushing it out of each in list order. The last push wins, and
 /// it lands the ship back inside the first. Next step, the same, in the other
@@ -965,8 +965,9 @@ pub struct CollisionReport {
 /// only on the geometry. The JS resolves motherships last so the hull "wins"
 /// against an embedded rock; iterating to a position clear of *both* is strictly
 /// better than picking a winner, and the shipped geometry cannot produce that
-/// case anyway — rock placement already avoids the motherships by
-/// [`crate::rules::AsteroidFieldRules::avoid_margin`].
+/// case anyway — there is no asteroid field on the map that has hulls, and none
+/// of the hulls on the map that has a field, the motherships having been
+/// removed ([`crate::rules::WorldRules`]).
 pub fn resolve_world_collisions(
     ship: &mut Ship,
     prev_pos: Vec3,
@@ -1187,7 +1188,7 @@ fn sphere_penetration(
 /// clear. The measuring half of `collideSphereWithBox`, `main.js:2123`.
 ///
 /// The interior case picks the shallowest face and pushes out through it, which
-/// is what stops a ship that has somehow ended up inside a mothership from being
+/// is what stops a ship that has somehow ended up inside an airfield from being
 /// launched through the far wall.
 fn box_penetration(pos: Vec3, radius: f64, b: BoxVolume) -> Option<Penetration> {
     let d = pos - b.pos;
@@ -2621,7 +2622,7 @@ mod tests {
         //
         // Three rocks that overlap each other, which is an ordinary thing for a
         // generated field to contain: `asteroids::populate` tests a placement
-        // against the moon and the motherships, and never against another rock.
+        // against the moon, and never against another rock.
         // A ship flies through them at full throttle, turns around, and burns
         // for eight more seconds — 640 units' worth of travel.
         //
@@ -2814,16 +2815,20 @@ mod tests {
     }
 
     #[test]
-    fn a_ship_is_pushed_out_of_a_mothership_hull() {
+    fn a_ship_is_pushed_out_of_a_hull() {
         let r = rules();
         let mut rng = Rng::new(5);
+        // A box the shape the motherships were, kept as a test fixture now that
+        // the map has none: the airfields are 280x4x190, too flat to exercise
+        // the top-face push interestingly.
+        let half = Vec3::new(45.0, 18.0, 35.0);
         let boxes = [BoxVolume {
             pos: Vec3::new(0.0, 0.0, -600.0),
-            half: r.world.mothership_half,
+            half,
         }];
         let mut ship = new_ship();
         // Just above the hull's top face, overlapping it.
-        ship.pos = Vec3::new(0.0, r.world.mothership_half.y + 1.0, -600.0);
+        ship.pos = Vec3::new(0.0, half.y + 1.0, -600.0);
         ship.vel = -Vec3::Y * 50.0;
         let out = resolve_static(
             &mut ship,
@@ -2834,7 +2839,7 @@ mod tests {
         );
         assert!(out.box_impact);
         assert_eq!(out.self_damage, 0, "hulls bounce, they do not hurt");
-        assert!(ship.pos.y >= r.world.mothership_half.y + r.ship.collide_radius - 1e-9);
+        assert!(ship.pos.y >= half.y + r.ship.collide_radius - 1e-9);
         assert!(ship.vel.y > 0.0);
     }
 
@@ -2842,9 +2847,10 @@ mod tests {
     fn a_ship_inside_a_hull_leaves_through_the_nearest_face() {
         let r = rules();
         let mut rng = Rng::new(6);
+        let half = Vec3::new(45.0, 18.0, 35.0);
         let boxes = [BoxVolume {
             pos: Vec3::ZERO,
-            half: r.world.mothership_half,
+            half,
         }];
         let mut ship = new_ship();
         // Deep inside, but nearest the +y face (half-extents are 45/18/35).
@@ -2856,7 +2862,7 @@ mod tests {
             Mode::Skirmish,
             &mut rng,
         );
-        assert!(ship.pos.y > r.world.mothership_half.y, "{:?}", ship.pos);
+        assert!(ship.pos.y > half.y, "{:?}", ship.pos);
         assert_eq!(ship.pos.x, 0.0);
         assert_eq!(ship.pos.z, 0.0);
     }

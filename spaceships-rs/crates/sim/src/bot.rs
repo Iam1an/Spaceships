@@ -77,10 +77,11 @@
 
 use std::f64::consts::PI;
 
-use crate::bullets::{spawn_bullet, BulletSpawn};
+use crate::bullets::{muzzle_origin, spawn_bullet, BulletSpawn, ShipBasis};
 use crate::math::{
     quat_from_axis_angle as axis_angle, quat_mul, quat_normalize, solve_intercept, Vec3,
 };
+use crate::missiles;
 use crate::rng::Rng;
 use crate::rules::Rules;
 use crate::world::{
@@ -506,12 +507,18 @@ fn plan_bot(
     // the range tests use the pre-move `dist`.
     let engageable = world.can_damage(ship.id, target);
 
+    // The bot's aircraft is the player's aircraft, so its gun port is the
+    // player's gun port: `bullets::muzzle_origin` and nothing local. `bot.js:304`
+    // had its own 2.5-along-the-nose, which put a bot's rounds inside its own
+    // fuselage the moment the muzzle became a real place on a real airframe.
+    let basis = ShipBasis::of(quat);
+
     let mut bullet = None;
     if bot.fsm == BotFsm::Attack && bot.fire_timer <= 0.0 && dist < br.fire_range && engageable {
         let ideal = (aim_world - pos).normalize();
         if fwd.dot(ideal) > br.fire_dot {
             bullet = Some(Shot {
-                origin: pos.add_scaled(fwd, br.muzzle_offset),
+                origin: muzzle_origin(pos, basis, rules),
                 dir: fwd,
             });
             bot.fire_timer = br.fire_cooldown_for(bot.hard_mode);
@@ -538,7 +545,7 @@ fn plan_bot(
         if fwd.dot(to_target) > br.missile_fire_dot {
             missile = Some((
                 Shot {
-                    origin: pos.add_scaled(fwd, rules.weapons.missile_spawn_offset),
+                    origin: pos + basis.transform(missiles::hardpoint(rules, bot.missiles_left)),
                     dir: fwd,
                 },
                 target_id,
