@@ -734,12 +734,30 @@ fn encode_intent(intent: NetIntent, ids: IdSwap) -> ClientMessage {
             quat: wire_quat(quat),
             boost,
         },
+        // One intent, two messages. `fire` is relayed under the *sender's* id,
+        // so it cannot describe a shot from a balance bot the host happens to
+        // be driving — `server/index.js:800` has `bot-fire` for exactly that,
+        // and it names the bot. Both are relayed to everyone but the sender, so
+        // the host's own copy of the round is the one it already simulated and
+        // nothing is drawn or claimed twice.
         NetIntent::Fire {
             weapon,
             origin,
             dir,
             target,
+            from_bot: None,
         } => ClientMessage::Fire {
+            kind: wire_weapon(weapon),
+            shots: vec![shot(weapon, origin, dir, target, ids)],
+        },
+        NetIntent::Fire {
+            weapon,
+            origin,
+            dir,
+            target,
+            from_bot: Some(bot),
+        } => ClientMessage::BotFire {
+            bot_id: ids.to_wire(bot),
             kind: wire_weapon(weapon),
             shots: vec![shot(weapon, origin, dir, target, ids)],
         },
@@ -2208,8 +2226,36 @@ mod tests {
                 origin: SimVec3::new(0.0, 0.0, 0.0),
                 dir: SimVec3::new(0.0, 0.0, 1.0),
                 target: None,
+                from_bot: None,
             }),
             r#"{"type":"fire","kind":"bullet","shots":[{"pos":[0.0,0.0,0.0],"dir":[0.0,0.0,1.0]}]}"#
+        );
+
+        // The same shot from a bot the host drives is a different message with
+        // the bot named, which is the only form the server will relay under a
+        // negative id (`main.js:3050`, `server/index.js:800`).
+        assert_eq!(
+            json(NetIntent::Fire {
+                weapon: WeaponKind::Bullet,
+                origin: SimVec3::new(10.0, 4.0, 494.0),
+                dir: SimVec3::new(0.0, 0.0, -1.0),
+                target: None,
+                from_bot: Some(-7),
+            }),
+            r#"{"type":"bot-fire","botId":-7,"kind":"bullet","shots":[{"pos":[10.0,4.0,494.0],"dir":[0.0,0.0,-1.0]}]}"#
+        );
+        // A bot's missile keeps its lock, or every other client re-simulates a
+        // round that flies straight past the ship it was aimed at
+        // (`main.js:3065`).
+        assert_eq!(
+            json(NetIntent::Fire {
+                weapon: WeaponKind::Missile,
+                origin: SimVec3::ZERO,
+                dir: SimVec3::new(0.0, 0.0, 1.0),
+                target: Some(1),
+                from_bot: Some(-7),
+            }),
+            r#"{"type":"bot-fire","botId":-7,"kind":"missile","shots":[{"pos":[0.0,0.0,0.0],"dir":[0.0,0.0,1.0],"targetId":1}]}"#
         );
 
         // A beam carries `end` instead, which is the endpoint the shooter
@@ -2220,6 +2266,7 @@ mod tests {
                 origin: SimVec3::new(0.0, 1.0, 2.0),
                 dir: SimVec3::new(0.0, 1.0, 900.0),
                 target: None,
+                from_bot: None,
             }),
             r#"{"type":"fire","kind":"beam","shots":[{"pos":[0.0,1.0,2.0],"end":[0.0,1.0,900.0]}]}"#
         );
@@ -2230,6 +2277,7 @@ mod tests {
                 origin: SimVec3::ZERO,
                 dir: SimVec3::new(0.0, 0.0, 1.0),
                 target: Some(7),
+                from_bot: None,
             }),
             r#"{"type":"fire","kind":"missile","shots":[{"pos":[0.0,0.0,0.0],"dir":[0.0,0.0,1.0],"targetId":7}]}"#
         );
@@ -3098,6 +3146,127 @@ mod tests {
         host.socket.close(500);
     }
 
+    /// A bot the host drives, seen from the *other* client — the defect, end to
+    /// end, through a real server.
+    ///
+    /// Nothing in this client emitted `bot-fire`, so a balance bot the host was
+    /// handed damaged the guest with rounds the guest never drew: the guest saw
+    /// the bot move (`bot-state`) and saw its own hit points fall (`hp`), with
+    /// nothing in between. This is the missing middle, and it is asserted on the
+    /// side that was blind — the guest's `NetEvent` stream, which is what
+    /// `sim::tick` re-simulates the bolt from.
+    ///
+    /// A screenshot cannot prove this: two windows would show two bolts and say
+    /// nothing about whether the *server* relayed one. Run it the same way as
+    /// the other live tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "needs a live server; see `a_live_server_answers_a_create`"]
+    fn a_hosted_bots_gunfire_reaches_the_other_client() {
+        let url = std::env::var("SPACESHIPS_TEST_SERVER")
+            .unwrap_or_else(|_| "ws://127.0.0.1:4100/ws".to_owned());
+
+        // `allow_bot: true`, which is the *opposite* of the empty-lobby recipe:
+        // this test is about the bot the server hands the host to drive.
+        let mut host = LiveClient::connect_with(&url, "HostPilot", true);
+        let code = host
+            .wait_for(|m| match m {
+                ServerMessage::Room { code, .. } => Some(code.clone()),
+                _ => None,
+            })
+            .expect("host got no `room`; is the server running?");
+
+        // **Three** humans, because the server only adds a balance bot when the
+        // teams come out uneven (`lobby.rs` `on_start`). Two would be 1v1 and
+        // there would be nothing to drive.
+        let join = |who: &'static str| {
+            let mut c = LiveClient::connect(&url, who);
+            c.send(ClientMessage::Leave);
+            c.send(ClientMessage::Join { code: code.clone() });
+            let id = c
+                .wait_for(|m| match m {
+                    ServerMessage::Room { you, .. } => Some(*you),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{who} got no `room`"));
+            (c, id)
+        };
+        let (mut guest, guest_id) = join("RustPilot");
+        let (third, _) = join("Wingman");
+        host.wait_for(|m| match m {
+            ServerMessage::Players { players } if players.len() >= 3 => Some(()),
+            _ => None,
+        })
+        .expect("host never saw both guests join");
+
+        host.send(ClientMessage::Start);
+        let bots = host
+            .wait_for(|m| match m {
+                ServerMessage::Start {
+                    bot_assignments, ..
+                } if !bot_assignments.is_empty() => Some(bot_assignments.clone()),
+                _ => None,
+            })
+            .expect("the host was handed no bot to drive");
+        let bot_wire = bots[0].id;
+        assert!(bot_wire < 0, "a bot's id is negative: {bot_wire}");
+
+        // The host's ids, and the bot as the *simulation* names it. This is the
+        // exact intent `bot::update_bots` raises when a hosted bot pulls the
+        // trigger.
+        let host_ids = IdSwap::new(host.wait_for(|m| match m {
+            ServerMessage::Room { you, .. } => Some(*you),
+            _ => None,
+        }));
+        let bot = host_ids.to_entity(bot_wire).expect("a bot id fits");
+        let origin = SimVec3::new(10.0, 4.0, 494.0);
+        let dir = SimVec3::new(0.0, 0.0, -1.0);
+        host.send(encode_intent(
+            NetIntent::Fire {
+                weapon: WeaponKind::Bullet,
+                origin,
+                dir,
+                target: None,
+                from_bot: Some(bot),
+            },
+            host_ids,
+        ));
+
+        // The guest must see it as an ordinary `fire` under the *bot's* id, and
+        // it must decode into the event the simulation re-spawns a bolt from.
+        let relayed = guest
+            .wait_for(|m| match m {
+                ServerMessage::Fire { id, .. } if *id == bot_wire => Some(m.clone()),
+                _ => None,
+            })
+            .expect("the guest never saw the bot fire: `bot-fire` was not sent or not relayed");
+
+        let guest_ids = IdSwap::new(Some(guest_id));
+        let mut events = Vec::new();
+        push_events(&relayed, guest_ids, &mut events);
+        let seen = as_net_event(&relayed, guest_ids).expect("a `fire` is always one event");
+        events.push(seen);
+        let bot_there = guest_ids.to_entity(bot_wire).expect("a bot id fits");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                NetEvent::Fired {
+                    id,
+                    weapon: WeaponKind::Bullet,
+                    origin: o,
+                    ..
+                } if *id == bot_there && *o == origin
+            )),
+            "the relayed shot did not decode into a bolt the guest can draw: {events:?}"
+        );
+
+        guest.send(ClientMessage::Leave);
+        guest.socket.close(500);
+        third.send(ClientMessage::Leave);
+        third.socket.close(500);
+        host.socket.close(500);
+    }
+
     /// A blocking wrapper around [`Socket`] for the two live tests. Test-only:
     /// the game never waits on the network, but a test that did not would be a
     /// sleep-and-hope.
@@ -3115,8 +3284,16 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     impl LiveClient {
-        /// Connects, waits for the handshake, and creates a room.
+        /// Connects, waits for the handshake, and creates a room with no
+        /// balance bot — a third `players` row and a negative id would be noise
+        /// in the tests that are about two humans.
         fn connect(url: &str, name: &'static str) -> Self {
+            Self::connect_with(url, name, false)
+        }
+
+        /// [`Self::connect`], with the bot toggle the create screen has. The
+        /// one test that *wants* a bot asks for one.
+        fn connect_with(url: &str, name: &'static str, allow_bot: bool) -> Self {
             let mut client = Self {
                 who: name,
                 socket: Socket::connect(url).expect("thread spawns"),
@@ -3131,9 +3308,7 @@ mod tests {
             client.send(ClientMessage::Create {
                 private: false,
                 map: spaceships_protocol::MapKind::Space,
-                // No balance bot: it would add a third `players` row and a
-                // negative id, and this test is about two humans.
-                allow_bot: false,
+                allow_bot,
             });
             client
         }

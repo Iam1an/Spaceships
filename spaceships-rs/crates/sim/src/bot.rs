@@ -84,8 +84,8 @@ use crate::math::{
 use crate::rng::Rng;
 use crate::rules::Rules;
 use crate::world::{
-    BotFsm, BotState, EntityId, Missile, MissileTarget, Quat, Ship, ShipKind, SimEvent, Team,
-    WeaponKind, World,
+    Authority, BotFsm, BotState, EntityId, Missile, MissileTarget, NetIntent, Quat, Ship, ShipKind,
+    SimEvent, Team, WeaponKind, World,
 };
 
 /// The deterministic transcendentals, under the name this module has always
@@ -213,13 +213,29 @@ fn missile_delay(rules: &Rules, rng: &mut Rng) -> f64 {
 /// not last tick's. Deciding for all of them and applying the results together
 /// would be a different simulation.
 ///
-/// `events` is appended to, never cleared, so a caller can thread one buffer
-/// through a whole tick.
+/// `events` and `net` are appended to, never cleared, so a caller can thread one
+/// buffer of each through a whole tick.
+///
+/// # Why this takes a net queue
+///
+/// A [`ShipKind::Bot`] under [`Authority::Server`] is a balance bot **this**
+/// client was handed by the server (`start.botAssignments`), and it is the only
+/// machine simulating it. Its pose already goes out as `bot-state`
+/// ([`crate::tick`]) and its hits already go out as `hit` with `fromBotId`
+/// ([`crate::tick`]'s `report_hit`) — but its *shots* went nowhere, so a bot the
+/// host drives damaged remote players with rounds that never appeared on their
+/// screens. `server/index.js:800` has had the `bot-fire` message for this since
+/// the JS client; nothing was sending it.
+///
+/// The report is raised here rather than one level up because this is where the
+/// missile's lock is still in hand — `bot-fire` carries `targetId` for a missile
+/// (`main.js:3065`), and a [`SimEvent::Fired`] does not.
 pub fn update_bots(
     world: &mut World,
     dt: f64,
     terrain: Option<&dyn TerrainHeight>,
     events: &mut Vec<SimEvent>,
+    net: &mut Vec<NetIntent>,
 ) {
     // Taken out and put back so the read-only planning pass can borrow the rest
     // of the world while still drawing from the bot stream. Cloning an `Rng` is
@@ -230,7 +246,7 @@ pub fn update_bots(
             continue;
         }
         let plan = plan_bot(world, i, dt, terrain, &mut rng);
-        apply_plan(world, i, &plan, events);
+        apply_plan(world, i, &plan, events, net);
     }
     world.rng.bots = rng;
 }
@@ -516,7 +532,13 @@ fn plan_bot(
 
 /// The mutable half of a bot's tick: write the pose, spawn the projectiles,
 /// report the events.
-fn apply_plan(world: &mut World, index: usize, plan: &Plan, events: &mut Vec<SimEvent>) {
+fn apply_plan(
+    world: &mut World,
+    index: usize,
+    plan: &Plan,
+    events: &mut Vec<SimEvent>,
+    net: &mut Vec<NetIntent>,
+) {
     let (id, team) = {
         let ship = &mut world.ships[index];
         ship.pos = plan.pos;
@@ -538,9 +560,11 @@ fn apply_plan(world: &mut World, index: usize, plan: &Plan, events: &mut Vec<Sim
 
     if let Some(shot) = plan.bullet {
         fire_bullet(world, index, shot, events);
+        report_shot(world, id, WeaponKind::Bullet, shot, None, net);
     }
     if let Some((shot, target)) = plan.missile {
         fire_missile(world, id, team, shot, target, events);
+        report_shot(world, id, WeaponKind::Missile, shot, Some(target), net);
     }
     if plan.flare {
         events.push(SimEvent::FlareBurst {
@@ -570,6 +594,36 @@ fn fire_bullet(world: &mut World, index: usize, shot: Shot, events: &mut Vec<Sim
         weapon: WeaponKind::Bullet,
         origin: shot.origin,
         dir: shot.dir,
+        allegiance: world.allegiance_of(owner),
+    });
+}
+
+/// Tells the server a locally driven bot pulled the trigger.
+///
+/// Silent under [`Authority::Local`], where there is no server and no other
+/// client: a solo skirmish emits nothing at all from here.
+///
+/// The bot's own copy of the round is already in [`World::bullets`], and
+/// `server/index.js` relays `bot-fire` to every socket *except* the sender
+/// (`lobby.rs`'s `relay`), so the shot is drawn exactly once on every screen
+/// including this one.
+fn report_shot(
+    world: &World,
+    bot: EntityId,
+    weapon: WeaponKind,
+    shot: Shot,
+    target: Option<EntityId>,
+    net: &mut Vec<NetIntent>,
+) {
+    if world.authority != Authority::Server {
+        return;
+    }
+    net.push(NetIntent::Fire {
+        weapon,
+        origin: shot.origin,
+        dir: shot.dir,
+        target,
+        from_bot: Some(bot),
     });
 }
 
@@ -600,6 +654,7 @@ fn fire_missile(
         weapon: WeaponKind::Missile,
         origin: shot.origin,
         dir: shot.dir,
+        allegiance: world.allegiance_of(owner),
     });
 }
 
@@ -920,11 +975,18 @@ mod tests {
     }
 
     fn tick(w: &mut World, n: usize) -> Vec<SimEvent> {
+        tick_reported(w, n).0
+    }
+
+    /// Both halves of a bot's output: what the renderer sees and what the
+    /// transport would send.
+    fn tick_reported(w: &mut World, n: usize) -> (Vec<SimEvent>, Vec<NetIntent>) {
         let mut ev = Vec::new();
+        let mut net = Vec::new();
         for _ in 0..n {
-            update_bots(w, DT, None, &mut ev);
+            update_bots(w, DT, None, &mut ev, &mut net);
         }
-        ev
+        (ev, net)
     }
 
     fn rock(w: &mut World, pos: Vec3, radius: f64) {
@@ -1287,8 +1349,21 @@ mod tests {
         init(&mut hard, true, false, &rules, &mut rng);
         assert_eq!(easy.bot.missiles_left, 1);
         assert_eq!(hard.bot.missiles_left, 3);
-        assert_eq!(rules.bot.fire_cooldown_for(false), 0.15);
-        assert_eq!(rules.bot.fire_cooldown_for(true), 0.05);
+        // Half `bot.js`'s rate of fire, and hard mode still exactly three times
+        // normal. See `BotRules::DEFAULT`.
+        assert_eq!(rules.bot.fire_cooldown_for(false), 0.30);
+        assert_eq!(rules.bot.fire_cooldown_for(true), 0.10);
+        assert!(
+            (rules.bot.fire_cooldown / rules.bot.fire_cooldown_hard - 3.0).abs() < 1e-9,
+            "hard mode must stay three times the rate of fire"
+        );
+        // The number this is actually about: sustained damage against a 100 HP
+        // hull, if every round connects.
+        let dps = f64::from(rules.weapons.gun_damage) / rules.bot.fire_cooldown;
+        assert!(
+            (dps - 33.333_333_333).abs() < 1e-6,
+            "a bot's perfect-aim DPS moved: {dps}"
+        );
     }
 
     #[test]
@@ -1305,6 +1380,80 @@ mod tests {
             w.bullets.len()
         };
         assert!(count(true) > count(false));
+    }
+
+    // --- reporting a bot's fire -------------------------------------------
+
+    #[test]
+    fn a_hosted_bots_shots_are_reported_to_the_server() {
+        let mut w = duel(300.0);
+        w.authority = Authority::Server;
+        w.ships[0].bot.missile_timer = 0.0;
+        let (events, net) = tick_reported(&mut w, 60);
+
+        // Every shot the bot took is on the wire, under the bot's own id, and
+        // exactly once — a round drawn twice is a round the server would let
+        // two `hit` claims through for.
+        let fired = events
+            .iter()
+            .filter(|e| matches!(e, SimEvent::Fired { owner: 1, .. }))
+            .count();
+        let reported = net
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    NetIntent::Fire {
+                        from_bot: Some(1),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(fired > 0, "the bot never fired");
+        assert_eq!(fired, reported, "{fired} shots but {reported} reports");
+        assert!(
+            net.iter().all(|i| matches!(
+                i,
+                NetIntent::Fire {
+                    from_bot: Some(1),
+                    ..
+                }
+            ) || !matches!(i, NetIntent::Fire { .. })),
+            "a bot's shot must never go out as the player's own `fire`"
+        );
+
+        // The missile carries its lock, or the copy every other client
+        // re-simulates flies straight past the ship it was aimed at.
+        let missile = net
+            .iter()
+            .find(|i| {
+                matches!(
+                    i,
+                    NetIntent::Fire {
+                        weapon: WeaponKind::Missile,
+                        ..
+                    }
+                )
+            })
+            .copied()
+            .expect("the bot launched a missile but never reported it");
+        let NetIntent::Fire { target, dir, .. } = missile else {
+            unreachable!()
+        };
+        assert_eq!(target, Some(2), "the lock must survive onto the wire");
+        assert!(dir.is_normalized(1e-9));
+    }
+
+    #[test]
+    fn a_solo_match_reports_nothing_at_all() {
+        // `Authority::Local` is every solo mode. There is no server to tell and
+        // no second client to draw it, so the queue must stay empty.
+        let mut w = duel(300.0);
+        w.ships[0].bot.missile_timer = 0.0;
+        let (events, net) = tick_reported(&mut w, 60);
+        assert!(events.iter().any(|e| matches!(e, SimEvent::Fired { .. })));
+        assert!(net.is_empty(), "a solo bot put {net:?} on the wire");
     }
 
     #[test]
@@ -1546,7 +1695,7 @@ mod tests {
             // threshold every tick.
             w.ships[0].pos = Vec3::ZERO;
             w.ships[0].vel = Vec3::ZERO;
-            update_bots(&mut w, DT, None, &mut ev);
+            update_bots(&mut w, DT, None, &mut ev, &mut Vec::new());
             if w.ships[0].bot.fsm == BotFsm::Evade {
                 evaded = true;
                 break;
@@ -1572,7 +1721,7 @@ mod tests {
         let ground = FlatGround(0.0);
         let mut ev = Vec::new();
         for _ in 0..120 {
-            update_bots(&mut w, DT, Some(&ground), &mut ev);
+            update_bots(&mut w, DT, Some(&ground), &mut ev, &mut Vec::new());
         }
         let floor = w.rules.bot.terrain_min_clearance;
         assert!(w.ships[0].pos.y >= floor - 1e-9, "sank through the floor");

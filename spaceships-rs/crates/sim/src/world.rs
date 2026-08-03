@@ -1337,6 +1337,21 @@ impl World {
             _ => true,
         }
     }
+
+    /// How a shot fired by `owner` reads to the local player.
+    ///
+    /// The convenience form of [`Allegiance::of`], for the once-per-shot sites
+    /// that raise a [`SimEvent::Fired`]. The per-projectile path in
+    /// [`crate::tick`] hoists the viewer lookup instead and calls
+    /// [`Allegiance::of`] directly.
+    #[must_use]
+    pub fn allegiance_of(&self, owner: EntityId) -> Allegiance {
+        Allegiance::of(
+            owner,
+            self.ship(owner).and_then(|s| s.team),
+            self.local_ship(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +1570,13 @@ pub enum SimEvent {
         origin: Vec3,
         /// Direction, or the beam's endpoint for [`WeaponKind::Beam`].
         dir: Vec3,
+        /// Whose shot it is, resolved at the moment of firing.
+        ///
+        /// The same field [`ProjView`] carries, for the same reason and by the
+        /// same rule — a beam and a muzzle flash are shots too, and a hostile
+        /// beam painted in the local palette is the same lie as a hostile bolt.
+        /// See [`Allegiance`].
+        allegiance: Allegiance,
     },
     /// A flare burst was released.
     FlareBurst {
@@ -1694,6 +1716,16 @@ pub enum NetIntent {
         dir: Vec3,
         /// Missile lock, if any.
         target: Option<EntityId>,
+        /// Set when a locally driven bot pulled the trigger rather than the
+        /// player, exactly as [`NetIntent::Hit::from_bot`] is.
+        ///
+        /// The transport sends the two as different messages — `fire` for the
+        /// player, `bot-fire` for a bot (`server/index.js:800`) — but they are
+        /// one event here: a shot happened on this machine that everybody else
+        /// has to be told about. Without it a bot the host drives damages
+        /// remote players with rounds they never see, because `fire` is only
+        /// ever relayed under the *sender's* id.
+        from_bot: Option<EntityId>,
     },
     /// A flare burst was released.
     Flare {
@@ -1833,6 +1865,81 @@ pub struct ShipView {
     pub hit_flash: f32,
 }
 
+/// Whose shot this is, from the point of view of the player at this screen.
+///
+/// # Why this and not an owner id or a team
+///
+/// `bullets.js` keeps three material pairs — `self`, `ally`, `enemy` — and picks
+/// between them with `isLocal` plus a team comparison, written out at the call
+/// site. A renderer handed a raw `owner: EntityId` would have to do the same
+/// thing: find the owner's ship, find the local player's ship, compare teams, and
+/// reproduce the rule that an *unassigned* team means hostile. That rule already
+/// exists here — it is the team half of [`World::can_damage`] — and a second
+/// copy of it in the renderer is exactly the client/server duplication the port
+/// exists to delete. So the relationship is resolved once, on the side that knows
+/// [`World::local_id`], and the renderer is handed the answer.
+///
+/// The consequence worth stating: a projectile drawn [`Allegiance::Hostile`] is
+/// one whose owner's team can hurt you, because both answers come from the same
+/// comparison. The colour cannot lie about the damage.
+///
+/// A raw owner id would additionally buy per-shooter effects (a trail keyed to
+/// its pilot), which nothing wants today; if that ever changes it is a second
+/// field, not a different one.
+///
+/// `#[repr(u32)]` so the discriminant has a fixed width in the `#[repr(C)]`
+/// records below, whose stride the WASM layer exposes as a typed array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum Allegiance {
+    /// Fired by the local player.
+    Own = 0,
+    /// Fired by someone on the local player's team.
+    Ally = 1,
+    /// Fired by anyone who can hurt the local player.
+    ///
+    /// The default, and deliberately the *dangerous* one: a frame built with no
+    /// local player at all — a headless server, a spectator — has nobody to be
+    /// friendly to, and a shot that cannot be accounted for should not be
+    /// painted as one of yours.
+    #[default]
+    Hostile = 2,
+}
+
+impl Allegiance {
+    /// How a shot fired by `owner`, whose team at launch was `owner_team`, reads
+    /// to `viewer`.
+    ///
+    /// `viewer` is the local player's ship, or `None` where there is none. Taking
+    /// the ship rather than looking it up keeps this out of the per-projectile
+    /// loop in [`crate::tick`]: the frame hoists one lookup and calls this once
+    /// per bolt.
+    ///
+    /// The team arm is [`World::can_damage`]'s, including the clause that an
+    /// unassigned team on either side is *not* friendly — a match whose teams
+    /// have not been handed out yet is a free-for-all, and colouring it
+    /// otherwise would tell the player a bolt is safe when it is not.
+    #[must_use]
+    pub fn of(owner: EntityId, owner_team: Option<Team>, viewer: Option<&Ship>) -> Allegiance {
+        let Some(viewer) = viewer else {
+            return Allegiance::Hostile;
+        };
+        if owner == viewer.id {
+            return Allegiance::Own;
+        }
+        match (owner_team, viewer.team) {
+            (Some(a), Some(b)) if a == b => Allegiance::Ally,
+            _ => Allegiance::Hostile,
+        }
+    }
+
+    /// Whether this shot belongs to the local player or one of their team-mates.
+    #[must_use]
+    pub const fn is_friendly(self) -> bool {
+        matches!(self, Allegiance::Own | Allegiance::Ally)
+    }
+}
+
 /// One bullet or missile, as the renderer needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[repr(C)]
@@ -1844,6 +1951,9 @@ pub struct ProjView {
     pub pos: [f32; 3],
     /// Unit facing, which orients the bolt or the missile body.
     pub dir: [f32; 3],
+    /// Whose shot it is, so the renderer can paint it without re-deriving who
+    /// is on whose side. See [`Allegiance`].
+    pub allegiance: Allegiance,
 }
 
 /// One burning flare.
@@ -2523,11 +2633,65 @@ mod tests {
         // And small: at 60 Hz with ~100 entities these strides are the entire
         // per-frame cost. If one of these grows, that is a decision, not a
         // drive-by.
+        //
+        // `ProjView` was 32 and is 40: `Allegiance` adds four bytes and the
+        // `u64` key's alignment rounds up the other four. That is the decision,
+        // taken deliberately. A bolt that does not say whose it is has to be
+        // *guessed* at by the renderer, which is a copy of a simulation rule on
+        // the wrong side of the boundary; three hundred bolts in the air is
+        // 2.4 kB a frame for it, against a 12 kB list, and it does not add a
+        // draw call because the colour rides in the vertex buffer that was
+        // already being rebuilt.
         use core::mem::size_of;
         assert_eq!(size_of::<ShipView>(), 60);
-        assert_eq!(size_of::<ProjView>(), 32);
+        assert_eq!(size_of::<ProjView>(), 40);
         assert_eq!(size_of::<FlareView>(), 32);
         assert_eq!(size_of::<RockView>(), 40);
+    }
+
+    #[test]
+    fn allegiance_follows_the_damage_rule() {
+        let rules = Rules::DEFAULT;
+        let mut world = world();
+        let mut me = Ship::spawn(1, ShipKind::Local, Vec3::ZERO, Quat::IDENTITY, &rules);
+        me.team = Some(Team::Zero);
+        let mut mate = Ship::spawn(2, ShipKind::Remote, Vec3::ZERO, Quat::IDENTITY, &rules);
+        mate.team = Some(Team::Zero);
+        let mut bandit = Ship::spawn(3, ShipKind::Bot, Vec3::ZERO, Quat::IDENTITY, &rules);
+        bandit.team = Some(Team::One);
+        let stray = Ship::spawn(4, ShipKind::Bot, Vec3::ZERO, Quat::IDENTITY, &rules);
+        world.ships.extend([me, mate, bandit, stray]);
+        world.local_id = Some(1);
+        // Spawn protection is universal, and it is a *liveness* rule rather
+        // than a sides rule — a bolt from a ship that happens to be untouchable
+        // this second is still a hostile bolt. Cleared so the comparison below
+        // is against the half of `can_damage` this shares.
+        for s in &mut world.ships {
+            s.invuln_timer = 0.0;
+        }
+
+        assert_eq!(world.allegiance_of(1), Allegiance::Own);
+        assert_eq!(world.allegiance_of(2), Allegiance::Ally);
+        assert_eq!(world.allegiance_of(3), Allegiance::Hostile);
+        // No team yet is a free-for-all, and `can_damage` agrees.
+        assert_eq!(world.allegiance_of(4), Allegiance::Hostile);
+
+        // The colour and the damage rule cannot disagree: everything painted
+        // friendly is something the local player may not shoot, and everything
+        // painted hostile is something they may.
+        for id in [2, 3, 4] {
+            let target = world.ship(id).expect("ship");
+            assert_eq!(
+                world.allegiance_of(id).is_friendly(),
+                !world.can_damage(1, target),
+                "allegiance and can_damage disagree about ship {id}"
+            );
+        }
+
+        // A headless frame has no viewer, so nothing is friendly.
+        world.local_id = None;
+        assert_eq!(world.allegiance_of(2), Allegiance::Hostile);
+        assert_eq!(Allegiance::default(), Allegiance::Hostile);
     }
 
     #[test]

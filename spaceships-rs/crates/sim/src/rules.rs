@@ -1616,11 +1616,11 @@ pub struct BotRules {
     /// Minimum `dot(forward, to_aimpoint)` before firing. `bot.js:18`
     /// (`FIRE_DOT`).
     pub fire_dot: f64,
-    /// Gun cooldown on normal difficulty. `bot.js:19` (`FIRE_COOLDOWN`, the
-    /// `: 0.15` branch).
+    /// Gun cooldown on normal difficulty. `bot.js:19` (`FIRE_COOLDOWN`) is
+    /// 0.15; see [`BotRules::DEFAULT`] for why this is not.
     pub fire_cooldown: f64,
     /// Gun cooldown on hard difficulty. `bot.js:19` (the `? 0.05` branch) —
-    /// three times the rate of fire.
+    /// three times the rate of fire, a ratio held across the retune above.
     pub fire_cooldown_hard: f64,
     /// Muzzle offset ahead of the bot. `bot.js:304`.
     pub muzzle_offset: f64,
@@ -1710,8 +1710,30 @@ impl BotRules {
 
         fire_range: 600.0,
         fire_dot: 0.97,
-        fire_cooldown: 0.15,
-        fire_cooldown_hard: 0.05,
+
+        // `bot.js:19` is 0.15 s, which is 6.67 rounds a second and — at
+        // `weapons.gun_damage` of 10 — a theoretical 66.7 HP/s, or a 100 HP
+        // ship dead in 1.5 seconds of held alignment. That was survivable in
+        // the JS only because a bot's rounds used a private 4.0-unit hit radius
+        // and a point test with no sweep, so most of them missed by
+        // construction. This port gives a bot the same swept collision the
+        // player's gun uses, and `aim_offset_max` below is the *accuracy* lever
+        // that was already pulled to put the hit rate back where it was.
+        //
+        // Accuracy and rate of fire are two different complaints, though, and
+        // the one left is rate: a bot that has you lined up empties into you
+        // faster than you can read that it has. Halved, so the burst a bot lands
+        // during one alignment window is two rounds where it was six or seven —
+        // 3.33 rounds a second, 33.3 HP/s at perfect aim, and a 3.0 s
+        // theoretical time-to-kill against a full hull.
+        //
+        // One lever, deliberately: this is judged by feel, and a single number
+        // moved is a single number to move again.
+        fire_cooldown: 0.30,
+        // Hard mode keeps `bot.js`'s 3x relationship to the line above rather
+        // than its old absolute value, so "secret hard mode" still means "three
+        // times the rate of fire" and not "six times".
+        fire_cooldown_hard: 0.10,
         muzzle_offset: 2.5,
 
         missile_min_range: 130.0,

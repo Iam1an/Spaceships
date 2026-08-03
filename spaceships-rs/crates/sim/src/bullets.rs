@@ -1169,8 +1169,21 @@ pub fn fire_gun(
         rules.weapons.bullet_cooldown
     };
 
-    let local = world.local_id == Some(shooter);
-    let report = world.authority == Authority::Server && local;
+    // Who is pulling this trigger decides what goes on the wire, and there are
+    // three answers rather than two. A shot simulated *here* has to be told to
+    // everyone else — under the player's own id for the player, under
+    // `fromBotId` for a bot this client was handed to drive (see
+    // [`crate::bot::update_bots`], which is where bots actually fire today).
+    // A shot re-simulated from someone else's `fire` message is already on
+    // every screen and must stay silent, or it is drawn twice and reported
+    // twice.
+    let from_bot = match world.ships[index].kind {
+        ShipKind::Local => Some(None),
+        ShipKind::Bot => Some(Some(shooter)),
+        ShipKind::Remote | ShipKind::BossHitbox => None,
+    };
+    let report = from_bot.filter(|_| world.authority == Authority::Server);
+    let allegiance = world.allegiance_of(shooter);
 
     if !beam {
         let spawn = BulletSpawn::gun(&rules, origin, dir, &world.ships[index]);
@@ -1180,13 +1193,15 @@ pub fn fire_gun(
             weapon: WeaponKind::Bullet,
             origin,
             dir,
+            allegiance,
         });
-        if report {
+        if let Some(from_bot) = report {
             out.net_out.push(NetIntent::Fire {
                 weapon: WeaponKind::Bullet,
                 origin,
                 dir,
                 target: None,
+                from_bot,
             });
         }
         return FireOutcome::Bullet;
@@ -1202,13 +1217,15 @@ pub fn fire_gun(
         weapon: WeaponKind::Beam,
         origin: visual_start,
         dir: cast.end,
+        allegiance,
     });
-    if report {
+    if let Some(from_bot) = report {
         out.net_out.push(NetIntent::Fire {
             weapon: WeaponKind::Beam,
             origin: visual_start,
             dir: cast.end,
             target: None,
+            from_bot,
         });
     }
     if let Some(target) = cast.hit {

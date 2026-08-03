@@ -2,8 +2,8 @@
 //!
 //! [`crate`]'s module docs name this file's constraint directly: the JS client
 //! spends 477 draw calls at p99 because it allocates a mesh per entity, and
-//! `ProjView`/`FlareView` are 32-byte records with hundreds in flight. A mesh
-//! per bolt reproduces that bottleneck exactly.
+//! `ProjView`/`FlareView` are small fixed-stride records with hundreds in
+//! flight. A mesh per bolt reproduces that bottleneck exactly.
 //!
 //! # The shape that does not
 //!
@@ -135,13 +135,31 @@
 //! Cost, measured: a scene with forty missile bodies in it is **one** more draw
 //! call than the same scene with none.
 //!
-//! # What is missing from `Frame`
+//! # Whose shot is whose
 //!
-//! - **`ProjView` has no owner or team.** `bullets.js` keeps three material
-//!   pairs — `self`/`ally`/`enemy` — and a bolt's colour is the clearest read
-//!   on whether it is about to hurt you. Nothing in the 32-byte record says. A
-//!   `team: i32` (or an owner id, which also buys per-shooter trails) is the
-//!   missing field. Everything here draws the `self` palette.
+//! `bullets.js` keeps three material pairs — `self`/`ally`/`enemy` — and a
+//! bolt's colour is the clearest read a player gets on whether it is about to
+//! hurt them. `ProjView` used to carry no owner and no team, so everything here
+//! drew the `self` palette and incoming fire looked exactly like outgoing.
+//!
+//! It now carries [`Allegiance`], resolved in the simulation off the same team
+//! comparison that decides whether the round can damage you. See that type for
+//! why the signal is a friend/foe verdict rather than a raw owner id: the
+//! renderer would otherwise have to re-derive a rule the simulation already
+//! owns, which is the client/server duplication the port exists to delete.
+//!
+//! It costs **no** extra draw calls. The colour is three floats in
+//! [`Mesh::ATTRIBUTE_COLOR`], in the same vertex buffer, in the same single
+//! mesh — [`bolt_palette`] resolves the three palettes once per frame and every
+//! bolt indexes it. Bullets, beams, muzzle flashes, and the halo around a
+//! missile body all take it; the missile *body* stays three flat greys on its
+//! shared mesh, because that mesh is what keeps forty rockets down to one batch.
+//!
+//! # What is still missing from `Frame`
+//!
+//! - **`FlareView` has no owner.** A decoy is not a weapon and nothing is
+//!   currently misled by a yellow flare, but the field is the same one-liner if
+//!   a use turns up.
 //! - **Beams are events, not state.** `SimEvent::Fired { weapon: Beam }` gives
 //!   the segment once; `beams.js` keeps it on screen for `BEAM_LIFE`. That
 //!   0.18 s lifetime therefore lives in [`Effects::beams`] on this side, and a
@@ -173,10 +191,13 @@
 //! before-and-after pair is a pair of the same thing. See [`fx_scene`] and
 //! [`forced_trail`].
 //!
-//! One value of the first is not an effect and does not take an age:
+//! Two values of the first are not effects and do not take an age:
 //! `SPACESHIPS_FX_SCENE=rocket@<units>` parks a flight of missile *bodies* at a
 //! range, because a body does not age and the question about it is how it reads
-//! at 10 units against how it reads at 60. See [`stage_rockets`].
+//! at 10 units against how it reads at 60 ([`stage_rockets`]); and
+//! `SPACESHIPS_FX_SCENE=allegiance@<units>` parks one volley of each side
+//! abreast, because "can you tell them apart" is a question about three things
+//! next to each other ([`stage_allegiance`]).
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
@@ -187,7 +208,7 @@ use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-use sim::world::{ExplosionKind, FlareView, ProjView, ShipFlags, SimEvent, WeaponKind};
+use sim::world::{Allegiance, ExplosionKind, FlareView, ProjView, ShipFlags, SimEvent, WeaponKind};
 use spaceships_sim as sim;
 
 use crate::sim_bridge::{pos as to_vec3, rot, SimFrame, SimSet};
@@ -210,13 +231,26 @@ const ULTRA_GLOW: f32 = 1.7;
 const BOLT_LEN: f32 = 5.0;
 /// `bullets.js` core cylinder radius is 0.09 and the halo's is 0.32. A
 /// soft-edged billboard reads thinner than a lit cylinder of the same radius,
-/// so the core is widened to keep a bolt visible at range; the halo is
-/// faithful.
-const BOLT_CORE_HALF_W: f32 = 0.16;
-/// `bullets.js` halo radius, and its 1.15× length.
-const BOLT_HALO_HALF_W: f32 = 0.32;
-/// `bullets.js`: halo cylinder is `LASER_LEN * 1.15`.
-const BOLT_HALO_LEN: f32 = BOLT_LEN * 1.15;
+/// so the core is widened to keep a bolt visible at range.
+const BOLT_CORE_HALF_W: f32 = 0.14;
+/// The halo, sized to be **read** rather than to match a radius.
+///
+/// `bullets.js`'s halo cylinder is 0.32, and at that width the bolt has no
+/// legible colour: `camera.rs` grades with [`Tonemapping::AcesFitted`], which
+/// desaturates highlights hard, so the 7.5-nit core blows to white and a
+/// two-pixel rim around it goes with it. Since the halo is now the thing that
+/// says *whose shot this is* ([`BoltInk`]), it is widened until the coloured
+/// area survives the grade at combat range — which is the same reasoning that
+/// widened the core, applied to the half of the bolt that carries information.
+///
+/// The JS could afford a thin one: it had a material per team and no ACES.
+const BOLT_HALO_HALF_W: f32 = 0.85;
+/// `bullets.js`: halo cylinder is `LASER_LEN * 1.15`, lengthened with the
+/// widening above so the glow stays a lozenge rather than becoming a bead.
+const BOLT_HALO_LEN: f32 = BOLT_LEN * 1.32;
+/// Opacity of the halo pass. `bullets.js` uses 0.55 against an unbloomed,
+/// ungraded frame; see [`BOLT_HALO_HALF_W`] for why this one has to work harder.
+const BOLT_HALO_ALPHA: f32 = 0.85;
 
 /// `beams.js`: cylinder radius 0.5.
 const BEAM_HALF_W: f32 = 0.5;
@@ -1506,18 +1540,23 @@ fn consume_events(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                 weapon,
                 origin,
                 dir,
+                allegiance,
                 ..
             } => match weapon {
                 // For a beam `dir` is the *endpoint*, not a direction —
                 // `SimEvent::Fired` says so, and it is the one field in this
                 // enum whose meaning changes with a sibling.
+                //
+                // A beam is a shot like any other, so it takes the shooter's
+                // halo. Its core stays the same white-hot channel: see
+                // `BoltInk` on why the hue lives in the halo.
                 WeaponKind::Beam => push_beam(
                     &mut fx.beams,
                     BeamFx {
                         start: to_vec3([origin.x as f32, origin.y as f32, origin.z as f32]),
                         end: to_vec3([dir.x as f32, dir.y as f32, dir.z as f32]),
                         age: 0.0,
-                        color: glow(0x88ffd6, 1.6),
+                        color: bolt_ink(allegiance).halo,
                     },
                 ),
                 // A muzzle flash. `bullets.js` has none — the bolt spawns at
@@ -1527,7 +1566,7 @@ fn consume_events(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                 WeaponKind::Bullet | WeaponKind::Missile => {
                     let p = to_vec3([origin.x as f32, origin.y as f32, origin.z as f32]);
                     let d = to_vec3([dir.x as f32, dir.y as f32, dir.z as f32]);
-                    muzzle_flash(&mut fx, p, d);
+                    muzzle_flash(&mut fx, p, d, allegiance);
                 }
             },
 
@@ -1556,7 +1595,14 @@ fn consume_events(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
 /// a gun looks like. A gun throws its flash forward along the barrel, so this is
 /// a short hot streak on the firing axis with a small bloom at its root: two
 /// quads, alive for four frames.
-fn muzzle_flash(fx: &mut Effects, p: Vec3, dir: Vec3) {
+///
+/// It cools to the shooter's own halo, which is the cheapest possible way to
+/// answer "who just opened up on me" — the flash is at the muzzle, so its colour
+/// names the ship as well as the shot.
+fn muzzle_flash(fx: &mut Effects, p: Vec3, dir: Vec3, allegiance: Allegiance) {
+    // The same two hexes the bolt uses, at the flash's own intensities — which
+    // are the ones this effect already shipped for the local palette.
+    let (core, halo) = BOLT_HEX[allegiance as usize];
     push_shell(
         &mut fx.shells,
         Shell {
@@ -1564,8 +1610,8 @@ fn muzzle_flash(fx: &mut Effects, p: Vec3, dir: Vec3) {
             life: 0.07,
             from: 0.55,
             to: 1.5,
-            color: glow(0xeaffe6, 3.0),
-            cool: glow(0x33ff99, 0.6),
+            color: glow(core, 3.0),
+            cool: glow(halo, 0.6),
             opacity: 0.9,
             ease: 0.55,
             fade: 1.2,
@@ -1582,8 +1628,8 @@ fn muzzle_flash(fx: &mut Effects, p: Vec3, dir: Vec3) {
             life: 0.06,
             half: 0.30,
             shrink: 0.7,
-            color: glow(0xd9ffe8, 4.0),
-            cool: glow(0x2bff9c, 0.8),
+            color: glow(core, 4.0),
+            cool: glow(halo, 0.8),
             opacity: 0.95,
             vel: dir * 90.0,
             smear: 0.030,
@@ -2497,6 +2543,13 @@ fn build_surface(
     let bullet_lead = RULES.weapons.bullet_speed as f32 * sim::world::TICK_DT as f32 * overstep;
     let missile_lead = RULES.weapons.missile_speed as f32 * sim::world::TICK_DT as f32 * overstep;
 
+    // The three palettes, resolved once for the whole frame rather than once
+    // per bolt: `glow` is a `powf` per channel and there can be hundreds of
+    // bolts. Indexing this array is the entire per-projectile cost of knowing
+    // whose shot it is — no branch, no lookup, and not one extra draw call,
+    // because the colour rides in the vertex buffer that is rebuilt anyway.
+    let ink = bolt_palette();
+
     // ── bullets ──────────────────────────────────────────────────────────
     //
     // `bullets.js` draws a core cylinder inside a wider, dimmer halo cylinder,
@@ -2504,6 +2557,7 @@ fn build_surface(
     for b in frame.0.bullets.iter().chain(fx.demo.bullets.iter()) {
         let dir = to_vec3(b.dir);
         let center = to_vec3(b.pos) + dir * bullet_lead;
+        let ink = ink[b.allegiance as usize];
         build.streak(
             center,
             dir,
@@ -2511,8 +2565,8 @@ fn build_surface(
             BOLT_HALO_HALF_W,
             cam_fwd,
             Brush::GLOW,
-            BOLT_HALO,
-            0.55,
+            ink.halo,
+            BOLT_HALO_ALPHA,
         );
         build.streak(
             center,
@@ -2521,7 +2575,7 @@ fn build_surface(
             BOLT_CORE_HALF_W,
             cam_fwd,
             Brush::CORE,
-            BOLT_CORE,
+            ink.core,
             0.95,
         );
     }
@@ -2548,6 +2602,18 @@ fn build_surface(
             Brush::GLOW,
             MISSILE_NOZZLE,
             0.70 + 0.25 * pulse,
+        );
+        // Whose rocket it is, in the one place a rocket can say so without
+        // giving up its shared mesh. See `MISSILE_HALO_ALPHA`.
+        build.streak(
+            center,
+            dir,
+            MISSILE_BODY_LEN * 0.75,
+            MISSILE_HALO_HALF_W,
+            cam_fwd,
+            Brush::GLOW,
+            ink[m.allegiance as usize].halo,
+            MISSILE_HALO_ALPHA,
         );
     }
 
@@ -2729,17 +2795,81 @@ fn build_surface(
 }
 
 // ── the palette, resolved once ───────────────────────────────────────────
-//
-// `bullets.js` keeps `self`/`ally`/`enemy` pairs. `ProjView` carries no owner,
-// so there is no way to choose between them here and everything draws `self`.
-// See the module docs.
 
-/// `bullets.js` `self.coreColor`.
-static BOLT_CORE: LinearRgba = LinearRgba::rgb(6.16, 7.49, 5.92);
-/// `bullets.js` `self.haloColor`.
-static BOLT_HALO: LinearRgba = LinearRgba::rgb(0.14, 2.55, 1.11);
-/// `missiles.js` nozzle glow `0xff9900`.
+/// One shot's two colours: the near-white core and the wide, saturated halo
+/// that carries the hue.
+///
+/// The core is deliberately *not* the identifying colour. A bolt's core sits
+/// well over the bloom threshold and blows out to white on screen whatever it
+/// started as, so the halo is the only part of a laser a player can actually
+/// read a hue off — which is why the three halos below are strongly separated
+/// and the three cores barely differ.
+#[derive(Clone, Copy)]
+struct BoltInk {
+    core: LinearRgba,
+    halo: LinearRgba,
+}
+
+/// `bullets.js`'s `mkLaserMats` pairs, in [`Allegiance`] order: `localMats`,
+/// `allyMats`, `enemyMats` (`bullets.js:26`–`:28`).
+///
+/// Green is yours, blue is your team's, red is coming at you — the convention
+/// the shipped game already trained its players on, kept exactly.
+const BOLT_HEX: [(u32, u32); 3] = [
+    (0xeaffe6, 0x44ffb0),
+    (0xe6f0ff, 0x4aa3ff),
+    (0xffe0e0, 0xff3030),
+];
+
+/// How far over the bloom threshold each half of a bolt sits.
+///
+/// The core is unchanged from what this module shipped: `glow(0xeaffe6, 4.4)`
+/// is exactly the white-hot channel it always drew. The halo is brighter than
+/// the 1.5 it was, for the reason in [`BOLT_HALO_HALF_W`] — it now has to carry
+/// a hue through an ACES grade rather than just soften an edge.
+const BOLT_CORE_GLOW: f32 = 4.4;
+const BOLT_HALO_GLOW: f32 = 2.4;
+
+/// The palette for one allegiance.
+///
+/// `glow` costs three `powf`s a channel, so this is called once per *frame* per
+/// palette (hoisted in [`build_surface`]) and once per *event* for the beams and
+/// muzzle flashes, never once per bolt.
+fn bolt_ink(allegiance: Allegiance) -> BoltInk {
+    let (core, halo) = BOLT_HEX[allegiance as usize];
+    BoltInk {
+        core: glow(core, BOLT_CORE_GLOW),
+        halo: glow(halo, BOLT_HALO_GLOW),
+    }
+}
+
+/// Every palette at once, for the per-frame loops.
+fn bolt_palette() -> [BoltInk; 3] {
+    [
+        bolt_ink(Allegiance::Own),
+        bolt_ink(Allegiance::Ally),
+        bolt_ink(Allegiance::Hostile),
+    ]
+}
+
+/// `missiles.js` nozzle glow `0xff9900`. Not tinted by allegiance: a rocket
+/// motor is a flame, and a green or red one reads as a bug rather than as a
+/// friend. The rocket says whose it is with the halo around its body instead —
+/// see [`MISSILE_HALO_ALPHA`].
 static MISSILE_NOZZLE: LinearRgba = LinearRgba::rgb(5.10, 1.30, 0.0);
+
+/// How bright the allegiance halo around a missile body is.
+///
+/// The body itself is three flat greys ([`missile_mesh`]) and stays that way:
+/// it is the one solid object in this module and repainting it team colours
+/// would cost the shared-mesh batch that makes it free. A soft streak of the
+/// shooter's own hue *around* it costs one quad in the buffer that was already
+/// being rebuilt, and it is what makes an incoming rocket readable at the range
+/// where the body is four pixels long.
+const MISSILE_HALO_ALPHA: f32 = 0.5;
+/// Half-width of that halo, comfortably wider than [`MISSILE_BODY_RAD`] so it
+/// reads as a glow around the body rather than as a stripe on it.
+const MISSILE_HALO_HALF_W: f32 = 1.15;
 /// `missiles.js` flare core `0xffffff`.
 static FLARE_CORE: LinearRgba = LinearRgba::rgb(5.10, 5.10, 5.10);
 /// `missiles.js` flare glow `0xffcc22`.
@@ -2801,6 +2931,9 @@ struct Demo {
     started: bool,
 }
 
+/// The allegiances [`run_demo`] cycles its synthetic projectiles through.
+const DEMO_SIDES: [Allegiance; 3] = [Allegiance::Own, Allegiance::Ally, Allegiance::Hostile];
+
 fn run_demo(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
     if !fx.demo.started {
         fx.demo.started = true;
@@ -2845,6 +2978,9 @@ fn run_demo(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                 ))
             .to_array(),
             dir: dir.to_array(),
+            // Round-robin, so the stress scene exercises all three palettes and
+            // a screenshot of it shows the cost of the busiest case.
+            allegiance: DEMO_SIDES[i % DEMO_SIDES.len()],
         });
     }
 
@@ -2860,6 +2996,7 @@ fn run_demo(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
             pos: (anchor + Vec3::new(a.cos() * 110.0, -18.0 + 36.0 * f, a.sin() * 110.0))
                 .to_array(),
             dir: dir.to_array(),
+            allegiance: DEMO_SIDES[i % DEMO_SIDES.len()],
         });
     }
 
@@ -2911,7 +3048,7 @@ fn run_demo(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                 start: anchor + Vec3::new(a.sin() * 12.0, -4.0, a.cos() * 12.0),
                 end: p,
                 age: 0.0,
-                color: glow(0x88ffd6, 1.6),
+                color: bolt_ink(DEMO_SIDES[((t / 0.22) as usize) % DEMO_SIDES.len()]).halo,
             },
         );
     }
@@ -2951,6 +3088,8 @@ enum SceneKind {
     Beam,
     /// A flight of missile bodies, held still. See [`stage_rockets`].
     Rocket,
+    /// One volley of each allegiance, side by side. See [`stage_allegiance`].
+    Allegiance,
 }
 
 fn fx_scene() -> Option<Scene> {
@@ -2975,6 +3114,7 @@ fn fx_scene() -> Option<Scene> {
                 "muzzle" => SceneKind::Muzzle,
                 "beam" => SceneKind::Beam,
                 "rocket" | "body" => SceneKind::Rocket,
+                "allegiance" | "sides" => SceneKind::Allegiance,
                 other => {
                     warn!("SPACESHIPS_FX_SCENE={other} is not an effect this module draws");
                     return None;
@@ -2986,7 +3126,10 @@ fn fx_scene() -> Option<Scene> {
                 // still of one has to answer is how it reads close up against
                 // how it reads at the range it is actually seen from. Floored
                 // clear of the camera's own near plane and of the hull.
-                SceneKind::Rocket => arg.unwrap_or(SCENE_AHEAD).max(6.0),
+                //
+                // `allegiance` is the same: three volleys do not age either, and
+                // the question is whether the sides stay apart at range.
+                SceneKind::Rocket | SceneKind::Allegiance => arg.unwrap_or(SCENE_AHEAD).max(6.0),
                 _ => arg.unwrap_or(0.35).clamp(0.0, 0.99),
             };
             Some(Scene { what, at })
@@ -3015,7 +3158,7 @@ fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
     // `Rocket` spends its argument on range rather than on age, so it is also
     // the one scene that decides how far out it is staged.
     let ahead = match scene.what {
-        SceneKind::Rocket => scene.at,
+        SceneKind::Rocket | SceneKind::Allegiance => scene.at,
         _ => SCENE_AHEAD,
     };
     let at = to_vec3(ship.pos) + fwd * ahead + quat * Vec3::Y * SCENE_LIFT;
@@ -3028,6 +3171,7 @@ fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
     fx.motes.clear();
 
     match scene.what {
+        SceneKind::Allegiance => stage_allegiance(&mut fx, at, quat, scene.at),
         SceneKind::Explosion(kind) => {
             let scale = match kind {
                 ExplosionKind::ShipDeath => 6.0,
@@ -3036,12 +3180,12 @@ fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
             };
             spawn_explosion(&mut fx, kind, at, scale);
         }
-        SceneKind::Muzzle => muzzle_flash(&mut fx, at, fwd),
+        SceneKind::Muzzle => muzzle_flash(&mut fx, at, fwd, Allegiance::Own),
         SceneKind::Beam => fx.beams.push(BeamFx {
             start: at - fwd * 30.0 + quat * Vec3::X * 3.0,
             end: at + fwd * 30.0,
             age: BEAM_LIFE * scene.at,
-            color: glow(0x88ffd6, 1.6),
+            color: bolt_ink(Allegiance::Own).halo,
         }),
         SceneKind::Rocket => stage_rockets(&mut fx, at, quat, scene.at),
     }
@@ -3122,8 +3266,57 @@ fn stage_rockets(fx: &mut Effects, at: Vec3, quat: Quat, dist: f32) {
                 key: 3_000_000 + (r * ATTITUDES.len() + i) as u64,
                 pos: (anchor + ship_space(offset) * dist * rank).to_array(),
                 dir: ship_space(facing).normalize().to_array(),
+                allegiance: Allegiance::Own,
             });
         }
+    }
+}
+
+/// `SPACESHIPS_FX_SCENE=allegiance@40`: three volleys, one per side, held still.
+///
+/// The question a still of this has to answer is not "does a bolt look good" —
+/// [`Demo`] and the live game both answer that — but **"can you tell them apart
+/// without thinking about it"**, and that is a question about three things next
+/// to each other. One volley of each allegiance is parked abeam at the staged
+/// range, each a short stream of bolts with a rocket flying alongside it, so a
+/// single frame carries every surface the palette touches: bolt core, bolt halo,
+/// missile halo, and the grey body they have to stay legible against.
+///
+/// They fly *across* the camera rather than away from it, because a bolt seen
+/// end-on is a dot and a player almost never sees one that way — the shot you
+/// have to identify in a real fight is the one crossing your view.
+fn stage_allegiance(fx: &mut Effects, at: Vec3, quat: Quat, dist: f32) {
+    /// Bolts in each volley, and the gap between them along the line of flight.
+    const PER_VOLLEY: usize = 7;
+    const SPACING: f32 = 9.0;
+    /// Vertical separation between the three volleys, in units of range, so the
+    /// layout holds its proportions at 12 units and at 90.
+    const LANE: f32 = 0.30;
+
+    let right = quat * Vec3::X;
+    let up = quat * Vec3::Y;
+
+    fx.demo.bullets.clear();
+    fx.demo.missiles.clear();
+    for (lane, side) in DEMO_SIDES.into_iter().enumerate() {
+        // Top lane is yours, bottom is theirs, so the reading order matches the
+        // one the HUD already uses.
+        let height = (1.0 - lane as f32) * LANE * dist;
+        let origin = at + up * height - right * (PER_VOLLEY as f32 * SPACING * 0.5);
+        for i in 0..PER_VOLLEY {
+            fx.demo.bullets.push(ProjView {
+                key: 4_000_000 + (lane * PER_VOLLEY + i) as u64,
+                pos: (origin + right * (i as f32 * SPACING)).to_array(),
+                dir: right.to_array(),
+                allegiance: side,
+            });
+        }
+        fx.demo.missiles.push(ProjView {
+            key: 5_000_000 + lane as u64,
+            pos: (origin + right * (PER_VOLLEY as f32 * SPACING) - up * dist * 0.09).to_array(),
+            dir: right.to_array(),
+            allegiance: side,
+        });
     }
 }
 
@@ -3336,17 +3529,22 @@ mod tests {
     #[test]
     fn every_bullet_costs_two_quads_and_no_entities() {
         let mut build = MeshBuild::default();
+        let ink = bolt_palette();
+        // Mixed sides, because the point of the test is that colouring a bolt
+        // by whose it is changes the *vertex* count and nothing else.
         let bullets: Vec<ProjView> = (0..250)
             .map(|i| ProjView {
                 key: i,
                 pos: [i as f32, 0.0, 0.0],
                 dir: [0.0, 0.0, 1.0],
+                allegiance: DEMO_SIDES[i as usize % DEMO_SIDES.len()],
             })
             .collect();
 
         for b in &bullets {
             let dir = Vec3::from_array(b.dir);
             let center = Vec3::from_array(b.pos);
+            let ink = ink[b.allegiance as usize];
             build.streak(
                 center,
                 dir,
@@ -3354,7 +3552,7 @@ mod tests {
                 BOLT_HALO_HALF_W,
                 Vec3::NEG_Z,
                 Brush::GLOW,
-                BOLT_HALO,
+                ink.halo,
                 0.55,
             );
             build.streak(
@@ -3364,7 +3562,7 @@ mod tests {
                 BOLT_CORE_HALF_W,
                 Vec3::NEG_Z,
                 Brush::CORE,
-                BOLT_CORE,
+                ink.core,
                 0.95,
             );
         }
@@ -3509,7 +3707,7 @@ mod tests {
             0.16,
             along, // camera forward parallel to the bolt
             Brush::CORE,
-            BOLT_CORE,
+            bolt_ink(Allegiance::Own).core,
             1.0,
         );
         assert_eq!(build.pos.len(), 4);
@@ -3819,7 +4017,7 @@ mod tests {
                     pos: Vec3::splat(i as f32),
                     half: 0.2,
                     shrink: 0.45,
-                    color: BOLT_CORE,
+                    color: bolt_ink(Allegiance::Own).core,
                     opacity: 0.85,
                     ..default()
                 },
@@ -4010,23 +4208,119 @@ mod tests {
         let close = |a: f32, b: f32, what: &str| {
             assert!((a - b).abs() < 0.02, "{what}: {a} vs {b}");
         };
-        // `bullets.js` self core 0xeaffe6 at intensity 4.4.
-        let core = glow(0xeaffe6, 4.4);
-        close(core.red, BOLT_CORE.red, "core red");
-        close(core.green, BOLT_CORE.green, "core green");
-        close(core.blue, BOLT_CORE.blue, "core blue");
+        // The local pair is what this module drew before it knew about sides,
+        // and it must not have moved: `bullets.js` `localMats`, core 0xeaffe6
+        // at 4.4 and halo 0x44ffb0 at 1.5.
+        let own = bolt_ink(Allegiance::Own);
+        close(own.core.red, 6.16, "core red");
+        close(own.core.green, 7.49, "core green");
+        close(own.core.blue, 5.92, "core blue");
+        // The halo's *intensity* is a tuning knob (see `BOLT_HALO_HALF_W`), so
+        // what is pinned is the hex it is built from — `bullets.js` `localMats`
+        // halo 0x44ffb0 — not the brightness it is scaled to.
+        let want = glow(0x44ffb0, BOLT_HALO_GLOW);
+        close(own.halo.red, want.red, "halo red");
+        close(own.halo.green, want.green, "halo green");
+        close(own.halo.blue, want.blue, "halo blue");
+        assert!(
+            own.halo.green > own.halo.blue && own.halo.blue > own.halo.red,
+            "0x44ffb0 is a green-dominant teal: {own:?}",
+            own = own.halo
+        );
 
         // Every effect colour has to clear the bloom prefilter threshold of
         // 0.9 on at least one channel, or the Ultra look is not being hit.
-        for (name, c) in [
-            ("bolt core", BOLT_CORE),
-            ("bolt halo", BOLT_HALO),
-            ("missile nozzle", MISSILE_NOZZLE),
-            ("flare core", FLARE_CORE),
-            ("flare glow", FLARE_GLOW),
-        ] {
+        let mut named: Vec<(String, LinearRgba)> = vec![
+            ("missile nozzle".to_owned(), MISSILE_NOZZLE),
+            ("flare core".to_owned(), FLARE_CORE),
+            ("flare glow".to_owned(), FLARE_GLOW),
+        ];
+        for side in DEMO_SIDES {
+            let ink = bolt_ink(side);
+            named.push((format!("{side:?} core"), ink.core));
+            named.push((format!("{side:?} halo"), ink.halo));
+        }
+        for (name, c) in &named {
             let peak = c.red.max(c.green).max(c.blue);
             assert!(peak > 0.9, "{name} peaks at {peak}, below the bloom floor");
         }
+    }
+
+    /// The whole point of the palette: three sides that are not each other.
+    ///
+    /// A colour test that only pinned hex values would pass on three shades of
+    /// the same green. This asserts *separation* — that each halo is dominated
+    /// by a different channel, which is the property a player actually reads at
+    /// speed, and that no two are close enough to confuse.
+    #[test]
+    fn the_three_sides_do_not_look_alike() {
+        let dominant = |c: LinearRgba| {
+            let (r, g, b) = (c.red, c.green, c.blue);
+            if r >= g && r >= b {
+                0
+            } else if g >= b {
+                1
+            } else {
+                2
+            }
+        };
+        let own = bolt_ink(Allegiance::Own).halo;
+        let ally = bolt_ink(Allegiance::Ally).halo;
+        let hostile = bolt_ink(Allegiance::Hostile).halo;
+
+        // Green is yours, blue is your team's, red is incoming — `bullets.js`'s
+        // convention, which the shipped game already taught its players.
+        assert_eq!(dominant(own), 1, "your own fire should read green");
+        assert_eq!(dominant(ally), 2, "a team-mate's should read blue");
+        assert_eq!(dominant(hostile), 0, "incoming should read red");
+
+        // And they are far apart in the space the shader actually blends in.
+        let apart = |a: LinearRgba, b: LinearRgba| {
+            ((a.red - b.red).powi(2) + (a.green - b.green).powi(2) + (a.blue - b.blue).powi(2))
+                .sqrt()
+        };
+        for (l, r, what) in [
+            (own, ally, "own vs ally"),
+            (own, hostile, "own vs hostile"),
+            (ally, hostile, "ally vs hostile"),
+        ] {
+            assert!(apart(l, r) > 1.5, "{what} are only {} apart", apart(l, r));
+        }
+    }
+
+    /// A frame with every side in it costs the same as a frame with one side.
+    ///
+    /// The constraint the whole module is built around: colour rides in the
+    /// vertex buffer, so knowing whose a bolt is cannot turn into a mesh, a
+    /// material, or an entity per shooter.
+    #[test]
+    fn colouring_by_side_costs_no_geometry() {
+        let build = |sides: &[Allegiance]| {
+            let mut b = MeshBuild::default();
+            let ink = bolt_palette();
+            for (i, side) in sides.iter().enumerate() {
+                b.streak(
+                    Vec3::new(i as f32, 0.0, 0.0),
+                    Vec3::Z,
+                    BOLT_LEN * 0.5,
+                    BOLT_CORE_HALF_W,
+                    Vec3::NEG_Z,
+                    Brush::CORE,
+                    ink[*side as usize].core,
+                    0.95,
+                );
+            }
+            b
+        };
+        let one = build(&[Allegiance::Own; 60]);
+        let all: Vec<Allegiance> = (0..60).map(|i| DEMO_SIDES[i % DEMO_SIDES.len()]).collect();
+        let mixed = build(&all);
+
+        assert_eq!(one.pos.len(), mixed.pos.len());
+        assert_eq!(one.index.len(), mixed.index.len());
+        // Same geometry, different paint — which is the only thing that may
+        // differ between the two.
+        assert_eq!(one.pos, mixed.pos);
+        assert_ne!(one.color, mixed.color);
     }
 }

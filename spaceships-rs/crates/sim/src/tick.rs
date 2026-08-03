@@ -108,9 +108,9 @@ use crate::missiles::{self, Detonation, DetonationCause, Volume};
 use crate::rules::Rules;
 use crate::ship::{self, FlightStep, WorldGeometry};
 use crate::world::{
-    is_boss_hitbox, Authority, BossView, EntityId, Flare, FlareView, Frame, GunMode, HudState,
-    Input, MapKind, Missile, Mode, NetEvent, NetIntent, ProjView, Quat, RockView, Ship, ShipFlags,
-    ShipKind, ShipView, SimEvent, Team, TrialsHud, WeaponKind, World,
+    is_boss_hitbox, Allegiance, Authority, BossView, EntityId, Flare, FlareView, Frame, GunMode,
+    HudState, Input, MapKind, Missile, Mode, NetEvent, NetIntent, ProjView, Quat, RockView, Ship,
+    ShipFlags, ShipKind, ShipView, SimEvent, Team, TrialsHud, WeaponKind, World,
 };
 
 // ---------------------------------------------------------------------------
@@ -383,6 +383,7 @@ fn ingest_remote_shot(
         weapon,
         origin,
         dir,
+        allegiance: world.allegiance_of(id),
     });
 }
 
@@ -845,12 +846,16 @@ impl TerrainHeight for RulesTerrain {
 }
 
 /// Runs bot AI, with the heightfield attached on the map that has one.
+///
+/// The net queue goes in as well as the event queue: a bot this machine drives
+/// is a shooter nobody else is simulating, so its trigger pulls have to reach
+/// the wire the same way the player's do. See [`crate::bot::update_bots`].
 fn step_bots(world: &mut World, dt: f64, out: &mut Out) {
     if world.map == MapKind::Terrain {
         let ground = RulesTerrain(world.rules);
-        bot::update_bots(world, dt, Some(&ground), &mut out.events);
+        bot::update_bots(world, dt, Some(&ground), &mut out.events, &mut out.net);
     } else {
-        bot::update_bots(world, dt, None, &mut out.events);
+        bot::update_bots(world, dt, None, &mut out.events, &mut out.net);
     }
 }
 
@@ -964,6 +969,7 @@ fn launch_missile(world: &mut World, id: EntityId, out: &mut Out) {
         weapon: WeaponKind::Missile,
         origin,
         dir,
+        allegiance: world.allegiance_of(id),
     });
     if world.authority == Authority::Server && world.local_id == Some(id) {
         out.net.push(NetIntent::Fire {
@@ -971,6 +977,7 @@ fn launch_missile(world: &mut World, id: EntityId, out: &mut Out) {
             origin,
             dir,
             target: Some(target),
+            from_bot: None,
         });
     }
 }
@@ -1100,15 +1107,22 @@ fn build_frame(world: &World, out: Out, flights: &[(EntityId, FlightStep)]) -> F
         });
     }
 
+    // One viewer lookup for the whole frame rather than one per projectile:
+    // `Allegiance::of` takes the local ship so the hundreds of bolts in a busy
+    // frame do not each walk the ship list. Both projectile lists carry the
+    // owner's team *as it was at launch* (`Bullet::owner_team`), so a shot
+    // cannot change sides in flight when its shooter does.
+    let viewer = world.local_ship();
     for b in &world.bullets {
         frame.bullets.push(ProjView {
             key: b.key,
             pos: vec3f(b.pos),
             dir: vec3f(b.vel.normalize()),
+            allegiance: Allegiance::of(b.owner, b.owner_team, viewer),
         });
     }
     for m in &world.missiles {
-        frame.missiles.push(missile_view(m));
+        frame.missiles.push(missile_view(m, viewer));
     }
     for f in &world.flares {
         frame.flares.push(flare_view(f));
@@ -1131,11 +1145,12 @@ fn build_frame(world: &World, out: Out, flights: &[(EntityId, FlightStep)]) -> F
     frame
 }
 
-fn missile_view(m: &Missile) -> ProjView {
+fn missile_view(m: &Missile, viewer: Option<&Ship>) -> ProjView {
     ProjView {
         key: m.key,
         pos: vec3f(m.pos),
         dir: vec3f(m.dir),
+        allegiance: Allegiance::of(m.owner, m.owner_team, viewer),
     }
 }
 

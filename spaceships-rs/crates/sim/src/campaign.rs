@@ -78,8 +78,8 @@ use crate::rules::{
     BOSS_TURRET_COUNT, BOSS_TURRET_MUZZLE, BOSS_TURRET_PIVOTS,
 };
 use crate::world::{
-    is_boss_hitbox, CampaignHud, CampaignPhase, CampaignState, EntityId, Mode, Quat, Ship,
-    ShipKind, SimEvent, Team, Turret, WeaponKind, World,
+    is_boss_hitbox, Allegiance, CampaignHud, CampaignPhase, CampaignState, EntityId, Mode, Quat,
+    Ship, ShipKind, SimEvent, Team, Turret, WeaponKind, World,
 };
 
 // ---------------------------------------------------------------------------
@@ -951,11 +951,16 @@ fn step_boss(world: &mut World, camp: &mut CampaignState, dt: f64, events: &mut 
         // this ship fired, so they do not detonate on its own deck either.
         let spawn = BulletSpawn::boss_turret(&rules, muzzle, dir, BOSS_ID_BASE, Some(Team::One));
         spawn_bullet(world, spawn);
+        // The capital ship has no [`Ship`] record of its own — only its
+        // hitboxes do — so its allegiance is stated rather than looked up. It
+        // is team 1 and the player is team 0, which is the same answer
+        // `allegiance_of` would give if there were a record to find.
         events.push(SimEvent::Fired {
             owner: BOSS_ID_BASE,
             weapon: WeaponKind::Bullet,
             origin: muzzle,
             dir,
+            allegiance: Allegiance::Hostile,
         });
     }
 }

@@ -924,6 +924,69 @@ fn the_frame_describes_the_world_the_step_just_produced() {
 }
 
 #[test]
+fn every_projectile_in_the_frame_says_whose_it_is() {
+    use spaceships_sim::world::Allegiance;
+
+    // Three shooters, one of each relationship to the player, all firing into
+    // the same frame. Without this the renderer paints the whole sky in the
+    // local palette and incoming fire is indistinguishable from outgoing.
+    let mut world = bare_world(0xA11E, Mode::Skirmish);
+    push_ship(&mut world, 1, Team::Zero, Vec3::ZERO);
+    push_ship(&mut world, 2, Team::Zero, Vec3::new(40.0, 0.0, 0.0));
+    push_ship(&mut world, 3, Team::One, Vec3::new(0.0, 0.0, 300.0));
+    world.local_id = Some(1);
+
+    let frame = tick(
+        &mut world,
+        &[hold_trigger(1), hold_trigger(2), hold_trigger(3)],
+        &[],
+        TICK_DT,
+    );
+    assert_eq!(frame.bullets.len(), 3, "one bolt from each shooter");
+
+    let of = |owner: i32| {
+        let key = world
+            .bullets
+            .iter()
+            .find(|b| b.owner == owner)
+            .expect("no bolt from that shooter")
+            .key;
+        frame
+            .bullets
+            .iter()
+            .find(|b| b.key == key)
+            .expect("the frame dropped a bullet")
+            .allegiance
+    };
+    assert_eq!(of(1), Allegiance::Own);
+    assert_eq!(of(2), Allegiance::Ally);
+    assert_eq!(of(3), Allegiance::Hostile);
+
+    // And the events say it too, so a beam and a muzzle flash are painted the
+    // same way the bolt is.
+    for (owner, want) in [(1, Allegiance::Own), (3, Allegiance::Hostile)] {
+        assert!(
+            frame.events.iter().any(|e| matches!(
+                e,
+                SimEvent::Fired { owner: o, allegiance, .. } if *o == owner && *allegiance == want
+            )),
+            "no {want:?} shot reported for ship {owner}"
+        );
+    }
+
+    // Missiles carry the same signal, off the launch-time team snapshot.
+    let launch = |id: i32| Input {
+        id,
+        fire_missile: true,
+        ..Input::default()
+    };
+    let frame = tick(&mut world, &[launch(1), launch(3)], &[], TICK_DT);
+    let mut seen: Vec<Allegiance> = frame.missiles.iter().map(|m| m.allegiance).collect();
+    seen.sort_unstable_by_key(|a| *a as u32);
+    assert_eq!(seen, vec![Allegiance::Own, Allegiance::Hostile]);
+}
+
+#[test]
 fn a_server_authoritative_match_reports_its_shots_and_its_pose() {
     use spaceships_sim::world::{Authority, NetEvent, NetIntent};
 
@@ -994,6 +1057,71 @@ fn a_server_authoritative_match_reports_its_shots_and_its_pose() {
     assert!(
         poses == nominal || poses + 1 == nominal,
         "expected about {nominal} pose updates in a second, got {poses}"
+    );
+}
+
+#[test]
+fn a_hosted_bot_announces_its_own_gunfire() {
+    use spaceships_sim::world::{Authority, NetIntent};
+
+    // The defect this pins: in the JS a balance bot the host drives damaged
+    // remote players with rounds those players never saw, because `sim` only
+    // reported `fire` for the local ship and nothing sent `bot-fire`.
+    let rules = Rules::DEFAULT;
+    let mut world = bare_world(0xB07F, Mode::Multiplayer);
+    assert_eq!(world.authority, Authority::Server);
+    push_ship(&mut world, 1, Team::Zero, Vec3::ZERO);
+    world.local_id = Some(1);
+
+    // A bot on the far team, close enough to open fire, driven here.
+    let mut hosted = Ship::spawn(
+        -3,
+        ShipKind::Bot,
+        Vec3::new(0.0, 0.0, 200.0),
+        Quat::FLIP_Y,
+        &rules,
+    );
+    hosted.team = Some(Team::One);
+    hosted.invuln_timer = 0.0;
+    bot::init(&mut hosted, false, false, &rules, &mut world.rng.bots);
+    world.ships.push(hosted);
+
+    let mut intents = Vec::new();
+    let mut shots = 0;
+    for _ in 0..900 {
+        let frame = tick(&mut world, &[idle(1)], &[], TICK_DT);
+        shots += frame
+            .events
+            .iter()
+            .filter(|e| matches!(e, SimEvent::Fired { owner: -3, .. }))
+            .count();
+        intents.extend(frame.net_out);
+    }
+
+    let announced = intents
+        .iter()
+        .filter(|i| {
+            matches!(
+                i,
+                NetIntent::Fire {
+                    from_bot: Some(-3),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(shots > 0, "the bot never fired in fifteen seconds");
+    assert_eq!(
+        shots, announced,
+        "{shots} bot shots but {announced} of them reached the wire"
+    );
+    // And the player's own id is never borrowed for them: `fire` and `bot-fire`
+    // are different messages and the server credits them differently.
+    assert!(
+        !intents
+            .iter()
+            .any(|i| matches!(i, NetIntent::Fire { from_bot: None, .. })),
+        "the player fired nothing, so no plain `fire` may go out"
     );
 }
 
