@@ -2530,6 +2530,20 @@ fn build_surface(
     let cam_up = cam.up().as_vec3();
     let cam_fwd = cam.forward().as_vec3();
 
+    // The viewer's own velocity, for the smear below.
+    //
+    // The chase camera rides the local ship, so the ship's velocity is the
+    // camera's to within the damping — near enough for a streak length, and far
+    // cheaper than differencing the camera transform between frames (which
+    // would also smear the whole field for one frame after every respawn and
+    // every teleport).
+    let viewer_vel = frame
+        .0
+        .ships
+        .iter()
+        .find(|s| s.flags.contains(sim::world::ShipFlags::LOCAL))
+        .map_or(Vec3::ZERO, |s| Vec3::from_array(s.vel));
+
     build.clear();
 
     // `SimFrame` is the last completed *tick*, and a bullet covers 13 units in
@@ -2725,14 +2739,27 @@ fn build_surface(
 
         // A particle moving several of its own diameters per frame is a bead on
         // a string however many of them there are, so it is drawn smeared along
-        // its own velocity instead — see `MOTE_SMEAR`. The threshold is what
-        // keeps a slow puff a puff: below it the streak would be shorter than
-        // the quad is wide and the branch would only cost a normalise.
-        let smear = m.vel.length() * m.smear;
+        // its motion instead — see `MOTE_SMEAR`. The threshold is what keeps a
+        // slow puff a puff: below it the streak would be shorter than the quad
+        // is wide and the branch would only cost a normalise.
+        //
+        // **Relative to the viewer, not to the world.** Smearing is a stand-in
+        // for the streak a fast-crossing particle would leave on a real sensor,
+        // and "fast" there means fast *across the view*. Exhaust inherits the
+        // ship's lateral velocity whole, so while drifting it hangs at the
+        // nozzle and is very nearly stationary to the pilot looking at it —
+        // while its world velocity is the better part of 80 u/s. Keyed off that
+        // number, every plume stretched into a line the moment the ship stopped
+        // flying straight, for motion the viewer could not see. Flying straight
+        // hid it: there the mote sheds 30% along the nose, and world and
+        // relative speed are close enough to look right by accident.
+        let motion = m.vel - viewer_vel;
+        let speed = motion.length();
+        let smear = speed * m.smear;
         if smear > r * 0.4 {
             build.streak(
                 m.pos,
-                m.vel / m.vel.length(),
+                motion / speed,
                 r + smear,
                 r,
                 cam_fwd,
@@ -3452,6 +3479,46 @@ fn binned_draw_calls(
 
 #[cfg(test)]
 mod tests {
+    /// Smearing is about motion *across the view*, so a particle travelling
+    /// with the viewer must stay round however fast the pair of them is going.
+    ///
+    /// The bug: the streak was keyed off world velocity. Exhaust inherits the
+    /// ship's lateral velocity whole — which is what keeps the plume on the
+    /// nozzles while drifting — so a drifting ship's motes were nearly still
+    /// relative to the pilot and yet carried ~80 u/s of world velocity. Every
+    /// plume became a line the moment the ship stopped flying straight.
+    #[test]
+    fn a_particle_moving_with_the_viewer_does_not_streak() {
+        // The rule `build_surface` applies, in one place so the test cannot
+        // drift from it.
+        fn streaks(mote_vel: Vec3, viewer_vel: Vec3, radius: f32) -> bool {
+            let motion = mote_vel - viewer_vel;
+            motion.length() * MOTE_SMEAR > radius * 0.4
+        }
+
+        let r = 0.35;
+        let drifting = Vec3::new(80.0, 0.0, 0.0);
+
+        // Co-moving: fast through the world, motionless to the pilot.
+        assert!(
+            !streaks(drifting, drifting, r),
+            "exhaust hanging at the nozzle must stay a puff",
+        );
+
+        // The old rule, for contrast: judged against a still world it streaks,
+        // which is exactly what was on screen.
+        assert!(
+            streaks(drifting, Vec3::ZERO, r),
+            "this is the case the fix exists for",
+        );
+
+        // And something genuinely crossing the view still streaks.
+        assert!(
+            streaks(Vec3::new(0.0, 0.0, 60.0), drifting, r),
+            "a bolt crossing the view must still smear",
+        );
+    }
+
     /// The exhaust may only fall behind *along its own axis*.
     ///
     /// The bug this pins: `vel * inherit` shed 30% of whatever direction the
