@@ -5230,6 +5230,7 @@ dependencies = [
  "js-sys",
  "serde_json",
  "spaceships-protocol",
+ "spaceships-replay",
  "spaceships-sim",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -5244,6 +5245,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "spaceships-replay"
+version = "0.1.0"
+dependencies = [
+ "spaceships-sim",
 ]
 
 [[package]]

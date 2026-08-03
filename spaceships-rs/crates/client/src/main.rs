@@ -74,6 +74,7 @@ mod cockpit;
 mod hud;
 mod input;
 mod net;
+mod replay;
 mod scene;
 mod sim_bridge;
 mod skybox;
@@ -234,6 +235,11 @@ fn main() {
         cockpit::CockpitPlugin,
         ui::UiPlugin,
         warp::WarpPlugin,
+        // Last, so that when `SPACESHIPS_REPLAY` names a file this plugin can
+        // overwrite the match `SimPlugin` built at startup. Adding it before
+        // would have the recorded world replaced by the default skirmish a
+        // moment later.
+        replay::ReplayPlugin,
     ))
     .init_resource::<FrameCost>()
     // `First` opens the window and `Last` closes it, so `busy` is the main

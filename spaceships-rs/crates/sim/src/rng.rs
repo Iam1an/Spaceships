@@ -82,6 +82,44 @@ impl Rng {
         rng
     }
 
+    /// This generator's position, as the two words it is made of.
+    ///
+    /// # Why this is public
+    ///
+    /// A replay is a seed plus an input log, re-simulated — but only a replay
+    /// that starts at tick 0 can rebuild the streams with
+    /// [`crate::world::WorldRng::from_seed`]. By the time the first tick runs,
+    /// the field generator has drawn a whole asteroid belt and every bot has
+    /// rolled its opening missile delay, so a recording taken at the start of a
+    /// *match* is already several thousand draws into four of the five streams.
+    ///
+    /// Writing the position out and reading it back is therefore the only way to
+    /// restore a world exactly, and it is what a periodic snapshot needs as
+    /// well: seeking a replay clones a `World` from ten seconds ago and
+    /// fast-forwards, which is wrong by every subsequent roll if the generator
+    /// does not come with it.
+    ///
+    /// [`Rng::from_raw`] is the inverse and the pair round-trips exactly. It is
+    /// deliberately *not* a way to invent a stream: `inc` must be odd for the
+    /// LCG to be full-period, and `from_raw` forces it, so the only values worth
+    /// passing in are ones this method produced.
+    #[must_use]
+    pub fn to_raw(&self) -> (u64, u64) {
+        (self.state, self.inc)
+    }
+
+    /// Restores a generator [`Rng::to_raw`] recorded.
+    ///
+    /// `inc` is forced odd, which is the one invariant the algorithm has and the
+    /// only thing a caller could get wrong.
+    #[must_use]
+    pub fn from_raw(state: u64, inc: u64) -> Rng {
+        Rng {
+            state,
+            inc: inc | 1,
+        }
+    }
+
     /// Advances the underlying LCG one step.
     #[inline]
     fn step(&mut self) {
@@ -454,5 +492,30 @@ mod tests {
         // The child stream should not simply echo the parent's.
         let parent_tail: Vec<u32> = (0..16).map(|_| parent_a.next_u32()).collect();
         assert_ne!(sa, parent_tail);
+    }
+
+    /// A generator written out mid-stream and read back must carry on from
+    /// exactly where it was, not from where it started. This is the property a
+    /// replay snapshot rests on.
+    #[test]
+    fn a_generator_round_trips_through_its_raw_words() {
+        let mut original = Rng::with_stream(0xC0FFEE, 4);
+        for _ in 0..97 {
+            original.next_u32();
+        }
+
+        let (state, inc) = original.to_raw();
+        let mut restored = Rng::from_raw(state, inc);
+
+        assert_eq!(original, restored, "the words must describe the generator");
+        let a: Vec<u32> = (0..32).map(|_| original.next_u32()).collect();
+        let b: Vec<u32> = (0..32).map(|_| restored.next_u32()).collect();
+        assert_eq!(a, b, "and the restored stream must continue, not restart");
+    }
+
+    /// `inc` must stay odd whatever a caller hands over.
+    #[test]
+    fn a_restored_generator_keeps_its_stream_odd() {
+        assert_eq!(Rng::from_raw(1, 8).to_raw().1, 9);
     }
 }

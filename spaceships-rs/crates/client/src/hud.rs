@@ -2732,6 +2732,7 @@ fn sync_hud(
     frame: Res<SimFrame>,
     time: Res<Time>,
     view: Res<crate::cockpit::ViewMode>,
+    free: Res<crate::replay::FreeCam>,
     lobby: Option<Res<crate::ui::LobbyOpen>>,
     setup: Res<crate::sim_bridge::MatchSetup>,
     nodes: Option<Res<HudNodes>>,
@@ -2748,19 +2749,33 @@ fn sync_hud(
     // for the same reason it stands down in the cockpit: something else is
     // already the interface.
     let hidden = view.seated || lobby.is_some_and(|l| l.0);
-    let next = model(
-        &frame.0,
-        Env {
-            time: time.elapsed_secs(),
-            seated: hidden,
-            locked: sight.locked,
-            range: sight.range,
-            map: setup.map,
-            hull: crate::weapons::forced_hull(),
-        },
-        &feed,
-        result.outcome,
-    );
+
+    // A replay's free camera stands the whole thing down, which is a stronger
+    // claim than `seated` makes. Seated, the glass keeps its reticle, its tapes
+    // and its scoreline, because a real HUD is projected on the canopy and the
+    // pilot is still flying — only the bars go, and `model` documents that list
+    // in full. Detached from every aircraft there is no pilot and no gun: a
+    // crosshair in the middle of a drone shot is aiming something nobody is
+    // holding. `HudModel::default` is the no-local-ship model, which is the one
+    // that hides the root, and it comes back the moment the viewer rides
+    // something.
+    let next = if free.active {
+        HudModel::default()
+    } else {
+        model(
+            &frame.0,
+            Env {
+                time: time.elapsed_secs(),
+                seated: hidden,
+                locked: sight.locked,
+                range: sight.range,
+                map: setup.map,
+                hull: crate::weapons::forced_hull(),
+            },
+            &feed,
+            result.outcome,
+        )
+    };
     let prev = applied.0;
 
     // The early-out. On a frame where nothing the player can see has changed —

@@ -1286,6 +1286,35 @@ fn outcome(winner: Option<Team>, frame: &sim::world::Frame) -> Option<bool> {
 // The credential store
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// This installation's own directory, by the platform's convention.
+///
+/// The credential store was the first thing to need one and is no longer the
+/// only one — `replay.rs` puts recordings in `replays/` beside it — so the
+/// directory is resolved here and the file names are the callers'. See
+/// [`store::path`] for why a bearer credential goes here rather than beside the
+/// executable, and note the same reasoning does *not* apply to a recording: a
+/// replay is not a secret, it lives here because this is where the game's own
+/// files live.
+///
+/// `SPACESHIPS_STATE_DIR` overrides it, which is how the tests exercise both
+/// without touching a real one.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn state_dir() -> Option<std::path::PathBuf> {
+    if let Some(explicit) = std::env::var_os("SPACESHIPS_STATE_DIR") {
+        return Some(std::path::PathBuf::from(explicit));
+    }
+    Some(if cfg!(target_os = "macos") {
+        std::path::PathBuf::from(std::env::var_os("HOME")?)
+            .join("Library/Application Support/Spaceships")
+    } else if cfg!(windows) {
+        std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("Spaceships")
+    } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        std::path::PathBuf::from(xdg).join("spaceships")
+    } else {
+        std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config/spaceships")
+    })
+}
+
 /// Where the JWT is kept between runs.
 ///
 /// Two implementations, one contract: [`load`](store::load), [`save`](store::save),
@@ -1360,19 +1389,7 @@ mod store {
     /// exercise this without touching a real one.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn path() -> Option<std::path::PathBuf> {
-        let dir = if let Some(explicit) = std::env::var_os("SPACESHIPS_STATE_DIR") {
-            std::path::PathBuf::from(explicit)
-        } else if cfg!(target_os = "macos") {
-            std::path::PathBuf::from(std::env::var_os("HOME")?)
-                .join("Library/Application Support/Spaceships")
-        } else if cfg!(windows) {
-            std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("Spaceships")
-        } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            std::path::PathBuf::from(xdg).join("spaceships")
-        } else {
-            std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config/spaceships")
-        };
-        Some(dir.join("credentials.json"))
+        Some(super::state_dir()?.join("credentials.json"))
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -16,6 +16,13 @@ described missing features and now describe shipped ones.
 The headline feature. Record a match, scrub it, fly through it freely, cut
 clips.
 
+> **Phase one is built.** `crates/replay` records and plays back;
+> `crates/client/src/replay.rs` is the dashcam, the transport, the free camera
+> and the ride-a-plane view. What is *not* built is the timeline UI, the camera
+> keyframes and the export — see [Phase two](#phase-two-what-is-left) at the end
+> of this section, which also carries the encoder decision. Everything above
+> that heading is the original design and still governs.
+
 ### Why this is cheap
 
 `crates/sim` is deterministic by construction: same seed plus same inputs
@@ -103,10 +110,109 @@ record the log even if nothing reads it yet.
 
 ### Open questions
 
-- Rules change between versions. A replay must store the `Rules` it ran under,
-  or old replays desync after a balance patch. Version the format from day one.
+- ~~Rules change between versions. A replay must store the `Rules` it ran under,
+  or old replays desync after a balance patch. Version the format from day one.~~
+  **Done, as a fingerprint rather than the rules themselves.** The file carries
+  a `u32` format version and a 64-bit hash of `Rules`'s `Debug` rendering, which
+  covers every field including ones added later. A recording made under
+  different rules is *refused* rather than silently replayed into a different
+  match. Storing the 265 values themselves — so an old replay still plays
+  *correctly* — is a strict addition to a format that already has somewhere to
+  put them.
 - Do replays record multiplayer matches server-side, or does each client record
-  its own? Server-side is authoritative and enables sharing.
+  its own? Server-side is authoritative and enables sharing. **Client-side is
+  what exists**, and what it captures is *what that client saw*: remote ships
+  interpolated from their `state` messages, not ground truth. The
+  `spaceships-replay` crate depends only on `sim`, so the server can record with
+  the same code whenever that becomes worth doing.
+
+---
+
+### Phase two: what is left
+
+#### Where phase one landed
+
+| | |
+|---|---|
+| Format | `seed + rules fingerprint + initial World + [(Input, NetEvent)] per tick` |
+| Size | ~480 kB for five minutes on the mouse; ~38 kB on the keyboard |
+| Seeking | keyframe every 5 s; 61 held over five minutes, ~70 ms to index, worst seek 1.3 ms |
+| Where | `<state dir>/replays/*.spr`, written on match end and on exit |
+| Playing | `SPACESHIPS_REPLAY=<file>`, plus `_VIEW` and `_AT` for captures |
+
+The **initial `World` is stored** rather than rebuilt from the seed. It is ten
+kilobytes against a log of hundreds, and it is what makes recording
+mode-agnostic — a networked match's opening state comes off the wire and cannot
+be reconstructed from a seed at all.
+
+The **`NetEvent` log is what makes multiplayer work.** Under `Authority::Server`
+this client resolves no hit points, respawns nobody and counts no clock; all of
+it arrives as events. `a_multiplayer_replay_is_wrong_without_its_net_events`
+pins that: strip the log and the same inputs produce a pilot who is never hurt.
+
+#### The encoder — decided
+
+**Apple's own stack: VideoToolbox for the encode, `AVAssetWriter` for the
+container.** Nothing to install, nothing to bundle — the frameworks ship with
+the OS — hardware H.264 and HEVC on every Apple Silicon Mac, and Apple carries
+the AVC patent licence. `AVAssetWriterInput` with an
+`AVVideoCodecTypeH264` and a pixel-buffer adaptor drives the encoder *and*
+muxes the MP4, so it collapses two problems into one API. Reached either through
+a ~150-line Swift shim (`swift-rs`) or through `objc2-video-toolbox` /
+`objc2-av-foundation`, which are already in the tree transitively via winit.
+120 fps is a different `expectedFrameRate` and timescale, not extra work.
+Estimate: 3–5 days.
+
+What was rejected, and why:
+
+| Option | Why not |
+|---|---|
+| Shell out to a stock `ffmpeg` | Every convenient prebuilt macOS binary is a **GPL** build with x264, and a `.dmg` recipient does not have one. A self-built `--disable-gpl --enable-videotoolbox` binary is a viable *fallback* — LGPL, single-digit MB, still hardware-encoded — but it is a nested executable to sign and notarize. |
+| `ffmpeg-next` / `video-rs` | Same dylib bundling as above **plus** the LGPL relinking obligation, and more FFI to get wrong, for one "write an MP4" feature. |
+| `openh264` | Building from source — the crate's default — puts us outside Cisco's royalty umbrella, which is the whole reason to use it. Constrained Baseline only: no B-frames, no CABAC. Fine as a prototype. |
+| `x264` | GPL, or a commercial licence. |
+| `rav1e` / AV1 | Apple ships no software AV1 decoder; playback needs M3 or later. A clip half the recipients cannot open is a bug. |
+| Pure-Rust H.264 | `rusty_h264` is real and moving, but one author, no aarch64 SIMD, sub-realtime at 1080p60. Revisit in a year. |
+
+Two things to do regardless: put a `trait ClipEncoder` in front of it on day one
+so the platform impl is swappable, and hand the encoder **NV12 or BGRA**
+buffers rather than RGBA — the colour conversion is the bottleneck, and
+VideoToolbox will do it on the GPU given the right format.
+
+`bevy_capture` 0.6 targets Bevy 0.19 exactly and its `Encoder` trait is the
+shape described above; it is worth taking for the offscreen capture plumbing
+even if its own encoders are not.
+
+On the web, `web-sys` exposes WebCodecs `VideoEncoder` behind
+`--cfg=web_sys_unstable_apis`, supported everywhere except Firefox for Android.
+A pure-Rust muxer (`muxide`, `mp4e`) would be shared between the two; the
+encoder never will be.
+
+#### The rest of phase two
+
+1. **The timeline.** The nav bar is the primary control surface and the reason
+   the phase-one overlay is deliberately two lines of text rather than a slider
+   — drawing one now means drawing it twice. It wants the match's *events* on
+   it, not just a scrubber: kills, deaths and missile launches are already in
+   `SimEvent`, and a timeline with the interesting moments marked is the
+   difference between scrubbing and hunting.
+2. **Camera keyframes.** A `Vec<(tick, Transform, fov)>` with Catmull-Rom
+   between them and constant-speed reparameterisation, saved *beside* the
+   recording rather than inside it — a camera path is authorship and a
+   recording is evidence, and one should not invalidate the other.
+3. **Export.** The render loop currently follows the display; export needs it
+   driven by the export clock, each frame fully resolved before the next, with a
+   fixed `overstep_fraction` rather than whatever the last frame happened to
+   have. That last detail is the one that silently ruins the output.
+4. **Two `sim` gaps that seeking exposes.** `sim_bridge::step_modes` still runs
+   the trials checkpoint scoring and the campaign wave arming outside `sim`, so
+   a *seek* through either loses that work — playing forward is exact, because
+   the replay path calls `step_modes` too. Both are already reported there as
+   one-line `sim` fixes; making them means seeking is exact everywhere and the
+   workaround disappears rather than being threaded into a second crate.
+5. **A per-ship `HudState`.** Riding another aircraft puts you in its seat with
+   the recorded pilot's telemetry on the panel, because `sim` derives `HudState`
+   for `World::local_id` alone.
 
 ---
 
