@@ -69,6 +69,9 @@
 //!
 //! - [`ship`] — the flight model, the clocks, damage, death, respawn, and
 //!   ship-versus-world collision.
+//! - [`terrain`] — the Sierras heightfield: a triangulated lattice built from
+//!   hash noise, with no transcendental in it, that a renderer draws exactly
+//!   rather than approximately.
 //! - [`bullets`] — bolt ballistics, the hitscan beam, and every projectile
 //!   impact, all resolved as swept segments.
 //! - [`missiles`] — lock-on, homing, obstacle avoidance, flare seduction, and
@@ -99,5 +102,6 @@ pub mod missiles;
 pub mod rng;
 pub mod rules;
 pub mod ship;
+pub mod terrain;
 pub mod tick;
 pub mod world;

@@ -34,8 +34,11 @@
 //! bit-identical across platforms or libm versions. The flight model cannot
 //! avoid them — the JS is written in terms of `THREE.MathUtils.damp` (an `exp`),
 //! `Math.pow(0.001, ..)` blends, `setFromAxisAngle` (a `sin`/`cos` pair) and a
-//! `Math.pow(x, 1.6)` response curve, and the terrain heightfield is seven sine
-//! octaves.
+//! `Math.pow(x, 1.6)` response curve.
+//!
+//! The terrain heightfield used to be on that list — seven sine octaves,
+//! transcribed from `terrain.js` — and is no longer here at all. It is
+//! [`crate::terrain`], rebuilt on hash noise with no transcendental in it.
 //!
 //! `setFromAxisAngle` is no longer among them: it is
 //! [`crate::math::quat_from_axis_angle`], which draws its sine and cosine from
@@ -44,8 +47,8 @@
 //! The rest are funnelled through the handful of functions in the
 //! "transcendental surface" section below, and **nothing else in this module
 //! calls a transcendental function directly**. If server-versus-WASM agreement
-//! ever needs hand-rolled implementations, those functions plus
-//! [`raw_terrain_height`] are the complete list of things to replace — and
+//! ever needs hand-rolled implementations, those functions are the complete
+//! list of things to replace — and
 //! [`crate::math::det`] already has `exp` and `pow`, so `damp`, `pow_blend`,
 //! `drag_factor` and `steer_curve` are a one-line change each whenever the
 //! resulting last-bit shift in the flight model is acceptable to make.
@@ -158,18 +161,9 @@ const HIT_FLASH_DECAY_RATE: f64 = 4.0;
 /// radius, which keeps the sample gap below the ship's own size.
 const TERRAIN_SWEEP_SPACING: f64 = 4.0;
 
-/// Hard cap on terrain samples per step, so a teleport cannot turn one tick into
-/// an unbounded loop over a heightfield that costs eleven `sin`/`cos` calls per
-/// sample.
+/// Hard cap on terrain samples per step, so a teleport cannot turn one tick
+/// into an unbounded loop over the heightfield.
 const TERRAIN_SWEEP_MAX_SAMPLES: u32 = 8;
-
-/// Steepness of the airfield flattening ramp. `terrain.js:18`
-/// (`smoothstep(Math.min(tx, tz) * 2.5)`).
-const AIRFIELD_BLEND_SHARPNESS: f64 = 2.5;
-
-// ---------------------------------------------------------------------------
-// The transcendental surface
-// ---------------------------------------------------------------------------
 
 /// `THREE.MathUtils.damp(x, y, lambda, dt)`.
 ///
@@ -253,14 +247,6 @@ fn sign_or_positive(x: f64) -> f64 {
     } else {
         1.0
     }
-}
-
-/// `t * t * (3 - 2t)` on a clamped `t`. `terrain.js:9`.
-#[inline]
-#[must_use]
-fn smoothstep(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 // ---------------------------------------------------------------------------
@@ -839,80 +825,30 @@ pub fn campaign_respawn_hp(rules: &Rules) -> i32 {
 // Terrain
 // ---------------------------------------------------------------------------
 
-/// Terrain surface height at a world `(x, z)`.
+/// Terrain surface height at a world `(x, z)` — the surface a ship is stopped
+/// by, which on this map includes the water.
 ///
-/// Ports `getTerrainHeight` (`terrain.js:35`), including the flat-topped
-/// airfields and the hard zero outside
-/// [`crate::rules::WorldRules::terrain_size`].
+/// **The heightfield moved to [`crate::terrain`].** What used to live here was
+/// `getTerrainHeight` (`terrain.js:35`) transcribed literally: a sum of eleven
+/// `sin`/`cos` calls, evaluated on the path that decides whether a ship is dead,
+/// in a crate that must produce bit-identical results on four different libm
+/// implementations. It was also unbuildable as a mesh without 295,000 triangles,
+/// and it had nowhere in it. See that module for what replaced it and why.
 ///
-/// # Where the numbers come from
-///
-/// The seven-octave sum in [`raw_terrain_height`] is `rawHeight`
-/// (`terrain.js:22`), transcribed literally. Its frequencies, phases and
-/// amplitudes are **not** in [`crate::rules`] — there is no field for them — so
-/// they are written there with the JS line beside each. They are world geometry
-/// rather than balance (changing one is a different map, not a rebalance), so
-/// this is a defensible home, but if a heightfield ever has to be swapped per
-/// map they belong in `WorldRules`.
-///
-/// The airfield rectangles *are* derived from the rules
-/// ([`crate::rules::WorldRules::airfield_z`] and `airfield_half`), which the JS
-/// duplicates as a third copy at `terrain.js:5`.
-///
-/// **Transcendental**, heavily: eleven `sin`/`cos` calls. This is the most
-/// platform-sensitive function in the module. It only ever feeds a `<`
-/// comparison against a ship's altitude, so a last-bit disagreement can change
-/// a kill/no-kill outcome only for a ship sitting exactly on the kill plane.
+/// This forward stays because the name is what the rest of the simulation and
+/// the bots call, and because there should be exactly one place that decides
+/// whether "the terrain height" means the bed or the water on top of it. It
+/// means the water.
 #[must_use]
 pub fn terrain_height(x: f64, z: f64, rules: &Rules) -> f64 {
-    let half = rules.world.terrain_size * 0.5;
-    if x.abs() > half || z.abs() > half {
-        return 0.0;
-    }
-    raw_terrain_height(x, z) * (1.0 - airfield_blend(x, z, rules))
-}
-
-/// The un-flattened heightfield. `terrain.js:22` (`rawHeight`).
-///
-/// **Transcendental.** See [`terrain_height`].
-#[must_use]
-fn raw_terrain_height(x: f64, z: f64) -> f64 {
-    // Two broad, low-frequency ridge systems, each a product of two half-
-    // rectified sines so the ranges form blobs rather than a grid.
-    let mut h = 0.0;
-    h += ((x * 0.0010 + 1.1).sin() * 0.5 + 0.5) * ((z * 0.0012 + 2.3).sin() * 0.5 + 0.5) * 390.0;
-    h += ((x * 0.0014 + 3.4).sin() * 0.5 + 0.5) * ((z * 0.0009 + 0.7).sin() * 0.5 + 0.5) * 255.0;
-    // Two clipped octaves: `max(0, ..)` cuts the troughs off, which is what puts
-    // flat valley floors between the ridges.
-    h += ((x * 0.0029 + 0.9).sin() * (z * 0.0026 + 1.6).cos()).max(0.0) * 165.0;
-    h += (x * 0.0039 - z * 0.0023 + 2.2).sin().max(0.0) * 105.0;
-    // Three unclipped detail octaves.
-    h += (x * 0.0072 + 1.7).sin() * (z * 0.0065 + 0.4).cos() * 42.0;
-    h += (x * 0.0117 - z * 0.0091 + 3.1).sin() * 24.0;
-    h += (x * 0.0208 + z * 0.0182 + 0.8).sin() * 12.0;
-    h.max(0.0)
-}
-
-/// How flat the terrain is forced to be at `(x, z)`: 0 on open ground, 1 on an
-/// airfield apron. `terrain.js:13` (`airfieldBlend`).
-#[must_use]
-fn airfield_blend(x: f64, z: f64, rules: &Rules) -> f64 {
-    let hw = rules.world.airfield_half.x;
-    let hd = rules.world.airfield_half.z;
-    let mut max_blend = 0.0f64;
-    for cz in [-rules.world.airfield_z, rules.world.airfield_z] {
-        let tx = (1.0 - (x / hw).abs()).max(0.0);
-        let tz = (1.0 - ((z - cz) / hd).abs()).max(0.0);
-        max_blend = max_blend.max(smoothstep(tx.min(tz) * AIRFIELD_BLEND_SHARPNESS));
-    }
-    max_blend
+    crate::terrain::surface_height(x, z, &rules.world)
 }
 
 /// The altitude below which a ship dies on the terrain map: the surface plus
 /// [`crate::rules::WorldRules::terrain_kill_clearance`]. `main.js:2251`.
 #[must_use]
 pub fn terrain_kill_altitude(x: f64, z: f64, rules: &Rules) -> f64 {
-    terrain_height(x, z, rules) + rules.world.terrain_kill_clearance
+    crate::terrain::kill_altitude(x, z, &rules.world)
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,11 +1430,21 @@ fn apply_contact(pos: &mut Vec3, vel: &mut Vec3, n: Vec3, push: f64, restitution
 ///
 /// The terrain is a heightfield, not a body, so [`crate::collision`] has no test
 /// for it and sampling is the tractable form. It is a bound, not a proof: a
-/// ridge narrower than the sample spacing can still be missed. The heightfield's
-/// steepest gradient is about 2.1, so over the longest possible step
-/// ([`crate::rules::MAX_FRAME_DT`] at full boost, ~9.5 units) the ground can
-/// rise about 20 units — enough to matter only for a ship already skimming the
-/// surface.
+/// ridge narrower than the sample spacing can still be missed.
+///
+/// # How big the miss can be
+///
+/// The steepest facet on the map is pinned by
+/// `terrain::tests::no_facet_is_a_vertical_wall` at a gradient below **6**, so
+/// over one [`TERRAIN_SWEEP_SPACING`] the ground can rise at most about 24
+/// units. Do not restate a measured figure here — it went stale once already:
+/// this used to claim 2.1, from the sine field, and the lattice that replaced
+/// it reaches 5.5 where the west range meets the border fade. Cite the test, and
+/// the number cannot rot again.
+///
+/// That matters only for a ship already skimming the surface, and the steepest
+/// facets are all at the map border, over open sea, where the surface is the
+/// waterline anyway.
 fn resolve_terrain(ship: &mut Ship, prev_pos: Vec3, rules: &Rules) -> bool {
     let motion = ship.pos - prev_pos;
     let horizontal = (motion.x * motion.x + motion.z * motion.z).sqrt();
@@ -2372,40 +2318,54 @@ mod tests {
 
     // -- Terrain ----------------------------------------------------------
 
+    // The heightfield's own properties are [`crate::terrain`]'s tests. What
+    // belongs here is only what *this* module promises about it: that the two
+    // forwards mean what their names say. The JS-parity case that used to sit
+    // here — eight coordinates checked against `getTerrainHeight` under Node —
+    // went with the sine field it pinned; there is no JS to be in parity with
+    // any more, and `terrain.rs` documents the divergence.
+
     #[test]
-    fn terrain_is_flat_outside_its_extent() {
+    fn terrain_is_water_outside_its_extent() {
         let r = rules();
         let edge = r.world.terrain_size * 0.5;
-        assert_eq!(terrain_height(edge + 1.0, 0.0, &r), 0.0);
-        assert_eq!(terrain_height(0.0, -edge - 1.0, &r), 0.0);
+        assert_eq!(terrain_height(edge + 1.0, 0.0, &r), r.world.water_level);
+        assert_eq!(terrain_height(0.0, -edge - 1.0, &r), r.world.water_level);
     }
 
     #[test]
     fn the_airfields_are_flat() {
         let r = rules();
         for cz in [-r.world.airfield_z, r.world.airfield_z] {
-            // Dead centre of an apron: fully blended, so exactly zero.
-            assert_eq!(
-                terrain_height(0.0, cz, &r),
-                0.0,
-                "airfield at z = {cz} is not flat"
+            // Tolerance, not equality — see
+            // `terrain::tests::both_mesas_are_flat_at_the_airfield_elevation`
+            // on why a barycentric blend of three equal corners is not exactly
+            // that corner.
+            let h = terrain_height(0.0, cz, &r);
+            assert!(
+                (h - r.world.airfield_elevation).abs() < 1e-9,
+                "airfield at z = {cz} is at {h}, not flat"
             );
         }
-        // And well away from one, it is not.
-        assert!(terrain_height(700.0, 0.0, &r) > 0.0);
     }
 
+    /// The forward means the *surface*, not the bed: over a lake it is the
+    /// waterline, which is what a ship is stopped by.
     #[test]
-    fn terrain_height_is_never_negative_and_is_deterministic() {
+    fn terrain_height_is_the_surface_and_never_below_the_waterline() {
         let r = rules();
         let mut rng = Rng::new(0x007E_88A1);
         for _ in 0..2000 {
             let x = rng.range_f64(-1800.0, 1800.0);
             let z = rng.range_f64(-1800.0, 1800.0);
             let h = terrain_height(x, z, &r);
-            assert!(h >= 0.0, "negative height {h} at ({x}, {z})");
+            assert!(h >= r.world.water_level, "height {h} at ({x}, {z}) is sunk");
             assert!(h.is_finite());
             assert_eq!(h.to_bits(), terrain_height(x, z, &r).to_bits());
+            assert_eq!(
+                h,
+                crate::terrain::ground_height(x, z, &r.world).max(r.world.water_level)
+            );
         }
     }
 
@@ -2417,39 +2377,6 @@ mod tests {
             terrain_kill_altitude(x, z, &r),
             terrain_height(x, z, &r) + r.world.terrain_kill_clearance
         );
-    }
-
-    #[test]
-    fn terrain_height_matches_the_javascript_it_was_ported_from() {
-        // Reference values produced by running `terrain.js`'s `getTerrainHeight`
-        // under Node against these exact coordinates. This is the test that
-        // catches a transposed frequency or a dropped phase in the octave sum,
-        // which no property test would.
-        //
-        // The tolerance is relative and loose enough to survive a libm that
-        // rounds `sin` differently — the point is the transcription, not the
-        // last bit. See `terrain_height` on why the last bit does not matter
-        // here anyway.
-        const CASES: [(f64, f64, f64); 8] = [
-            (0.0, 0.0, 532.789_124_271_990_8),
-            (600.0, 200.0, 328.275_495_291_581_2),
-            (-1234.5, 987.25, 392.548_200_515_870_4),
-            (450.0, 220.0, 351.276_079_467_126_6),
-            (700.0, 0.0, 339.886_415_804_582_4),
-            (-250.0, 1550.0, 119.358_095_791_100_25),
-            (1799.0, 1799.0, 142.954_890_479_763_75),
-            // On an airfield apron the blend is 1 and the result is a hard zero.
-            (33.5, -1420.75, 0.0),
-        ];
-        let r = rules();
-        for (x, z, expected) in CASES {
-            let got = terrain_height(x, z, &r);
-            let tol = 1e-12 * expected.abs().max(1.0);
-            assert!(
-                (got - expected).abs() <= tol,
-                "getTerrainHeight({x}, {z}): got {got}, JS says {expected}"
-            );
-        }
     }
 
     // -- Collision --------------------------------------------------------

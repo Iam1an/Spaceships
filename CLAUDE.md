@@ -242,7 +242,7 @@ All gameplay state lives as `let` variables closed over inside the `startGame()`
 
 ### Maps
 - **Space** (default): Skybox, moon (radius 80 at origin), 2 motherships at Z=±600, asteroid field.
-- **Terrain (Sierras)**: Heightmap ground, trees, clouds, fog (`Fog(0xbbd5f0, 1400, 4800)`), 2 airfields at Z=±1500. Ground contact = instant death.
+- **Terrain (Sierras)**: Heightmap ground, trees, clouds, fog (`Fog(0xbbd5f0, 1400, 4800)`), 2 airfields at Z=±1500. Ground contact = instant death. *Rebuilt from scratch in the Rust port — see [The Sierras](#the-sierras-rust-port-only) below. The JS version described here is unchanged and still what `public/src/terrain.js` draws.*
 
 ### Physics & Movement
 
@@ -525,7 +525,7 @@ In progress on branch `rust-port`. The goal is an all-Rust game: a Bevy renderer
 
 ```
 spaceships-rs/
-├── crates/sim        Deterministic simulation. 380 tests. ZERO dependencies.
+├── crates/sim        Deterministic simulation. 430 tests. ZERO dependencies.
 ├── crates/protocol   The 35 WebSocket messages. 48 round-trip tests.
 ├── crates/server     Replacing server/ — axum + tokio-tungstenite + rusqlite.
 └── crates/client     Bevy 0.19 renderer, native + wasm.
@@ -541,3 +541,29 @@ spaceships-rs/
 ### Why determinism matters beyond netcode
 
 It also makes the planned replay system nearly free: a replay is a seed plus an input log, re-simulated, rather than recorded state. See `BACKLOG.md`.
+
+### The Sierras (Rust port only)
+
+The terrain map was rebuilt and **deliberately diverges from `public/src/terrain.js`**. The JS map is untouched and still runs the JS game; nothing below applies to it.
+
+**The heightfield is simulation, not rendering.** It lives in `crates/sim/src/terrain.rs`. `ship::terrain_height` is a forward to it. A new map means changing it *there* — changing only the renderer gives you ground that looks different and still kills you at the old altitude.
+
+**The terrain is a triangulated lattice, and the lattice is the definition.** `node_height` evaluates the map at a lattice node (150 quads a side, 24-unit cells); between nodes the height is the plane of the containing triangle. The client draws one triangle per lattice face, so the drawn surface *is* the collision surface rather than an approximation of it — which is where the low-poly look comes from and why there is no LOD scheme. `terrain::ground_height` and `client/terrain/ground.rs` must keep the same cell split; both carry tests that pin it.
+
+**No transcendentals.** The noise is hash-based value noise with a quintic fade — integer mixing plus `+ - * / sqrt`. The old sine sum was the crate's largest determinism hazard. Do not reintroduce `sin`/`cos` here; `math::det` is not needed either.
+
+| | JS | Rust port |
+|---|---|---|
+| Height function | 11 `sin`/`cos` per sample | hash noise, no transcendentals |
+| Client mesh | 384² segments, 295k triangles, smooth | 150² lattice, 45k triangles, flat-shaded |
+| Below sea level | clamped to 0 | allowed — `water_level` (0) is a real surface |
+| Airfields | flat at `y = 0`, in a pit | mesas at `airfield_elevation` (210) |
+| `airfield_z` | ∓1500 | ∓1400, so the mesa ramp finishes inside the map |
+| Spawn `terrain_y` | 40 | `airfield_elevation + 40` |
+| Sun | straight down | fixed raking direction |
+
+New `WorldRules` fields: `water_level`, `airfield_elevation`. `SpawnRules::terrain_y`/`terrain_z` are now derived from them rather than written out.
+
+**Water is solid.** `terrain::ground_height` is the *bed* and may be negative; `surface_height` (what `ship::terrain_height` returns) is `max(bed, water_level)`. The kill plane and the bots' `height_at` both use the surface, so a lake stops a ship exactly as a hillside does. Scenery placement wants the bed.
+
+**Dev tools.** `cargo run -p spaceships-sim --example heightmap -- out.png` renders a plan view of the map — the fastest way to see a layout mistake. `SPACESHIPS_START=x,y,z` puts the player anywhere, for screenshots.

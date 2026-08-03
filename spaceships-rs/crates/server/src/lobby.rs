@@ -53,48 +53,21 @@ use crate::db::Db;
 // Spawn geometry
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Team spawn anchors on the space map.
+/// Team spawn anchors, per map.
 ///
-/// Two motherships face each other across the field: team 0 sits at `z = -540`
-/// (the mothership is at -600, hangar mouth around -565) looking down `+Z`, and
-/// team 1 mirrors it at `z = +540` with a 180° yaw.
+/// Only the *facing* lives here. The offsets — how far out from the structure,
+/// how high, and how wide the scatter is — come from
+/// [`spaceships_sim::rules::SpawnRules`], which is the single definition the
+/// client's own spawn path reads too.
 ///
-/// These live here rather than in `spaceships-sim` because `sim` does not
-/// expose them — [`spaceships_sim::rules::WorldRules`] has `mothership_z`
-/// (600) and `airfield_z` (1500), which are the *structures*, not the offsets
-/// the server spawns players at. See the crate docs for the full list of gaps.
-const TEAM_SPAWNS: [TeamSpawn; 2] = [
-    TeamSpawn {
-        z: -540.0,
-        y: 0.0,
-        quat: [0.0, 0.0, 0.0, 1.0],
-    },
-    TeamSpawn {
-        z: 540.0,
-        y: 0.0,
-        quat: [0.0, 1.0, 0.0, 0.0],
-    },
-];
-
-/// Team spawn anchors on the terrain map: above each airfield's runway.
-const TERRAIN_TEAM_SPAWNS: [TeamSpawn; 2] = [
-    TeamSpawn {
-        z: -1400.0,
-        y: 40.0,
-        quat: [0.0, 0.0, 0.0, 1.0],
-    },
-    TeamSpawn {
-        z: 1400.0,
-        y: 40.0,
-        quat: [0.0, 1.0, 0.0, 0.0],
-    },
-];
-
-struct TeamSpawn {
-    z: f64,
-    y: f64,
-    quat: Quat,
-}
+/// **This used to be a second copy.** The z, y and jitter figures were written
+/// out here as literals, with a comment explaining that `sim` exposed only
+/// `mothership_z` and `airfield_z` and therefore could not be asked. It exposed
+/// all of it, in `SpawnRules`, and the copies drifted the moment the terrain
+/// map's airfields moved onto mesas: the server would have kept spawning ships
+/// at `y = 40`, 170 units inside a hill. Duplicated rules are the failure mode
+/// `crates/sim/src/rules.rs` exists to prevent, so this reads them.
+const TEAM_FACING: [Quat; 2] = [[0.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 0.0]];
 
 /// A spawn position and orientation.
 #[derive(Debug, Clone, Copy)]
@@ -105,34 +78,26 @@ pub struct SpawnPoint {
     pub quat: Quat,
 }
 
-/// `spawnForTeam` — a jittered point in front of the team's mothership or
-/// airfield.
+/// `spawnForTeam` — a jittered point in front of the team's mothership or above
+/// its airfield.
 ///
 /// The three jitter draws happen in `x, y, z` order, matching the JS argument
 /// evaluation order, so a seeded run reproduces exactly.
 fn spawn_for_team(rng: &mut Rng, team: u8, map: MapKind) -> SpawnPoint {
     let idx = usize::from(team.min(1));
-    match map {
-        MapKind::Terrain => {
-            let t = &TERRAIN_TEAM_SPAWNS[idx];
-            let x = (rng.next_f64() - 0.5) * 60.0;
-            let y = t.y + (rng.next_f64() - 0.5) * 10.0;
-            let z = t.z + (rng.next_f64() - 0.5) * 40.0;
-            SpawnPoint {
-                pos: [x, y, z],
-                quat: t.quat,
-            }
-        }
-        MapKind::Space => {
-            let t = &TEAM_SPAWNS[idx];
-            let x = (rng.next_f64() - 0.5) * 8.0;
-            let y = (rng.next_f64() - 0.5) * 4.0;
-            let z = t.z + (rng.next_f64() - 0.5) * 6.0;
-            SpawnPoint {
-                pos: [x, y, z],
-                quat: t.quat,
-            }
-        }
+    let sign = if idx == 0 { -1.0 } else { 1.0 };
+    let spawn = &spaceships_sim::rules::Rules::DEFAULT.spawn;
+    let (z, y, jitter) = match map {
+        MapKind::Terrain => (spawn.terrain_z, spawn.terrain_y, spawn.terrain_jitter),
+        MapKind::Space => (spawn.space_z, spawn.space_y, spawn.space_jitter),
+    };
+    SpawnPoint {
+        pos: [
+            (rng.next_f64() - 0.5) * jitter.x,
+            y + (rng.next_f64() - 0.5) * jitter.y,
+            sign * z + (rng.next_f64() - 0.5) * jitter.z,
+        ],
+        quat: TEAM_FACING[idx],
     }
 }
 
@@ -1441,15 +1406,27 @@ mod tests {
         }
     }
 
+    /// Above the runway, not inside the mesa it sits on: the assertion is
+    /// against the *terrain*, so it stays honest if either the pad elevation or
+    /// the launch height moves again.
     #[test]
     fn terrain_spawns_sit_above_the_runways() {
+        let rules = spaceships_sim::rules::Rules::DEFAULT;
         let mut rng = Rng::new(11);
         for _ in 0..200 {
-            let a = spawn_for_team(&mut rng, 0, MapKind::Terrain);
-            assert!((a.pos[1] - 40.0).abs() <= 5.0);
-            assert!((a.pos[2] - -1400.0).abs() <= 20.0);
-            let b = spawn_for_team(&mut rng, 1, MapKind::Terrain);
-            assert!((b.pos[2] - 1400.0).abs() <= 20.0);
+            for team in 0..2u8 {
+                let s = spawn_for_team(&mut rng, team, MapKind::Terrain);
+                let sign = if team == 0 { -1.0 } else { 1.0 };
+                assert!((s.pos[2] - sign * rules.spawn.terrain_z).abs() <= 20.0);
+                let ground =
+                    spaceships_sim::terrain::ground_height(s.pos[0], s.pos[2], &rules.world);
+                assert_eq!(ground, rules.world.airfield_elevation);
+                let clearance = s.pos[1] - ground;
+                assert!(
+                    (clearance - 40.0).abs() <= 5.0,
+                    "spawned {clearance} above the pad",
+                );
+            }
         }
     }
 }

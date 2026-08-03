@@ -353,8 +353,8 @@ mod tests {
     ///
     /// The terrain map, for the reason `bot.rs` uses it: [`MapKind::Space`] puts
     /// an 80-unit moon at the origin and every fixture here aims through the
-    /// origin. The two airfield boxes it does add are at `z = ±1500`, and aim
-    /// assist never looks at boxes.
+    /// origin. The two airfield boxes it does add are on the terrain mesas, well
+    /// clear of it, and aim assist never looks at boxes anyway.
     fn world() -> World {
         let mut w = World::new(SEED, Rules::DEFAULT, Mode::Skirmish, MapKind::Terrain);
         w.local_id = Some(1);

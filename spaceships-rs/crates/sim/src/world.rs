@@ -1237,9 +1237,13 @@ impl World {
                 }
             }
             MapKind::Terrain => {
+                // On the mesa, not at sea level: `airfield_elevation` is the
+                // height `terrain` flattens each pad to, and a landing box left
+                // at `y = 0` would sit buried inside the mesa with nothing to
+                // land on.
                 for z in [-rules.world.airfield_z, rules.world.airfield_z] {
                     boxes.push(BoxVolume {
-                        pos: Vec3::new(0.0, 0.0, z),
+                        pos: Vec3::new(0.0, rules.world.airfield_elevation, z),
                         half: rules.world.airfield_half,
                     });
                 }
@@ -2265,8 +2269,17 @@ mod tests {
             "the terrain map has no moon (main.js:182)"
         );
         assert_eq!(w.boxes.len(), 2);
-        assert_eq!(w.boxes[0].half, Vec3::new(280.0, 4.0, 190.0));
-        assert_eq!(w.boxes[1].pos.z, 1500.0);
+        assert_eq!(w.boxes[0].half, Rules::DEFAULT.world.airfield_half);
+        assert_eq!(w.boxes[1].pos.z, Rules::DEFAULT.world.airfield_z);
+        // The pads ride on top of the mesas, so the boxes do too. The surface
+        // a ship lands on has to be the surface that stops it.
+        for b in &w.boxes {
+            assert_eq!(b.pos.y, Rules::DEFAULT.world.airfield_elevation);
+            assert_eq!(
+                crate::terrain::ground_height(b.pos.x, b.pos.z, &Rules::DEFAULT.world),
+                Rules::DEFAULT.world.airfield_elevation,
+            );
+        }
     }
 
     #[test]

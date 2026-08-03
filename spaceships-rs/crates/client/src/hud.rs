@@ -3817,8 +3817,9 @@ fn set_text(q: &mut Query<&mut Text>, entity: Entity, value: impl FnOnce() -> St
 //   differs by about a degree of parallax. A hit distance on `HudState`, or a
 //   ray query on `sim`, would remove the approximation.
 // - **No height query.** The `AGL` half of [`AltBlock`] calls
-//   [`sim::ship::terrain_height`] straight, which is a seven-octave noise sum
-//   per frame on the render thread for a number `sim::ship` has already computed
+//   [`sim::ship::terrain_height`] straight, which is a lattice lookup and four
+//   noise evaluations per frame on the render thread, for a number `sim::ship`
+//   has already computed
 //   this tick to decide whether the ship is still alive. One `f32` on `HudState`
 //   would delete it, and the same field would let the cockpit grow a radar
 //   altimeter without a second copy of the sum.
@@ -4351,7 +4352,11 @@ mod tests {
     fn the_altitude_block_follows_the_map() {
         let mut f = frame(healthy());
         // Well clear of the ground, and with a contact on the boresight.
-        f.ships[0].pos = [0.0, 900.0, 0.0];
+        //
+        // Not over the origin: since the Sierras rebuild the middle of the map
+        // is a lake, and a test that wants to prove the readout *subtracts* the
+        // ground needs somewhere the ground is not zero.
+        f.ships[0].pos = [820.0, 900.0, -430.0];
 
         let space = super::model(
             &f,
@@ -4384,8 +4389,8 @@ mod tests {
         // Height *above ground*, not altitude — and the ground under the origin
         // is a long way up, which is the whole reason this is a radar altimeter
         // and not `pos.y`. Expected from `sim::ship` rather than assumed flat.
-        let ground = sim::ship::terrain_height(0.0, 0.0, &Rules::DEFAULT);
-        assert!(ground > 0.0, "the origin is not on the sea floor");
+        let ground = sim::ship::terrain_height(820.0, -430.0, &Rules::DEFAULT);
+        assert!(ground > 0.0, "the test point is not over land");
         assert_eq!(terrain.steps, quantise(900.0 - ground as f32));
     }
 
