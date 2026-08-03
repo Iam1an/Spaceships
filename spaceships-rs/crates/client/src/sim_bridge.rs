@@ -835,9 +835,37 @@ pub fn new_match(setup: &MatchSetup) -> (SimWorldState, Roster) {
 /// countdown a grid start rather than a hunt for the first ring
 /// (`main.js:224`).
 fn player_start(rules: &Rules, setup: &MatchSetup) -> (SimVec3, SimQuat) {
+    if let Some(at) = start_override() {
+        return (at, SimQuat::IDENTITY);
+    }
     match setup.mode {
         Mode::Trials(_) => (rules.spawn.trials_start, SimQuat::IDENTITY),
         _ => team_anchor(rules, setup.map, Team::Zero),
+    }
+}
+
+/// `SPACESHIPS_START=x,y,z` puts the player anywhere on the map.
+///
+/// A screenshot hook, in the same family as `SPACESHIPS_SCREENSHOT`,
+/// `SPACESHIPS_COCKPIT` and `SPACESHIPS_FX_SCENE`, and it earns its keep on
+/// exactly the job those do: looking at a change. Everything the terrain map
+/// draws is 1,400 units from a spawn point, which at 80 u/s is twenty seconds of
+/// flying per look and a ship that has to survive the trip — so without this,
+/// checking whether a ravine reads as a ravine means either playing to it or
+/// guessing from a plan view.
+///
+/// Native only in effect: `std::env::var` always fails on
+/// `wasm32-unknown-unknown`, so the web build takes the normal spawn with no
+/// `cfg`.
+fn start_override() -> Option<SimVec3> {
+    let spec = std::env::var("SPACESHIPS_START").ok()?;
+    let mut parts = spec.split(',').map(|p| p.trim().parse::<f64>());
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(x)), Some(Ok(y)), Some(Ok(z)), None) => Some(SimVec3::new(x, y, z)),
+        _ => {
+            warn!("SPACESHIPS_START={spec} is not an x,y,z position");
+            None
+        }
     }
 }
 

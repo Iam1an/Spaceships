@@ -304,7 +304,19 @@ impl Layout {
     const COAST_WANDER: f64 = 250.0;
     /// Feature size of that wander.
     const COAST_SCALE: f64 = 620.0;
-    /// Width of the band over which the terrain is faded to sea level at the
+    /// How far *below* the waterline the terrain is taken at the very border.
+    ///
+    /// Not zero, which is the obvious choice and the wrong one. The renderer
+    /// draws an opaque sea at `water_level` over the whole map; terrain faded to
+    /// exactly that height is coplanar with it, and a ring of coplanar geometry
+    /// all the way round the island z-fights in a band a hundred pixels wide.
+    /// Ten units under is invisible — it is beneath the water either way — and
+    /// the two surfaces never meet.
+    ///
+    /// It has no simulation effect: `surface_height` clamps to the waterline, so
+    /// a ship over the border is stopped by the sea exactly as before.
+    const BORDER_SUBMERGE: f64 = 10.0;
+    /// Width of the band over which the terrain is faded below sea level at the
     /// very border, so the drawn edge and the "outside the map is water" rule
     /// meet without a step.
     ///
@@ -384,6 +396,23 @@ impl Layout {
     /// Feature size of the bank wander. Short, so a river meanders over its
     /// length rather than bulging once.
     const BANK_SCALE: f64 = 240.0;
+
+    /// Amplitude and feature size of the fine detail laid over everything.
+    ///
+    /// The `min` cuts that carve the lake, the channels and the coast all
+    /// produce *exact planes* — that is what makes them cheap and what makes
+    /// their rims crisp — and a ravine wall two hundred units across with a
+    /// mathematically constant gradient reads as a ramp somebody built. Eight
+    /// units of roughness at a 110-unit wavelength is enough to break that up
+    /// into rock without moving anything.
+    ///
+    /// It is added last of the natural terms, so it roughens the carved
+    /// surfaces and not just the noise ones. The mesas are blended in
+    /// afterwards and stay dead flat.
+    const DETAIL: f64 = 8.0;
+    /// See [`Self::DETAIL`]. At a 24-unit lattice this resolves to about four
+    /// samples a cycle, which is the finest anything here can usefully be.
+    const DETAIL_SCALE: f64 = 110.0;
 
     /// The two flanking ranges and the two transverse walls.
     const RANGES: &'static [Range] = &[
@@ -609,8 +638,7 @@ fn sample(x: f64, z: f64, rules: &WorldRules) -> f64 {
     //    river does, while a wandering height would put lumps in the water.
     let (lx, lz) = Layout::LAKE_CENTRE;
     let lake_d = ((x - lx) * (x - lx) + (z - lz) * (z - lz)).sqrt()
-        - Layout::LAKE_WANDER
-            * fbm(x / Layout::LAKE_SCALE, z / Layout::LAKE_SCALE, 3, SALT_LAKE);
+        - Layout::LAKE_WANDER * fbm(x / Layout::LAKE_SCALE, z / Layout::LAKE_SCALE, 3, SALT_LAKE);
     h = cut(
         h,
         lake_d,
@@ -618,8 +646,8 @@ fn sample(x: f64, z: f64, rules: &WorldRules) -> f64 {
         Layout::LAKE_SHORE,
         Layout::LAKE_FLOOR,
     );
-    let bank = Layout::BANK_WANDER
-        * fbm(x / Layout::BANK_SCALE, z / Layout::BANK_SCALE, 3, SALT_BANK);
+    let bank =
+        Layout::BANK_WANDER * fbm(x / Layout::BANK_SCALE, z / Layout::BANK_SCALE, 3, SALT_BANK);
     for ch in Layout::CHANNELS {
         h = cut(
             h,
@@ -630,24 +658,33 @@ fn sample(x: f64, z: f64, rules: &WorldRules) -> f64 {
         );
     }
 
-    // 5. Fade the natural terrain to sea level at the border, so the drawn
+    // 5. Fine detail, over everything natural — including the flat planes the
+    //    cuts above leave behind. See `Layout::DETAIL`.
+    h += Layout::DETAIL
+        * fbm(
+            x / Layout::DETAIL_SCALE,
+            z / Layout::DETAIL_SCALE,
+            2,
+            SALT_DETAIL,
+        );
+
+    // 6. Fade the natural terrain to sea level at the border, so the drawn
     //    edge meets the open water `ground_height` returns beyond it with no
     //    step. This runs *before* the mesas and not after: a fade applied last
     //    would drag a landing pad down toward the waterline in proportion to
     //    how close to the edge it sits, and a pad has to be exactly level.
-    h *= edge;
+    h = h * edge - Layout::BORDER_SUBMERGE * (1.0 - edge);
 
-    // 6. The two mesas, last, because a base has to exist whatever the terrain
+    // 7. The two mesas, last, because a base has to exist whatever the terrain
     //    under it was doing. `airfield_z` is chosen so a mesa's outer ramp
     //    finishes inside the map — see that field — and the ramp therefore runs
     //    down into the sea rather than off a cliff at the border.
     let blend = plateau_blend(x, z, rules);
     h = h * (1.0 - blend) + rules.airfield_elevation * blend;
     // `+ 0.0` normalises `-0.0` to `+0.0` and is the identity on everything
-    // else. The fade above multiplies a negative sea floor by zero at the very
-    // border, and a signed zero there is enough to make a lattice node and the
-    // same point read through `ground_height` differ *in their bits* while
-    // being equal as numbers — which is exactly the guarantee
+    // else. Any expression that can produce a signed zero here is enough to make
+    // a lattice node and the same point read through `ground_height` differ *in
+    // their bits* while being equal as numbers — which is exactly the guarantee
     // `sampling_a_node_returns_that_nodes_height_exactly` exists to hold.
     h + 0.0
 }
@@ -738,6 +775,8 @@ const SALT_COAST: u64 = 0x5361_6C74_436F_6173;
 const SALT_LAKE: u64 = 0x5361_6C74_4C61_6B65;
 /// Salt for the channel bank wander.
 const SALT_BANK: u64 = 0x5361_6C74_4261_6E6B;
+/// Salt for the fine surface detail.
+const SALT_DETAIL: u64 = 0x5361_6C74_4465_7461;
 
 /// The domain warp: displace a sample point by two independent noise fields.
 /// See [`Layout::WARP`].
@@ -831,8 +870,7 @@ fn fade(t: f64) -> f64 {
 /// The float conversion takes the top 53 bits, the exact width of an `f64`
 /// mantissa, so it is a division by a power of two and therefore exact.
 fn hash_to_unit(ix: i64, iz: i64, salt: u64) -> f64 {
-    let mixed = (ix as u64)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    let mixed = (ix as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (iz as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
         ^ salt;
     let h = splitmix(mixed);
@@ -973,14 +1011,12 @@ mod tests {
         // The last ring of nodes is at or below the waterline all the way
         // round, so nothing pokes through the seam.
         for i in 0..LATTICE_NODES {
-            for (ix, iz) in [
-                (0, i),
-                (LATTICE_SEGMENTS, i),
-                (i, 0),
-                (i, LATTICE_SEGMENTS),
-            ] {
+            for (ix, iz) in [(0, i), (LATTICE_SEGMENTS, i), (i, 0), (i, LATTICE_SEGMENTS)] {
                 let h = node_height(ix, iz, &w);
-                assert!(h <= w.water_level, "node ({ix}, {iz}) is {h} above water");
+                assert!(
+                    h < w.water_level - 1.0,
+                    "node ({ix}, {iz}) is {h}, not safely under the sea",
+                );
             }
         }
     }
@@ -1086,14 +1122,20 @@ mod tests {
     #[test]
     fn the_ravines_cut_below_the_walls_they_cross() {
         let w = world();
-        for (x, z, across) in [(350.0, -800.0, 270.0), (-430.0, 800.0, 250.0)] {
+        for (x, z) in [(350.0, -800.0), (-430.0, 800.0)] {
             let floor = ground_height(x, z, &w);
-            let left = ground_height(x - across, z, &w);
-            let right = ground_height(x + across, z, &w);
+            // Scan out to either side rather than sampling one fixed offset: a
+            // wall crest is not at a known distance, and a single probe can land
+            // in a dip and understate it by a hundred units.
+            let mut crest = f64::NEG_INFINITY;
+            for step in 4..=14 {
+                let d = f64::from(step) * 24.0;
+                crest = crest.max(ground_height(x - d, z, &w));
+                crest = crest.max(ground_height(x + d, z, &w));
+            }
             assert!(
-                floor + 120.0 < left.max(right),
-                "the ravine at ({x}, {z}) floor {floor} is not below its walls \
-                 ({left}, {right})",
+                floor + 120.0 < crest,
+                "the ravine at ({x}, {z}) floor {floor} is not below its walls ({crest})",
             );
         }
     }

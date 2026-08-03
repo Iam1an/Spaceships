@@ -71,7 +71,10 @@ fn main() {
 
     std::fs::write(&path, encode_png(SIZE, SIZE, &rgb)).expect("write png");
     println!("wrote {path}  ({SIZE}x{SIZE})");
-    println!("peak {peak:.1}   deepest {deepest:.1}   water {}", w.water_level);
+    println!(
+        "peak {peak:.1}   deepest {deepest:.1}   water {}",
+        w.water_level
+    );
 }
 
 /// The palette the plan view uses. Not the game's — this one is picked to make

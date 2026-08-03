@@ -2324,10 +2324,14 @@ mod tests {
     fn the_airfields_are_flat() {
         let r = rules();
         for cz in [-r.world.airfield_z, r.world.airfield_z] {
-            assert_eq!(
-                terrain_height(0.0, cz, &r),
-                r.world.airfield_elevation,
-                "airfield at z = {cz} is not flat"
+            // Tolerance, not equality — see
+            // `terrain::tests::both_mesas_are_flat_at_the_airfield_elevation`
+            // on why a barycentric blend of three equal corners is not exactly
+            // that corner.
+            let h = terrain_height(0.0, cz, &r);
+            assert!(
+                (h - r.world.airfield_elevation).abs() < 1e-9,
+                "airfield at z = {cz} is at {h}, not flat"
             );
         }
     }
