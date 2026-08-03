@@ -82,6 +82,10 @@ pub struct FlightCamera;
 #[derive(Component)]
 struct ChaseCam {
     up: Vec3,
+    /// The warp-in displacement currently folded into the camera's translation
+    /// — see [`crate::warp::Warps::camera_offset`], and [`follow`] for why it
+    /// has to be remembered rather than merely applied.
+    arrival: Vec3,
 }
 
 pub struct FollowCameraPlugin;
@@ -168,7 +172,10 @@ pub fn spawn_camera(mut commands: Commands) {
             far: 20_000.0,
             ..default()
         }),
-        ChaseCam { up: Vec3::Y },
+        ChaseCam {
+            up: Vec3::Y,
+            arrival: Vec3::ZERO,
+        },
         FlightCamera,
         Transform::from_xyz(0.0, HEIGHT, -540.0 - DISTANCE),
     ));
@@ -441,6 +448,21 @@ fn advance_grain(time: Res<Time>, mut grades: Query<&mut FilmGrade>) {
 //
 // The `Without` bounds are load-bearing: both queries touch `Transform`, and
 // Bevy cannot prove the archetypes are disjoint without them.
+//
+// # The warp-in's approach rides on the end of this
+//
+// A ship spawns at rest, so a camera that is already at its resting pose when
+// the arrival begins watches a completely motionless world through the star
+// streaks. `warp.rs` answers that by holding the camera back down the ship's
+// nose and closing the gap by the arrival instant, and the offset is applied
+// *here*, as the last thing this function does, rather than by a second system
+// afterwards. The difference matters: the damping below is a filter over the
+// camera's own previous position, so an offset left in that position would be
+// read back as part of the chase and dragged toward the ship over the following
+// frames — the approach would fight the follow, and the two together would
+// settle somewhere neither asked for. Subtracting last frame's offset before
+// damping and adding this frame's after is what keeps the chase working on the
+// pose the camera would have had with no warp at all.
 fn follow(
     ships: Query<(&ShipRoot, &Transform), Without<ChaseCam>>,
     time: Res<Time>,
@@ -448,6 +470,7 @@ fn follow(
     // that is the resource's default — and it is somebody else's aircraft when
     // a replay is riding one. See `replay::ViewTarget`.
     target: Res<crate::replay::ViewTarget>,
+    warps: Res<crate::warp::Warps>,
     mut cam: Query<(&mut Transform, &mut ChaseCam), Without<ShipRoot>>,
 ) {
     let Some((_, me)) = ships.iter().find(|(root, _)| root.0 == target.0) else {
@@ -472,7 +495,12 @@ fn follow(
     // bases differ on purpose: position chases hard (0.0001) while the up
     // vector rolls in slowly (0.01), which is what keeps a barrel roll from
     // whipping the horizon around.
-    tf.translation = tf.translation.lerp(desired, damp(0.0001, dt));
+    //
+    // The damping runs on the pose *without* the warp-in's approach folded in;
+    // see the note above the signature.
+    let chased = (tf.translation - chase.arrival).lerp(desired, damp(0.0001, dt));
+    chase.arrival = warps.camera_offset();
+    tf.translation = chased + chase.arrival;
     chase.up = chase.up.lerp(up, damp(0.01, dt)).normalize_or(Vec3::Y);
 
     // Look slightly *past* the nose rather than straight down it, so the ship

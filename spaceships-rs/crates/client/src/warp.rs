@@ -27,6 +27,31 @@
 //!    All three ride in `camera.rs`'s grade pass — see [`camera::WarpLens`] —
 //!    because it is already the last node to touch the image.
 //!
+//! # There is nothing there to arrive *at*
+//!
+//! All four of those are screen effects, and for a while all four of them played
+//! **around a ship that was already parked in the map**. That is what the first
+//! person to watch it said: *"it doesn't really work — it looks like you can see
+//! yourself in the map and then it plays a warp animation"*. Every curve below
+//! was right and the staging was wrong, because an arrival is not something that
+//! happens to a thing which is already present.
+//!
+//! So the aircraft is **not drawn at all** until [`ARRIVAL`]. [`stage_ships`]
+//! hides the root of every ship that has a warp running and puts it back on the
+//! frame the lines collapse, which makes the snap, the flash and the appearance
+//! of the aeroplane one event instead of three. The camera arrives with it:
+//! [`Warps::camera_offset`] holds the chase pose [`DOLLY_BACK`] units back down
+//! the ship's own nose and closes that gap to nothing by the same instant. That
+//! last part is what puts the *world* in motion during the bend — `ship::respawn`
+//! zeroes the velocity, so a camera already sitting at its resting pose watches
+//! a completely static asteroid field while the sky folds, which is the other
+//! half of why the effect read as a filter over a still scene.
+//!
+//! Being absent is not the local player's privilege — only the camera work is.
+//! A ship id is a ship id to [`stage_ships`], so the flight §13 wants arriving
+//! together is nine aircraft that are each simply *not there* until their own
+//! staggered snap.
+//!
 //! # The snap is the moment
 //!
 //! The timeline is deliberately **asymmetric**, which is the second thing §9
@@ -62,6 +87,8 @@
 //!   event covers respawns only; this covers the match's first tick and a
 //!   mid-match join, which have no event because nothing *re*-spawned.
 //!
+//! Both are gated on [`arrives_here`], which is a property of the *map*.
+//!
 //! # It covers the invulnerability window
 //!
 //! [`DURATION`] is `warp.js`'s 1.5 s against `combat.spawn_invuln` of 2.0 s,
@@ -76,10 +103,12 @@
 //! nobody else can see it. Watching an enemy fall out of warp at its own
 //! position is worth more than having it appear, so a remote arrival gets the
 //! same tunnel — same geometry, same curves — anchored to *that ship* and
-//! scaled down to its own length scale, streaming along its nose. Nothing
-//! screen-space: the FOV punch, the sky stretch and the lens are the local
-//! player's alone, because a remote ship arriving must not move the camera it is
-//! being watched through, and the sky is not bending around *it*.
+//! scaled down to its own length scale, streaming along its nose, and the ship
+//! itself is missing from the map until its own snap exactly as yours is.
+//! Nothing screen-space: the FOV punch, the sky stretch, the camera's approach
+//! and the lens are the local player's alone, because a remote ship arriving
+//! must not move the camera it is being watched through, and the sky is not
+//! bending around *it*.
 //!
 //! # An arrival is a ship's, not the player's
 //!
@@ -117,7 +146,14 @@
 //! never retires it. This is a *motion* effect and a still of a random frame
 //! says nothing about whether the snap reads; freezing the clock is what makes
 //! "the build-up", "peak stretch", "the instant of collapse" and "settled" four
-//! comparable screenshots rather than four lucky ones.
+//! comparable screenshots rather than four lucky ones. It pins the staging with
+//! everything else — a freeze before [`ARRIVAL`] is a map with no aircraft in
+//! it and the camera still short of its pose, which is the only way to *see*
+//! that the staging is what it claims to be.
+//!
+//! The match's own first tick is already an arrival, so a freeze alone is a
+//! complete rig: `SPACESHIPS_UI=off SPACESHIPS_WARP_FREEZE=0.5` boots straight
+//! into a match pinned half a second into everybody's warp.
 //!
 //! # Not done here
 //!
@@ -126,15 +162,17 @@
 //! need is [`Warps::live`], which is already public to this crate, and the beat
 //! it should cut on is [`ARRIVAL`].
 //!
-//! **The Sierras map still warps you in**, minus the sky stretch, because there
-//! is no starfield there to stretch — so what is left is a tunnel of white
-//! streaks over a blue sky and a runway, which is not right. Suppressing it
-//! would put that map's spawn back to nothing at all, and §13 has the actual
-//! answer: terrain gets a take-off roll instead of an arrival. This is a
-//! placeholder either way, and the better one of the two.
+//! **The Sierras map no longer warps you in.** It used to, minus the sky
+//! stretch, because there is no starfield there to stretch — a tunnel of white
+//! streaks over a blue sky and a runway, kept only because suppressing it put
+//! that map's spawn back to nothing at all. Now that an arrival also *removes*
+//! the aircraft until the snap, that trade is gone: the placeholder had become a
+//! ship missing from a runway. [`arrives_here`] is the whole of it, and §13
+//! still has the actual answer — terrain gets a take-off roll rather than an
+//! arrival.
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::visibility::NoFrustumCulling;
+use bevy::camera::visibility::{NoFrustumCulling, VisibilitySystems};
 use bevy::image::{ImageSampler, ImageSamplerDescriptor};
 use bevy::light::{NotShadowCaster, Skybox};
 use bevy::mesh::{Indices, PrimitiveTopology};
@@ -142,11 +180,12 @@ use bevy::post_process::effect_stack::ChromaticAberration;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-use sim::world::{EntityId, Frame, ShipFlags, SimEvent};
+use sim::world::{EntityId, Frame, MapKind, ShipFlags, SimEvent};
 use spaceships_sim as sim;
 
 use crate::camera::{FilmGrade, FlightCamera, WarpLens, BASE_FOV};
-use crate::sim_bridge::{pos as to_vec3, rot, SimFrame, SimSet, LOCAL_ID};
+use crate::scene::ShipRoot;
+use crate::sim_bridge::{pos as to_vec3, rot, MatchSetup, SimFrame, SimSet, LOCAL_ID};
 use crate::skybox::{SkyStar, Starfield, TEXEL_RADIANS};
 
 /// The rules, so the invulnerability window below is *derived* rather than
@@ -189,6 +228,11 @@ const SNAP_TIME: f32 = 0.10;
 ///
 /// Everything punctuating the arrival hangs off this — the flash, the shockwave,
 /// the peak of the lens, and the start of the FOV's deceleration.
+///
+/// It is also the frame the **ship itself appears on**, and the frame the camera
+/// finishes closing on its resting pose. See [`stage_ships`]: before this the
+/// aircraft is not in the map at all, so the collapse and the arrival are the
+/// same event rather than an animation played over something already there.
 pub const ARRIVAL: f32 = SNAP_AT + SNAP_TIME;
 
 /// What is left afterwards for the lens to relax and the FOV to settle through.
@@ -201,6 +245,17 @@ const RELAX: f32 = DURATION - ARRIVAL;
 /// The phases have to tile the arrival in order, or a curve would be evaluated
 /// on a segment that does not exist.
 const _: () = assert!(0.0 < BEND_IN && BEND_IN <= SNAP_AT && ARRIVAL < DURATION);
+
+/// How far back down its own nose the camera comes in from, in world units.
+///
+/// The chase camera's arrival, and the reason the world moves at all while the
+/// sky is bending: `ship::respawn` zeroes the velocity, so the aircraft is
+/// stationary from the first frame and a camera parked at its resting pose sees
+/// a still asteroid field behind the streaks. Ninety units is eight times the
+/// chase camera's own 11-unit stand-off, and closing it over [`ARRIVAL`] peaks at
+/// 150 u/s — between the ship's top speed of 80 and its boosted 136. Fast enough
+/// to read as coming out of something, slow enough that the rocks do not strobe.
+const DOLLY_BACK: f32 = 90.0;
 
 /// How far apart consecutive ships arrive when a whole roster appears at once.
 ///
@@ -527,6 +582,33 @@ pub mod curves {
         }
     }
 
+    /// How much of the camera's approach is still to run: 1 before the arrival
+    /// starts, 0 from [`ARRIVAL`] onward.
+    ///
+    /// Smoothstep, which is the one shape with **zero velocity at both ends**.
+    /// That matters at both of them and for different reasons. At the start,
+    /// because a respawn is already a cut — the ship teleports to the spawn
+    /// point — and a camera that begins its approach at full speed adds a second
+    /// discontinuity to the same frame. At the end, because the ship it is
+    /// chasing is stationary, so any residual speed at [`ARRIVAL`] would have to
+    /// be killed by the chase damping *after* the snap, and a camera still
+    /// drifting forward through the flash is the one thing that would say the
+    /// arrival had not finished arriving.
+    ///
+    /// The peak in the middle lands near [`BEND_IN`], so the world is moving
+    /// fastest at full stretch and decelerating through the hold.
+    #[must_use]
+    pub fn dolly01(age: f32) -> f32 {
+        if age <= 0.0 {
+            1.0
+        } else if age >= ARRIVAL {
+            0.0
+        } else {
+            let t = age / ARRIVAL;
+            1.0 - t * t * (3.0 - 2.0 * t)
+        }
+    }
+
     /// How far the shockwave has run, `0..=1`, from [`ARRIVAL`].
     ///
     /// Decelerating, because a wave loses energy: `1 - (1 - t)^3` puts most of
@@ -703,18 +785,57 @@ impl Warps {
         self.live.iter().find(|a| a.local)
     }
 
+    /// Whether a ship is still on its way in, and therefore not yet drawn.
+    ///
+    /// The one question [`stage_ships`] asks, and the one anything else drawing
+    /// per-ship has to ask now that a ship can be in the match without being in
+    /// the map. `hud.rs`'s target brackets are the outstanding case: they track
+    /// a contact off `SimFrame` and will happily box an aircraft that has not
+    /// arrived yet.
+    #[must_use]
+    pub fn inbound(&self, id: EntityId) -> bool {
+        self.live.iter().any(|a| a.id == id && a.age < ARRIVAL)
+    }
+
+    /// Where the chase camera sits relative to its resting pose, in world units.
+    ///
+    /// Zero unless the local player is mid-arrival, and zero again from
+    /// [`ARRIVAL`] onward — see [`curves::dolly01`] and [`DOLLY_BACK`]. Read by
+    /// `camera::follow`, which owns the camera's transform and applies this as
+    /// the last thing it does; doing it there rather than in a second system
+    /// here is what keeps the exponential damping working on the *unoffset*
+    /// pose, so the approach cannot fight the chase.
+    ///
+    /// Down the ship's nose rather than the camera's forward: the nose is fixed
+    /// for the whole arrival, and a camera that is itself still swinging into
+    /// place would otherwise feed its own motion back into the offset.
+    #[must_use]
+    pub fn camera_offset(&self) -> Vec3 {
+        match self.local() {
+            Some(a) => a.dir * -(DOLLY_BACK * curves::dolly01(a.age)),
+            None => Vec3::ZERO,
+        }
+    }
+
     /// Reads one tick and starts an arrival for anything that just spawned.
     ///
     /// Both routes in one place because they must not double-fire: a respawning
     /// ship never leaves `Frame::ships`, so it can only ever match the event
     /// path, and a ship joining in progress has no event so it can only ever
     /// match the new-id path.
-    pub fn observe(&mut self, frame: &Frame) {
-        for event in &frame.events {
-            if let SimEvent::ShipRespawned { id, pos } = *event {
-                let at = Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32);
-                let dir = facing(frame, id);
-                self.begin(id, at, dir);
+    ///
+    /// `enabled` is [`arrives_here`], and a map that does not warp still walks
+    /// the whole of this: the ids have to go into `seen` either way, or every
+    /// ship on the Sierras would look brand new to the first tick after a map
+    /// change and warp in at once.
+    pub fn observe(&mut self, frame: &Frame, enabled: bool) {
+        if enabled {
+            for event in &frame.events {
+                if let SimEvent::ShipRespawned { id, pos } = *event {
+                    let at = Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32);
+                    let dir = facing(frame, id);
+                    self.begin(id, at, dir);
+                }
             }
         }
 
@@ -735,7 +856,7 @@ impl Warps {
             if ship.flags.contains(ShipFlags::BOSS_HITBOX) {
                 continue;
             }
-            if !self.seen.contains(&ship.id) {
+            if enabled && !self.seen.contains(&ship.id) {
                 let delay = if ship.id == LOCAL_ID {
                     0.0
                 } else {
@@ -761,7 +882,8 @@ impl Warps {
 
     /// The same, `delay` seconds from now.
     ///
-    /// Nothing calls this with a non-zero delay yet. It is here because
+    /// Only a match start passes a non-zero delay, from [`Self::observe`]. It is
+    /// a separate entry point because
     /// `BACKLOG.md` §13 turns on exactly one thing this module does not
     /// otherwise express — "staged rather than simultaneous — a half-second
     /// ripple down each flight reads as a formation arriving, where a single
@@ -811,7 +933,8 @@ fn facing(frame: &Frame, id: EntityId) -> Vec3 {
 // The plugin
 // ---------------------------------------------------------------------------
 
-/// Wires the arrival effect: one resource, one mesh, one projection driver.
+/// Wires the arrival effect: one resource, one mesh, one projection driver, and
+/// the one thing that makes it an arrival rather than an overlay — [`stage_ships`].
 pub struct WarpPlugin;
 
 impl Plugin for WarpPlugin {
@@ -840,13 +963,94 @@ impl Plugin for WarpPlugin {
                 (drive_fov, drive_sky, drive_lens, build_surface)
                     .chain()
                     .after(TransformSystems::Propagate),
+            )
+            // Whether a ship is drawn at all is settled before Bevy resolves
+            // inherited visibility, and therefore in the same frame — a write
+            // after the propagation would show for one frame what it is trying
+            // to hide, on the frames where that is the entire point.
+            .add_systems(
+                PostUpdate,
+                stage_ships.before(VisibilitySystems::VisibilityPropagate),
             );
     }
 }
 
+/// Whether spawning on this map is an arrival.
+///
+/// A property of the map and not of the effect, which is why it is a `match`
+/// with no default arm: a new map has to answer the question rather than inherit
+/// somebody else's answer.
+///
+/// The Sierras says no. There is no starfield over the Sierras to stretch, and
+/// with the aircraft now absent until the snap what was left was a ship missing
+/// from a runway under a tunnel of white streaks. `BACKLOG.md` §13 gives terrain
+/// a take-off roll instead, which is a different feature and not this one.
+#[must_use]
+fn arrives_here(map: MapKind) -> bool {
+    match map {
+        MapKind::Space => true,
+        MapKind::Terrain => false,
+    }
+}
+
 /// Copies this tick's spawns into [`Warps`].
-fn watch_spawns(frame: Res<SimFrame>, mut warps: ResMut<Warps>) {
-    warps.observe(&frame.0);
+fn watch_spawns(frame: Res<SimFrame>, setup: Res<MatchSetup>, mut warps: ResMut<Warps>) {
+    warps.observe(&frame.0, arrives_here(setup.map));
+}
+
+/// Keeps an arriving ship out of the map until the instant it arrives.
+///
+/// The staging, and the whole of the fix described at the top of this file: the
+/// warp used to play *around* an aircraft that was already sitting there.
+///
+/// It writes `Visibility` on the [`ShipRoot`], which `scene.rs` also writes —
+/// once per *tick*, from the simulation's alive flag. Two writers of one
+/// component is normally a bug; here it is a deliberate override with a strict
+/// order, and the two rules compose rather than fight because this one only ever
+/// speaks about the handful of ships that have a warp running, and hands each
+/// one straight back the moment the warp is over. It runs in `PostUpdate`, which
+/// is after every `FixedUpdate` tick this frame, so it is always the last word.
+///
+/// The frame is still consulted for the alive flag rather than assumed, because
+/// spawn protection does not cover flying into an asteroid: a ship can die
+/// inside its own arrival, and when it does, `scene.rs`'s answer is the right
+/// one and this must not resurrect it.
+///
+/// Hiding the *root* takes the whole aircraft with it — the glTF, and the
+/// cockpit interior, which `cockpit.rs` hangs off the same root. That is
+/// correct in both views for the same reason: from the seat, the canopy frame
+/// materialising around you at the snap is the arrival seen from inside it.
+fn stage_ships(
+    warps: Res<Warps>,
+    frame: Res<SimFrame>,
+    mut ships: Query<(&ShipRoot, &mut Visibility)>,
+) {
+    if warps.live.is_empty() {
+        return;
+    }
+    for (root, mut vis) in &mut ships {
+        // A ship with no warp running is nothing to do with this module, and
+        // keeps whatever `scene.rs` gave it.
+        if !warps.live.iter().any(|a| a.id == root.0) {
+            continue;
+        }
+        let arrived = !warps.inbound(root.0) && alive(&frame.0, root.0);
+        // `set_if_neq`, so a ship that is already in the state it wants does not
+        // mark `Visibility` changed and drag the propagation along behind it.
+        vis.set_if_neq(if arrived {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
+    }
+}
+
+/// Whether the simulation still has this ship alive, this tick.
+fn alive(frame: &Frame, id: EntityId) -> bool {
+    frame
+        .ships
+        .iter()
+        .any(|s| s.id == id && s.flags.contains(ShipFlags::ALIVE))
 }
 
 /// Ages every arrival, or pins them all if `SPACESHIPS_WARP_FREEZE` is set.
@@ -877,7 +1081,7 @@ fn advance(time: Res<Time>, mut warps: ResMut<Warps>, mut freeze: Local<Option<O
     }
 }
 
-/// `SPACESHIPS_WARP` / `SPACESHIPS_WARP_ALL`: fire an arrival on cue.
+/// `SPACESHIPS_WARP` / `SPACESHIPS_WARP_REMOTE`: fire an arrival on cue.
 ///
 /// The match's real first tick is at `t = 0`, which is three seconds before
 /// `main.rs`'s automatic screenshot and long gone. Without a way to re-fire on
@@ -2063,12 +2267,12 @@ mod tests {
         let mut frame = Frame::new();
         frame.ships = vec![ship(LOCAL_ID, 0.0), ship(2, 10.0), ship(3, 20.0)];
 
-        warps.observe(&frame);
+        warps.observe(&frame, true);
         assert_eq!(warps.live.len(), 3);
         assert_eq!(warps.local().map(|a| a.id), Some(LOCAL_ID));
         assert_eq!(warps.live.iter().filter(|a| a.local).count(), 1);
 
-        warps.observe(&frame);
+        warps.observe(&frame, true);
         assert_eq!(warps.live.len(), 3, "the same ships arrived twice");
     }
 
@@ -2078,12 +2282,12 @@ mod tests {
         let mut warps = Warps::default();
         let mut frame = Frame::new();
         frame.ships = vec![ship(LOCAL_ID, 0.0)];
-        warps.observe(&frame);
+        warps.observe(&frame, true);
         warps.advance(DURATION);
         assert!(warps.live.is_empty());
 
         frame.ships.push(ship(7, 99.0));
-        warps.observe(&frame);
+        warps.observe(&frame, true);
         assert_eq!(warps.live.len(), 1);
         let a = warps.live[0];
         assert_eq!(a.id, 7);
@@ -2101,14 +2305,14 @@ mod tests {
         let mut warps = Warps::default();
         let mut frame = Frame::new();
         frame.ships = vec![ship(LOCAL_ID, 0.0), ship(2, 0.0)];
-        warps.observe(&frame);
+        warps.observe(&frame, true);
         warps.advance(DURATION);
 
         frame.events = vec![SimEvent::ShipRespawned {
             id: 2,
             pos: sim::math::Vec3::new(4.0, 5.0, 6.0),
         }];
-        warps.observe(&frame);
+        warps.observe(&frame, true);
         assert_eq!(warps.live.len(), 1, "a respawn must not fire twice");
         assert_eq!(warps.live[0].id, 2);
         assert_eq!(warps.live[0].pos, Vec3::new(4.0, 5.0, 6.0));
@@ -2121,7 +2325,7 @@ mod tests {
         let mut warps = Warps::default();
         let mut frame = Frame::new();
         frame.ships = vec![ship(2, 0.0), ship(LOCAL_ID, 10.0), ship(3, 20.0)];
-        warps.observe(&frame);
+        warps.observe(&frame, true);
 
         let age = |id| warps.live.iter().find(|a| a.id == id).unwrap().age;
         assert_eq!(age(LOCAL_ID), 0.0, "you do not queue behind your own team");
@@ -2140,14 +2344,14 @@ mod tests {
         let mut warps = Warps::default();
         let mut frame = Frame::new();
         frame.ships = vec![ship(LOCAL_ID, 0.0), ship(2, 0.0)];
-        warps.observe(&frame);
+        warps.observe(&frame, true);
         warps.advance(DURATION);
 
         frame.events = vec![SimEvent::ShipRespawned {
             id: 2,
             pos: sim::math::Vec3::new(0.0, 0.0, 0.0),
         }];
-        warps.observe(&frame);
+        warps.observe(&frame, true);
         assert_eq!(warps.live[0].age, 0.0);
     }
 
@@ -2172,7 +2376,7 @@ mod tests {
         hitbox.flags = ShipFlags::ALIVE.with(ShipFlags::BOSS_HITBOX);
         frame.ships = vec![ship(LOCAL_ID, 0.0), hitbox];
 
-        warps.observe(&frame);
+        warps.observe(&frame, true);
         assert_eq!(warps.live.len(), 1);
         assert_eq!(warps.live[0].id, LOCAL_ID);
     }
@@ -2199,6 +2403,146 @@ mod tests {
         warps.advance(0.001);
         assert!(warps.live.is_empty(), "the arrival outlived its duration");
         assert!(warps.local().is_none());
+    }
+
+    // -- the staging --------------------------------------------------------
+
+    /// The fix this module exists in its current form for: a ship is *not in
+    /// the map* for the whole build-up, and is there from the snap onward.
+    /// `stage_ships` is the query around this predicate and nothing else.
+    #[test]
+    fn a_ship_is_absent_until_the_lines_collapse() {
+        let mut warps = Warps::default();
+        let mut frame = Frame::new();
+        frame.ships = vec![ship(LOCAL_ID, 0.0), ship(2, 10.0)];
+        warps.observe(&frame, true);
+
+        // Everyone, from the first frame — including the one whose turn in the
+        // ripple has not come round yet. A ship waiting at a negative age has
+        // not arrived either.
+        assert!(warps.inbound(LOCAL_ID));
+        assert!(warps.inbound(2));
+
+        // The whole of the bend and the hold.
+        warps.advance(SNAP_AT);
+        assert!(warps.inbound(LOCAL_ID), "visible during the hold");
+
+        // The snap itself is still the effect, not the aeroplane.
+        warps.advance(SNAP_TIME - 0.01);
+        assert!(warps.inbound(LOCAL_ID), "visible mid-collapse");
+
+        // And then, on the same instant as the flash and the shockwave.
+        warps.advance(0.02);
+        assert!(!warps.inbound(LOCAL_ID));
+        assert!(curves::flash01(ARRIVAL) > 0.0, "it appears in the dark");
+
+        // A ship with no arrival at all is nothing to do with this module —
+        // `scene.rs` owns its visibility and must be left holding it.
+        assert!(!warps.inbound(404));
+    }
+
+    /// The staggered half of the same thing: at match start each ship appears on
+    /// its own snap, in `Frame::ships` order, and the local player is first.
+    #[test]
+    fn a_flight_appears_one_at_a_time() {
+        let mut warps = Warps::default();
+        let mut frame = Frame::new();
+        frame.ships = vec![ship(LOCAL_ID, 0.0), ship(2, 10.0), ship(3, 20.0)];
+        warps.observe(&frame, true);
+
+        warps.advance(ARRIVAL + 1e-4);
+        assert!(!warps.inbound(LOCAL_ID), "you arrive first");
+        assert!(warps.inbound(2));
+        assert!(warps.inbound(3));
+
+        warps.advance(STAGGER);
+        assert!(!warps.inbound(2));
+        assert!(warps.inbound(3), "the ripple collapsed to one instant");
+    }
+
+    /// The camera arrives with the ship: held back at the start, exactly on its
+    /// resting pose from the snap onward, and never anywhere else afterwards.
+    #[test]
+    fn the_camera_closes_on_its_pose_by_the_snap() {
+        assert_eq!(curves::dolly01(0.0), 1.0);
+        assert_eq!(curves::dolly01(-0.4), 1.0);
+        assert_eq!(curves::dolly01(ARRIVAL), 0.0);
+        assert_eq!(curves::dolly01(DURATION), 0.0);
+        assert_eq!(curves::dolly01(9.0), 0.0);
+
+        // Monotone in, and it never overshoots either end.
+        let mut prev = f32::INFINITY;
+        for step in 0..=100 {
+            let v = curves::dolly01(step as f32 / 100.0 * ARRIVAL);
+            assert!(v <= prev + 1e-6, "the approach reversed at {step}");
+            assert!((0.0..=1.0).contains(&v));
+            prev = v;
+        }
+
+        // Zero velocity at both ends — the reason it is a smoothstep. Measured
+        // as the travel over the first and last hundredth of the approach,
+        // against the travel over the middle hundredth.
+        let step = ARRIVAL / 100.0;
+        let start = curves::dolly01(0.0) - curves::dolly01(step);
+        let middle = curves::dolly01(ARRIVAL * 0.5) - curves::dolly01(ARRIVAL * 0.5 + step);
+        let end = curves::dolly01(ARRIVAL - step) - curves::dolly01(ARRIVAL);
+        assert!(start * 10.0 < middle, "it starts with a jolt");
+        assert!(end * 10.0 < middle, "it arrives still moving");
+    }
+
+    /// And the offset itself: behind the ship, down its own nose, and gone by
+    /// the time anything else can be looking at it.
+    #[test]
+    fn the_camera_comes_in_from_behind_the_nose() {
+        let mut warps = Warps::default();
+        assert_eq!(warps.camera_offset(), Vec3::ZERO, "idle costs nothing");
+
+        warps.begin(LOCAL_ID, Vec3::ZERO, Vec3::Z);
+        let back = warps.camera_offset();
+        assert_eq!(back, Vec3::new(0.0, 0.0, -DOLLY_BACK));
+        assert!(back.dot(Vec3::Z) < 0.0, "the camera came in from in front");
+
+        warps.advance(ARRIVAL);
+        assert_eq!(warps.camera_offset(), Vec3::ZERO);
+        warps.advance(DURATION);
+        assert_eq!(warps.camera_offset(), Vec3::ZERO);
+
+        // A remote arrival is somebody else's and must not move this camera.
+        let mut warps = Warps::default();
+        warps.begin(2, Vec3::ZERO, Vec3::Z);
+        assert_eq!(warps.camera_offset(), Vec3::ZERO);
+    }
+
+    /// The Sierras has no starfield to stretch and, now, no arrival either —
+    /// but the ids still have to be recorded, or the first tick after a map
+    /// change would treat the whole roster as new.
+    #[test]
+    fn the_sierras_spawns_normally() {
+        assert!(arrives_here(MapKind::Space));
+        assert!(!arrives_here(MapKind::Terrain));
+
+        let mut warps = Warps::default();
+        let mut frame = Frame::new();
+        frame.ships = vec![ship(LOCAL_ID, 0.0), ship(2, 10.0)];
+        frame.events = vec![SimEvent::ShipRespawned {
+            id: 2,
+            pos: sim::math::Vec3::new(0.0, 0.0, 0.0),
+        }];
+
+        warps.observe(&frame, false);
+        assert!(warps.live.is_empty(), "the Sierras warped somebody in");
+        // Nothing is hidden, either — `stage_ships` speaks only about ships
+        // with an arrival running, and there are none.
+        assert!(!warps.inbound(LOCAL_ID));
+
+        // And the map is not new to it: switching back to space must not fire
+        // an arrival for ships that were already flying.
+        frame.events.clear();
+        warps.observe(&frame, true);
+        assert!(
+            warps.live.is_empty(),
+            "the roster warped in on a map change"
+        );
     }
 
     // -- the scatter --------------------------------------------------------
