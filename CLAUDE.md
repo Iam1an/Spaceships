@@ -184,6 +184,8 @@ Spaceships/
 
 These 35 messages are mirrored exactly in `spaceships-rs/crates/protocol`, with round-trip tests pinning every tag spelling. **Changing a message shape means changing both.**
 
+One message exists in `protocol` and *not* here: `emp`, in both directions. See [The EMP](#the-emp-rust-port-only). An addition is only allowed when it is inert to the JS on both sides — this server drops unknown tags and both JS clients ignore them — and anything that is not inert is a change to `server/index.js` instead.
+
 ### Hit Validation (server-side)
 - Target must be alive
 - No friendly fire
@@ -567,3 +569,27 @@ New `WorldRules` fields: `water_level`, `airfield_elevation`. `SpawnRules::terra
 **Water is solid.** `terrain::ground_height` is the *bed* and may be negative; `surface_height` (what `ship::terrain_height` returns) is `max(bed, water_level)`. The kill plane and the bots' `height_at` both use the surface, so a lake stops a ship exactly as a hillside does. Scenery placement wants the bed.
 
 **Dev tools.** `cargo run -p spaceships-sim --example heightmap -- out.png` renders a plan view of the map — the fastest way to see a layout mistake. `SPACESHIPS_START=x,y,z` puts the player anywhere, for screenshots.
+
+### The EMP (Rust port only)
+
+A weapon the JS game does not have: it deals no damage and takes a pilot's *information* instead. `BACKLOG.md` §2 is the spec; `crates/sim/src/emp.rs` is the implementation and its module docs carry every decision.
+
+`G` fires it. It is a **sphere centred on the firing ship** — no aim, no travel time, `emp.radius` 300 units — and it costs the whole `emp.charge` meter, which fills over `emp.charge_time` (60 s) and is deliberately **not** reset by `ship::respawn`, so dying neither refunds it nor arms a fresh spawn.
+
+Everyone caught flies blind for `emp.blind_duration` (4 s), which switches off, in five places:
+
+| What | Where |
+|---|---|
+| Aim assist — cone, pull, lead marker | `aim_assist::update` treats blind exactly as dead |
+| Missile lock, and therefore launches | `missiles::acquire_lock` returns `None` |
+| Cockpit lighting, instruments, radar, annunciators | `cockpit.rs`'s `CockpitPower::emp` |
+| The whole head-up display — tapes, meters, pips, brackets, boresight | `hud.rs`'s `HudModel::unpowered` |
+| The voice warnings | `audio.rs`, after one `JAMMER` callout |
+
+**Not** the flight model and **not** the guns. The match scoreline, the kill feed, the death banner and the hit vignette also survive — the aeroplane stops talking, the match does not.
+
+Allies are caught (`emp.friendly_blind`), the firing pilot is not (`emp.blinds_owner`), and a ship inside its spawn-protection window is not. Bots are caught too: no missiles, no flares, and `emp.bot_aim_error_scale` (6x) on their aim wander.
+
+**Multiplayer is partial against the JS server, on purpose.** `emp` is the only message in `crates/protocol` with no `server/index.js` counterpart. That server drops unknown tags, so an EMP fired in a Node-hosted match blinds only the ships the firing client simulates — the host's bots — and no remote human. `crates/server` relays it and cross-Rust play is complete. Do not "fix" this by editing `server/`.
+
+**Dev tools.** `SPACESHIPS_EMP=<seconds>` fires one at yourself at that time, with `blinds_owner` on and `charge_time` at zero; `SPACESHIPS_SHOT_AT=<seconds>` moves `SPACESHIPS_SCREENSHOT`'s shutter, which is what makes a four-second effect photographable. `SPACESHIPS_FX_SCENE=emp@0.5` stages the wavefront alone, from outside.

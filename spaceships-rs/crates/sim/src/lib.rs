@@ -76,6 +76,8 @@
 //!   impact, all resolved as swept segments.
 //! - [`missiles`] — lock-on, homing, obstacle avoidance, flare seduction, and
 //!   detonation.
+//! - [`emp`] — the pulse that blinds instead of damaging: charge, radius, and
+//!   the four seconds of no instruments that follow.
 //! - [`asteroids`] — seeded field generation, damage, and spin.
 //! - [`bot`] — target selection, pursuit, evasion, and weapon use.
 //! - [`campaign`] — waves, lives, checkpoints, and the capital ship.
@@ -97,6 +99,7 @@ pub mod bot;
 pub mod bullets;
 pub mod campaign;
 pub mod collision;
+pub mod emp;
 pub mod math;
 pub mod missiles;
 pub mod rng;

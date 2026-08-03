@@ -344,6 +344,17 @@ async fn state_and_fire_are_relayed_to_peers_but_never_echoed() {
     assert_eq!(v["id"], 1);
     assert_eq!(v["pos"], serde_json::json!([4.0, 5.0, 6.0]));
 
+    // The EMP, which is the one tag `server/index.js` does not know. Relayed
+    // like a flare: stamped with the sender's id, and never echoed back to the
+    // pilot who set it off — they blinded their own copy of the world before
+    // the frame left.
+    a.send(r#"{"type":"emp","pos":[7,8,9]}"#).await;
+    assert_eq!(
+        b.expect("emp", 2000).await,
+        r#"{"type":"emp","id":1,"pos":[7.0,8.0,9.0]}"#
+    );
+    a.expect_none("emp", 200).await;
+
     a.send(r#"{"type":"colors","hullColor":16711680,"accentColor":65280}"#)
         .await;
     assert_eq!(

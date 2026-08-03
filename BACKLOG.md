@@ -110,7 +110,27 @@ record the log even if nothing reads it yet.
 
 ---
 
-## 2. EMP
+## 2. EMP — **DONE**
+
+> Built. `crates/sim/src/emp.rs` is the weapon and `crates/sim/src/rules.rs`'s
+> `EmpRules` is every number in it; the client half is `CockpitPower::emp`, one
+> `HudModel::unpowered`, and `spawn_emp` in `weapons.rs`. `G` fires it.
+>
+> The open questions below were all answered, and the answers are in the code's
+> doc comments rather than here. In summary: **a bubble, not a shot** — no aim,
+> no travel time, 300-unit radius centred on the firing ship; **the whole glass
+> goes**, not just the cockpit, because the HUD and the panel are one electrical
+> system; **allies are caught, the firing pilot is not**; **the aim-assist
+> asymmetry is leaned into** rather than softened; **no reboot-mash input**,
+> because a blinded pilot is not idle — they have a full flight model and a full
+> gun; and **bots are caught too**, losing their lock and their flare reflex and
+> keeping a much worse aim, which is a bot's version of the same loss.
+>
+> **The multiplayer limit is real and is not a bug.** `emp` is the first
+> protocol message with no JS counterpart. `server/index.js` drops unknown tags,
+> so against the Node server an EMP blinds only what the firing client
+> simulates — the host's bots — and no remote human. The Rust server relays it
+> and it works fully there. `server/` was deliberately not modified.
 
 Blind them instead of killing them. The cockpit goes dark, the aim cone
 disappears, and for a few seconds everyone in range has to fly and shoot by

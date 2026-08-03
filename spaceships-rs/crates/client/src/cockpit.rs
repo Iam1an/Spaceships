@@ -7,7 +7,8 @@
 //! `applyExteriorMode` and `syncShipVisibility`.
 //!
 //! Press `V` to sit down. Hold the right mouse button for free-look, `Alt` to
-//! look back over your shoulder, `G` to fire a test EMP at yourself.
+//! look back over your shoulder. `G` fires the EMP — see [`CockpitPower`] for
+//! what that does to this panel.
 //!
 //! # The instruments are geometry, not a canvas
 //!
@@ -54,9 +55,14 @@
 //! Every self-illuminated material in here is registered in [`Rig::lit`] with
 //! the emissive colour it has when powered, and both interior lamps carry
 //! [`CockpitLamp`]. [`apply_power`] multiplies the lot by one `level` float.
-//! Nothing else in the module knows the EMP exists; adding the weapon means
-//! calling [`CockpitPower::emp`] where its event arrives, next to the
-//! `AudioCommands::stop_warnings` that is already there for the same reason.
+//! Nothing else in the module knows the EMP exists.
+//!
+//! **The weapon landed, and it cost this module the four lines of
+//! [`tick_power`] the design predicted.** The pulse itself is `sim::emp`; what
+//! arrives here is `HudState::emp_blind`, a number of seconds, handed straight to
+//! [`CockpitPower::emp`] alongside the `AudioCommands::stop_warnings` that was
+//! always going to sit next to it. Nothing about the instruments, the radar, the
+//! annunciators or the lamps changed.
 //!
 //! # Where the camera comes from
 //!
@@ -663,37 +669,37 @@ impl CockpitPower {
     }
 }
 
-/// `G`, but only when `SPACESHIPS_EMP` is set — a dev hook for an effect with
-/// no weapon in front of it yet, kept off the shipped binding table.
-fn emp_test_key() -> Option<KeyCode> {
-    #[cfg(not(target_arch = "wasm32"))]
-    if std::env::var_os("SPACESHIPS_EMP").is_some() {
-        return Some(KeyCode::KeyG);
-    }
-    None
-}
-
+/// Cuts the panel whenever the simulation says this pilot is blind.
+///
+/// The weapon now exists ([`sim::emp`]), and this reads its *state* rather than
+/// its event. `HudState::emp_blind` is seconds remaining, so handing it straight
+/// to [`CockpitPower::emp`] is idempotent — both clocks run down at the same
+/// rate, so re-asserting it every frame holds the blackout exactly as long as
+/// the simulation says and no longer, and a dropped or duplicated event cannot
+/// leave the panel stuck dark or bring it back early.
+///
+/// The audio is edge-triggered instead, because cutting a callout off is a thing
+/// that happens once. `AudioCommands::stop_warnings` exists for precisely this —
+/// *"a dead cockpit that also goes silent is a genuinely unsettling few
+/// seconds"*, `BACKLOG.md` §2 — and `audio.rs` keeps the box quiet for the rest
+/// of the blackout and says `JAMMER` on the way in.
 fn tick_power(
     time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    frame: Res<SimFrame>,
     mut power: ResMut<CockpitPower>,
     mut audio: Option<ResMut<AudioCommands>>,
+    mut was_blind: Local<bool>,
 ) {
-    // TODO(emp): the weapon does not exist yet, so this stands in for the event
-    // that will eventually carry it. When it lands, this block is the only
-    // thing that changes.
-    //
-    // Behind `SPACESHIPS_EMP` rather than on a bare `G`: the JS binds no such
-    // key, and a port whose whole promise is that the controls are the same
-    // cannot quietly grow one for an unshipped weapon.
-    if emp_test_key().is_some_and(|k| keys.just_pressed(k)) {
-        power.emp(4.0);
-        // "Should it kill the audio warnings? A dead cockpit that also goes
-        // silent is a genuinely unsettling few seconds." — BACKLOG.md §2.
-        if let Some(audio) = audio.as_mut() {
-            audio.stop_warnings();
+    let blind = frame.0.hud.emp_blind;
+    if blind > 0.0 {
+        power.emp(blind);
+        if !*was_blind {
+            if let Some(audio) = audio.as_mut() {
+                audio.stop_warnings();
+            }
         }
     }
+    *was_blind = blind > 0.0;
 
     let dt = time.delta_secs();
     if power.blackout > 0.0 {

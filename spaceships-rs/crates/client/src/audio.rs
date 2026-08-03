@@ -763,6 +763,9 @@ struct WarnEdges {
     boost01: f32,
     /// Previous `overcharge01`.
     overcharge01: f32,
+    /// Whether the pilot was already flying blind, so `JAMMER` is said once per
+    /// pulse rather than sixty times a second for four seconds.
+    blind: bool,
 }
 
 impl Default for WarnEdges {
@@ -774,6 +777,7 @@ impl Default for WarnEdges {
             hp01: 1.0,
             boost01: 1.0,
             overcharge01: 0.0,
+            blind: false,
         }
     }
 }
@@ -816,12 +820,12 @@ struct LoopVoice {
 ///   call [`AudioCommands::warn`] each frame. They are *level*-triggered on
 ///   purpose — the danger persists, so the callout repeats at its cooldown
 ///   until you climb out.
-/// - **The radar callouts.** [`Warning::RwrLock`], [`Warning::Jammer`], and the
-///   four `Tws*` variants have no trigger in the JS either. The clips and the
-///   table entries are here; the sensor model that fires them is not.
+/// - **The radar callouts.** [`Warning::RwrLock`] and the four `Tws*` variants
+///   have no trigger in the JS either. The clips and the table entries are here;
+///   the sensor model that fires them is not. [`Warning::Jammer`] used to be on
+///   this list and now has a caller — it is what an EMP victim hears, in
+///   [`watch_sim`].
 /// - **[`Warning::Caution`]**, likewise unused so far.
-/// - **EMP.** [`AudioCommands::stop_warnings`] silences the cockpit mid-
-///   sentence, which is the whole reason `stopWarnings()` exists in the JS.
 #[derive(Resource, Default)]
 pub struct AudioCommands {
     /// Drained every frame by [`run_commands`].
@@ -838,12 +842,8 @@ enum Command {
     PlayAt(Sfx, Vec3),
     /// Request a callout. May be refused; see [`arbitrate`].
     Warn(Warning),
-    /// Cut off whatever is speaking.
-    #[allow(
-        dead_code,
-        reason = "the EMP that silences the cockpit is not ported yet; \
-                  `AudioCommands::stop_warnings` is the caller"
-    )]
+    /// Cut off whatever is speaking. Raised by `cockpit.rs` the instant an EMP
+    /// lands, which is the whole reason `stopWarnings()` exists in the JS.
     StopWarnings,
 }
 
@@ -966,6 +966,10 @@ fn gate_playback(
 /// | `ShipDestroyed`     | [`Sfx::ShipDeath`]                                |
 /// | `AsteroidDestroyed` | [`Sfx::RockBreak`]                                |
 /// | `Explosion`         | [`EXPLOSION_SFX`] — impacts only, see there       |
+///
+/// The EMP is the one effect here that is *subtractive*: it has no clip of its
+/// own, and what it does to the mix is take the voice away. See the `blind`
+/// block below.
 fn watch_sim(
     frame: Res<SimFrame>,
     mut cmds: ResMut<AudioCommands>,
@@ -1038,7 +1042,28 @@ fn watch_sim(
     // ones are the terrain callouts, which are not reachable from here.
     let hud = &frame.hud;
     let alive = me.is_some_and(|s| s.flags.contains(ShipFlags::ALIVE));
-    if alive {
+
+    // An EMP takes the voice with the panel. `BACKLOG.md` §2 asks the question —
+    // *"should it kill the audio warnings? A dead cockpit that also goes silent
+    // is a genuinely unsettling few seconds"* — and the answer is yes, for the
+    // same reason the tapes go out: the box that speaks is part of the avionics
+    // the pulse killed, and a cockpit that goes dark while still calmly
+    // announcing a missile lock would be telling the pilot the damage is
+    // cosmetic.
+    //
+    // `JAMMER` is the exception and the last thing they hear. It is the one
+    // callout in the table that names electronic warfare, it has been sitting
+    // unused since the warnings landed, and one word before the silence is what
+    // turns "my game broke" into "I have been hit with something". `cockpit.rs`
+    // cuts off whatever was mid-sentence on the same edge, so the order on the
+    // wire is: stop, JAMMER, four seconds of nothing.
+    let blind = hud.emp_blind > 0.0;
+    if blind && !edges.blind {
+        cmds.warn(Warning::Jammer);
+    }
+    edges.blind = blind;
+
+    if alive && !blind {
         if hud.missile_lock_warning && !edges.locked {
             cmds.warn(Warning::Lock);
         }

@@ -395,7 +395,16 @@ fn plan_bot(
         bot.tracked_lead = lead_point;
         bot.tracked_lead_seeded = true;
     }
-    let error_scale = dist / br.aim_ref_dist;
+    // An EMP does not switch a bot off, it makes it shoot like someone who has
+    // lost their lead marker: the random walk above is the bot's whole
+    // inaccuracy, and this is the one dial that widens it. See
+    // [`crate::rules::EmpRules::bot_aim_error_scale`] for why a firing ban would
+    // have been a harsher EMP than the one a human gets.
+    let error_scale = if crate::emp::is_blind(ship) {
+        dist / br.aim_ref_dist * rules.emp.bot_aim_error_scale
+    } else {
+        dist / br.aim_ref_dist
+    };
     let aim_world = bot.tracked_lead.add_scaled(bot.aim_offset, error_scale);
 
     // --- Steering (`bot.js:184`) -------------------------------------------
@@ -509,8 +518,16 @@ fn plan_bot(
         }
     }
 
+    // A blinded bot loses exactly what a blinded player loses, in the same two
+    // places: the seeker head, so no missile leaves the rail, and the threat
+    // receiver, so nothing tells it to punch out flares. For a human those are
+    // `missiles::acquire_lock` returning `None` and the lock warning going out;
+    // a bot has no HUD, so its equivalents are these two decisions.
+    let blind = crate::emp::is_blind(ship);
+
     let mut missile = None;
-    if bot.missiles_left > 0
+    if !blind
+        && bot.missiles_left > 0
         && bot.fsm == BotFsm::Attack
         && bot.missile_timer <= 0.0
         && dist > br.missile_min_range
@@ -531,7 +548,7 @@ fn plan_bot(
         }
     }
 
-    let flare = wants_flare(world, ship, pos);
+    let flare = !blind && wants_flare(world, ship, pos);
 
     Plan {
         pos,

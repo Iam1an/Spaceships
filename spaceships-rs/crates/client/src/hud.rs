@@ -355,6 +355,14 @@ const METER_SEGS: usize = 10;
 /// charge is over in [`sim::rules::ShipRules::brake_full_time`] seconds and a
 /// coarse strip would jump from empty to full in three steps.
 const CHARGE_SEGS: usize = 12;
+/// Ticks in the `EMP` strip.
+///
+/// The same twelve as the brake, and the same uniform ticks, because it is the
+/// same *kind* of readout — a thing filling up — and giving it a ramped stack
+/// would put it in the family of `GUN` and `BST`, which are quantities you
+/// spend. Twelve over a sixty-second charge is a tick every five seconds, which
+/// is slow enough that a glance tells you roughly how long is left.
+const EMP_SEGS: usize = 12;
 /// Width of one meter segment, and the gap between two.
 const SEG_W: f32 = 4.0;
 const SEG_GAP: f32 = 2.0;
@@ -368,10 +376,15 @@ const CHARGE_SEG_H: f32 = 6.0;
 const PIP_WIDTH: f32 = 4.0;
 const PIP_HEIGHT: f32 = 13.0;
 
-/// Distance off the floor of the three symbology rows, bottom up.
+/// Distance off the floor of the four symbology rows, bottom up.
 const PIP_ROW_BOTTOM: f32 = 46.0;
 const METER_ROW_BOTTOM: f32 = 70.0;
 const CHARGE_ROW_BOTTOM: f32 = 94.0;
+/// The `EMP` strip, above the brake charge. Centred and on its own line rather
+/// than beside `MSL`/`FLR`, because it is a charge and not a store: there is one
+/// pulse, so a pip row would be a single square that is either on or off and
+/// would say nothing about the fifty-nine seconds before it.
+const EMP_ROW_BOTTOM: f32 = 114.0;
 /// Gap between screen centre and the inboard edge of a paired row.
 const ROW_SPLIT: f32 = 18.0;
 
@@ -389,6 +402,10 @@ const LOCK_WARNING_TEXT: &str = ">> MISSILE LOCK <<";
 
 /// The ground-proximity warning, terrain only.
 const PULL_UP_TEXT: &str = "PULL UP";
+
+/// What a blinded pilot is left with. See the legend's builder in
+/// [`build_banners`] for why it is one word and not a countdown.
+const EMP_BANNER_TEXT: &str = "-- EMP --";
 
 /// Height above ground below which [`PULL_UP_TEXT`] lights, as a multiple of
 /// the clearance that actually kills you.
@@ -644,6 +661,23 @@ struct HudModel {
     /// Flares remaining.
     flares: u8,
 
+    /// Lit ticks in the `EMP` strip.
+    emp_seg: u8,
+    /// Whether the strip is at full deflection, which recolours it. Derived from
+    /// `emp_seg` and carried separately only so the *colour* change is its own
+    /// comparison rather than being folded into the count.
+    emp_ready: bool,
+    /// Whether the glass is dark: an EMP has this ship's avionics.
+    ///
+    /// The one field that is not a readout. Everything above it is forced to its
+    /// off value while this is set — see [`model`] — so a blind frame produces a
+    /// *constant* model and the diff writes the blackout once rather than every
+    /// frame of it.
+    blind: bool,
+    /// The lit half of the `EMP` legend's blink, on the same square wave as the
+    /// missile-lock warning. **Forced false when `blind` is false.**
+    blind_blink: bool,
+
     /// The altitude-or-range block under the hull tape.
     alt: AltBlock,
 
@@ -700,6 +734,54 @@ struct KillRowModel {
     killer: EntityId,
     /// Who died.
     victim: EntityId,
+}
+
+impl HudModel {
+    /// This model with the aircraft's own instruments switched off.
+    ///
+    /// The EMP's whole share of this file. `BACKLOG.md` §2 lists the cockpit,
+    /// aim assist, the target boxes and the lock warning, and then asks about
+    /// "HUD bars, if we want it to bite harder" — and the answer taken here is
+    /// that **the whole glass goes**, on the grounds that it is one electrical
+    /// system. A combining glass is projected by the same avionics that light
+    /// the panel; leaving the airspeed tape and the hull ladder up while the
+    /// cockpit behind them is pitch dark would say the damage is cosmetic, and
+    /// it would leave the pilot with most of what they had.
+    ///
+    /// What survives, and the rule behind the list: **the airframe stops
+    /// talking; the match does not.** A pulse is a thing done to one aircraft,
+    /// and it has no business editing the scoreline, the kill feed, or the card
+    /// that says the match is over — those are the referee, drawn on the same
+    /// screen but not by this aeroplane. The hit vignette stays for a different
+    /// reason: it is not an instrument at all, it is being hit, and a pilot who
+    /// could no longer feel damage would be losing something §2 explicitly does
+    /// not take. `DESTROYED` stays because a blackout must never be able to hide
+    /// the fact that you are dead.
+    ///
+    /// Written as "default, plus the survivors" rather than as a list of things
+    /// to zero, so a field added to [`HudModel`] later is dark during an EMP by
+    /// construction. That is the safe direction to be wrong in: a new readout
+    /// that should have gone out is a bug you find by adding it to this list, a
+    /// new readout that stayed up is a bug nobody notices.
+    fn unpowered(self) -> HudModel {
+        HudModel {
+            present: self.present,
+            alive: self.alive,
+            // Every element the cockpit stands down is also an element the pulse
+            // kills, so this rides along rather than needing its own flag.
+            bars_hidden: true,
+            vignette: self.vignette,
+            match_on: self.match_on,
+            team0: self.team0,
+            team1: self.team1,
+            clock: self.clock,
+            kills: self.kills,
+            result: self.result,
+            blind: self.blind,
+            blind_blink: self.blind_blink,
+            ..HudModel::default()
+        }
+    }
 }
 
 /// The model [`sync_hud`] last wrote to the tree. `None` until the first frame,
@@ -993,7 +1075,15 @@ fn model(frame: &Frame, env: Env, feed: &KillFeed, result: Option<Outcome>) -> H
         Alert::Ok
     };
 
-    HudModel {
+    // An EMP is a *power* question, so it is applied to the finished model
+    // rather than threaded through every field below: see `HudModel::unpowered`.
+    // The legend blinks on the missile-lock warning's square wave, because it is
+    // the same kind of statement — a thing being done to you, right now — and
+    // reusing the wave means the two can never beat against each other.
+    let blind = hud.emp_blind > 0.0 && alive;
+    let emp_seg = segments(hud.emp_charge01, EMP_SEGS);
+
+    let model = HudModel {
         present: true,
         alive,
 
@@ -1039,6 +1129,14 @@ fn model(frame: &Frame, env: Env, feed: &KillFeed, result: Option<Outcome>) -> H
         missiles: if seated { 0 } else { hud.missiles },
         flares: if seated { 0 } else { hud.flares },
 
+        // Not zeroed while seated, for the same reason the speed tape and the
+        // reticle are not: the instrument panel has no EMP gauge, so this is not
+        // duplicating anything the pilot can already see from the seat.
+        emp_seg,
+        emp_ready: emp_seg as usize >= EMP_SEGS,
+        blind,
+        blind_blink: blind && phase(time, BLINK_HALF_PERIOD).is_multiple_of(2),
+
         alt: alt_block(me, env),
 
         // `main.js:1929` — `anyVisible && bestAlignment < 22`, which is a
@@ -1082,6 +1180,12 @@ fn model(frame: &Frame, env: Env, feed: &KillFeed, result: Option<Outcome>) -> H
         // from a tick and this is what keeps the two agreeing about "4 seconds
         // ago" across a hitch.
         kills: feed.model(frame.time),
+    };
+
+    if blind {
+        model.unpowered()
+    } else {
+        model
     }
 }
 
@@ -1215,6 +1319,18 @@ struct HudNodes {
     /// The brake-charge strip and its ticks.
     charge_row: Entity,
     charge_segs: [Entity; CHARGE_SEGS],
+
+    /// The `EMP` charge strip: its row, its legend, and its ticks.
+    ///
+    /// Not in [`Self::cockpit_hidden`] — that array mirrors the six elements
+    /// `index.html:865`–`:870` names and nothing else — but it *is* switched off
+    /// by an EMP, which is what its row's visibility carries.
+    emp_row: Entity,
+    emp_label: Entity,
+    emp_segs: [Entity; EMP_SEGS],
+    /// The `EMP` legend on a dark glass: the one thing the head-up display can
+    /// still say while the pulse is running.
+    emp_banner: Entity,
 
     missile_pips: [Entity; MISSILE_PIPS],
     flare_pips: [Entity; FLARE_PIPS],
@@ -1405,6 +1521,10 @@ struct Nodes {
     gun_label: Entity,
     charge_row: Entity,
     charge_segs: [Entity; CHARGE_SEGS],
+    emp_row: Entity,
+    emp_label: Entity,
+    emp_segs: [Entity; EMP_SEGS],
+    emp_banner: Entity,
     missile_pips: [Entity; MISSILE_PIPS],
     flare_pips: [Entity; FLARE_PIPS],
     reticle_anchor: Entity,
@@ -1441,6 +1561,10 @@ impl Default for Nodes {
             gun_label: Entity::PLACEHOLDER,
             charge_row: Entity::PLACEHOLDER,
             charge_segs: [Entity::PLACEHOLDER; CHARGE_SEGS],
+            emp_row: Entity::PLACEHOLDER,
+            emp_label: Entity::PLACEHOLDER,
+            emp_segs: [Entity::PLACEHOLDER; EMP_SEGS],
+            emp_banner: Entity::PLACEHOLDER,
             missile_pips: [Entity::PLACEHOLDER; MISSILE_PIPS],
             flare_pips: [Entity::PLACEHOLDER; FLARE_PIPS],
             reticle_anchor: Entity::PLACEHOLDER,
@@ -1477,6 +1601,10 @@ impl Nodes {
             gun_label: self.gun_label,
             charge_row: self.charge_row,
             charge_segs: self.charge_segs,
+            emp_row: self.emp_row,
+            emp_label: self.emp_label,
+            emp_segs: self.emp_segs,
+            emp_banner: self.emp_banner,
             missile_pips: self.missile_pips,
             flare_pips: self.flare_pips,
             reticle_anchor: self.reticle_anchor,
@@ -1981,6 +2109,53 @@ fn build_meters(hud: &mut ChildSpawnerCommands, font: &HudFont, n: &mut Nodes) {
         })
         .id();
     n.cockpit_hidden[2] = boost;
+
+    // -- the EMP charge strip, above the brake charge -------------------------
+    // Uniform ticks like the brake's, because it is the same kind of readout: a
+    // thing filling up rather than a quantity being spent. The legend sits to
+    // its left and turns amber with the strip when the weapon is armed, which is
+    // the only moment the pilot needs to notice it — for the fifty-nine seconds
+    // before that it is a slow bar in the corner of the eye, which is exactly
+    // what it should be.
+    //
+    // Always up, including in the cockpit: the instrument panel has no EMP
+    // gauge, so this duplicates nothing the seated pilot can already read. It
+    // goes out only under a pulse, which is what its own row's visibility says.
+    n.emp_row = hud
+        .spawn(centred_row(EMP_ROW_BOTTOM))
+        .with_children(|row| {
+            row.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(7),
+                ..default()
+            })
+            .with_children(|inner| {
+                n.emp_label = inner.spawn(caption(font, "EMP", 9.0)).id();
+                inner
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: px(SEG_GAP),
+                        ..default()
+                    })
+                    .with_children(|strip| {
+                        for slot in &mut n.emp_segs {
+                            *slot = strip
+                                .spawn((
+                                    Node {
+                                        width: px(SEG_W - 1.0),
+                                        height: px(CHARGE_SEG_H),
+                                        ..default()
+                                    },
+                                    BackgroundColor(unlit()),
+                                ))
+                                .id();
+                        }
+                    });
+            });
+        })
+        .id();
 }
 
 /// One `▁▃▅▇` stack. `reversed` runs the ramp right to left.
@@ -2267,6 +2442,43 @@ fn build_banners(hud: &mut ChildSpawnerCommands, font: &HudFont, n: &mut Nodes) 
                 Text::new(LOCK_WARNING_TEXT.to_owned()),
                 hud_font(font, 15.0, 800),
                 TextColor(WARN),
+                LetterSpacing::Px(7.0),
+                Visibility::Hidden,
+            ))
+            .id();
+    });
+
+    // -- the EMP legend -------------------------------------------------------
+    //
+    // §2 asks how a victim knows what happened, and this is the answer: one word
+    // on an otherwise empty glass. Without it a pilot who has never been hit by
+    // one reads four seconds of nothing as the game having broken, which is the
+    // worst possible outcome for a weapon whose entire effect is an absence.
+    //
+    // One word and no more. A countdown would hand back a piece of the
+    // information the pulse just took, and the recovery is already legible: the
+    // cockpit reboots on a ramp and the glass comes back with it.
+    //
+    // Amber rather than red. Red on this HUD means a threat you must act on —
+    // the hull warning, the lock warning, `PULL UP`. An EMP is a caution: there
+    // is nothing to do about it but keep flying.
+    hud.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0),
+            right: px(0),
+            top: percent(42),
+            justify_content: JustifyContent::Center,
+            ..default()
+        },
+        ZIndex(Z_WARNING),
+    ))
+    .with_children(|row| {
+        n.emp_banner = row
+            .spawn((
+                Text::new(EMP_BANNER_TEXT.to_owned()),
+                hud_font(font, 15.0, 800),
+                TextColor(AMBER),
                 LetterSpacing::Px(7.0),
                 Visibility::Hidden,
             ))
@@ -2985,6 +3197,54 @@ fn sync_hud(
         }
     }
 
+    // -- the EMP strip ------------------------------------------------------
+    if moved!(emp_seg, emp_ready) {
+        // Amber at full deflection, phosphor while it fills. The colour change
+        // is the only announcement the weapon gets: there is no toast, no
+        // chime, and nothing on the reticle, because an armed EMP is an option
+        // rather than an event.
+        let colour = if next.emp_ready { AMBER } else { PHOSPHOR };
+        for (i, &seg) in nodes.emp_segs.iter().enumerate() {
+            set(
+                &mut w.bg,
+                seg,
+                BackgroundColor(if i < next.emp_seg as usize {
+                    colour
+                } else {
+                    unlit()
+                }),
+            );
+        }
+    }
+    if moved!(emp_ready) {
+        set(
+            &mut w.text_colour,
+            nodes.emp_label,
+            TextColor(if next.emp_ready { AMBER } else { legend() }),
+        );
+    }
+
+    // -- the pulse ----------------------------------------------------------
+    //
+    // Three writes on the frame a pulse lands and three on the frame it clears.
+    // Everything else the EMP switches off was already forced to its resting
+    // value by `HudModel::unpowered`, so those guards see an unchanging zero
+    // and none of them fire for the whole four seconds — the same discipline
+    // the cockpit stand-down runs on.
+    if moved!(blind) {
+        set_visible(&mut w.vis, nodes.spd.root, !next.blind);
+        set_visible(&mut w.vis, nodes.emp_row, !next.blind);
+        set_visible(&mut w.vis, nodes.reticle_anchor, !next.blind);
+        set_visible(&mut w.vis, nodes.emp_banner, next.blind);
+    }
+    if moved!(blind_blink) {
+        set(
+            &mut w.text_colour,
+            nodes.emp_banner,
+            TextColor(AMBER.with_alpha(if next.blind_blink { 1.0 } else { 0.15 })),
+        );
+    }
+
     // -- stores -------------------------------------------------------------
     sync_pips(
         &mut w.bg,
@@ -3461,6 +3721,21 @@ fn sync_world_markers(
         return;
     };
 
+    // An EMP takes the target brackets, the callsigns and the lead rings with
+    // the rest of the avionics — `BACKLOG.md` §2 names all three. This is the
+    // same exit a missing camera takes, which is the right one: `hide_all` also
+    // clears `Boresight`, so `sync_hud`'s reticle lock goes out with them
+    // instead of staying red on a target the pilot can no longer see marked.
+    //
+    // Note what a blinded pilot still has here: the enemy ship itself, drawn in
+    // the world by `scene.rs` and completely unaffected. They can see the
+    // aircraft. What they have lost is everything this file was drawing *on top
+    // of* it.
+    if frame.0.hud.emp_blind > 0.0 {
+        hide_all(&mut applied, &mut q_vis, &nodes, &mut sight);
+        return;
+    }
+
     // The gun line: `main.js:1830`'s muzzle and nose. The nose is local +Z,
     // which is `camera.rs`'s convention and `sim`'s. Where a point on it lands
     // on screen depends on how far down it sits — see [`AIM_RANGE`] — so the
@@ -3886,6 +4161,123 @@ mod tests {
         let c = model(&f, 10.0, false);
         assert_eq!(a, b);
         assert_eq!(a, c);
+    }
+
+    /// An EMP takes the whole glass, and the model says so in one comparison.
+    #[test]
+    fn a_pulse_darkens_every_instrument_at_once() {
+        let lit = model(&frame(healthy()), 0.0, false);
+        let dark = model(
+            &frame(HudState {
+                emp_blind: 4.0,
+                ..healthy()
+            }),
+            0.0,
+            false,
+        );
+
+        assert!(dark.blind);
+        assert!(dark.bars_hidden, "the six bars go with everything else");
+        // Every readout at its resting value: tapes parked, stacks empty, pips
+        // spent, the range block down, the boresight unlocked.
+        assert_eq!(dark.spd, 0);
+        assert_eq!(dark.spd_px, 0);
+        assert_eq!(dark.hp, 0);
+        assert_eq!(dark.hull_px, 0);
+        assert_eq!(dark.boost_seg, 0);
+        assert_eq!(dark.gun_seg, 0);
+        assert_eq!(dark.emp_seg, 0);
+        assert_eq!(dark.missiles, 0);
+        assert_eq!(dark.flares, 0);
+        assert!(!dark.alt.shown);
+        assert!(!dark.reticle_locked);
+        assert!(!dark.lock_warning);
+        // And none of that was already true, or the assertions above would pass
+        // on a HUD that had never been lit.
+        assert!(lit.spd_px != 0 || lit.hp != 0);
+        assert_ne!(lit.gun_seg, 0);
+        assert_ne!(lit.boost_seg, 0);
+    }
+
+    /// What the pulse must *not* take: the referee's half of the screen, and
+    /// being hit.
+    #[test]
+    fn a_pulse_leaves_the_match_and_the_damage_flash_alone() {
+        let f = Frame {
+            ships: vec![ShipView {
+                id: 1,
+                flags: ShipFlags::LOCAL.with(ShipFlags::ALIVE),
+                hit_flash: 1.0,
+                ..Default::default()
+            }],
+            hud: HudState {
+                emp_blind: 4.0,
+                match_active: true,
+                team_kills: [3, 5],
+                match_timer: 61.0,
+                ..healthy()
+            },
+            ..Default::default()
+        };
+        let dark = super::model(
+            &f,
+            Env::default(),
+            &KillFeed::default(),
+            Some(Outcome::Victory),
+        );
+
+        assert!(dark.match_on && dark.team0 == 3 && dark.team1 == 5);
+        assert_eq!(dark.clock, 61);
+        assert_eq!(dark.result, Some(Outcome::Victory));
+        assert!(dark.vignette > 0, "you can still feel being shot");
+        assert!(dark.alive, "and a blackout may never hide DESTROYED");
+    }
+
+    /// A blind frame has to be *constant*, or the diff churns for four seconds
+    /// on state nobody can see. The blink is the only thing allowed to move.
+    #[test]
+    fn a_blind_frame_writes_nothing_but_the_legend() {
+        let f = frame(HudState {
+            emp_blind: 4.0,
+            ..healthy()
+        });
+        let a = model(&f, 0.0, false);
+        let b = model(&f, BLINK_HALF_PERIOD * 2.0, false);
+        assert_eq!(a, b, "a whole blink period on, the model is identical");
+
+        let half = model(&f, BLINK_HALF_PERIOD, false);
+        assert_ne!(a.blind_blink, half.blind_blink);
+        assert_eq!(
+            HudModel {
+                blind_blink: a.blind_blink,
+                ..half
+            },
+            a,
+            "and the blink is the only field the clock touches"
+        );
+    }
+
+    /// The attacker's half: a strip that fills, and one colour change at the top
+    /// of it.
+    #[test]
+    fn the_emp_strip_fills_and_says_when_it_is_armed() {
+        let at = |charge: f32| {
+            let m = model(
+                &frame(HudState {
+                    emp_charge01: charge,
+                    ..healthy()
+                }),
+                0.0,
+                false,
+            );
+            (m.emp_seg, m.emp_ready)
+        };
+        assert_eq!(at(0.0), (0, false), "a fresh spawn is not armed");
+        assert_eq!(at(0.5), (EMP_SEGS as u8 / 2, false));
+        // Rounded up, like every other stack here: a meter with something in it
+        // must not read as empty.
+        assert_eq!(at(0.001).0, 1);
+        assert_eq!(at(1.0), (EMP_SEGS as u8, true));
     }
 
     /// Losing hit points moves the health fields and nothing else.

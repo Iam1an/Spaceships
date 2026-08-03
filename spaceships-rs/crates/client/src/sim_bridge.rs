@@ -525,6 +525,7 @@ impl Roster {
 struct EdgeLatch {
     fire_missile: bool,
     deploy_flare: bool,
+    fire_emp: bool,
     toggle_gun: bool,
     toggle_aim_assist: bool,
 }
@@ -534,6 +535,7 @@ impl EdgeLatch {
     fn latch(&mut self, input: &SimInput) {
         self.fire_missile |= input.fire_missile;
         self.deploy_flare |= input.deploy_flare;
+        self.fire_emp |= input.fire_emp;
         self.toggle_gun |= input.toggle_gun;
         self.toggle_aim_assist |= input.toggle_aim_assist;
     }
@@ -543,6 +545,7 @@ impl EdgeLatch {
     fn drain_into(&mut self, input: &mut SimInput) {
         input.fire_missile = std::mem::take(&mut self.fire_missile);
         input.deploy_flare = std::mem::take(&mut self.deploy_flare);
+        input.fire_emp = std::mem::take(&mut self.fire_emp);
         input.toggle_gun = std::mem::take(&mut self.toggle_gun);
         input.toggle_aim_assist = std::mem::take(&mut self.toggle_aim_assist);
     }
@@ -782,9 +785,50 @@ pub fn tick(
 /// bot flies and where a team spawns; how many bots there are is a lobby
 /// decision, and the counts come from [`sim::rules::SpawnRules`] rather than
 /// from literals here.
+/// The rule set this client plays under: [`Rules::DEFAULT`], plus whatever the
+/// environment asks for.
+///
+/// **One function, used by every world this crate builds** — [`new_match`] for
+/// solo and `net.rs` for a networked match — so a screenshot hook cannot apply to
+/// one and not the other, which is how you end up photographing something the
+/// game does not do.
+///
+/// Overriding *rules* rather than poking at world state is the shape that keeps
+/// a hook honest: a `Rules` is data the simulation already carries, a replay
+/// already stores, and `Rules::validate` already checks, so a hooked run is a
+/// legal match under a different rule set rather than a special case threaded
+/// through the tick.
+///
+/// Today there is exactly one hook. `SPACESHIPS_EMP` makes the EMP
+/// self-inflicting and instantly charged:
+///
+/// - `emp.blinds_owner = true`, so the pulse catches the pilot who fired it and
+///   a single aircraft can photograph the effect;
+/// - `emp.charge_time = 0.0`, so the meter is full from the first tick instead of
+///   sixty seconds in.
+///
+/// `input.rs`'s `emp_test_fire` reads the same variable for *when* to pull the
+/// trigger.
+#[must_use]
+pub fn match_rules() -> Rules {
+    #[allow(
+        unused_mut,
+        reason = "the web build has no environment to read, so every hook below \
+                  is compiled out and the binding is left immutable"
+    )]
+    let mut rules = Rules::DEFAULT;
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var_os("SPACESHIPS_EMP").is_some() {
+        rules.emp.blinds_owner = true;
+        rules.emp.charge_time = 0.0;
+    }
+    debug_assert!(rules.validate().is_ok(), "hooked rules must still be legal");
+    rules
+}
+
 #[must_use]
 pub fn new_match(setup: &MatchSetup) -> (SimWorldState, Roster) {
-    let rules = Rules::DEFAULT;
+    let rules = match_rules();
     let mut setup = setup.clone();
     setup.normalize();
 

@@ -453,6 +453,24 @@ pub struct Ship {
     /// Flare charges remaining.
     pub flares_left: u8,
 
+    /// EMP charge, `0..=1`. One pulse costs the whole meter.
+    ///
+    /// **Not reset by [`crate::ship::respawn`], and that is the rule rather
+    /// than an omission.** `BACKLOG.md` §2 asks that the EMP "cannot be
+    /// respawn-cycled: the meter does not reset on death, so dying does not
+    /// refund it and a fresh spawn does not arrive armed". Both halves fall out
+    /// of leaving this field alone across a death — which is exactly why
+    /// `respawn` names it in a comment instead of silently not mentioning it.
+    pub emp_charge: f64,
+    /// Seconds of EMP blindness left. Zero is a working aircraft.
+    ///
+    /// This is *information* damage and nothing else: it never touches
+    /// [`Self::hp`], never touches the flight model, and never stops a trigger
+    /// pull. What it does is switch off everything that was doing the pilot's
+    /// looking for them — see [`crate::emp`] for the list and for why the list
+    /// stops where it does.
+    pub emp_blind: f64,
+
     /// Boost meter, in seconds of boost remaining.
     pub boost_meter: f64,
     /// Time since boost was last requested, gating recharge. `main.js:1266`.
@@ -551,6 +569,12 @@ impl Ship {
             ammo_idle: rules.weapons.ammo_regen_delay,
             missiles_left: rules.weapons.missile_max,
             flares_left: rules.weapons.flare_max,
+
+            // Empty, not full: "a fresh spawn does not arrive armed"
+            // (`BACKLOG.md` §2). The first pulse of a match is therefore
+            // `emp.charge_time` into it, for everybody, at the same moment.
+            emp_charge: 0.0,
+            emp_blind: 0.0,
 
             boost_meter: rules.ship.max_boost,
             boost_idle: rules.ship.boost_regen_delay,
@@ -1425,6 +1449,11 @@ pub struct Input {
     pub fire_missile: bool,
     /// Release a flare burst. Edge-triggered (`main.js:1446`).
     pub deploy_flare: bool,
+    /// Fire the EMP. Edge-triggered.
+    ///
+    /// The one input on this struct with no `main.js` citation, because the JS
+    /// has no such weapon and binds no such key. See [`crate::emp`].
+    pub fire_emp: bool,
     /// Switch gun. Edge-triggered (`main.js:1034`).
     pub toggle_gun: bool,
     /// Switch aim assist. Edge-triggered (`main.js:999`).
@@ -1495,6 +1524,23 @@ pub enum NetEvent {
         pos: Vec3,
         /// Their facing, which orients the burst cone.
         quat: Quat,
+    },
+    /// Someone set off an EMP.
+    ///
+    /// **No JS counterpart**, and the only variant here without one. The pulse
+    /// is re-detonated locally from `pos` rather than being described as a list
+    /// of who it caught, for the same reason [`Self::Fired`] carries an origin
+    /// and a direction rather than a hit list: given the centre, every client
+    /// resolves the identical sphere against the poses it already has.
+    ///
+    /// See [`crate::emp`] for what reaches a browser client, which is nothing.
+    EmpBurst {
+        /// Who fired it. Excluded from its own pulse; see
+        /// [`crate::rules::EmpRules::blinds_owner`].
+        id: EntityId,
+        /// Centre of the sphere: the firing ship's position at the moment it
+        /// went off.
+        pos: Vec3,
     },
     /// One scoreboard row. `main.js:858` (`players`).
     PlayerRow {
@@ -1588,6 +1634,23 @@ pub enum SimEvent {
         owner: EntityId,
         /// Where.
         origin: Vec3,
+    },
+    /// An EMP went off. Drives the shockwave, the cockpit blackout, and the
+    /// silence that follows it.
+    ///
+    /// It says where the pulse was and who set it off, and deliberately not who
+    /// it caught: whether *this* screen went dark is
+    /// [`HudState::emp_blind`], which is a state rather than an event and stays
+    /// true for the whole four seconds rather than for the one frame the burst
+    /// happened on.
+    EmpBurst {
+        /// Who fired it.
+        owner: EntityId,
+        /// Centre of the pulse.
+        origin: Vec3,
+        /// Its radius, so the renderer's shockwave ends where the effect does
+        /// rather than at a number of its own.
+        radius: f64,
     },
     /// Something exploded.
     Explosion {
@@ -1737,6 +1800,18 @@ pub enum NetIntent {
         pos: Vec3,
         /// Facing.
         quat: Quat,
+    },
+    /// An EMP was set off, for other clients to detonate against their own
+    /// copies of the world.
+    ///
+    /// Carries the centre and nothing else. Who it caught is each recipient's
+    /// own answer, computed from the poses they already hold — which is what
+    /// keeps the pulse honest when two clients disagree about exactly where a
+    /// third ship is, and what makes the message a fixed 24 bytes rather than a
+    /// list.
+    Emp {
+        /// Centre of the pulse.
+        pos: Vec3,
     },
     /// A hit is claimed on another ship.
     ///
@@ -2041,6 +2116,19 @@ pub struct HudState {
     pub missiles: u8,
     /// Flares remaining.
     pub flares: u8,
+    /// EMP charge, `0..1`. At `1.0` the weapon is armed.
+    ///
+    /// The attacker's whole share of the HUD: an EMP has no reticle, no lock and
+    /// no lead, so the only thing the glass can tell you about it is whether it
+    /// is ready.
+    pub emp_charge01: f32,
+    /// Seconds of EMP blindness left on the local ship, or zero.
+    ///
+    /// Seconds rather than a `bool` because three consumers want the number:
+    /// `cockpit.rs` hands it straight to `CockpitPower::emp` as a blackout
+    /// length, the HUD uses `> 0.0` as its power rail, and the audio layer
+    /// needs the rising edge and the whole span, not just the flag.
+    pub emp_blind: f32,
     /// Selected gun.
     pub gun_mode: GunMode,
     /// Whether spawn protection is active.

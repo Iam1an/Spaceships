@@ -422,6 +422,15 @@ impl Lobby {
             ClientMessage::Flare { pos, quat } => {
                 self.relay_if_alive(id, ServerMessage::Flare { id, pos, quat });
             }
+            // The one tag with no `server/index.js` counterpart. Relayed exactly
+            // like a flare — same liveness gate, same "everyone but the sender",
+            // no validation — because it is the same kind of message: an
+            // announcement of something the sender has already resolved locally,
+            // which each recipient then resolves against its own world. See
+            // `spaceships_protocol::ClientMessage::Emp`.
+            ClientMessage::Emp { pos } => {
+                self.relay_if_alive(id, ServerMessage::Emp { id, pos });
+            }
             ClientMessage::Hit {
                 target_id,
                 kind,

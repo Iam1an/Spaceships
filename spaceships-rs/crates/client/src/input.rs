@@ -191,6 +191,44 @@ fn raw_mouse() -> bool {
     std::env::var_os("SPACESHIPS_MOUSE_RAW").is_some()
 }
 
+/// `SPACESHIPS_EMP=<seconds>`: pull the EMP trigger by itself, once, that many
+/// seconds after launch.
+///
+/// The screenshot hook for a weapon whose whole effect is *not being able to
+/// see*, which is the one thing a still frame can show and the one thing you
+/// cannot arrange by hand — the pulse has to have gone off, the pilot has to be
+/// the one it caught, and the shutter has to open somewhere inside four seconds.
+/// With `SPACESHIPS_EMP` fixing the first two (`sim_bridge` also flips
+/// `EmpRules::blinds_owner` and drops the charge time to zero) and
+/// `SPACESHIPS_SCREENSHOT_AT` fixing the third, every frame of the effect is
+/// reachable from a command line.
+///
+/// `SPACESHIPS_EMP=1` with no number means "at one second", which is why the bare
+/// flag the cockpit's old dev hook used still does something sensible.
+///
+/// Returns whether *this* frame is the one to fire on, so the caller keeps the
+/// edge — the simulation debounces nothing.
+#[cfg(not(target_arch = "wasm32"))]
+fn emp_test_fire(time: &Time, fired: &mut bool) -> bool {
+    if *fired {
+        return false;
+    }
+    let Ok(spec) = std::env::var("SPACESHIPS_EMP") else {
+        return false;
+    };
+    let at = spec.trim().parse::<f32>().unwrap_or(1.0);
+    if time.elapsed_secs() < at {
+        return false;
+    }
+    *fired = true;
+    true
+}
+
+#[cfg(target_arch = "wasm32")]
+fn emp_test_fire(_time: &Time, _fired: &mut bool) -> bool {
+    false
+}
+
 fn gather_input(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -201,6 +239,7 @@ fn gather_input(
     lobby: Option<Res<crate::ui::LobbyOpen>>,
     mut virt: ResMut<VirtualCursor>,
     mut out: ResMut<PlayerInput>,
+    mut emp_fired: Local<bool>,
 ) {
     let axis = |neg: KeyCode, pos: KeyCode| -> f64 {
         f64::from(keys.pressed(pos)) - f64::from(keys.pressed(neg))
@@ -324,6 +363,15 @@ fn gather_input(
         fire: keys.pressed(KeyCode::KeyF) || mouse.pressed(MouseButton::Left),
         fire_missile: keys.just_pressed(KeyCode::KeyE),
         deploy_flare: keys.just_pressed(KeyCode::KeyQ),
+        // **The one binding that is not in `main.js`'s table**, and the comment
+        // above says why an extra key is normally wrong: the muscle memory being
+        // ported is the point. It is right here for the one reason that
+        // overrides it — the EMP is a weapon the JS does not have, so there is no
+        // muscle memory to preserve and no browser pilot who could be surprised
+        // by it. `G` because `cockpit.rs`'s dev hook has been the EMP key since
+        // before the weapon existed, and because it is the closest unbound key to
+        // `E` and `Q`, which are the other two stores.
+        fire_emp: keys.just_pressed(KeyCode::KeyG) || emp_test_fire(&time, &mut emp_fired),
         toggle_gun: keys.just_pressed(KeyCode::KeyP),
         // C, not T: `main.js:1385` (`prevKeyC`). T is not bound to anything in
         // the JS at all.

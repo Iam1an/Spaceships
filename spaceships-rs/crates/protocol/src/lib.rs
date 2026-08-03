@@ -42,6 +42,30 @@
 //! not literally byte-identical. The round-trip tests compare structurally for
 //! exactly this reason.
 //!
+//! # Messages the JS does not have
+//!
+//! The paragraph above is still the rule, and there is now exactly one
+//! documented exception to it: **`emp`**, in both directions
+//! ([`ClientMessage::Emp`], [`ServerMessage::Emp`]). The EMP is a weapon the
+//! browser game does not implement, so there is no `ws.send` to transcribe and
+//! no `msg.type === 'emp'` to match.
+//!
+//! Adding it is safe in both directions and deliberately does not change the JS:
+//!
+//! - **To the Node server**, an unknown tag falls off the end of
+//!   `handleConnection`'s `if` chain and is dropped. Nothing errors, nothing
+//!   disconnects, and no browser peer is told — so an EMP fired in a match
+//!   hosted by the JS server blinds only what the firing client simulates
+//!   itself.
+//! - **To a browser client**, both `lobby.js` and `main.js` ignore tags they do
+//!   not know, so a Rust server may relay this into a mixed room without
+//!   breaking anyone.
+//!
+//! The precedent for an additive field is already here: [`ServerMessage::Start`]
+//! carries an optional `seed` the JS server never sends. The rule this section
+//! makes explicit is that *additions must be inert to the JS on both sides*, and
+//! anything that is not is a change to `server/index.js` instead.
+//!
 //! # Direction
 //!
 //! [`ClientMessage`] is browser -> server, [`ServerMessage`] is server ->
@@ -488,6 +512,25 @@ pub enum ClientMessage {
         quat: Quat,
     },
 
+    /// The sender set off an EMP. Relayed as [`ServerMessage::Emp`].
+    ///
+    /// **The one message in this crate with no JavaScript counterpart.** See the
+    /// crate docs' *"Messages the JS does not have"* for the rule, and
+    /// `spaceships-sim`'s `emp` module for the weapon. What it means in practice:
+    /// `server/index.js` dispatches a fixed `if (msg.type === ...)` chain and
+    /// falls through on anything else, so sending this to the Node server is a
+    /// no-op — it is dropped, no browser peer is told, and nothing breaks. The
+    /// Rust server relays it.
+    ///
+    /// Carries the centre of the pulse and nothing else: who it caught is each
+    /// recipient's own answer, computed against the poses that recipient already
+    /// holds. There is no `quat` because a sphere has no facing, and no radius
+    /// because that is a rule both ends already share.
+    Emp {
+        /// Centre of the pulse: the firing ship's position when it went off.
+        pos: Vec3,
+    },
+
     /// Client-authoritative hit report. The server applies damage, kills, team
     /// score, and respawn scheduling from this message.
     ///
@@ -702,6 +745,19 @@ pub enum ServerMessage {
         pos: Vec3,
         /// Deployment orientation.
         quat: Quat,
+    },
+
+    /// Relayed EMP. Never echoed back to the sender, who has already detonated
+    /// its own copy.
+    ///
+    /// No JS counterpart — see [`ClientMessage::Emp`]. A browser client ignores
+    /// tags it does not know, so a Rust server relaying this into a mixed room
+    /// is harmless there as well: the JS pilots simply never go dark.
+    Emp {
+        /// Who set it off. Excluded from their own pulse.
+        id: PlayerId,
+        /// Centre of the pulse.
+        pos: Vec3,
     },
 
     /// Relayed ship colors. Never echoed back to the sender.

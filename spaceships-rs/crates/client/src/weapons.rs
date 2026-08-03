@@ -351,6 +351,21 @@ const MAX_MOTES: usize = 900;
 /// can starve the other; the mesh budget below covers both.
 const MAX_DAMAGE_MOTES: usize = 320;
 
+/// Cap on EMP wavefront particles, and a **third** pool for the same reason
+/// there is a second.
+///
+/// This one was found by looking rather than reasoned out in advance. The front
+/// went into [`MAX_MOTES`] first, and the wave was invisible: a ten-ship
+/// skirmish emits engine trail at about 450 particles a second against a
+/// 900-slot pool, so the pool is saturated within seconds of a match starting
+/// and every new trail mote evicts the oldest thing in it — which, for the two
+/// hundred milliseconds after a pulse, is the pulse. Two thirds of the
+/// wavefront was deleted before it had travelled sixty units.
+///
+/// Sized at [`EMP_MOTES`] × 2 so two overlapping pulses both survive intact,
+/// which is a real case: friendly blinding is on, so a furball can eat two.
+const MAX_PULSE_MOTES: usize = EMP_MOTES * 2;
+
 /// Cap on live explosion shells, and on beams.
 ///
 /// Neither list had one. A shell is short-lived so the count self-limits in
@@ -366,11 +381,11 @@ const MAX_BEAMS: usize = 32;
 /// see the padding in `rebuild`. Sized for the worst case the caps above allow,
 /// with headroom: every quad is 4 vertices and 6 indices.
 ///
-/// The worst case, counted: 900 motes + 320 damage + 128 shells + 32 beams,
-/// plus the projectiles a ten-ship match can have in flight — 400 bolts at two
-/// quads each (a 0.05 s gun cooldown against a 2 s bolt life), 30 flares at two,
-/// and 40 missiles at **one**, their bodies having moved off this mesh onto
-/// their own. That is 2 280 quads against 4 096.
+/// The worst case, counted: 900 motes + 320 damage + 400 pulse + 128 shells +
+/// 32 beams, plus the projectiles a ten-ship match can have in flight — 400
+/// bolts at two quads each (a 0.05 s gun cooldown against a 2 s bolt life), 30
+/// flares at two, and 40 missiles at **one**, their bodies having moved off this
+/// mesh onto their own. That is 2 680 quads against 4 096.
 const MESH_QUAD_CAPACITY: usize = 4096;
 const MESH_VERTEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 4;
 const MESH_INDEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 6;
@@ -1013,6 +1028,9 @@ struct Effects {
     /// Battle-damage smoke and fire. Its own pool, on its own cap — see
     /// [`MAX_DAMAGE_MOTES`].
     damage: Vec<Mote>,
+    /// EMP wavefronts. Its own pool for the same reason, and see
+    /// [`MAX_PULSE_MOTES`] for the specific way sharing one went wrong.
+    pulse: Vec<Mote>,
     /// Trail emission accumulators, keyed by ship id. A ship emitting at 45 Hz
     /// against a 60 Hz tick owes a fractional particle each tick.
     trail_debt: HashMap<i32, f32>,
@@ -1580,6 +1598,11 @@ fn consume_events(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
                 spawn_explosion(&mut fx, kind, p, scale as f32);
             }
 
+            SimEvent::EmpBurst { origin, radius, .. } => {
+                let p = to_vec3([origin.x as f32, origin.y as f32, origin.z as f32]);
+                spawn_emp(&mut fx, p, radius as f32);
+            }
+
             _ => {}
         }
     }
@@ -1887,6 +1910,119 @@ const FLARE_BURST: Burst = Burst {
     spark_life: (0.18, 0.52),
     spark_half: (0.07, 0.17),
 };
+
+/// Motes in the EMP front. Enough to read as a continuous shell at 300 units,
+/// cheap enough that two overlapping pulses cannot evict the engine trails —
+/// see [`MAX_MOTES`].
+const EMP_MOTES: usize = 200;
+
+/// How long the front takes to reach [`sim::rules::EmpRules::radius`].
+///
+/// The blackout is four seconds and this is well under one, deliberately: the
+/// wave is the *announcement*, not the effect. By the time a pilot has
+/// registered that their panel is dark, the thing that did it should already be
+/// leaving.
+///
+/// Tuned by looking. At half this it is over before the eye finds it — three
+/// hundred units in under half a second is faster than a bullet, and from the
+/// centre it reads as one frame of glare and nothing else. This is slow enough
+/// that the wall is a wall for a moment.
+const EMP_FRONT_SECS: f32 = 0.9;
+
+/// The EMP pulse: a cold front that runs out to the edge of the weapon's radius
+/// and stops.
+///
+/// Not a [`Burst`], and not routed through [`spawn_explosion`], because it is
+/// the one effect in this module that is not an explosion — nothing burns,
+/// nothing comes apart, and there is nothing to throw fragments of.
+///
+/// # Why the wave is motes and not a [`Shell`]
+///
+/// It was three nested shells, which is what every other blast here is, and it
+/// was wrong for one specific reason: **a `Shell` is a camera-facing billboard,
+/// so it only reads as a sphere from outside**. Every other shell in this file
+/// is a handful of units across and is looked at from tens of units away, so the
+/// distinction never comes up. This one is three hundred units across and is
+/// centred on the pilot who fired it — the camera is *inside* it — and a
+/// billboard drawn from the inside is a quad across the whole viewport. The
+/// screenshot was a white-out with a ship silhouetted in it.
+///
+/// A front of radial motes has no inside and no outside: it is a shell of
+/// particles in world space, so it reads as an expanding wall from any camera,
+/// and a camera at the centre watches it *leave* rather than being painted over
+/// by it. The cost is a hundred quads for half a second, which is an eighth of
+/// the mote budget.
+///
+/// # The rest of the recipe
+///
+/// - **Blue-white, cooling to a dead navy.** Every fireball here goes white →
+///   yellow → red because that is what burning matter does; this is the one
+///   effect that must not read as fire.
+/// - **The front stops at the weapon's radius**, straight off
+///   [`sim::world::SimEvent::EmpBurst`], so what you see is exactly who was
+///   caught. Watching the wall pass over an aircraft and then watching that
+///   aircraft go dark is the whole read, and a wave sized by taste would break
+///   it.
+/// - **Uniform speed, not the squared draw [`push_sparks`] uses.** Sparks want
+///   to fill a volume; a wavefront wants to be a surface, and scattering the
+///   speeds is precisely what would turn it back into a cloud.
+/// - **One small, very bright flash at the origin**, well over the camera's
+///   bloom threshold, so the moment of detonation has something to mark it. It
+///   is deliberately smaller than the chase camera's own standoff, which is what
+///   keeps *this* billboard outside the lens.
+fn spawn_emp(fx: &mut Effects, pos: Vec3, radius: f32) {
+    push_shell(
+        &mut fx.shells,
+        Shell {
+            pos,
+            life: 0.12,
+            from: 0.4,
+            to: 7.0,
+            color: glow(0xffffff, 5.0),
+            cool: glow(0x88ddff, 1.4),
+            opacity: 1.0,
+            ease: 0.5,
+            fade: 1.4,
+            ..default()
+        },
+    );
+
+    let speed = radius / EMP_FRONT_SECS;
+    let hot = glow(0xdff2ff, 2.6);
+    let cool = glow(0x1b4d8a, 0.05);
+    for _ in 0..EMP_MOTES {
+        let dir = fx.rng.direction();
+        // A little jitter on the speed only — enough that the wall has some
+        // thickness and does not look like a wireframe sphere, not enough to
+        // stop it being a wall.
+        let speed = speed * fx.rng.range(0.93, 1.0);
+        push_pulse(
+            &mut fx.pulse,
+            Mote {
+                pos: pos + dir * 3.0,
+                life: EMP_FRONT_SECS + 0.12,
+                // Big, and growing, because the far side of this front is three
+                // hundred units away: a trail-sized mote is a single pixel
+                // there, and the wall would dissolve into static exactly as it
+                // reached the aircraft it is about to blind.
+                half: 3.0,
+                grow: 2.4,
+                color: hot,
+                cool,
+                opacity: 0.85,
+                vel: dir * speed,
+                // No drag: a wavefront that slowed down would bunch up short of
+                // the radius it is supposed to describe.
+                drag: 0.0,
+                // Smeared along its own travel, so each mote is a radial dash
+                // rather than a dot and the front reads as motion.
+                smear: 0.014,
+                brush: Brush::GLOW,
+                ..default()
+            },
+        );
+    }
+}
 
 fn push_shells(out: &mut Vec<Shell>, pos: Vec3, scale: f32, spec: &[ShellSpec]) {
     for s in spec {
@@ -2242,6 +2378,15 @@ fn push_damage(damage: &mut Vec<Mote>, mote: Mote) {
     damage.push(mote);
 }
 
+/// Pushes an EMP wavefront particle, dropping the oldest when its own cap is
+/// reached.
+fn push_pulse(pulse: &mut Vec<Mote>, mote: Mote) {
+    if pulse.len() >= MAX_PULSE_MOTES {
+        pulse.remove(0);
+    }
+    pulse.push(mote);
+}
+
 /// Pushes a particle, dropping the oldest when the global cap is reached.
 ///
 /// `trails.js` does `list.shift()` on overflow, which is the same policy. The
@@ -2311,6 +2456,7 @@ fn age_effects(time: Res<Time>, frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
 
     advance(&mut fx.motes, dt);
     advance(&mut fx.damage, dt);
+    advance(&mut fx.pulse, dt);
 
     // Missile exhaust. Emitted here rather than in `emit_trails` because the
     // 0.028 s interval is finer than a 16.7 ms tick and the missiles it hangs
@@ -2726,12 +2872,17 @@ fn build_surface(
         );
     }
 
-    // ── trail, exhaust and damage motes ──────────────────────────────────
+    // ── trail, exhaust, damage and pulse motes ───────────────────────────
     //
     // Damage first, so a fresh flame draws over the smoke it came out of rather
-    // than under it. Both lists are the same record and the same quad; they are
-    // separate only so their caps are.
-    for m in fx.damage.iter().chain(fx.motes.iter()) {
+    // than under it. All three lists are the same record and the same quad;
+    // they are separate only so their caps are.
+    for m in fx
+        .damage
+        .iter()
+        .chain(fx.motes.iter())
+        .chain(fx.pulse.iter())
+    {
         let t = (m.age / m.life).clamp(0.0, 1.0);
         let r = m.half * (1.0 + t * m.grow) * (1.0 - t * m.shrink);
         let color = mix(m.color, m.cool, t);
@@ -3117,6 +3268,15 @@ enum SceneKind {
     Rocket,
     /// One volley of each allegiance, side by side. See [`stage_allegiance`].
     Allegiance,
+    /// An EMP wavefront, staged **far** enough out to be seen from outside.
+    ///
+    /// Its own variant rather than an [`ExplosionKind`] because it is not one,
+    /// and because it is the only effect here whose radius is larger than the
+    /// distance every other scene is staged at: at [`SCENE_AHEAD`] a
+    /// three-hundred-unit front swallows the camera on the first frame, which is
+    /// the exact failure that made this effect a front of particles instead of a
+    /// billboard in the first place. `emp@0.3` stages it two radii out.
+    Emp,
 }
 
 fn fx_scene() -> Option<Scene> {
@@ -3142,6 +3302,7 @@ fn fx_scene() -> Option<Scene> {
                 "beam" => SceneKind::Beam,
                 "rocket" | "body" => SceneKind::Rocket,
                 "allegiance" | "sides" => SceneKind::Allegiance,
+                "emp" | "pulse" => SceneKind::Emp,
                 other => {
                     warn!("SPACESHIPS_FX_SCENE={other} is not an effect this module draws");
                     return None;
@@ -3186,6 +3347,9 @@ fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
     // the one scene that decides how far out it is staged.
     let ahead = match scene.what {
         SceneKind::Rocket | SceneKind::Allegiance => scene.at,
+        // Two radii out, so the whole front is in shot and the camera is
+        // outside it.
+        SceneKind::Emp => EMP_SCENE_RADIUS * 2.0,
         _ => SCENE_AHEAD,
     };
     let at = to_vec3(ship.pos) + fwd * ahead + quat * Vec3::Y * SCENE_LIFT;
@@ -3196,8 +3360,10 @@ fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
     fx.shells.clear();
     fx.beams.clear();
     fx.motes.clear();
+    fx.pulse.clear();
 
     match scene.what {
+        SceneKind::Emp => spawn_emp(&mut fx, at, EMP_SCENE_RADIUS),
         SceneKind::Allegiance => stage_allegiance(&mut fx, at, quat, scene.at),
         SceneKind::Explosion(kind) => {
             let scale = match kind {
@@ -3226,13 +3392,24 @@ fn stage_scene(frame: Res<SimFrame>, mut fx: ResMut<Effects>) {
     // written, or every spark would sit on the detonation point. Substepped
     // because the drag makes the path curved and a single jump of a third of a
     // second would land in the wrong place.
-    for m in &mut fx.motes {
+    // Two separate loops, not one chained borrow: `Effects` is behind a
+    // `ResMut`, so `fx.motes.iter_mut().chain(fx.pulse.iter_mut())` reborrows
+    // the whole resource twice and the checker refuses it — the same disjoint
+    // field problem `emit_damage` notes about `fx.rng` and `fx.damage`.
+    let hold = |m: &mut Mote| {
         let dt = m.life * scene.at / SCENE_SUBSTEPS as f32;
         for _ in 0..SCENE_SUBSTEPS {
             step(m, dt);
         }
-    }
+    };
+    fx.motes.iter_mut().for_each(hold);
+    fx.pulse.iter_mut().for_each(hold);
 }
+
+/// The radius the `emp` scene stages, which is
+/// [`sim::rules::EmpRules::radius`] rather than a number picked here — a
+/// wavefront photographed at the wrong size is a photograph of nothing.
+const EMP_SCENE_RADIUS: f32 = sim::rules::Rules::DEFAULT.emp.radius as f32;
 
 /// How finely the harness integrates a staged particle to its held age. Sixty
 /// is a frame-rate's worth, which is the accuracy the live effect gets.
@@ -4203,9 +4380,38 @@ mod tests {
         assert_eq!(fx.damage.len(), MAX_DAMAGE_MOTES, "30s should fill it");
         assert!(fx.motes.is_empty(), "damage must not touch the trail pool");
 
-        // And both together stay inside the mesh's fixed vertex budget, which
-        // is what stops the slab allocator's use-after-free coming back.
-        const { assert!(MAX_MOTES + MAX_DAMAGE_MOTES < MESH_QUAD_CAPACITY) };
+        // And all three together stay inside the mesh's fixed vertex budget,
+        // which is what stops the slab allocator's use-after-free coming back.
+        const { assert!(MAX_MOTES + MAX_DAMAGE_MOTES + MAX_PULSE_MOTES < MESH_QUAD_CAPACITY) };
+    }
+
+    /// The EMP front gets its own pool, and this is the bug that made it need
+    /// one: a saturated trail pool deleted the wave before it was sixty units
+    /// out, so the pulse was invisible in exactly the situation — a busy
+    /// dogfight — that it is fired in.
+    #[test]
+    fn the_pulse_front_cannot_be_evicted_by_engine_trails() {
+        let mut fx = Effects::default();
+        // A trail pool already at its cap, as a ten-ship skirmish reaches within
+        // seconds of the match starting.
+        for _ in 0..MAX_MOTES {
+            push_mote(&mut fx.motes, Mote::default());
+        }
+        spawn_emp(&mut fx, Vec3::ZERO, 300.0);
+        assert_eq!(fx.pulse.len(), EMP_MOTES);
+        assert_eq!(fx.motes.len(), MAX_MOTES, "the front took no trail slots");
+
+        // A second full second of trail emission does not touch it.
+        for _ in 0..MAX_MOTES {
+            push_mote(&mut fx.motes, Mote::default());
+        }
+        assert_eq!(fx.pulse.len(), EMP_MOTES, "and none of it was evicted");
+
+        // Two overlapping pulses both survive whole; a third evicts the first.
+        spawn_emp(&mut fx, Vec3::ZERO, 300.0);
+        assert_eq!(fx.pulse.len(), MAX_PULSE_MOTES);
+        spawn_emp(&mut fx, Vec3::ZERO, 300.0);
+        assert_eq!(fx.pulse.len(), MAX_PULSE_MOTES, "bounded on its own");
     }
 
     /// Every particle sits on the wing, not at the hull origin — the fit test.

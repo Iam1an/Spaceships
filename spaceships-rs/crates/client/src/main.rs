@@ -248,6 +248,27 @@ fn main() {
     app.run();
 }
 
+/// When [`screenshot_on_f12`] opens the shutter, in seconds since launch.
+///
+/// Three by default: long enough for the glTF and both textures to have loaded
+/// and for the camera damping to have settled.
+///
+/// `SPACESHIPS_SHOT_AT` moves it, which is what makes a *timed* effect
+/// photographable at all. The EMP is the case that needed it — the pulse fires,
+/// four seconds of blackout run, and then the cockpit reboots over another
+/// six-tenths, so "detonation", "blind" and "recovery" are three different
+/// moments of the same run and no fixed shutter can reach all three. Paired with
+/// `SPACESHIPS_EMP=<seconds>`, which decides when the trigger is pulled, any
+/// frame of the effect is one command line away.
+#[cfg(not(target_arch = "wasm32"))]
+fn screenshot_at() -> f32 {
+    std::env::var("SPACESHIPS_SHOT_AT")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .unwrap_or(3.0)
+}
+
 /// Writes the exact render target to a PNG, on `F12` or on a timer.
 ///
 /// Native only — it writes to disk. Worth the dozen lines: a hand-cropped grab
@@ -255,7 +276,7 @@ fn main() {
 /// is, which is precisely the question you have when a camera looks subtly
 /// wrong. `SPACESHIPS_SCREENSHOT=path.png` captures once the assets have had
 /// time to land and then quits, which is the form a visual regression check
-/// would use.
+/// would use; `SPACESHIPS_SHOT_AT` decides when.
 #[cfg(not(target_arch = "wasm32"))]
 fn screenshot_on_f12(
     mut commands: Commands,
@@ -267,10 +288,9 @@ fn screenshot_on_f12(
 ) {
     let auto = std::env::var("SPACESHIPS_SCREENSHOT").ok();
 
-    // Three seconds in: long enough for the glTF and both textures to have
-    // loaded and for the camera damping to have settled.
     if let Some(path) = auto.as_ref() {
-        if !*auto_done && time.elapsed_secs() > 3.0 {
+        let at = screenshot_at();
+        if !*auto_done && time.elapsed_secs() > at {
             *auto_done = true;
             info!("writing {path}");
             commands
@@ -279,7 +299,7 @@ fn screenshot_on_f12(
         }
         // The capture is asynchronous — it round-trips through the render
         // world — so quitting has to wait a beat.
-        if *auto_done && time.elapsed_secs() > 5.0 {
+        if *auto_done && time.elapsed_secs() > at + 2.0 {
             // 0.17 renamed buffered events to messages: `EventWriter::send` is
             // `MessageWriter::write`.
             exit.write(AppExit::Success);
