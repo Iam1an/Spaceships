@@ -13,8 +13,10 @@
 //! boulder field is the same. That is what buys the tree count going up from
 //! 340 to [`TREE_COUNT`] while the frame gets cheaper rather than dearer.
 //!
-//! The clouds are the exception and stay as entities, because they drift. They
-//! share one sphere and one material, so they are still a single batch.
+//! The clouds drift, so that argument does not reach them — but they are
+//! *transparent*, and Bevy's transparent pass draws one item at a time rather
+//! than instancing. Each cluster is therefore baked into its own mesh too, which
+//! took the map from 138 transparent draw calls to 26. See [`install_clouds`].
 //!
 //! # Everything is placed through the height function
 //!
@@ -283,6 +285,34 @@ impl Builder {
         }
     }
 
+    /// Appends another mesh's triangles, transformed and recoloured.
+    ///
+    /// Expands the source's index buffer, because everything here is unindexed
+    /// so that `compute_normals` stays flat. Positions only — the normals are
+    /// recomputed at the end anyway, so carrying the source's would be work
+    /// thrown away, and a non-uniform scale would have made them wrong.
+    fn append(&mut self, mesh: &Mesh, at: Transform, color: [f32; 4]) {
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(src)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            return;
+        };
+        let point = |i: usize| at.transform_point(Vec3::from(src[i]));
+        match mesh.indices() {
+            Some(idx) => {
+                let v: Vec<usize> = idx.iter().collect();
+                for t in v.chunks_exact(3) {
+                    self.tri(point(t[0]), point(t[1]), point(t[2]), color);
+                }
+            }
+            None => {
+                for t in (0..src.len()).collect::<Vec<_>>().chunks_exact(3) {
+                    self.tri(point(t[0]), point(t[1]), point(t[2]), color);
+                }
+            }
+        }
+    }
+
     fn build(self) -> Mesh {
         let mut mesh = Mesh::new(
             PrimitiveTopology::TriangleList,
@@ -402,11 +432,26 @@ const CLOUD_DRIFT_SPEED: f32 = 0.8;
 
 /// `createClouds` (`clouds.js:6`): clusters of six to nine overlapping spheres.
 ///
-/// The JS builds a `SphereGeometry` per puff, at a different radius each time —
-/// two hundred distinct geometries. Here it is **one unit sphere** scaled by the
-/// transform, so the whole sky is a single batch. The sphere is coarse on
-/// purpose: at this distance the facets read as the lumpiness of a cumulus, and
-/// they match the faceting of everything below them.
+/// # One mesh per cluster, and why that is not the same argument as the forest's
+///
+/// The forest is baked because per-entity work is wasted on geometry that never
+/// moves. Clouds *do* move, so that argument does not apply — but a second one
+/// does, and it is sharper.
+///
+/// Clouds are **transparent**, and Bevy's transparent pass sorts back to front
+/// per item; it does not instance them the way it instances the opaque queue. So
+/// where 900 trees sharing a handle cost one draw call, 26 clusters of 6–9 puffs
+/// sharing a handle cost *one draw call each puff*. Measured with
+/// `SPACESHIPS_DRAWCALLS=1`: the map was drawing 142 calls, 138 of them
+/// transparent, and every one of those was a sphere.
+///
+/// Baking each cluster into a single mesh — the puffs are rigid relative to one
+/// another, so the drift still works on the parent transform — takes that to 26.
+/// The clusters differ, so this is 26 handles rather than one, but a batch key
+/// that is never batched anyway costs nothing to multiply.
+///
+/// The sphere is coarse on purpose: at this distance the facets read as the
+/// lumpiness of a cumulus, and they match the faceting of everything below them.
 fn install_clouds(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -414,7 +459,10 @@ fn install_clouds(
 ) {
     let mut rng = Rng::with_stream(SCATTER_SEED, 3);
 
-    let puff = meshes.add(Sphere::new(1.0).mesh().ico(1).expect("ico(1) is valid"));
+    let puff = Sphere::new(1.0)
+        .mesh()
+        .ico(1)
+        .expect("ico(1) is a valid sphere");
     // `clouds.js:7`: white, `opacity: 0.72`, `depthWrite: false`. Bevy's
     // `AlphaMode::Blend` is exactly "sort into the transparent pass and do not
     // write depth", so the flag has no separate spelling here.
@@ -440,31 +488,32 @@ fn install_clouds(
         let drift = dir * rng.range_f64(0.4, 1.0) as f32 * CLOUD_DRIFT_SPEED;
         let puffs = 6 + rng.bounded_usize(4);
 
-        commands
-            .spawn((
-                Transform::from_xyz(cx, cy, cz),
-                Visibility::default(),
-                CloudDrift(drift),
-                MapScenery,
-            ))
-            .with_children(|cluster| {
-                for _ in 0..puffs {
-                    let r = rng.range_f64(18.0, 46.0) as f32 * scale;
-                    let sx = (rng.next_f64() as f32 - 0.5) * 60.0 * scale;
-                    let sy = (rng.next_f64() as f32 - 0.5) * 14.0 * scale;
-                    let sz = (rng.next_f64() as f32 - 0.5) * 50.0 * scale;
-                    cluster.spawn((
-                        Mesh3d(puff.clone()),
-                        MeshMaterial3d(material.clone()),
-                        Transform::from_xyz(sx, sy, sz).with_scale(Vec3::splat(r)),
-                        NotShadowCaster,
-                    ));
-                }
-            });
+        let mut cluster = Builder::default();
+        for _ in 0..puffs {
+            let r = rng.range_f64(18.0, 46.0) as f32 * scale;
+            let sx = (rng.next_f64() as f32 - 0.5) * 60.0 * scale;
+            let sy = (rng.next_f64() as f32 - 0.5) * 14.0 * scale;
+            let sz = (rng.next_f64() as f32 - 0.5) * 50.0 * scale;
+            cluster.append(
+                &puff,
+                Transform::from_xyz(sx, sy, sz).with_scale(Vec3::splat(r)),
+                [1.0; 4],
+            );
+        }
+
+        commands.spawn((
+            Mesh3d(meshes.add(cluster.build())),
+            MeshMaterial3d(material.clone()),
+            Transform::from_xyz(cx, cy, cz),
+            CloudDrift(drift),
+            NotShadowCaster,
+            MapScenery,
+        ));
     }
 }
 
-/// `clouds.js:38`: drift along x and wrap. Twenty-six transforms a frame.
+/// `clouds.js:38`: drift along x and wrap. Twenty-six transforms a frame — one
+/// per cluster, since each is now a single baked mesh.
 pub fn drift_clouds(time: Res<Time>, mut clusters: Query<(&mut Transform, &CloudDrift)>) {
     let dt = time.delta_secs();
     let wrap = CLOUD_SPREAD + 200.0;

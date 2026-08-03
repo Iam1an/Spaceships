@@ -42,7 +42,7 @@
 //! | Sea | 1 | 1 |
 //! | Trees (merged) | 1 | 1 |
 //! | Boulders (merged) | 1 | 1 |
-//! | Clouds (shared sphere, instanced) | ~220 | 1 |
+//! | Clouds (one baked mesh per cluster) | 26 | 26 |
 //! | Bases (two) | ~130 | ~22 |
 //!
 //! # Swapping maps
