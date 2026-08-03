@@ -1,8 +1,13 @@
 # Backlog
 
-Ideas parked until the Rust rewrite lands. Nothing here should start before the
-Bevy client reaches parity with the Three.js version — with one flagged
-exception in the replay section.
+Ideas parked until the Rust rewrite lands. That gate has now lifted: the Bevy
+client plays, packages, and plays online against browser clients, so the work
+below is live rather than parked.
+
+Sections marked **DONE** were built during the port and are kept for their
+design notes, which still govern anything added to those areas later. Check the
+marker before starting on a section — several of these were written when they
+described missing features and now describe shipped ones.
 
 ---
 
@@ -49,6 +54,44 @@ a rendering concern over a re-simulated world — no extra recording required.
   between them, scrub to preview. This is the clip-production feature.
 - **Export.** Offscreen render to a video file at a fixed step, so output is
   smooth regardless of what the machine can do in real time.
+
+### The shape this should take (decided)
+
+Not a debug scrubber — a clip editor. In order of what a session looks like:
+
+1. **Fly it like a drone.** Free camera, detached from every ship, six degrees
+   of freedom. This is the default view, not a mode you opt into.
+2. **A timeline along the bottom.** Scrub, play, pause, step. The nav bar is
+   the primary control surface, so it is worth designing properly rather than
+   bolting a slider onto the HUD.
+3. **Keyframes.** Drop a camera keyframe at a point on the timeline, move,
+   drop another, spline between them. Scrub to preview the move before
+   committing it.
+4. **Click a plane to ride it.** Selecting an aircraft snaps the camera to it,
+   and once attached, **outside and inside views toggle** — the chase camera
+   and `cockpit.rs`'s seated view, the same two the pilot had. Then detach and
+   go back to flying free.
+5. **Export the keyframed clip to an MP4 on the Desktop.** High quality, 60 fps
+   by default and **120 fps behind a setting**. Rendered offscreen at a fixed
+   step, so the output is smooth whatever the machine manages live.
+
+### What that adds beyond "re-simulate and watch"
+
+- **An encoder.** Bevy will not write an MP4. Either shell out to `ffmpeg` (a
+  hard external dependency the game has never had, and one a `.dmg` recipient
+  will not have installed) or link a Rust H.264 encoder. This is the single
+  biggest unknown in the feature and worth settling before anything else is
+  built — the answer changes whether export is a day or a fortnight.
+- **Offscreen rendering at a fixed step.** The render loop currently follows
+  the display. Export needs it driven by the export clock instead, with each
+  frame fully resolved before the next — including a fixed `overstep_fraction`
+  rather than whatever the last frame happened to have.
+- **A camera-path representation** with spline interpolation, and a UI for
+  editing it that is not the CRT lobby. Two very different interfaces in one
+  binary.
+- **Seeking that is not "re-simulate from zero".** Periodic `World` snapshots,
+  as above. A 5-minute match at 60 Hz is 18,000 ticks; scrubbing has to feel
+  instant or the whole editor is unusable.
 
 ### Do this bit *during* the rewrite, not after
 
@@ -121,7 +164,11 @@ skill.
 
 ---
 
-## 3. Audio warnings ("Bitchin' Betty")
+## 3. Audio warnings ("Bitchin' Betty") — **DONE**
+
+> Built. `crates/client/src/audio.rs` carries all fourteen callouts with the
+> arbitration described below, and the clips are in `public/sounds/warnings/`.
+> Kept for the design notes, which still govern any callout added later.
 
 F-16-style spoken warnings: *"PULL UP"*, *"TERRAIN"*, *"CAUTION TERRAIN"*,
 *"ALTITUDE"*, *"MISSILE LOCK"*, *"OVER-G"*.
@@ -300,7 +347,11 @@ alternate dogfight arena; here the ground is the point.
 
 ---
 
-## 6. Rebuild the terrain map
+## 6. Rebuild the terrain map — **DONE**
+
+> Built, and it went further than this section asked: the heightfield moved
+> into `crates/sim/src/terrain.rs`, so the drawn surface *is* the collision
+> surface. See CLAUDE.md's "The Sierras (Rust port only)".
 
 Sierras needs a full redo. The problem is the generation approach, not the
 tuning — no choice of coefficients fixes it.
@@ -363,7 +414,10 @@ flying over.
 
 ---
 
-## 7. Replace the ship models — make them fighter jets
+## 7. Replace the ship models — make them fighter jets — **DONE**
+
+> Built. `public/jet.glb` is the default hull; `scene::model_fit`,
+> `weapons.rs`'s nozzles and `cockpit.rs`'s `JET_PROFILE` are all fitted to it.
 
 The default ship reads as blocks because it geometrically is. It should also
 stop being a generic spaceship.
@@ -470,7 +524,11 @@ Bevy loads glTF natively, so the format does not need to change.
 
 ---
 
-## 8. UI redesign — the menu is the aircraft
+## 8. UI redesign — the menu is the aircraft — **DONE**
+
+> Built. The CRT instrument-panel lobby in `ui.rs`, sharing `cockpit.rs`'s
+> palette. The military vocabulary it originally shipped with was later
+> replaced with plain words — the look was the good part, the jargon was not.
 
 The lobby, shop, profile and settings all get redone as **avionics**, not as a
 game menu. This is the last major client surface and it has **not** been ported
@@ -573,6 +631,23 @@ The distinctive part is a **screen-space radial distortion** — UVs displaced
 toward or away from centre, strongest at the arrival instant and relaxing on an
 ease-out over roughly 0.6 s. That is the thing that reads as space folding
 rather than as stars going past.
+
+**The reference is Star Wars, and it is specific.** The sky *bends around the
+ship* and then snaps — the starfield stretches into lines drawn toward a
+vanishing point, holds, and collapses back to points at arrival. Two things
+make it read right and both are easy to get wrong:
+
+- **The stars stretch, the world does not.** The streaking belongs to the
+  skybox, not to a full-screen blur. `skybox.rs` generates the starfield
+  procedurally, so the stretch can be done there — displacing along the view
+  axis — while ships, rocks and terrain stay sharp. A post-process applied to
+  everything looks like motion blur, which is a different effect entirely.
+- **The snap is the moment.** The collapse from lines back to points wants to
+  be much faster than the build-up: a slow bend in, a hard arrival. Easing both
+  ends symmetrically is what makes a warp look like a dissolve.
+
+The radial bend above rides on top of that, strongest at the instant the lines
+collapse.
 
 It composes with what the client already has:
 
