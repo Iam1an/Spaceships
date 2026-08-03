@@ -52,8 +52,16 @@ const TREE_COUNT: usize = 900;
 /// times the target, and it matters: the band is narrow and a run that cannot
 /// fill it must end rather than spin.
 const TREE_ATTEMPTS: usize = TREE_COUNT * 30;
-/// Lowest ground a tree grows on, above the waterline. Below this is beach.
-const TREE_MIN_HEIGHT: f64 = 5.0;
+/// Lowest ground a tree grows on, measured **up from the waterline**. Below this
+/// is beach.
+///
+/// Relative and not absolute, for the same reason [`super::ground`]'s colour
+/// bands are: the two numbers are equal today only because
+/// [`WorldRules::water_level`] is zero, and a tree line pinned to `y = 5` would
+/// go on looking right until the sea moved and the forest was growing out of it.
+///
+/// [`WorldRules::water_level`]: sim::rules::WorldRules::water_level
+const TREE_MIN_CLEARANCE: f64 = 5.0;
 /// Highest ground a tree grows on — the tree line, just into the upland band.
 const TREE_MAX_HEIGHT: f64 = 290.0;
 /// Steepest ground a tree grows on. About 37°: soil does not hold above that,
@@ -72,10 +80,17 @@ const ROCK_MIN_SLOPE: f64 = 0.55;
 
 /// Clearance kept around each landing pad, measured from the mesa centre.
 ///
-/// Generous: it has to cover the pad, its apron and its ramp, or trees grow out
-/// of the runway edge and boulders sit in the approach.
+/// [`sim::terrain::mesa_half_extent`] is the mesa itself — pad, apron and ramp —
+/// and this is that plus a margin, so nothing grows out of the runway edge or
+/// stands in the approach. Asking the simulation rather than restating
+/// `airfield_half + <a number>` is what keeps the two from drifting when the
+/// ramp is retuned.
+const BASE_MARGIN: f64 = 70.0;
+
+/// See [`BASE_MARGIN`].
 fn base_clearance(rules: &WorldRules) -> (f64, f64) {
-    (rules.airfield_half.x + 260.0, rules.airfield_half.z + 260.0)
+    let (hw, hd) = sim::terrain::mesa_half_extent(rules);
+    (hw + BASE_MARGIN, hd + BASE_MARGIN)
 }
 
 /// Is `(x, z)` inside either mesa's keep-clear rectangle?
@@ -108,7 +123,7 @@ fn tree_placements(rules: &WorldRules) -> Vec<Placement> {
         TREE_COUNT,
         TREE_ATTEMPTS,
         |ground, slope, x, z| {
-            (TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT).contains(&ground)
+            (rules.water_level + TREE_MIN_CLEARANCE..=TREE_MAX_HEIGHT).contains(&ground)
                 && slope <= TREE_MAX_SLOPE
                 && !on_a_base(x, z, rules)
         },
@@ -544,7 +559,7 @@ mod tests {
         assert_eq!(trees.len(), TREE_COUNT, "the forest has to fill");
         for t in &trees {
             assert_eq!(t.ground, height(t.x, t.z));
-            assert!((TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT).contains(&t.ground));
+            assert!((rules.water_level + TREE_MIN_CLEARANCE..=TREE_MAX_HEIGHT).contains(&t.ground));
             assert!(sim::terrain::slope_at(t.x, t.z, &rules) <= TREE_MAX_SLOPE);
             assert!(!on_a_base(t.x, t.z, &rules), "a tree at ({}, {})", t.x, t.z);
             assert!((0.7..=1.55).contains(&t.scale));
@@ -598,7 +613,7 @@ mod tests {
             10,
             300,
             |g, s, x, z| {
-                (TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT).contains(&g)
+                (rules.water_level + TREE_MIN_CLEARANCE..=TREE_MAX_HEIGHT).contains(&g)
                     && s <= TREE_MAX_SLOPE
                     && !on_a_base(x, z, &rules)
             },

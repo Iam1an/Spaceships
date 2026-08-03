@@ -3817,8 +3817,9 @@ fn set_text(q: &mut Query<&mut Text>, entity: Entity, value: impl FnOnce() -> St
 //   differs by about a degree of parallax. A hit distance on `HudState`, or a
 //   ray query on `sim`, would remove the approximation.
 // - **No height query.** The `AGL` half of [`AltBlock`] calls
-//   [`sim::ship::terrain_height`] straight, which is a seven-octave noise sum
-//   per frame on the render thread for a number `sim::ship` has already computed
+//   [`sim::ship::terrain_height`] straight, which is a lattice lookup and four
+//   noise evaluations per frame on the render thread, for a number `sim::ship`
+//   has already computed
 //   this tick to decide whether the ship is still alive. One `f32` on `HudState`
 //   would delete it, and the same field would let the cockpit grow a radar
 //   altimeter without a second copy of the sum.

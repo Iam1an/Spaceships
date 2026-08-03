@@ -16,9 +16,9 @@
 //!   transforms.
 //! - [`camera`] — the chase camera from `public/src/camera.js`.
 //! - [`skybox`] — the procedural starfield from `public/src/skybox.js`.
-//! - [`terrain`] — the Sierras map: ground, airfields, trees, clouds, and fog,
-//!   with the ground generated from `sim::ship::terrain_height` so what you see
-//!   is what kills you.
+//! - [`terrain`] — the Sierras map: ground, sea, bases, trees, boulders, clouds
+//!   and fog, with the ground drawn one triangle per `sim::terrain` lattice face
+//!   so what you see is exactly what kills you.
 //!
 //! The dependency direction is one-way: `scene`, `camera`, and `skybox` read
 //! `Frame` and never touch `World`.

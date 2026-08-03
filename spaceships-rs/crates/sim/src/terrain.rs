@@ -228,6 +228,23 @@ pub fn kill_altitude(x: f64, z: f64, rules: &WorldRules) -> f64 {
     surface_height(x, z, rules) + rules.terrain_kill_clearance
 }
 
+/// Half-extents of a mesa's whole footprint: the flat top plus the ramp off it.
+///
+/// Published because the renderer needs it and would otherwise restate it. The
+/// scenery scatter has to keep trees and boulders off a base, and "off a base"
+/// means clear of the ramp as well as the pad — a number built from
+/// [`crate::rules::WorldRules::airfield_half`] plus a guess drifts the moment
+/// the ramp is retuned, which is the duplication `crates/sim/src/rules.rs`
+/// exists to prevent.
+///
+/// The real footprint has rounded corners, so treating this as a rectangle is
+/// conservative — it never claims a mesa is smaller than it is.
+#[must_use]
+pub fn mesa_half_extent(rules: &WorldRules) -> (f64, f64) {
+    let out = Layout::MESA_APRON + Layout::MESA_RAMP;
+    (rules.airfield_half.x + out, rules.airfield_half.z + out)
+}
+
 /// Magnitude of the surface gradient at a point — rise over run, so `1.0` is
 /// 45°.
 ///
@@ -520,11 +537,21 @@ impl Layout {
         // widest channel on the map and the one genuinely flyable water route
         // between the halves.
         Channel {
+            //
+            // The dog-leg east at `z ≈ 950` is not decoration. The south mesa's
+            // blend covers `|x| ≤ 483` for all `z ≥ 1007`, and it runs *after*
+            // the cuts, so a spine that crossed that line at `x ≈ 370` — which
+            // the first version did — got filled straight back in and the map
+            // had a river that stopped at a wall of nothing. `every_channel_is_
+            // actually_cut_along_its_spine` walks all six spines and is what
+            // makes this a checked property rather than a coordinate someone
+            // eyeballed.
             spine: &[
                 (55.0, 400.0),
-                (240.0, 820.0),
-                (570.0, 1300.0),
-                (690.0, 1800.0),
+                (300.0, 760.0),
+                (560.0, 950.0),
+                (700.0, 1320.0),
+                (760.0, 1800.0),
             ],
             half_width: 62.0,
             wall_slope: 1.15,
@@ -1114,6 +1141,55 @@ mod tests {
                 h > w.water_level + 20.0,
                 "the ravine at ({x}, {z}) has flooded to {h}",
             );
+        }
+    }
+
+    /// **Every channel is cut along its whole length**, not just where somebody
+    /// thought to look.
+    ///
+    /// The cuts run before [`plateau_blend`], which means a mesa silently fills
+    /// in any channel that strays inside its footprint — and the outflow gorge
+    /// did exactly that for 150 units of its run, coming out of the water and
+    /// back into it. Three hand-picked sample points in
+    /// `the_water_features_are_where_the_layout_says` all happened to sit
+    /// outside the affected stretch, so the map shipped with a river that
+    /// stopped at a wall.
+    ///
+    /// This walks each spine end to end instead. It is the general form of that
+    /// test and it is the one to extend when a channel is added.
+    #[test]
+    fn every_channel_is_actually_cut_along_its_spine() {
+        let w = world();
+        for (i, ch) in Layout::CHANNELS.iter().enumerate() {
+            for pair in ch.spine.windows(2) {
+                let (ax, az) = pair[0];
+                let (bx, bz) = pair[1];
+                let steps = 60;
+                for k in 0..=steps {
+                    let t = f64::from(k) / f64::from(steps);
+                    let x = ax + (bx - ax) * t;
+                    let z = az + (bz - az) * t;
+                    let h = ground_height(x, z, &w);
+                    if ch.floor < w.water_level {
+                        // A river has to be water for its whole length, or it
+                        // is a dry ditch with a puddle at each end.
+                        assert!(
+                            h < w.water_level,
+                            "channel {i} is dry at ({x:.0}, {z:.0}): {h:.1}",
+                        );
+                    } else {
+                        // A ravine only has to have been cut. The allowance is
+                        // `Layout::DETAIL`, which is added after the cut and is
+                        // the whole reason the floor is not exactly flat.
+                        assert!(
+                            h <= ch.floor + Layout::DETAIL + 1.0,
+                            "channel {i} was not cut at ({x:.0}, {z:.0}): {h:.1} \
+                             against a floor of {:.1}",
+                            ch.floor,
+                        );
+                    }
+                }
+            }
         }
     }
 

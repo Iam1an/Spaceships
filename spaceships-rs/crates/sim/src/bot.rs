@@ -889,7 +889,8 @@ mod tests {
     /// Deliberately the terrain map: [`MapKind::Space`] puts an 80-unit moon at
     /// the origin (`World::new`), and a fixture that spawned a bot there would
     /// be testing collision response rather than AI. The two airfield boxes the
-    /// terrain map does add are at `z = ±1500` and are invisible to bots
+    /// terrain map does add are at `z = ±`[`crate::rules::WorldRules::airfield_z`],
+    /// on top of their mesas, and are invisible to bots
     /// anyway — see [`compute_avoidance`].
     fn world() -> World {
         World::new(SEED, Rules::DEFAULT, Mode::Skirmish, MapKind::Terrain)

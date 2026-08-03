@@ -69,7 +69,16 @@ use super::FOG_END;
 // Palette
 // ---------------------------------------------------------------------------
 
-/// One elevation band: the height at which it starts, and its colour.
+/// One elevation band: the height **above the waterline** at which it starts,
+/// and its colour.
+///
+/// Above the waterline, not above zero. They happen to be the same number today
+/// because [`WorldRules::water_level`] is 0, and a table written in absolute
+/// heights would go on looking right until the day it moved — at which point the
+/// beach band would sit somewhere in the hills. [`face_color`] is handed the
+/// relative height so the table cannot be read any other way.
+///
+/// [`WorldRules::water_level`]: sim::rules::WorldRules::water_level
 ///
 /// Authored in sRGB — which is how colour is picked — and converted to linear
 /// once, at build time, because `Mesh::ATTRIBUTE_COLOR` is a linear multiplier
@@ -150,14 +159,15 @@ const CLIFF_RGB: u32 = 0x6b_63_58;
 /// only thing to look at.
 const FACE_JITTER: f32 = 0.085;
 
-/// Colour for one face, from its centroid height and its slope.
+/// Colour for one face, from its centroid height *above the waterline* and its
+/// slope.
 ///
 /// Returns linear RGBA, ready for `Mesh::ATTRIBUTE_COLOR`.
-fn face_color(height: f32, slope: f32, jitter: f32) -> [f32; 4] {
+fn face_color(above_water: f32, slope: f32, jitter: f32) -> [f32; 4] {
     let mut rgb = GROUND
         .iter()
         .rev()
-        .find(|b| height >= b.from)
+        .find(|b| above_water >= b.from)
         .map_or(GROUND[0].rgb, |b| b.rgb);
     if slope >= CLIFF_SLOPE {
         rgb = CLIFF_RGB;
@@ -295,7 +305,7 @@ fn ground_mesh(rules: &WorldRules) -> Mesh {
                     (hd - hc, hd - hb)
                 };
                 let slope = ((dx * dx + dz * dz).sqrt() / step) as f32;
-                let color = face_color(mid as f32, slope, face_jitter(face));
+                let color = face_color((mid - rules.water_level) as f32, slope, face_jitter(face));
                 for p in tri {
                     positions.push([p[0] as f32, p[1] as f32, p[2] as f32]);
                     colors.push(color);

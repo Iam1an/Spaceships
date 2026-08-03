@@ -34,8 +34,11 @@
 //! bit-identical across platforms or libm versions. The flight model cannot
 //! avoid them — the JS is written in terms of `THREE.MathUtils.damp` (an `exp`),
 //! `Math.pow(0.001, ..)` blends, `setFromAxisAngle` (a `sin`/`cos` pair) and a
-//! `Math.pow(x, 1.6)` response curve, and the terrain heightfield is seven sine
-//! octaves.
+//! `Math.pow(x, 1.6)` response curve.
+//!
+//! The terrain heightfield used to be on that list — seven sine octaves,
+//! transcribed from `terrain.js` — and is no longer here at all. It is
+//! [`crate::terrain`], rebuilt on hash noise with no transcendental in it.
 //!
 //! `setFromAxisAngle` is no longer among them: it is
 //! [`crate::math::quat_from_axis_angle`], which draws its sine and cosine from
@@ -44,8 +47,8 @@
 //! The rest are funnelled through the handful of functions in the
 //! "transcendental surface" section below, and **nothing else in this module
 //! calls a transcendental function directly**. If server-versus-WASM agreement
-//! ever needs hand-rolled implementations, those functions plus
-//! [`raw_terrain_height`] are the complete list of things to replace — and
+//! ever needs hand-rolled implementations, those functions are the complete
+//! list of things to replace — and
 //! [`crate::math::det`] already has `exp` and `pow`, so `damp`, `pow_blend`,
 //! `drag_factor` and `steer_curve` are a one-line change each whenever the
 //! resulting last-bit shift in the flight model is acceptable to make.
@@ -1427,11 +1430,21 @@ fn apply_contact(pos: &mut Vec3, vel: &mut Vec3, n: Vec3, push: f64, restitution
 ///
 /// The terrain is a heightfield, not a body, so [`crate::collision`] has no test
 /// for it and sampling is the tractable form. It is a bound, not a proof: a
-/// ridge narrower than the sample spacing can still be missed. The heightfield's
-/// steepest gradient is about 2.1, so over the longest possible step
-/// ([`crate::rules::MAX_FRAME_DT`] at full boost, ~9.5 units) the ground can
-/// rise about 20 units — enough to matter only for a ship already skimming the
-/// surface.
+/// ridge narrower than the sample spacing can still be missed.
+///
+/// # How big the miss can be
+///
+/// The steepest facet on the map is pinned by
+/// `terrain::tests::no_facet_is_a_vertical_wall` at a gradient below **6**, so
+/// over one [`TERRAIN_SWEEP_SPACING`] the ground can rise at most about 24
+/// units. Do not restate a measured figure here — it went stale once already:
+/// this used to claim 2.1, from the sine field, and the lattice that replaced
+/// it reaches 5.5 where the west range meets the border fade. Cite the test, and
+/// the number cannot rot again.
+///
+/// That matters only for a ship already skimming the surface, and the steepest
+/// facets are all at the map border, over open sea, where the surface is the
+/// waterline anyway.
 fn resolve_terrain(ship: &mut Ship, prev_pos: Vec3, rules: &Rules) -> bool {
     let motion = ship.pos - prev_pos;
     let horizontal = (motion.x * motion.x + motion.z * motion.z).sqrt();
