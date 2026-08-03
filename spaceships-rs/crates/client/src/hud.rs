@@ -181,6 +181,7 @@ impl Plugin for HudPlugin {
         app.init_resource::<AppliedHud>()
             .init_resource::<AppliedMarkers>()
             .init_resource::<KillFeed>()
+            .init_resource::<EmpReport>()
             .init_resource::<Boresight>()
             .init_resource::<MatchResult>()
             .add_systems(Startup, spawn_hud)
@@ -197,7 +198,10 @@ impl Plugin for HudPlugin {
             // `MatchEnded` is an event too, and for the same reason it is read
             // per tick rather than per frame — read in `Update` a slow frame
             // would miss the only tick it is ever published on.
-            .add_systems(FixedUpdate, (collect_kills, watch_match_end).after(SimSet))
+            .add_systems(
+                FixedUpdate,
+                (collect_kills, collect_emp, watch_match_end).after(SimSet),
+            )
             // The world-space markers need the *interpolated* ship poses and
             // the chase camera's settled transform, neither of which exists
             // before transform propagation — see [`sync_world_markers`].
@@ -385,6 +389,19 @@ const CHARGE_ROW_BOTTOM: f32 = 94.0;
 /// pulse, so a pip row would be a single square that is either on or off and
 /// would say nothing about the fifty-nine seconds before it.
 const EMP_ROW_BOTTOM: f32 = 114.0;
+/// Where the firing pilot's confirmation sits, measured from the top.
+///
+/// It began one line above the `EMP` strip, on the argument that the emptied
+/// meter and the sentence explaining it should be one glance. The first capture
+/// killed that: **the chase camera parks the aircraft over the whole of the
+/// lower centre**, so amber text at that height lands on a white hull and is the
+/// one thing on the glass you cannot read. The bars beside it get away with it
+/// because they are shapes rather than words.
+///
+/// So it goes at the top, on sky, thirty-two pixels under the missile-lock
+/// warning — the other line this HUD prints when something has just happened.
+/// The two are different colours and can be up at once.
+const EMP_REPORT_TOP: f32 = 128.0;
 /// Gap between screen centre and the inboard edge of a paired row.
 const ROW_SPLIT: f32 = 18.0;
 
@@ -677,6 +694,14 @@ struct HudModel {
     /// The lit half of the `EMP` legend's blink, on the same square wave as the
     /// missile-lock warning. **Forced false when `blind` is false.**
     blind_blink: bool,
+    /// Whether the *attacker's* confirmation is up: you fired one, and this is
+    /// what it did. See [`EmpReport`].
+    fired_emp: bool,
+    /// How many that pulse caught. **Zero is a real answer** and is the whole
+    /// reason this is a count rather than a flag: a pulse into empty space and a
+    /// pulse that blinded three aircraft must not produce the same picture.
+    /// **Forced zero when `fired_emp` is false.**
+    emp_caught: u8,
 
     /// The altitude-or-range block under the hull tape.
     alt: AltBlock,
@@ -815,6 +840,11 @@ struct MarkerModel {
     /// Whether aim assist is currently holding *this* target
     /// ([`HudState::assist_target`]), which brightens the bracket.
     assisted: bool,
+    /// Whether this contact is flying blind because of *your* EMP, for as long
+    /// as it is. The half of the confirmation that says **who**: a count on the
+    /// glass tells you a pulse worked, and a bracket tells you which aircraft to
+    /// go after while it cannot see you. See [`EmpReport`].
+    jammed: bool,
 }
 
 /// What [`sync_world_markers`] last wrote to each slot.
@@ -891,6 +921,158 @@ impl KillFeed {
     }
 }
 
+// ---------------------------------------------------------------------------
+// What your own EMP did
+// ---------------------------------------------------------------------------
+
+/// How long the firing pilot's confirmation stays on the glass.
+///
+/// Longer than a hit marker and shorter than the four seconds of blindness it
+/// reports on, so it is gone before the aircraft it caught can see again.
+const EMP_REPORT_SECS: f64 = 2.6;
+
+/// The attacker's read-out, and the one thing the weapon had no way to say.
+///
+/// # The signal is not in the frame, so this derives it
+///
+/// `Ship::emp_blind` is per ship in the simulation and **does not reach the
+/// renderer**. `ShipView` has no blindness bit, and `HudState::emp_blind` is the
+/// *local* pilot's — which, for the pilot who just fired, is always zero, because
+/// `EmpRules::blinds_owner` is false and rightly so. So the one fact the weapon's
+/// entire feedback loop depends on is the one fact `Frame` does not carry.
+///
+/// What the frame *does* carry turns out to be enough. `SimEvent::EmpBurst`
+/// gives the centre and **the simulation's own radius** — it is published for
+/// the shockwave, precisely so the renderer does not size the effect itself —
+/// and `ShipView` gives every ship's position, team, and the `ALIVE`, `INVULN`
+/// and `BOSS_HITBOX` flags. Those are exactly the exclusions `sim::emp::detonate`
+/// applies, and the two that are *rules* rather than facts —
+/// `EmpRules::blinds_owner` and `friendly_blind` — are read from `rules.rs`,
+/// which is where they are defined once.
+///
+/// **It is still a second copy of one predicate, and that is a real cost.** If
+/// `detonate` grows a fifth exclusion, this reports a ship as caught that was
+/// not. The fix is one bit — `ShipFlags::EMP_BLIND`, set beside `INVULN` in
+/// `sim`'s frame builder — after which this is a filter over a flag and cannot
+/// drift at all. That is a change to `sim` and is deliberately not made from
+/// here.
+///
+/// Two smaller approximations, both bounded and both stated rather than hidden:
+/// the positions are the ones at the *end* of the tick the pulse went off in
+/// (about two units of travel against a three-hundred-unit sphere), and a ship
+/// destroyed by something else in that same tick reads as out rather than in.
+#[derive(Resource, Default)]
+struct EmpReport {
+    /// Whether a pulse of the local pilot's has ever gone off this match.
+    fired: bool,
+    /// [`Frame::time`] it went off at.
+    at: f64,
+    /// Who it caught. Small by construction: a match is ten aircraft.
+    victims: Vec<EntityId>,
+    /// When the blindness it caused runs out, so the brackets stop flagging
+    /// them at the moment their instruments come back.
+    blind_until: f64,
+}
+
+impl EmpReport {
+    /// Whether the confirmation is still up.
+    fn showing(&self, now: f64) -> bool {
+        self.fired && now - self.at < EMP_REPORT_SECS
+    }
+
+    /// How many it caught, for the line the confirmation prints.
+    fn caught(&self) -> u8 {
+        #[allow(clippy::cast_possible_truncation)]
+        let n = self.victims.len().min(u8::MAX as usize) as u8;
+        n
+    }
+
+    /// Whether this contact is one of them, and still flying blind.
+    fn jammed(&self, id: EntityId, now: f64) -> bool {
+        now < self.blind_until && self.victims.contains(&id)
+    }
+
+    /// Works out who one pulse caught, and starts the confirmation.
+    ///
+    /// Pure over the frame, so the tests below can put a ship at a distance and
+    /// ask, which is the only way to hold this in step with `sim::emp::detonate`
+    /// without the flag that would make the question unnecessary.
+    fn record(
+        &mut self,
+        frame: &Frame,
+        me: &sim::world::ShipView,
+        owner: EntityId,
+        origin: [f64; 3],
+        radius: f64,
+    ) {
+        let emp = Rules::DEFAULT.emp;
+        let r2 = radius * radius;
+        self.victims.clear();
+        for ship in &frame.ships {
+            // The four exclusions of `sim::emp::detonate`, in its order.
+            if ship.flags.contains(ShipFlags::BOSS_HITBOX) {
+                continue;
+            }
+            if !ship.flags.contains(ShipFlags::ALIVE) || ship.flags.contains(ShipFlags::INVULN) {
+                continue;
+            }
+            if ship.id == owner && !emp.blinds_owner {
+                continue;
+            }
+            // `-1` is unassigned, and two unassigned ships are not team-mates —
+            // the same clause `sync_world_markers` and `World::can_damage` carry.
+            if !emp.friendly_blind && ship.id != owner && me.team >= 0 && ship.team == me.team {
+                continue;
+            }
+            let d = [
+                f64::from(ship.pos[0]) - origin[0],
+                f64::from(ship.pos[1]) - origin[1],
+                f64::from(ship.pos[2]) - origin[2],
+            ];
+            if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > r2 {
+                continue;
+            }
+            self.victims.push(ship.id);
+        }
+        self.fired = true;
+        self.at = frame.time;
+        self.blind_until = frame.time + emp.blind_duration;
+    }
+}
+
+/// Works out what the local pilot's pulse caught, once, on the tick it went off.
+///
+/// In `FixedUpdate` for the reason [`collect_kills`] is: a burst is an event and
+/// an event lives for exactly one tick, so reading it per rendered frame would
+/// miss it on a slow frame and count it twice on a fast one.
+fn collect_emp(frame: Res<SimFrame>, mut report: ResMut<EmpReport>) {
+    let Some(me) = frame
+        .0
+        .ships
+        .iter()
+        .find(|s| s.flags.contains(ShipFlags::LOCAL))
+    else {
+        return;
+    };
+    for event in &frame.0.events {
+        let SimEvent::EmpBurst {
+            owner,
+            origin,
+            radius,
+        } = *event
+        else {
+            continue;
+        };
+        // Only this pilot's own. Somebody else's pulse announces itself by
+        // taking the whole panel, which is a louder statement than any banner,
+        // and a pilot who was *not* caught by one has learnt nothing they need.
+        if owner != me.id {
+            continue;
+        }
+        report.record(&frame.0, me, owner, [origin.x, origin.y, origin.z], radius);
+    }
+}
+
 /// Steps in one half of the overload pulse.
 ///
 /// The CSS animates `box-shadow` continuously over 0.3 s. Eight steps is under
@@ -963,7 +1145,13 @@ impl Default for Env {
     }
 }
 
-fn model(frame: &Frame, env: Env, feed: &KillFeed, result: Option<Outcome>) -> HudModel {
+fn model(
+    frame: &Frame,
+    env: Env,
+    feed: &KillFeed,
+    emp: &EmpReport,
+    result: Option<Outcome>,
+) -> HudModel {
     let Env {
         time,
         seated,
@@ -1082,6 +1270,10 @@ fn model(frame: &Frame, env: Env, feed: &KillFeed, result: Option<Outcome>) -> H
     // reusing the wave means the two can never beat against each other.
     let blind = hud.emp_blind > 0.0 && alive;
     let emp_seg = segments(hud.emp_charge01, EMP_SEGS);
+    // The attacker's half. Not carried through `unpowered`, deliberately: it is
+    // an instrument like any other, and a pilot whose own pulse crossed with
+    // somebody else's does not get to keep one readout lit on a dark glass.
+    let fired_emp = emp.showing(frame.time) && alive;
 
     let model = HudModel {
         present: true,
@@ -1136,6 +1328,8 @@ fn model(frame: &Frame, env: Env, feed: &KillFeed, result: Option<Outcome>) -> H
         emp_ready: emp_seg as usize >= EMP_SEGS,
         blind,
         blind_blink: blind && phase(time, BLINK_HALF_PERIOD).is_multiple_of(2),
+        fired_emp,
+        emp_caught: if fired_emp { emp.caught() } else { 0 },
 
         alt: alt_block(me, env),
 
@@ -1328,6 +1522,10 @@ struct HudNodes {
     emp_row: Entity,
     emp_label: Entity,
     emp_segs: [Entity; EMP_SEGS],
+    /// The firing pilot's confirmation: what your own pulse just did. It sits
+    /// above the charge strip, beside the meter it emptied, so the two read as
+    /// one statement.
+    emp_report: Entity,
     /// The `EMP` legend on a dark glass: the one thing the head-up display can
     /// still say while the pulse is running.
     emp_banner: Entity,
@@ -1524,6 +1722,7 @@ struct Nodes {
     emp_row: Entity,
     emp_label: Entity,
     emp_segs: [Entity; EMP_SEGS],
+    emp_report: Entity,
     emp_banner: Entity,
     missile_pips: [Entity; MISSILE_PIPS],
     flare_pips: [Entity; FLARE_PIPS],
@@ -1564,6 +1763,7 @@ impl Default for Nodes {
             emp_row: Entity::PLACEHOLDER,
             emp_label: Entity::PLACEHOLDER,
             emp_segs: [Entity::PLACEHOLDER; EMP_SEGS],
+            emp_report: Entity::PLACEHOLDER,
             emp_banner: Entity::PLACEHOLDER,
             missile_pips: [Entity::PLACEHOLDER; MISSILE_PIPS],
             flare_pips: [Entity::PLACEHOLDER; FLARE_PIPS],
@@ -1604,6 +1804,7 @@ impl Nodes {
             emp_row: self.emp_row,
             emp_label: self.emp_label,
             emp_segs: self.emp_segs,
+            emp_report: self.emp_report,
             emp_banner: self.emp_banner,
             missile_pips: self.missile_pips,
             flare_pips: self.flare_pips,
@@ -2156,6 +2357,40 @@ fn build_meters(hud: &mut ChildSpawnerCommands, font: &HudFont, n: &mut Nodes) {
             });
         })
         .id();
+
+    // -- what your own pulse did ----------------------------------------------
+    //
+    // The gap this closes: `EmpRules::blinds_owner` is false, so the one screen
+    // that stays lit through a pulse is the firing pilot's — and until this line
+    // existed, that screen was told nothing at all. The charge meter emptied and
+    // a wavefront left the ship, and whether it had caught anybody, or whether
+    // the nearest aircraft was four hundred units away, looked identical.
+    //
+    // Its colour and its wording are set by [`sync_hud`], because they are the
+    // whole difference between a hit and a miss — see there. Its *position* is
+    // [`EMP_REPORT_TOP`], which has its own story.
+    hud.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0),
+            right: px(0),
+            top: px(EMP_REPORT_TOP),
+            justify_content: JustifyContent::Center,
+            ..default()
+        },
+        ZIndex(Z_WARNING),
+    ))
+    .with_children(|row| {
+        n.emp_report = row
+            .spawn((
+                Text::new(String::new()),
+                hud_font(font, 13.0, 800),
+                TextColor(AMBER),
+                LetterSpacing::Px(5.0),
+                Visibility::Hidden,
+            ))
+            .id();
+    });
 }
 
 /// One `▁▃▅▇` stack. `reversed` runs the ramp right to left.
@@ -2950,6 +3185,7 @@ fn sync_hud(
     nodes: Option<Res<HudNodes>>,
     roster: Res<Roster>,
     feed: Res<KillFeed>,
+    emp: Res<EmpReport>,
     sight: Res<Boresight>,
     result: Res<MatchResult>,
     mut applied: ResMut<AppliedHud>,
@@ -2985,6 +3221,7 @@ fn sync_hud(
                 hull: crate::weapons::forced_hull(),
             },
             &feed,
+            &emp,
             result.outcome,
         )
     };
@@ -3237,6 +3474,40 @@ fn sync_hud(
             nodes.emp_label,
             TextColor(if next.emp_ready { AMBER } else { legend() }),
         );
+    }
+
+    // -- what your own pulse did ---------------------------------------------
+    //
+    // **The two outcomes must not look alike**, which is the whole complaint
+    // this answers: firing into an empty sky and blinding three aircraft used to
+    // produce the same picture, so the weapon read as broken. They differ three
+    // ways at once, deliberately, because peripheral vision only reliably gets
+    // one of them —
+    //
+    //   * the words: a count, or `NOTHING IN RANGE`;
+    //   * the colour: amber, the EMP's own colour and the same one the strip
+    //     turns when it is armed, against the dimmest legend grey on the glass;
+    //   * the world: every aircraft it caught wears `JAMMED` on its bracket for
+    //     as long as it is blind — `sync_world_markers`, which is the half that
+    //     says *who* rather than *how many*.
+    //
+    // Two writes when a pulse goes off and two when the line expires. Nothing
+    // between: `fired_emp` and `emp_caught` are both constant for the whole
+    // couple of seconds the line is up.
+    if moved!(fired_emp, emp_caught) {
+        set_visible(&mut w.vis, nodes.emp_report, next.fired_emp);
+        if next.fired_emp {
+            set_text(&mut w.text, nodes.emp_report, || match next.emp_caught {
+                0 => "EMP - NOTHING IN RANGE".to_owned(),
+                1 => "EMP - 1 SHIP BLINDED".to_owned(),
+                n => format!("EMP - {n} SHIPS BLINDED"),
+            });
+            set(
+                &mut w.text_colour,
+                nodes.emp_report,
+                TextColor(if next.emp_caught > 0 { AMBER } else { legend() }),
+            );
+        }
     }
 
     // -- the pulse ----------------------------------------------------------
@@ -3699,6 +3970,7 @@ fn occluded_by(from: Vec3, to: Vec3, centre: Vec3, radius: f32) -> bool {
 fn sync_world_markers(
     frame: Res<SimFrame>,
     roster: Res<Roster>,
+    emp: Res<EmpReport>,
     setup: Res<crate::sim_bridge::MatchSetup>,
     nodes: Option<Res<HudNodes>>,
     mut applied: ResMut<AppliedMarkers>,
@@ -3965,6 +4237,7 @@ fn sync_world_markers(
             // The lock, not a threshold: exactly one slot can carry it.
             aligned: locked_on == Some(i),
             assisted: assist >= 0 && assist == c.id,
+            jammed: emp.jammed(c.id, frame.0.time),
         };
         if was == now {
             continue;
@@ -3980,22 +4253,43 @@ fn sync_world_markers(
         if fresh || was.boxed != now.boxed {
             set_visible(&mut q_vis, slot.boxes, now.boxed);
         }
-        if now.boxed && (fresh || !was.boxed || was.id != now.id || was.hp != now.hp) {
-            // `main.js:1921` — `${targetName}  HP ${r.hp}`, two spaces.
+        if now.boxed
+            && (fresh
+                || !was.boxed
+                || was.id != now.id
+                || was.hp != now.hp
+                || was.jammed != now.jammed)
+        {
+            // `main.js:1921` — `${targetName}  HP ${r.hp}`, two spaces. The
+            // third field is this port's: an aircraft your pulse caught says so
+            // for the four seconds it is blind, and then stops.
             set_text(&mut q_text, slot.label, || {
-                format!("{}  HP {}", roster.callsign(c.id), c.hp)
+                let mut line = format!("{}  HP {}", roster.callsign(c.id), c.hp);
+                if now.jammed {
+                    line.push_str("  JAMMED");
+                }
+                line
             });
         }
         if fresh || was.aligned != now.aligned {
             set_visible(&mut q_vis, slot.lead_solid, now.aligned);
             set_visible(&mut q_vis, slot.lead_dashed, !now.aligned);
         }
-        if now.boxed && (fresh || !was.boxed || was.assisted != now.assisted) {
+        if now.boxed
+            && (fresh || !was.boxed || was.assisted != now.assisted || was.jammed != now.jammed)
+        {
             // The one thing `HudState::assist_target` is the right source for.
             // The 22-pixel test above says "your nose is on them"; this says
             // "the assist has picked them", which is a different fact and the
             // one that tells a player why their aim is being helped.
-            let colour = if now.assisted {
+            //
+            // Jammed wins over both. A bracket that has gone amber on a red
+            // glass is the loudest thing this file can say without a warning
+            // colour, and an aircraft that cannot see you is exactly the one
+            // worth picking out of a furball.
+            let colour = if now.jammed {
+                AMBER
+            } else if now.assisted {
                 HOSTILE
             } else {
                 HOSTILE.with_alpha(0.7)
@@ -4137,6 +4431,7 @@ mod tests {
                 ..Env::default()
             },
             &KillFeed::default(),
+            &EmpReport::default(),
             None,
         )
     }
@@ -4238,6 +4533,7 @@ mod tests {
             &f,
             Env::default(),
             &KillFeed::default(),
+            &EmpReport::default(),
             Some(Outcome::Victory),
         );
 
@@ -4773,6 +5069,7 @@ mod tests {
                 ..Env::default()
             },
             &KillFeed::default(),
+            &EmpReport::default(),
             None,
         )
         .alt;
@@ -4788,6 +5085,7 @@ mod tests {
                 ..Env::default()
             },
             &KillFeed::default(),
+            &EmpReport::default(),
             None,
         )
         .alt;
@@ -4828,6 +5126,7 @@ mod tests {
                     ..Env::default()
                 },
                 &KillFeed::default(),
+                &EmpReport::default(),
                 None,
             )
             .alt
@@ -4867,6 +5166,7 @@ mod tests {
                     ..Env::default()
                 },
                 &KillFeed::default(),
+                &EmpReport::default(),
                 None,
             )
             .alt;
@@ -4890,18 +5190,137 @@ mod tests {
             ..Env::default()
         };
         assert!(
-            !super::model(&held, Env::default(), &KillFeed::default(), None).reticle_locked,
+            !super::model(
+                &held,
+                Env::default(),
+                &KillFeed::default(),
+                &EmpReport::default(),
+                None
+            )
+            .reticle_locked,
             "the assist holding a target is not a lock"
         );
         assert!(
-            super::model(&held, aimed, &KillFeed::default(), None).reticle_locked,
+            super::model(
+                &held,
+                aimed,
+                &KillFeed::default(),
+                &EmpReport::default(),
+                None
+            )
+            .reticle_locked,
             "being lined up on one is"
         );
 
         // And a corpse never locks, however well aimed.
         let mut dead = frame(healthy());
         dead.ships[0].flags = ShipFlags::LOCAL;
-        assert!(!super::model(&dead, aimed, &KillFeed::default(), None).reticle_locked);
+        assert!(
+            !super::model(
+                &dead,
+                aimed,
+                &KillFeed::default(),
+                &EmpReport::default(),
+                None
+            )
+            .reticle_locked
+        );
+    }
+
+    /// The whole complaint, as a test: a pulse that caught somebody and a pulse
+    /// that caught nobody must not produce the same picture.
+    #[test]
+    fn a_pulse_that_hits_and_a_pulse_that_misses_look_different() {
+        let f = frame(healthy());
+        let hit = EmpReport {
+            fired: true,
+            victims: vec![7],
+            ..EmpReport::default()
+        };
+        let miss = EmpReport {
+            fired: true,
+            ..EmpReport::default()
+        };
+
+        let a = super::model(&f, Env::default(), &KillFeed::default(), &hit, None);
+        let b = super::model(&f, Env::default(), &KillFeed::default(), &miss, None);
+        assert!(a.fired_emp && b.fired_emp, "both said something");
+        assert_ne!(a, b, "and the two things they said are not the same");
+        assert_eq!(a.emp_caught, 1);
+        assert_eq!(b.emp_caught, 0);
+    }
+
+    /// And it goes away on its own, without a frame of churn while it is up.
+    #[test]
+    fn the_confirmation_expires_and_says_nothing_in_between() {
+        let mut f = frame(healthy());
+        let report = EmpReport {
+            fired: true,
+            at: 0.0,
+            victims: vec![7],
+            blind_until: 4.0,
+        };
+        let at = |f: &Frame| super::model(f, Env::default(), &KillFeed::default(), &report, None);
+
+        let opening = at(&f);
+        assert!(opening.fired_emp);
+        // Halfway through, nothing about it has moved.
+        f.time = EMP_REPORT_SECS / 2.0;
+        assert_eq!(at(&f), opening, "a live confirmation must not churn");
+        // And then it is gone.
+        f.time = EMP_REPORT_SECS + 0.01;
+        let after = at(&f);
+        assert!(!after.fired_emp);
+        assert_eq!(after.emp_caught, 0, "and takes its count with it");
+    }
+
+    /// The exclusions this mirrors out of `sim::emp::detonate`. If that function
+    /// grows a fifth, this test still passes and the count is quietly wrong —
+    /// which is the argument for the `ShipFlags` bit named in [`EmpReport`].
+    #[test]
+    fn the_report_excludes_what_the_pulse_excludes() {
+        let rules = Rules::DEFAULT.emp;
+        let near = (rules.radius / 2.0) as f32;
+        let far = (rules.radius * 2.0) as f32;
+        let ship = |id: EntityId, team: i32, flags: ShipFlags, x: f32| ShipView {
+            id,
+            team,
+            flags,
+            pos: [x, 0.0, 0.0],
+            ..Default::default()
+        };
+        let alive = ShipFlags::ALIVE;
+        let me = ship(1, 0, alive.with(ShipFlags::LOCAL), 0.0);
+        let f = Frame {
+            ships: vec![
+                me,
+                ship(2, 1, alive, near),                         // caught
+                ship(3, 1, alive, far),                          // out of range
+                ship(4, 1, ShipFlags::NONE, near),               // dead
+                ship(5, 1, alive.with(ShipFlags::INVULN), near), // just spawned
+                ship(6, 1, alive.with(ShipFlags::BOSS_HITBOX), near), // not a pilot
+                ship(7, 0, alive, near),                         // a team-mate
+            ],
+            ..Default::default()
+        };
+
+        let mut report = EmpReport::default();
+        report.record(&f, &me, 1, [0.0, 0.0, 0.0], rules.radius);
+
+        // Friendly blinding is on by default, so the team-mate *is* caught —
+        // read from the rules rather than asserted from memory, because that is
+        // the switch this whole list hangs off.
+        let mut want = vec![2];
+        if rules.friendly_blind {
+            want.push(7);
+        }
+        if rules.blinds_owner {
+            want.insert(0, 1);
+        }
+        let mut got = report.victims.clone();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
     }
 
     /// A kill lands on top and scrolls the rest down, and the ones that did not
@@ -4961,15 +5380,18 @@ mod tests {
         let f = frame(healthy());
         let mut feed = KillFeed::default();
 
-        let quiet = super::model(&f, Env::default(), &feed, None);
+        let quiet = super::model(&f, Env::default(), &feed, &EmpReport::default(), None);
         let later = Env {
             time: 5.0,
             ..Env::default()
         };
-        assert_eq!(quiet, super::model(&f, later, &feed, None));
+        assert_eq!(
+            quiet,
+            super::model(&f, later, &feed, &EmpReport::default(), None)
+        );
 
         feed.push(2, 3, 0.0);
-        let loud = super::model(&f, Env::default(), &feed, None);
+        let loud = super::model(&f, Env::default(), &feed, &EmpReport::default(), None);
         assert_ne!(quiet, loud);
         assert_eq!(
             HudModel {

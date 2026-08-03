@@ -200,12 +200,20 @@ impl Plugin for UiPlugin {
             .add_systems(
                 Update,
                 (
-                    mirror_cockpit_flag,
+                    (
+                        mirror_cockpit_flag,
+                        // Before the keyboard, so a page that has just come up
+                        // has its rows filled in before the cursor is allowed
+                        // to land on one — the ordering `follow_session` has.
+                        follow_replays,
+                        forced_replay,
+                    ),
                     read_input,
                     advance_boot,
                     publish_lobby_open,
                     publish_volume,
                     drive_menu,
+                    drive_replay_page,
                     // Between the cursor and the paint: `read_input` moves the
                     // choice, this carries it to the resource, and
                     // `paint_preview` is what the resource looks like.
@@ -1208,10 +1216,15 @@ enum Screen {
     Auth,
     /// Systems configuration. `#settingsPanel`.
     Config,
+    /// Watch a match back. No JS counterpart — `crates/replay` is a Rust-port
+    /// feature, and until this page existed the only way to reach it was an
+    /// environment variable, which is to say nobody who was handed the `.dmg`
+    /// could reach it at all.
+    Replays,
 }
 
 impl Screen {
-    const ALL: [Screen; 15] = [
+    const ALL: [Screen; 16] = [
         Screen::Boot,
         Screen::Main,
         Screen::Solo,
@@ -1227,6 +1240,7 @@ impl Screen {
         Screen::Standings,
         Screen::Auth,
         Screen::Config,
+        Screen::Replays,
     ];
 
     fn index(self) -> usize {
@@ -1250,6 +1264,11 @@ impl Screen {
             Screen::Standings => "LEADERBOARD",
             Screen::Auth => "LOG IN",
             Screen::Config => "SETTINGS",
+            // "REPLAYS", not "RECORDINGS" and emphatically not anything with
+            // the word `crate` in it. The player who reported this feature
+            // missing had searched the interface for a word out of a technical
+            // description and, reasonably, found nothing.
+            Screen::Replays => "REPLAYS",
         }
     }
 
@@ -1263,7 +1282,8 @@ impl Screen {
             Screen::Net | Screen::Create | Screen::Browser | Screen::Waiting => 2,
             Screen::Armory | Screen::Livery => 3,
             Screen::Record | Screen::Standings | Screen::Auth => 4,
-            Screen::Config => 5,
+            Screen::Replays => 5,
+            Screen::Config => 6,
         })
     }
 
@@ -1271,9 +1291,12 @@ impl Screen {
     fn back(self) -> Option<Screen> {
         Some(match self {
             Screen::Boot | Screen::Main => return None,
-            Screen::Solo | Screen::Net | Screen::Armory | Screen::Record | Screen::Config => {
-                Screen::Main
-            }
+            Screen::Solo
+            | Screen::Net
+            | Screen::Armory
+            | Screen::Record
+            | Screen::Config
+            | Screen::Replays => Screen::Main,
             Screen::Trials | Screen::Campaign => Screen::Solo,
             Screen::Create | Screen::Browser => Screen::Net,
             Screen::Waiting => Screen::Net,
@@ -1317,6 +1340,7 @@ impl Screen {
             "standings" | "leaderboard" => Screen::Standings,
             "auth" | "login" | "signin" => Screen::Auth,
             "config" | "settings" => Screen::Config,
+            "replays" | "replay" => Screen::Replays,
             _ => return None,
         })
     }
@@ -1417,6 +1441,8 @@ struct Menu {
     /// toggle `CLAUDE.md` tells testers to clear to get an empty map.
     auto_bot: bool,
     sortie: u8,
+    /// Which row of [`Screen::Replays`] is armed.
+    replay: u8,
     item: u8,
     /// Index into [`LIVERY`].
     hull: u8,
@@ -1442,6 +1468,8 @@ struct Menu {
 
     /// What the socket last reported. See [`NetView`].
     net: NetView,
+    /// What the recordings shelf last reported. See [`ReplayView`].
+    replays: ReplayView,
     /// A request that is waiting for the socket to finish opening.
     ///
     /// `flush_outbox` **drops** anything written while the socket is not open,
@@ -1617,11 +1645,37 @@ impl NetView {
     }
 }
 
+/// The part of [`crate::replay::Replays`] the recordings page colours itself
+/// from.
+///
+/// The same arrangement as [`NetView`] and for the same reason: [`model`]
+/// reduces the page to one `Copy`/`Eq` value, a `Vec<ReplayEntry>` cannot go in
+/// it, and a revision counter can. [`follow_replays`] is the only writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ReplayView {
+    /// [`crate::replay::Replays::rev`], which moves on every rescan and every
+    /// complaint.
+    rev: u32,
+    /// Rows with a recording behind them, capped at [`REPLAY_ROWS`]. A row past
+    /// this reads dead and refuses to open, which is what lets the page be a
+    /// fixed pool.
+    rows: u8,
+    /// How many there are altogether, so the page can admit to the ones it is
+    /// not showing.
+    total: u16,
+}
+
 /// Rows the room browser draws. The server lists every open, unstarted room and
 /// the JS browser scrolls; this one is a fixed pool, because a page built once
 /// cannot grow and a scroll view on a CRT is the wrong instrument. Six is more
 /// than the live server has ever had open at once.
 const SORTIE_ROWS: usize = 6;
+
+/// Rows the recordings page draws, on the same reasoning as [`SORTIE_ROWS`]:
+/// a page built once cannot grow, and a scroll view on a CRT is the wrong
+/// instrument. Eight is a couple of evenings' matches, and the page says how
+/// many older ones it is not showing.
+const REPLAY_ROWS: usize = 8;
 
 /// Seats the crew room draws. `server/index.js` has no cap, but a room is two
 /// teams of five in every mode the game offers.
@@ -1646,6 +1700,7 @@ impl Default for Menu {
             private: false,
             auto_bot: true,
             sortie: 0,
+            replay: 0,
             item: 6,
             // `customization.js:8`/`:11`'s defaults, as near as this palette
             // gets: a pale hull and a dark accent, which is the split
@@ -1664,6 +1719,7 @@ impl Default for Menu {
             notice: "READY".to_owned(),
             notice_rev: 0,
             net: NetView::default(),
+            replays: ReplayView::default(),
             pending: None,
             acct: AccountView::default(),
             form: AuthForm::default(),
@@ -2188,6 +2244,10 @@ enum Action {
     SetAutoBot(bool),
     SetScheme(u8),
     SetSortie(u8),
+    /// Watch one of the recordings on [`Screen::Replays`]. Arming and playing
+    /// are the same action, exactly as they are on the tasking rows — see
+    /// [`apply`].
+    SetReplay(u8),
     SetItem(u8),
     SetHull(u8),
     SetAccent(u8),
@@ -2317,6 +2377,9 @@ struct MenuModel {
     /// second would otherwise make the model differ on every frame of a live
     /// match and defeat the early-out this whole module is shaped around.
     net: NetView,
+    /// What the recordings shelf last reported. Safe to carry unconditionally:
+    /// it only moves on a rescan, which only happens on the way into the page.
+    replays: ReplayView,
     /// Frames in and out, summed. **Zero unless the `DATA LINK` panel is on
     /// screen**, which is the only thing that draws it — it moves at 20 Hz
     /// while a match runs and belongs to no other page.
@@ -2371,6 +2434,7 @@ fn selection_key(m: &Menu, data: &LobbyData) -> u64 {
     push(u64::from(m.private), 1);
     push(u64::from(m.auto_bot), 1);
     push(u64::from(m.sortie), 3);
+    push(u64::from(m.replay), 3);
     push(u64::from(m.item), 4);
     push(u64::from(m.hull), 3);
     push(u64::from(m.accent), 3);
@@ -2388,7 +2452,7 @@ fn selection_key(m: &Menu, data: &LobbyData) -> u64 {
 }
 
 /// How many bits [`selection_key`] packs. Must stay at or under 64.
-const SELECTION_BITS: u32 = 2 + 2 + 2 + 1 + 1 + 1 + 1 + 3 + 4 + 3 + 3 + 3 + 2 + 6 + 4 + 4 + 16;
+const SELECTION_BITS: u32 = 2 + 2 + 2 + 1 + 1 + 1 + 1 + 3 + 3 + 4 + 3 + 3 + 3 + 2 + 6 + 4 + 4 + 16;
 
 /// Reduces the world to a [`MenuModel`].
 fn model(m: &Menu, data: &LobbyData, net: &NetStatus, now: f32) -> MenuModel {
@@ -2441,6 +2505,7 @@ fn model(m: &Menu, data: &LobbyData, net: &NetStatus, now: f32) -> MenuModel {
         clock: up as u32,
         notice: m.notice_rev,
         net: m.net,
+        replays: m.replays,
         frames: if m.screen == Screen::Net {
             #[allow(clippy::cast_possible_truncation)]
             let total = net.sent.saturating_add(net.received) as u32;
@@ -2501,6 +2566,8 @@ struct MenuNodes {
     detail: [Entity; 4],
     /// Everything the four network pages write. See [`NetNodes`].
     net: NetNodes,
+    /// Everything [`Screen::Replays`] writes. See [`ReplayNodes`].
+    replays: ReplayNodes,
     /// Everything the pilot's own pages write. See [`DossierNodes`].
     dossier: DossierNodes,
     controls: Vec<ControlDef>,
@@ -2537,6 +2604,30 @@ impl NetNodes {
         sortie_rows: [usize::MAX; SORTIE_ROWS],
         launch_row: usize::MAX,
         endpoint_row: usize::MAX,
+    };
+}
+
+/// What [`Screen::Replays`] hands back.
+///
+/// A fixed pool of rows written from [`crate::replay::Replays`], on exactly the
+/// terms [`NetNodes::sortie_rows`] is: the tree is built once, and a page that
+/// respawned its rows on every rescan would be the relayout this module exists
+/// to avoid.
+#[derive(Debug, Clone, Copy)]
+struct ReplayNodes {
+    /// Control indices whose label and value are live.
+    rows: [usize; REPLAY_ROWS],
+    /// The line that says what is wrong, or what the list is not showing.
+    note: Entity,
+    /// The count above the list.
+    count: Entity,
+}
+
+impl ReplayNodes {
+    const EMPTY: ReplayNodes = ReplayNodes {
+        rows: [usize::MAX; REPLAY_ROWS],
+        note: Entity::PLACEHOLDER,
+        count: Entity::PLACEHOLDER,
     };
 }
 
@@ -2789,7 +2880,13 @@ fn wordmark(f: &Fonts, text: &str, size: f32, colour: Color, track: f32) -> impl
 /// under the cursor is the match that starts. Deliberately a bundle rather than
 /// a control — see the call sites.
 fn hint(f: &Fonts) -> impl Bundle {
-    tracked(f, "SELECT TO LAUNCH", 8.0, dim(0.35), 2.4)
+    hint_words(f, "SELECT TO LAUNCH")
+}
+
+/// The same line in the same place, for a page whose rows do something other
+/// than launch a match.
+fn hint_words(f: &Fonts, words: &str) -> impl Bundle {
+    tracked(f, words, 8.0, dim(0.35), 2.4)
 }
 
 fn section(parent: &mut ChildSpawnerCommands, f: &Fonts, text: &str) {
@@ -3080,6 +3177,7 @@ fn build_menu(
     let mut brief = [Entity::PLACEHOLDER; 3];
     let mut detail = [Entity::PLACEHOLDER; 4];
     let mut net_nodes = NetNodes::EMPTY;
+    let mut replay_nodes = ReplayNodes::EMPTY;
     let mut dossier = DossierNodes::EMPTY;
 
     // -- the menu itself, rendered into the target --------------------------
@@ -3286,6 +3384,7 @@ fn build_menu(
                                 (Screen::Net, "MULTIPLAYER"),
                                 (Screen::Armory, "CUSTOMISE"),
                                 (Screen::Record, "STATS"),
+                                (Screen::Replays, "REPLAYS"),
                                 (Screen::Config, "SETTINGS"),
                             ] {
                                 // Rail keys belong to no page: they are live on
@@ -3341,6 +3440,7 @@ fn build_menu(
                                 &mut brief,
                                 &mut detail,
                                 &mut net_nodes,
+                                &mut replay_nodes,
                                 &mut dossier,
                                 &menu,
                                 &data,
@@ -3434,6 +3534,7 @@ fn build_menu(
         brief,
         detail,
         net: net_nodes,
+        replays: replay_nodes,
         dossier,
         controls,
         applied,
@@ -3577,6 +3678,7 @@ fn build_pages(
     brief: &mut [Entity; 3],
     detail: &mut [Entity; 4],
     net: &mut NetNodes,
+    replays: &mut ReplayNodes,
     dossier: &mut DossierNodes,
     menu: &Menu,
     data: &LobbyData,
@@ -3623,6 +3725,11 @@ fn build_pages(
                     (Screen::Net, "MULTIPLAYER"),
                     (Screen::Armory, "CUSTOMISE"),
                     (Screen::Record, "YOUR STATS"),
+                    // On the board as well as on the rail. The rail is how you
+                    // get anywhere once you know the game; the board is what a
+                    // pilot reads on the first run, and a feature that is only
+                    // on the rail is a feature only a returning player finds.
+                    (Screen::Replays, "REPLAYS"),
                     (Screen::Auth, "LOG IN"),
                     (Screen::Config, "SETTINGS"),
                 ] {
@@ -3893,6 +4000,59 @@ fn build_pages(
                     None,
                     15.0,
                 );
+            });
+        })
+        .id();
+
+    // ---- REPLAYS ----------------------------------------------------------
+    //
+    // A fixed pool of eight rows, written from `crate::replay::Replays`. Same
+    // shape as the browser above and for the same reasons; what is different is
+    // that the list is a directory rather than a socket, so it is re-read on the
+    // way in rather than asked for.
+    pages[Screen::Replays.index()] = stack
+        .spawn(page(on(Screen::Replays)))
+        .with_children(|p| {
+            p.spawn(page_col(60.0)).with_children(|c| {
+                replays.count = c.spawn(readout(f, "", 10.0, dim(0.6))).id();
+                c.spawn(gap(18.0));
+                for i in 0..REPLAY_ROWS {
+                    #[allow(clippy::cast_possible_truncation)]
+                    control_row(
+                        c,
+                        ui,
+                        Screen::Replays,
+                        Action::SetReplay(i as u8),
+                        "- - - -",
+                        Some(" "),
+                        16.0,
+                    );
+                    replays.rows[i] = ui.controls.len() - 1;
+                }
+                c.spawn(gap(10.0));
+                c.spawn(hint_words(f, "SELECT TO WATCH"));
+            });
+            p.spawn(page_col(34.0)).with_children(|c| {
+                section(c, f, "ABOUT REPLAYS");
+                // The whole feature, in the four lines it takes to say it.
+                // Nobody arrives on this page knowing that every match is kept,
+                // and a list of files with no explanation is a list of files.
+                c.spawn(readout(
+                    f,
+                    "EVERY MATCH YOU PLAY IS SAVED\nAND CAN BE WATCHED BACK FROM\nANY ANGLE.",
+                    11.0,
+                    pal::WHITE,
+                ));
+                c.spawn(gap(26.0));
+                section(c, f, "WHILE WATCHING");
+                c.spawn(readout(
+                    f,
+                    "SPACE   PLAY / PAUSE\n< >     JUMP BACK / FORWARD\n- =     SLOWER / FASTER\nTAB     RIDE A SHIP\nV       INSIDE / OUTSIDE\nG       FREE CAMERA\nESC     BACK TO THE MENU",
+                    11.0,
+                    dim(0.75),
+                ));
+                c.spawn(gap(20.0));
+                replays.note = c.spawn(readout(f, "", 11.0, pal::AMBER)).id();
             });
         })
         .id();
@@ -4593,6 +4753,7 @@ fn read_input(
     mut data: ResMut<LobbyData>,
     mut setup: ResMut<MatchSetup>,
     mut launch: MessageWriter<LaunchRequest>,
+    mut watch: MessageWriter<crate::replay::WatchReplay>,
     mut outbox: MessageWriter<ToServer>,
     mut commands: MessageWriter<NetCommand>,
     mut api: MessageWriter<ApiRequest>,
@@ -4748,6 +4909,7 @@ fn read_input(
             &mut data,
             &mut setup,
             &mut launch,
+            &mut watch,
             &mut ops,
         );
         on_screen_change(was, &mut menu, &mut ops);
@@ -4954,6 +5116,7 @@ fn preview(action: Action, menu: &mut Menu) {
         Action::SetTrial(t) => menu.trial = t,
         Action::SetMission(m) => menu.mission = m,
         Action::SetSortie(s) => menu.sortie = s,
+        Action::SetReplay(r) => menu.replay = r,
         Action::SetItem(i) => menu.item = i,
         // The paint applies as the cursor passes over it. That is the whole
         // point of a live preview: you look at the aircraft, not at the list.
@@ -4964,6 +5127,35 @@ fn preview(action: Action, menu: &mut Menu) {
     }
 }
 
+/// Opens a recording, and takes the display down to show it.
+///
+/// One definition, called by [`apply`] when a row is pressed and by
+/// [`forced_replay`] when the environment presses one for a capture — so the
+/// screenshot recipe exercises the shipped flow rather than a shortcut past it,
+/// the same property `SPACESHIPS_ROOM` documents for the network pages.
+///
+/// The display closes here rather than when the file has been read.
+/// `replay.rs`'s loader reopens it if the recording will not decode, and says
+/// why on the page; the alternative is a menu that sits there for the length of
+/// a half-megabyte read and then either vanishes or does not.
+/// Returns the message to send rather than sending it, so the decision is a
+/// pure function of the menu and the tests below can make it without an `App`.
+fn watch_replay(row: u8, menu: &mut Menu) -> Option<crate::replay::WatchReplay> {
+    if row >= menu.replays.rows {
+        menu.say("NO REPLAY THERE");
+        return None;
+    }
+    menu.replay = row;
+    menu.open = false;
+    // Whatever match was paused behind this display is not what `ESC` should
+    // return to now — a recording has taken the world.
+    menu.resumable = false;
+    menu.say("OPENING REPLAY");
+    Some(crate::replay::WatchReplay {
+        index: usize::from(row),
+    })
+}
+
 /// Carries out one activation.
 fn apply(
     action: Action,
@@ -4971,6 +5163,7 @@ fn apply(
     data: &mut LobbyData,
     setup: &mut MatchSetup,
     launch: &mut MessageWriter<LaunchRequest>,
+    watch: &mut MessageWriter<crate::replay::WatchReplay>,
     ops: &mut NetOps,
 ) {
     match action {
@@ -5079,6 +5272,16 @@ fn apply(
             }
             menu.sortie = s;
             menu.say("ORDER SELECTED");
+        }
+        // A row that names a match watches that match, on exactly the reasoning
+        // the tasking rows above are built on: arrowing over one arms it and
+        // fills in the panel beside the list, and pressing it opens it. A
+        // separate `WATCH` row below the list would be the second press this
+        // page has no need of.
+        Action::SetReplay(r) => {
+            if let Some(msg) = watch_replay(r, menu) {
+                watch.write(msg);
+            }
         }
         Action::SetItem(i) => menu.item = i,
         // Neither of these saves anything, and that is not an omission. The
@@ -5228,6 +5431,97 @@ fn trial_locked(t: u8) -> bool {
 
 fn mission_locked(m: u8) -> bool {
     m >= 2
+}
+
+/// Keeps [`Menu::replays`] in step with the shelf, and re-reads the shelf on the
+/// way onto the page.
+///
+/// The rescan is here rather than in [`on_screen_change`] because it is not a
+/// page *change* that matters — it is the page being **up**, however it got
+/// there: the rail, the mission board, `SPACESHIPS_UI=replays`, or coming back
+/// out of a recording that would not open. One rising edge, one listing.
+///
+/// It is cheap by construction: a directory listing and a `stat` per file. See
+/// [`crate::replay::ReplayEntry`] for why nothing is decoded to build a row.
+fn follow_replays(
+    mut shelf: ResMut<crate::replay::Replays>,
+    mut menu: ResMut<Menu>,
+    mut was: Local<bool>,
+) {
+    let up = menu.open && menu.screen == Screen::Replays;
+    if up && !*was {
+        shelf.rescan();
+    }
+    *was = up;
+
+    #[allow(clippy::cast_possible_truncation)]
+    let view = ReplayView {
+        rev: shelf.rev,
+        rows: shelf.entries.len().min(REPLAY_ROWS) as u8,
+        total: shelf.entries.len().min(usize::from(u16::MAX)) as u16,
+    };
+    // Guarded, like every other write into `Menu` from a `follow_*` system: an
+    // unconditional one would mark the resource changed every frame and defeat
+    // [`MenuModel`]'s early out.
+    if menu.replays != view {
+        menu.replays = view;
+    }
+    // A list that got shorter must not leave the cursor pointing past its end,
+    // which is the one way `menu.replay` can go stale.
+    if menu.replay >= view.rows && menu.replay != 0 {
+        menu.replay = 0;
+    }
+}
+
+/// `SPACESHIPS_REPLAY_PICK=<row>`: press one of the page's rows.
+///
+/// The counterpart to [`forced_room`], and for the same reason that one exists:
+/// a check that the lobby can open a recording should not need somebody sitting
+/// at the keyboard. It goes through [`watch_replay`] — the function the button
+/// calls — rather than around it, so what a capture photographs is the shipped
+/// path.
+///
+/// Waits for the shelf to have been read at all (`rev != 0`), because the
+/// listing happens when the page comes up and this can run before it.
+fn forced_replay(
+    mut menu: ResMut<Menu>,
+    mut watch: MessageWriter<crate::replay::WatchReplay>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    let Some(row) = forced_replay_pick() else {
+        *done = true;
+        return;
+    };
+    if menu.screen != Screen::Replays {
+        menu.screen = Screen::Replays;
+        return;
+    }
+    if menu.replays.rev == 0 {
+        return;
+    }
+    *done = true;
+    if let Some(msg) = watch_replay(row, &mut menu) {
+        watch.write(msg);
+    }
+}
+
+/// `SPACESHIPS_REPLAY_PICK`, as a row index.
+fn forced_replay_pick() -> Option<u8> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var("SPACESHIPS_REPLAY_PICK")
+            .ok()?
+            .trim()
+            .parse::<u8>()
+            .ok()
+    }
 }
 
 /// `SPACESHIPS_ROOM`: open straight into a networked room.
@@ -5718,6 +6012,10 @@ fn drive_menu(
         });
     }
 
+    // The recordings page's own text is written by [`drive_replay_page`]; only
+    // its rows' *highlighting* is here, in the control pass below, which reads
+    // `ReplayView::rows` through `control_state`.
+
     // -- the pilot's own pages ----------------------------------------------
     //
     // One guard for the mission board's header, the service record, the
@@ -5834,7 +6132,7 @@ fn drive_menu(
     // Guarded by one packed key rather than by fourteen comparisons, and the
     // pass writes only the controls whose state byte moved — the trick
     // `hud.rs::sync_pips` plays on a pip row, at a larger scale.
-    if moved!(screen, focus, sel, credits) {
+    if moved!(screen, focus, sel, credits, replays) {
         let list = page_controls(&nodes, Screen::ALL[next.screen as usize]);
         let states: Vec<(usize, u8)> = nodes
             .controls
@@ -6194,6 +6492,75 @@ fn write_network_pages(
     }
 }
 
+/// Writes the recordings page.
+///
+/// Its own system rather than another branch inside [`drive_menu`], for a
+/// mundane reason worth stating: a Bevy system takes at most sixteen
+/// parameters, `drive_menu` is at that ceiling, and the shelf would be the
+/// seventeenth. It keeps the same discipline — reduce the page to something
+/// `Copy` and `Eq`, compare it whole, and **return before taking a single
+/// `Mut`** — which in flight is two integers and an early return.
+fn drive_replay_page(
+    menu: Res<Menu>,
+    shelf: Res<crate::replay::Replays>,
+    nodes: Option<Res<MenuNodes>>,
+    mut q_text: Query<&mut Text>,
+    mut applied: Local<Option<(bool, u32)>>,
+) {
+    let Some(nodes) = nodes else { return };
+    // Nothing about this page can look different while it is not on screen, so
+    // the whole model is "is it up" and "which listing".
+    let up = menu.open && menu.screen == Screen::Replays;
+    let next = (up, if up { shelf.rev } else { 0 });
+    if *applied == Some(next) {
+        return;
+    }
+    *applied = Some(next);
+    if !up {
+        return;
+    }
+    write_replay_page(&nodes, &shelf, &mut q_text);
+}
+
+/// Writes the recordings page from [`crate::replay::Replays`].
+fn write_replay_page(
+    nodes: &MenuNodes,
+    shelf: &crate::replay::Replays,
+    q_text: &mut Query<&mut Text>,
+) {
+    let r = &nodes.replays;
+
+    set_text(q_text, r.count, || match shelf.entries.len() {
+        0 => "NOTHING SAVED YET".to_owned(),
+        1 => "1 REPLAY".to_owned(),
+        n if n <= REPLAY_ROWS => format!("{n} REPLAYS, NEWEST FIRST"),
+        n => format!("{n} REPLAYS, NEWEST {REPLAY_ROWS} SHOWN"),
+    });
+    set_text(q_text, r.note, || shelf.note.clone());
+
+    for (i, &row) in r.rows.iter().enumerate() {
+        if row == usize::MAX {
+            continue;
+        }
+        let def = &nodes.controls[row];
+        match shelf.entries.get(i) {
+            Some(entry) => {
+                set_text(q_text, def.label, || entry.label.clone());
+                // The age is the useful half and goes on the right where the
+                // eye lands after the name; the size is there because it is the
+                // only hint the list can give about how long a match ran.
+                set_text(q_text, def.value, || {
+                    format!("{:<16} {} KB", entry.age, entry.size_kb)
+                });
+            }
+            None => {
+                set_text(q_text, def.label, || "- - - -".to_owned());
+                set_text(q_text, def.value, String::new);
+            }
+        }
+    }
+}
+
 /// Whether a control reads as selected, unavailable, or already held.
 fn control_state(def: &ControlDef, menu: &Menu, data: &LobbyData) -> (bool, bool, bool) {
     match def.action {
@@ -6220,6 +6587,10 @@ fn control_state(def: &ControlDef, menu: &Menu, data: &LobbyData) -> (bool, bool
         // `JOIN` refuses it. That is why the browser can be a fixed pool
         // without ever offering a room that is not there.
         Action::SetSortie(s) => (menu.sortie == s, s >= menu.net.rooms, false),
+        // The same fixed-pool arrangement as the browser: a row past the end of
+        // the shelf reads dead, the cursor will not stop on it, and
+        // [`watch_replay`] refuses it.
+        Action::SetReplay(r) => (menu.replay == r, r >= menu.replays.rows, false),
         // Only the flight lead may launch, and the row says so either way — see
         // the label swap in `drive_menu`.
         Action::LaunchNet => (false, !menu.net.host, false),
@@ -6864,6 +7235,13 @@ mod tests {
                 },
             ),
             (
+                "replay",
+                Menu {
+                    replay: 5,
+                    ..Menu::default()
+                },
+            ),
+            (
                 "item",
                 Menu {
                     item: 9,
@@ -6931,6 +7309,73 @@ mod tests {
         assert_eq!(stock(8, &data), Stock::Short, "rung 8 must start unheld");
         bought.pilot.owned |= 1 << 8;
         assert_ne!(selection_key(&base, &bought), k, "ownership");
+    }
+
+    /// The empty shelf is the case a new pilot sees, and pressing a row of it
+    /// must not take the display down and leave them looking at nothing.
+    #[test]
+    fn watching_a_row_that_is_not_there_does_nothing() {
+        let (mut menu, ..) = quiet();
+        menu.open = true;
+        assert!(watch_replay(0, &mut menu).is_none());
+        assert!(menu.open, "an empty shelf must not close the display");
+    }
+
+    #[test]
+    fn watching_a_row_names_it_and_stands_the_display_down() {
+        let (mut menu, ..) = quiet();
+        menu.open = true;
+        menu.resumable = true;
+        menu.replays = ReplayView {
+            rev: 1,
+            rows: 3,
+            total: 3,
+        };
+
+        let msg = watch_replay(2, &mut menu).expect("row 2 has a recording behind it");
+        assert_eq!(msg.index, 2);
+        assert!(!menu.open, "the display gets out of the way");
+        assert!(
+            !menu.resumable,
+            "a recording has taken the world, so ESC cannot resume a match"
+        );
+
+        // And the row past the end is still refused with a shorter list.
+        assert!(watch_replay(3, &mut menu).is_none());
+    }
+
+    /// A row with nothing behind it reads dead, which is what stops the cursor
+    /// resting on it — the same property the room browser's empty slots have.
+    #[test]
+    fn empty_replay_rows_read_dead() {
+        let (mut menu, data, _) = quiet();
+        menu.replays = ReplayView {
+            rev: 1,
+            rows: 2,
+            total: 2,
+        };
+        let def = |row: u8| ControlDef {
+            screen: Screen::Replays,
+            action: Action::SetReplay(row),
+            root: Entity::PLACEHOLDER,
+            tick: Entity::PLACEHOLDER,
+            label: Entity::PLACEHOLDER,
+            value: Entity::PLACEHOLDER,
+        };
+        assert!(
+            arms_on_focus(&def(1), &menu, &data),
+            "row 1 has a recording"
+        );
+        assert!(!arms_on_focus(&def(2), &menu, &data), "row 2 has none");
+    }
+
+    /// The word the player looked for and could not find.
+    #[test]
+    fn the_page_is_called_what_a_player_would_search_for() {
+        assert_eq!(Screen::Replays.title(), "REPLAYS");
+        assert_eq!(Screen::parse("replays"), Some(Screen::Replays));
+        // And it is not filed under the network rail, which needs a socket.
+        assert!(!Screen::Replays.is_network());
     }
 
     /// The packed key must fit, and the constant must agree with the pushes.
@@ -7271,14 +7716,26 @@ mod tests {
 
         let mut world = World::new();
         world.init_resource::<Messages<LaunchRequest>>();
-        let mut state: SystemState<MessageWriter<LaunchRequest>> = SystemState::new(&mut world);
+        world.init_resource::<Messages<crate::replay::WatchReplay>>();
+        let mut state: SystemState<(
+            MessageWriter<LaunchRequest>,
+            MessageWriter<crate::replay::WatchReplay>,
+        )> = SystemState::new(&mut world);
         let mut setup = MatchSetup::default();
         let mut config = NetConfig::default();
         let callsign = data.pilot.callsign.clone();
         let mut ops = NetOps::new(session, &mut config, &callsign);
         {
-            let mut launch = state.get_mut(&mut world).expect("the writer validates");
-            apply(action, menu, &mut data, &mut setup, &mut launch, &mut ops);
+            let (mut launch, mut watch) = state.get_mut(&mut world).expect("the writer validates");
+            apply(
+                action,
+                menu,
+                &mut data,
+                &mut setup,
+                &mut launch,
+                &mut watch,
+                &mut ops,
+            );
         }
         state.apply(&mut world);
         Fired {

@@ -58,6 +58,21 @@
 //! and make moving it *harder*. Solo deathmatch, skirmish, training and
 //! multiplayer — everything with no `step_modes` work to do — seek exactly.
 //!
+//! # The way in
+//!
+//! `SPACESHIPS_REPLAY=<file>` was the *only* way in, which meant the feature did
+//! not exist for anybody who opens the `.dmg`. There is now a `REPLAYS` page on
+//! the lobby's rail: [`Replays`] is the shelf — what is in `<state dir>/replays`,
+//! newest first — and [`WatchReplay`] is the button. `ui.rs` draws the shelf and
+//! writes the message; [`open_requested`] does exactly what [`install`] does,
+//! except through `Commands` rather than at plugin-build time, so the two paths
+//! open a recording identically.
+//!
+//! **The browser has no filesystem**, so on wasm the shelf is always empty and
+//! [`Replays::note`] says why. The page is still there: a web player who is told
+//! "recordings are saved by the desktop version" has learnt something, and a
+//! rail key that appears on one build and not the other is worse.
+//!
 //! # What phase one deliberately does not do
 //!
 //! No timeline widget, no camera keyframes, no export. The overlay is two lines
@@ -125,7 +140,14 @@ impl Plugin for ReplayPlugin {
         app.init_resource::<ViewTarget>()
             .init_resource::<FreeCam>()
             .init_resource::<Tape>()
+            .init_resource::<Replays>()
+            .add_message::<WatchReplay>()
             .add_systems(Startup, spawn_overlay)
+            // The door from the lobby, and the two things that have to happen
+            // when it is used in either direction. Neither is gated on
+            // `replaying`: opening one is what *makes* a replay run, and
+            // launching a match has to be able to stop one.
+            .add_systems(Update, (open_requested, stop_on_launch))
             .add_systems(
                 Update,
                 (
@@ -137,8 +159,12 @@ impl Plugin for ReplayPlugin {
                     update_overlay,
                 )
                     .chain()
-                    .run_if(replaying),
+                    .run_if(replaying.and_then(not(under_the_menu))),
             )
+            // Outside the gate above, because it is the *transition* into the
+            // menu it watches for: a system that stops running when the lobby
+            // opens can never notice that the lobby opened.
+            .add_systems(Update, pause_under_the_menu.run_if(replaying))
             // `PostUpdate`, and after propagation, for the reason
             // `cockpit.rs::seat_camera` is: `camera.rs::follow` writes the
             // camera in `PostUpdate` and this has to be the last word. Both are
@@ -402,6 +428,17 @@ fn flush_on_exit(mut exit: MessageReader<AppExit>, mut tape: ResMut<Tape>) {
     }
 }
 
+/// Where recordings are kept: `replays/` inside this installation's own
+/// directory.
+///
+/// One definition, because two things now need it — the writer below and the
+/// shelf the lobby lists — and a menu that looked somewhere other than where the
+/// files land would be the most confusing possible bug in this feature.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn replay_dir() -> Option<std::path::PathBuf> {
+    crate::api::state_dir().map(|d| d.join("replays"))
+}
+
 /// The browser has no filesystem, so the tape has nowhere to go and is never
 /// started in the first place — see [`recording_enabled`].
 #[cfg(target_arch = "wasm32")]
@@ -425,7 +462,7 @@ fn write_tape(tape: &mut Tape) {
     tape.written = true;
 
     let recording = recorder.recording();
-    let Some(dir) = crate::api::state_dir().map(|d| d.join("replays")) else {
+    let Some(dir) = replay_dir() else {
         warn!("replay: no state directory, so nothing was saved");
         return;
     };
@@ -471,6 +508,186 @@ fn slug(label: &str) -> String {
         out = out.replace("--", "-");
     }
     out.trim_matches('-').to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// The shelf
+// ---------------------------------------------------------------------------
+
+/// One recording on disk, in the words a page can print.
+///
+/// Everything here comes out of the **file name**, which [`write_tape`] builds
+/// as `<unix seconds>-<mode>-on-<map>.spr`. Nothing is decoded to list a
+/// recording, and that is the point: a five-minute match on the mouse is most of
+/// half a megabyte, and reading eight of them to fill in a column nobody asked
+/// for would put a visible stall on the way into the page. What a player needs
+/// in a list is *which match* and *when*, and the name carries both.
+///
+/// The consequence, stated because it is a real limitation: the list cannot show
+/// how long a recording runs. That number is the step count, which is the end of
+/// the file, and there is no way to it that does not read the whole thing. The
+/// transport says it the moment the recording opens.
+#[derive(Debug, Clone)]
+pub struct ReplayEntry {
+    /// `SKIRMISH ON SPACE`. The mode and map [`label_for`] wrote.
+    pub label: String,
+    /// `3 HOURS AGO`. Relative rather than a date, deliberately: the timestamp
+    /// in the name is UTC and this build has no timezone database, so a printed
+    /// clock time would be wrong by hours for most of the planet. An age is
+    /// right everywhere.
+    pub age: String,
+    /// Kilobytes on disk, rounded up so a very short match is not `0`.
+    pub size_kb: u64,
+    /// The file itself. Private: `ui.rs` names a row by index and never handles
+    /// a path, so there is one place that turns a choice into a file.
+    #[cfg(not(target_arch = "wasm32"))]
+    path: std::path::PathBuf,
+}
+
+/// What has been recorded, as the lobby's `REPLAYS` page shows it.
+///
+/// Filled by [`Replays::rescan`] when the page comes up, which is cheap — a
+/// directory listing and a `stat` each — and re-run rather than watched, because
+/// the only thing that writes into that directory is this process.
+#[derive(Resource, Default)]
+pub struct Replays {
+    /// Newest first.
+    pub entries: Vec<ReplayEntry>,
+    /// Moves whenever the list or [`Replays::note`] does, so `ui.rs` can put a
+    /// single comparison in front of the whole page — the discipline that file
+    /// is built on.
+    pub rev: u32,
+    /// What to say when there is nothing to show, or when one would not open.
+    /// Empty means "the list speaks for itself".
+    pub note: String,
+}
+
+impl Replays {
+    /// Re-reads the recordings directory.
+    pub fn rescan(&mut self) {
+        let (entries, note) = scan();
+        self.entries = entries;
+        self.note = note;
+        self.rev = self.rev.wrapping_add(1);
+    }
+
+    /// Records why a recording would not open, for the page to print.
+    fn complain(&mut self, note: impl Into<String>) {
+        self.note = note.into();
+        self.rev = self.rev.wrapping_add(1);
+    }
+}
+
+/// The browser has no filesystem, so there is nothing to list and one honest
+/// thing to say about it.
+#[cfg(target_arch = "wasm32")]
+fn scan() -> (Vec<ReplayEntry>, String) {
+    (
+        Vec::new(),
+        "THE WEB VERSION DOES NOT SAVE REPLAYS - PLAY ON THE DESKTOP APP".to_owned(),
+    )
+}
+
+/// Everything in `<state dir>/replays` that looks like a recording, newest
+/// first.
+///
+/// Best effort throughout. A directory that cannot be read, a file whose name
+/// says nothing, a `stat` that fails — none of those is worth refusing to show
+/// the rest of the list over.
+#[cfg(not(target_arch = "wasm32"))]
+fn scan() -> (Vec<ReplayEntry>, String) {
+    let Some(dir) = replay_dir() else {
+        return (
+            Vec::new(),
+            "NO PLACE TO KEEP REPLAYS ON THIS MACHINE".to_owned(),
+        );
+    };
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        // Not an error: the directory is created by the first match that ends.
+        return (
+            Vec::new(),
+            "NO REPLAYS YET - EVERY MATCH YOU PLAY IS RECORDED".to_owned(),
+        );
+    };
+
+    let now = unix_now();
+    let mut found: Vec<(u64, ReplayEntry)> = Vec::new();
+    for item in read.flatten() {
+        let path = item.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(spaceships_replay::EXTENSION) {
+            continue;
+        }
+        if let Some(pair) = describe(&path, now) {
+            found.push(pair);
+        }
+    }
+    // Newest first, and the name as a tie-break so the order is stable between
+    // two recordings made in the same second.
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(&b.1.label)));
+
+    let entries: Vec<ReplayEntry> = found.into_iter().map(|(_, e)| e).collect();
+    let note = if entries.is_empty() {
+        "NO REPLAYS YET - EVERY MATCH YOU PLAY IS RECORDED".to_owned()
+    } else {
+        String::new()
+    };
+    (entries, note)
+}
+
+/// One file, as a row — or `None` if it is not one of ours.
+#[cfg(not(target_arch = "wasm32"))]
+fn describe(path: &std::path::Path, now: u64) -> Option<(u64, ReplayEntry)> {
+    let stem = path.file_stem()?.to_str()?;
+    // `<unix>-<slug>`, which is what `write_tape` writes. A file that was
+    // renamed or copied in by hand keeps its own name as the label and dates
+    // itself off the filesystem, so it still lists rather than disappearing.
+    let (stamp, slug) = match stem.split_once('-') {
+        Some((left, right)) => (left.parse::<u64>().ok(), right),
+        None => (None, stem),
+    };
+
+    let meta = std::fs::metadata(path).ok();
+    let modified = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let at = stamp.filter(|s| *s > 0).or(modified).unwrap_or(0);
+    let size = meta.as_ref().map_or(0, std::fs::Metadata::len);
+
+    let label = slug.replace(['-', '_'], " ").trim().to_ascii_uppercase();
+    Some((
+        at,
+        ReplayEntry {
+            label: if label.is_empty() {
+                "MATCH".to_owned()
+            } else {
+                label
+            },
+            age: ago(now.saturating_sub(at)),
+            size_kb: size.div_ceil(1024),
+            path: path.to_owned(),
+        },
+    ))
+}
+
+/// How long ago, in the coarsest unit that still says something.
+#[cfg(not(target_arch = "wasm32"))]
+fn ago(seconds: u64) -> String {
+    // A recording stamped in the future — a clock that was wound back, a file
+    // copied off another machine — arrives here as zero (the caller saturates)
+    // and reads as new rather than as nonsense.
+    match seconds {
+        0..=59 => "JUST NOW".to_owned(),
+        60..=3599 => plural(seconds / 60, "MINUTE"),
+        3600..=86_399 => plural(seconds / 3600, "HOUR"),
+        _ => plural(seconds / 86_400, "DAY"),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn plural(n: u64, unit: &str) -> String {
+    format!("{n} {unit}{} AGO", if n == 1 { "" } else { "S" })
 }
 
 // ---------------------------------------------------------------------------
@@ -529,11 +746,53 @@ fn replay_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(raw))
 }
 
+/// Why a recording would not open.
+///
+/// Typed rather than a `String`, because the lobby has to tell two of these
+/// apart: a file this build cannot re-simulate is *old*, which is a thing to
+/// say plainly, and everything else is *broken*. Matching on a formatted message
+/// would work today and stop working the first time one of those sentences is
+/// reworded.
+#[cfg(not(target_arch = "wasm32"))]
+enum LoadFailure {
+    /// The file could not be read at all.
+    Io(std::io::Error),
+    /// The bytes were read and refused.
+    Decode(spaceships_replay::Error),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LoadFailure {
+    /// One line for the page, in a player's words.
+    fn note(&self) -> &'static str {
+        use spaceships_replay::Error;
+        match self {
+            LoadFailure::Io(_) => "THAT REPLAY COULD NOT BE READ",
+            // The rules fingerprint and the format version are the same fact
+            // from a player's side: the game has moved on since it was recorded.
+            LoadFailure::Decode(Error::RulesChanged { .. } | Error::UnknownVersion { .. }) => {
+                "THAT REPLAY IS FROM AN OLDER VERSION OF THE GAME"
+            }
+            LoadFailure::Decode(_) => "THAT REPLAY FILE IS DAMAGED",
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl core::fmt::Display for LoadFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LoadFailure::Io(e) => write!(f, "{e}"),
+            LoadFailure::Decode(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Reads a recording and builds its seek index.
 #[cfg(not(target_arch = "wasm32"))]
-fn load(path: &std::path::Path) -> Result<Theatre, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let recording = spaceships_replay::Recording::decode(&bytes).map_err(|e| e.to_string())?;
+fn load(path: &std::path::Path) -> Result<Theatre, LoadFailure> {
+    let bytes = std::fs::read(path).map_err(LoadFailure::Io)?;
+    let recording = spaceships_replay::Recording::decode(&bytes).map_err(LoadFailure::Decode)?;
 
     let ticks = recording.len();
     let label = recording.label.clone();
@@ -589,14 +848,34 @@ fn env_f64(key: &str) -> Option<f64> {
     std::env::var(key).ok()?.trim().parse::<f64>().ok()
 }
 
-/// Swaps the recorded match in for whatever `sim_bridge` built at startup.
+/// Everything swapping a recording in replaces, resolved before anything is
+/// written.
+///
+/// Two callers put these somewhere: [`install`] at plugin-build time, for
+/// `SPACESHIPS_REPLAY`, and [`open_requested`] through `Commands`, for the
+/// lobby. Splitting the *deciding* from the *writing* is what keeps them one
+/// behaviour — the alternative is the same eight resources assembled twice and
+/// drifting the first time one is added.
+#[cfg(not(target_arch = "wasm32"))]
+struct Opened {
+    world: SimWorldState,
+    frame: sim::world::Frame,
+    setup: MatchSetup,
+    theatre: Theatre,
+    free: FreeCam,
+    view: crate::cockpit::ViewMode,
+    ride: Option<EntityId>,
+}
+
+/// Winds a loaded recording to its opening moment and works out what the client
+/// has to look like to show it.
 ///
 /// The map has to move as well as the world: `terrain.rs` installs or tears the
 /// Sierras down when [`MatchSetup::map`] changes, so a recording made on the
 /// terrain map would otherwise be flown over an empty starfield with an
 /// invisible kill plane in it.
 #[cfg(not(target_arch = "wasm32"))]
-fn install(app: &mut App, mut theatre: Theatre) {
+fn open(mut theatre: Theatre) -> Opened {
     let mut world = theatre.timeline.start_world();
 
     // `SPACESHIPS_REPLAY_AT=<seconds>` opens on a moment and holds it. Same
@@ -638,25 +917,186 @@ fn install(app: &mut App, mut theatre: Theatre) {
     };
     let (free, seated, ride) = opening_view();
 
-    app.insert_resource(SimWorld(world))
-        .insert_resource(setup)
-        .insert_resource(SimFrame(frame))
+    Opened {
+        world,
+        frame,
+        setup,
+        theatre,
+        free: FreeCam {
+            active: free,
+            ..default()
+        },
+        view: crate::cockpit::ViewMode {
+            first_person: seated,
+            seated: false,
+        },
+        ride,
+    }
+}
+
+/// The startup path: `SPACESHIPS_REPLAY` named a file before the app ran.
+#[cfg(not(target_arch = "wasm32"))]
+fn install(app: &mut App, theatre: Theatre) {
+    let opened = open(theatre);
+    app.insert_resource(SimWorld(opened.world))
+        .insert_resource(opened.setup)
+        .insert_resource(SimFrame(opened.frame))
         // Nothing is being recorded during a replay. Recording the replay would
         // produce a byte-identical copy of the file already on disk, one match
         // later.
         .insert_resource(Tape::default())
-        .insert_resource(FreeCam {
-            active: free,
-            ..default()
-        })
-        .insert_resource(crate::cockpit::ViewMode {
-            first_person: seated,
-            seated: false,
-        })
-        .insert_resource(theatre);
-    if let Some(id) = ride {
+        .insert_resource(opened.free)
+        .insert_resource(opened.view)
+        .insert_resource(opened.theatre);
+    if let Some(id) = opened.ride {
         app.insert_resource(ViewTarget(id));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The door from the lobby
+// ---------------------------------------------------------------------------
+
+/// "Watch this one." Raised by `ui.rs` with a row's index into
+/// [`Replays::entries`].
+///
+/// An index rather than a path, so the lobby never handles a file name and this
+/// module keeps the one route from a choice to a recording. It is also what
+/// makes the message meaningful on wasm, where there are no paths at all: the
+/// shelf is empty there, so every index misses and the page says why.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct WatchReplay {
+    /// Which row of [`Replays::entries`].
+    ///
+    /// Never read on the web, where the shelf cannot have rows: the handler
+    /// there answers every request the same way, which is the honest thing for
+    /// it to do and leaves the field unused on that target alone.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub index: usize,
+}
+
+/// Opens the recording the lobby picked.
+///
+/// The same [`open`] the startup path uses, through `Commands` instead of an
+/// `App` — so a menu-opened replay and a `SPACESHIPS_REPLAY` one are the same
+/// thing, including the map swap and the opening view.
+///
+/// **Failure reopens the menu.** `ui.rs` closes the display optimistically when
+/// the row is pressed, because in the overwhelming case the file opens; a
+/// recording that will not decode — one made under different `Rules`, a
+/// truncated write — would otherwise leave the pilot staring at whatever was on
+/// screen before with no display and no replay. [`crate::ui::ReturnToLobby`]
+/// brings it straight back, and [`Replays::note`] is on the page saying why.
+#[cfg(not(target_arch = "wasm32"))]
+fn open_requested(
+    mut requests: MessageReader<WatchReplay>,
+    mut commands: Commands,
+    mut replays: ResMut<Replays>,
+    mut fixed: ResMut<Time<Fixed>>,
+    mut back: MessageWriter<crate::ui::ReturnToLobby>,
+) {
+    // `last`, on the same reasoning as `apply_start_match`: two in one frame is
+    // two presses, and decoding the loser first is wasted work.
+    let Some(request) = requests.read().last().copied() else {
+        return;
+    };
+    let Some(entry) = replays.entries.get(request.index) else {
+        replays.complain("THAT REPLAY IS NO LONGER THERE");
+        back.write(crate::ui::ReturnToLobby);
+        return;
+    };
+    let path = entry.path.clone();
+
+    let theatre = match load(&path) {
+        Ok(theatre) => theatre,
+        Err(e) => {
+            error!("replay: cannot play {}: {e}", path.display());
+            replays.complain(e.note());
+            back.write(crate::ui::ReturnToLobby);
+            return;
+        }
+    };
+
+    let opened = open(theatre);
+    // A previous replay may have left the clock in slow motion. The rate is the
+    // fixed timestep — see [`drive_transport`] — so it has to be put back, or
+    // the new recording opens at whatever speed the last one was left at.
+    fixed.set_timestep_hz(f64::from(TICK_HZ as f32 * RATES[NORMAL_RATE]));
+    commands.insert_resource(SimWorld(opened.world));
+    commands.insert_resource(opened.setup);
+    commands.insert_resource(SimFrame(opened.frame));
+    commands.insert_resource(Tape::default());
+    commands.insert_resource(opened.free);
+    commands.insert_resource(opened.view);
+    commands.insert_resource(ViewTarget(opened.ride.unwrap_or(LOCAL_ID)));
+    commands.insert_resource(opened.theatre);
+}
+
+/// The web has no files, so there is nothing to open and the page has already
+/// said so. The message is still consumed: a queue nobody drains is a leak.
+#[cfg(target_arch = "wasm32")]
+fn open_requested(mut requests: MessageReader<WatchReplay>, mut replays: ResMut<Replays>) {
+    if requests.read().next().is_some() {
+        requests.clear();
+        replays.complain("THE WEB VERSION DOES NOT SAVE REPLAYS");
+    }
+}
+
+/// Launching a match ends the replay.
+///
+/// Without this, `ESC` out of a recording and pressing `START` would build a new
+/// world and then hand every fixed step straight back to [`Theatre`], which
+/// would overwrite it with the recording again — a match that starts and is
+/// instantly replaced by the thing you were watching. Dropping the resource is
+/// the whole of it: `replaying` is `Option<Res<Theatre>>`, so the transport, the
+/// overlay and `fixed_tick`'s replay branch all stand down together.
+fn stop_on_launch(
+    mut requests: MessageReader<crate::ui::LaunchRequest>,
+    theatre: Option<Res<Theatre>>,
+    mut commands: Commands,
+    mut fixed: ResMut<Time<Fixed>>,
+    mut free: ResMut<FreeCam>,
+    mut target: ResMut<ViewTarget>,
+) {
+    if requests.read().next().is_none() {
+        return;
+    }
+    requests.clear();
+    if theatre.is_none() {
+        return;
+    }
+    commands.remove_resource::<Theatre>();
+    fixed.set_timestep_hz(f64::from(TICK_HZ as f32));
+    // The two things a replay leaves pointing somewhere else. A pilot who
+    // launched a match from a drone camera parked over somebody else's wing
+    // would otherwise fly it from there.
+    *free = FreeCam::default();
+    *target = ViewTarget::default();
+}
+
+/// Run condition: the lobby is covering the screen.
+fn under_the_menu(lobby: Option<Res<crate::ui::LobbyOpen>>) -> bool {
+    lobby.is_some_and(|l| l.0)
+}
+
+/// Stops the clock when the display comes up over a replay.
+///
+/// `sim_bridge::fixed_tick` takes its replay branch *above* the pause that
+/// freezes a solo match behind the menu, so a recording left playing would run
+/// on underneath the lobby — and the pilot would come back to a match several
+/// minutes further on than they left it. Pausing here rather than there keeps
+/// the transport's state where the transport lives: the recording is paused, the
+/// overlay says `PAUSE`, and `Space` starts it again.
+fn pause_under_the_menu(
+    lobby: Option<Res<crate::ui::LobbyOpen>>,
+    mut theatre: ResMut<Theatre>,
+    mut was_up: Local<bool>,
+) {
+    let up = lobby.is_some_and(|l| l.0);
+    if up && !*was_up && theatre.playing {
+        theatre.playing = false;
+    }
+    *was_up = up;
 }
 
 // ---------------------------------------------------------------------------
@@ -975,5 +1415,49 @@ mod tests {
     fn the_view_defaults_to_the_pilot() {
         assert_eq!(ViewTarget::default().0, LOCAL_ID);
         assert!(!FreeCam::default().active);
+    }
+
+    /// The round trip the shelf rests on: a label becomes a file name, and the
+    /// file name becomes a label a player can read.
+    #[test]
+    fn a_file_name_reads_back_as_the_match_it_was() {
+        let name = format!("1700000000-{}.spr", slug("Skirmish on Space"));
+        let (at, entry) = describe(std::path::Path::new(&name), 1_700_000_000)
+            .expect("a name of ours describes itself");
+        assert_eq!(at, 1_700_000_000);
+        assert_eq!(entry.label, "SKIRMISH ON SPACE");
+        assert_eq!(entry.age, "JUST NOW");
+    }
+
+    /// A file somebody copied in by hand still lists rather than vanishing.
+    #[test]
+    fn a_hand_named_file_still_lists() {
+        let entry = describe(std::path::Path::new("the good one.spr"), 0);
+        assert_eq!(entry.expect("still described").1.label, "THE GOOD ONE");
+    }
+
+    #[test]
+    fn an_age_reads_in_the_coarsest_useful_unit() {
+        assert_eq!(ago(0), "JUST NOW");
+        assert_eq!(ago(59), "JUST NOW");
+        assert_eq!(ago(60), "1 MINUTE AGO");
+        assert_eq!(ago(60 * 59), "59 MINUTES AGO");
+        assert_eq!(ago(60 * 60), "1 HOUR AGO");
+        assert_eq!(ago(60 * 60 * 5), "5 HOURS AGO");
+        assert_eq!(ago(60 * 60 * 24), "1 DAY AGO");
+        assert_eq!(ago(60 * 60 * 24 * 9), "9 DAYS AGO");
+    }
+
+    /// Empty is a state the page has to be able to describe, and an empty note
+    /// would leave it describing nothing.
+    #[test]
+    fn an_empty_shelf_says_why() {
+        let mut shelf = Replays::default();
+        let was = shelf.rev;
+        shelf.rescan();
+        assert_ne!(shelf.rev, was, "a rescan has to be visible to the page");
+        if shelf.entries.is_empty() {
+            assert!(!shelf.note.is_empty(), "an empty list must explain itself");
+        }
     }
 }

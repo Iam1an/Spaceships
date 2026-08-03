@@ -362,9 +362,10 @@ const MAX_DAMAGE_MOTES: usize = 320;
 /// hundred milliseconds after a pulse, is the pulse. Two thirds of the
 /// wavefront was deleted before it had travelled sixty units.
 ///
-/// Sized at [`EMP_MOTES`] × 2 so two overlapping pulses both survive intact,
-/// which is a real case: friendly blinding is on, so a furball can eat two.
-const MAX_PULSE_MOTES: usize = EMP_MOTES * 2;
+/// Sized at [`EMP_PULSE_MOTES`] × 2 so two overlapping pulses both survive
+/// intact, which is a real case: friendly blinding is on, so a furball can eat
+/// two.
+const MAX_PULSE_MOTES: usize = EMP_PULSE_MOTES * 2;
 
 /// Cap on live explosion shells, and on beams.
 ///
@@ -381,11 +382,11 @@ const MAX_BEAMS: usize = 32;
 /// see the padding in `rebuild`. Sized for the worst case the caps above allow,
 /// with headroom: every quad is 4 vertices and 6 indices.
 ///
-/// The worst case, counted: 900 motes + 320 damage + 400 pulse + 128 shells +
+/// The worst case, counted: 900 motes + 320 damage + 672 pulse + 128 shells +
 /// 32 beams, plus the projectiles a ten-ship match can have in flight — 400
 /// bolts at two quads each (a 0.05 s gun cooldown against a 2 s bolt life), 30
 /// flares at two, and 40 missiles at **one**, their bodies having moved off this
-/// mesh onto their own. That is 2 680 quads against 4 096.
+/// mesh onto their own. That is 2 952 quads against 4 096.
 const MESH_QUAD_CAPACITY: usize = 4096;
 const MESH_VERTEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 4;
 const MESH_INDEX_CAPACITY: usize = MESH_QUAD_CAPACITY * 6;
@@ -723,6 +724,68 @@ pub(crate) fn forced_hull() -> Option<f32> {
     }
 }
 
+/// `SPACESHIPS_EMP_SHOT=<seconds>`: pull the EMP trigger once, at that time,
+/// under the **shipped** rules.
+///
+/// # Why this is not `SPACESHIPS_EMP`
+///
+/// That hook exists for the *victim*. `sim_bridge::match_rules` turns
+/// `EmpRules::blinds_owner` on so a single aircraft can photograph a blackout,
+/// and drops `charge_time` to zero so it does not take a minute to get there.
+/// Both are exactly wrong for the other half of this weapon: **the pilot who
+/// fires an EMP is not blinded by it**, and everything they are shown — the
+/// wavefront leaving the hull, the confirmation on the glass, the `JAMMED`
+/// brackets on the aircraft it caught — is drawn on a screen that is still lit.
+/// Under `SPACESHIPS_EMP` that screen goes dark and none of it can be seen, so a
+/// capture taken with it is a photograph of the wrong pilot.
+///
+/// So this changes no rules at all: the meter fills over its real sixty seconds
+/// and the pulse goes off under `Rules::DEFAULT`. The cost is that a capture has
+/// to run for a minute of match time, which is the correct price for
+/// photographing what the game actually does rather than a rule set it does not
+/// ship.
+///
+/// It writes `Input::fire_emp` and `sim_bridge`'s edge latch carries it into the
+/// next tick, which is the same route the `G` key takes.
+///
+/// The trigger is **held** from that moment rather than tapped once, because
+/// `emp::fire` refuses while the ship is dead and a minute into a training
+/// match the pilot may well be two seconds into a respawn. Holding costs
+/// nothing: the pulse spends the whole meter, so the presses after the first
+/// successful one do nothing for the next sixty seconds.
+#[cfg(not(target_arch = "wasm32"))]
+fn emp_shot_at() -> Option<f32> {
+    static AT: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("SPACESHIPS_EMP_SHOT")
+            .ok()?
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|t| t.is_finite() && *t >= 0.0)
+    })
+}
+
+/// Pulls that trigger. Native only; the browser has no environment to ask.
+#[cfg(not(target_arch = "wasm32"))]
+fn pull_emp_trigger(
+    time: Res<Time>,
+    mut input: ResMut<crate::sim_bridge::PlayerInput>,
+    mut said: Local<bool>,
+) {
+    let Some(at) = emp_shot_at() else {
+        return;
+    };
+    if time.elapsed_secs() < at {
+        return;
+    }
+    input.0.fire_emp = true;
+    if !*said {
+        *said = true;
+        info!("SPACESHIPS_EMP_SHOT: trigger held from {at} s");
+    }
+}
+
 /// `SPACESHIPS_FX_TRAIL=move|boost|brake`: pins the engine-trail emitter's mode.
 ///
 /// The same kind of hook as [`forced_hull`] and for the same reason. A trail is
@@ -791,6 +854,15 @@ impl Plugin for WeaponsPlugin {
             // last frame. `camera::follow` writes the chase pose in
             // `PostUpdate` before `Propagate`.
             .add_systems(PostUpdate, build_surface.after(TransformSystems::Propagate));
+
+        // The capture trigger, where `ui.rs::hold_the_stick` writes the same
+        // resource: after `input.rs` has filled it in `PreUpdate` and before the
+        // fixed loop's edge latch reads it.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(
+            RunFixedMainLoop,
+            pull_emp_trigger.before(bevy::app::RunFixedMainLoopSystems::BeforeFixedMainLoop),
+        );
     }
 
     /// The draw-call probe lives in the render world, which `RenderPlugin`
@@ -1914,20 +1986,57 @@ const FLARE_BURST: Burst = Burst {
 /// Motes in the EMP front. Enough to read as a continuous shell at 300 units,
 /// cheap enough that two overlapping pulses cannot evict the engine trails —
 /// see [`MAX_MOTES`].
-const EMP_MOTES: usize = 200;
+const EMP_MOTES: usize = 264;
+
+/// How many bands the front is dealt into.
+///
+/// The wall was one shell of motes leaving at one speed, which from close up is
+/// a spray of dots that thins as it goes and never reads as a *surface*. Three
+/// concentric bands a fraction of a second apart give it thickness: the eye
+/// gets an edge, a body and a trailing haze, which is what a shock front looks
+/// like. It costs nothing — the same motes, dealt differently.
+const EMP_BANDS: usize = 3;
+
+/// Motes in the discharge that stays with the aircraft.
+///
+/// The reason this exists: **the pilot who fires an EMP is never blinded by
+/// it** (`EmpRules::blinds_owner`, and that decision is right), so the wave is
+/// the only thing their screen has to show them — and the wave is gone from the
+/// chase camera in about a twentieth of a second, because it leaves at three
+/// hundred units a second and the camera sits fourteen units back. From the one
+/// seat that matters most, a three-hundred-unit sphere is a flicker.
+///
+/// So a slower, much closer band stays around the airframe for half a second:
+/// it is the same pulse leaving the hull, at a speed a camera parked on that
+/// hull can actually see.
+const EMP_DISCHARGE_MOTES: usize = 72;
+
+/// Everything one pulse pushes into the pulse pool.
+const EMP_PULSE_MOTES: usize = EMP_MOTES + EMP_DISCHARGE_MOTES;
 
 /// How long the front takes to reach [`sim::rules::EmpRules::radius`].
 ///
-/// The blackout is four seconds and this is well under one, deliberately: the
+/// The blackout is four seconds and this is comfortably under half of it: the
 /// wave is the *announcement*, not the effect. By the time a pilot has
 /// registered that their panel is dark, the thing that did it should already be
 /// leaving.
 ///
-/// Tuned by looking. At half this it is over before the eye finds it — three
-/// hundred units in under half a second is faster than a bullet, and from the
-/// centre it reads as one frame of glare and nothing else. This is slow enough
-/// that the wall is a wall for a moment.
-const EMP_FRONT_SECS: f32 = 0.9;
+/// Tuned by looking, twice. At half of this it is over before the eye finds it —
+/// three hundred units in under half a second is faster than a bullet, and from
+/// the centre it reads as one frame of glare and nothing else. It was 0.9 s and
+/// that was still too quick for the *firing* pilot, who is at the centre and is
+/// the only one whose screen stays lit; at 1.4 s the wall is legibly a wall
+/// travelling outward, and it still clears the radius inside the first third of
+/// the blackout it announces.
+const EMP_FRONT_SECS: f32 = 1.4;
+
+/// How long the near-field discharge lasts, and how far out it gets as a
+/// fraction of the weapon's radius.
+///
+/// Deliberately small. This is the pulse leaving the hull, not a second weapon:
+/// it must not be mistaken for the *reach*, which is what the front describes.
+const EMP_DISCHARGE_SECS: f32 = 0.55;
+const EMP_DISCHARGE_REACH: f32 = 0.16;
 
 /// The EMP pulse: a cold front that runs out to the edge of the weapon's radius
 /// and stops.
@@ -1970,53 +2079,109 @@ const EMP_FRONT_SECS: f32 = 0.9;
 ///   bloom threshold, so the moment of detonation has something to mark it. It
 ///   is deliberately smaller than the chase camera's own standoff, which is what
 ///   keeps *this* billboard outside the lens.
+/// - **A discharge that stays with the aircraft** for half a second — see
+///   [`EMP_DISCHARGE_MOTES`] for why the effect needs something the camera on
+///   the *firing* ship can see, which the front by itself is not.
 fn spawn_emp(fx: &mut Effects, pos: Vec3, radius: f32) {
     push_shell(
         &mut fx.shells,
         Shell {
             pos,
-            life: 0.12,
+            life: 0.18,
             from: 0.4,
-            to: 7.0,
-            color: glow(0xffffff, 5.0),
-            cool: glow(0x88ddff, 1.4),
+            to: 8.5,
+            color: glow(0xffffff, 6.0),
+            cool: glow(0x88ddff, 1.6),
             opacity: 1.0,
             ease: 0.5,
             fade: 1.4,
             ..default()
         },
     );
+    // A second, cooler flash behind the first: the first is the instant, this is
+    // the afterglow, and together they give the detonation a shape rather than a
+    // single frame of white. Still inside the chase camera's standoff.
+    push_shell(
+        &mut fx.shells,
+        Shell {
+            pos,
+            life: 0.5,
+            from: 1.5,
+            to: 12.0,
+            color: glow(0x9fd8ff, 2.2),
+            cool: glow(0x123a6b, 0.05),
+            opacity: 0.55,
+            ease: 0.35,
+            fade: 1.8,
+            ..default()
+        },
+    );
 
     let speed = radius / EMP_FRONT_SECS;
-    let hot = glow(0xdff2ff, 2.6);
+    let hot = glow(0xdff2ff, 3.0);
     let cool = glow(0x1b4d8a, 0.05);
-    for _ in 0..EMP_MOTES {
+    for i in 0..EMP_MOTES {
         let dir = fx.rng.direction();
-        // A little jitter on the speed only — enough that the wall has some
+        // Three bands rather than one shell — see [`EMP_BANDS`]. The leading
+        // band is the brightest and the trailing one is the haze, so the front
+        // has an edge and a body instead of being uniformly thin.
+        #[allow(clippy::cast_precision_loss)]
+        let band = (i % EMP_BANDS) as f32 / EMP_BANDS as f32;
+        let taper = 1.0 - band * 0.55;
+        // A little jitter on the speed only — enough that each band has some
         // thickness and does not look like a wireframe sphere, not enough to
         // stop it being a wall.
-        let speed = speed * fx.rng.range(0.93, 1.0);
+        let speed = speed * (1.0 - band * 0.22) * fx.rng.range(0.94, 1.0);
         push_pulse(
             &mut fx.pulse,
             Mote {
                 pos: pos + dir * 3.0,
-                life: EMP_FRONT_SECS + 0.12,
+                life: EMP_FRONT_SECS + 0.2,
                 // Big, and growing, because the far side of this front is three
                 // hundred units away: a trail-sized mote is a single pixel
                 // there, and the wall would dissolve into static exactly as it
                 // reached the aircraft it is about to blind.
-                half: 3.0,
-                grow: 2.4,
+                half: 3.4,
+                grow: 3.2,
                 color: hot,
                 cool,
-                opacity: 0.85,
+                opacity: 0.92 * taper,
                 vel: dir * speed,
                 // No drag: a wavefront that slowed down would bunch up short of
                 // the radius it is supposed to describe.
                 drag: 0.0,
                 // Smeared along its own travel, so each mote is a radial dash
                 // rather than a dot and the front reads as motion.
-                smear: 0.014,
+                smear: 0.02,
+                brush: Brush::GLOW,
+                ..default()
+            },
+        );
+    }
+
+    // The discharge, at the airframe, for the pilot who fired it.
+    let near = radius * EMP_DISCHARGE_REACH / EMP_DISCHARGE_SECS;
+    for _ in 0..EMP_DISCHARGE_MOTES {
+        let dir = fx.rng.direction();
+        push_pulse(
+            &mut fx.pulse,
+            Mote {
+                pos: pos + dir * 1.5,
+                life: EMP_DISCHARGE_SECS * fx.rng.range(0.7, 1.0),
+                // Small at this range, and barely growing: these are metres from
+                // the lens, not hundreds, and a mote sized for the far front
+                // would be a wall of white across the canopy.
+                half: 0.6,
+                grow: 1.1,
+                color: glow(0xeaf8ff, 3.4),
+                cool,
+                opacity: 0.8,
+                vel: dir * near * fx.rng.range(0.35, 1.0),
+                // Unlike the front, this one is allowed to slow: it is arcing
+                // off the hull rather than describing a radius, so bunching is
+                // the right look.
+                drag: 1.6,
+                smear: 0.03,
                 brush: Brush::GLOW,
                 ..default()
             },
@@ -4398,14 +4563,18 @@ mod tests {
             push_mote(&mut fx.motes, Mote::default());
         }
         spawn_emp(&mut fx, Vec3::ZERO, 300.0);
-        assert_eq!(fx.pulse.len(), EMP_MOTES);
+        assert_eq!(fx.pulse.len(), EMP_PULSE_MOTES);
         assert_eq!(fx.motes.len(), MAX_MOTES, "the front took no trail slots");
 
         // A second full second of trail emission does not touch it.
         for _ in 0..MAX_MOTES {
             push_mote(&mut fx.motes, Mote::default());
         }
-        assert_eq!(fx.pulse.len(), EMP_MOTES, "and none of it was evicted");
+        assert_eq!(
+            fx.pulse.len(),
+            EMP_PULSE_MOTES,
+            "and none of it was evicted"
+        );
 
         // Two overlapping pulses both survive whole; a third evicts the first.
         spawn_emp(&mut fx, Vec3::ZERO, 300.0);
