@@ -74,8 +74,10 @@ use bevy::shader::{Shader, ShaderRef};
 use bevy::world_serialization::{WorldAsset, WorldAssetRoot, WorldInstanceReady};
 use std::f32::consts::{FRAC_PI_2, PI};
 
+use spaceships_protocol::{ClientMessage, ServerMessage};
 use spaceships_sim as sim;
 
+use crate::net::{FromServer, NetSession, NetSet, Phase, ToServer};
 use crate::sim_bridge::{pos, rot, SimFrame, SimSet, LOCAL_ID};
 
 /// The player model, at the asset root.
@@ -268,6 +270,104 @@ const PALETTE: [Srgba; 8] = [
     hex(0xff_8833),
     hex(0x99_ff55),
 ];
+
+/// The paints a bot's airframe can be sprayed in.
+///
+/// Bots used to take [`PALETTE`] too, and that list is a *lobby* palette: it was
+/// written for `spaceship.glb`, six flat-shaded primitives with a glow, where a
+/// saturated primary reads as a toy spaceship because the thing is a toy
+/// spaceship. `jet.glb` is an F-22 — a large, smooth, grey airframe — and
+/// `#55ff88` on it reads as a die-cast model, not as an aircraft.
+///
+/// So these are *paints*, not colours. Every one is a scheme a real airframe
+/// wears: the two greys of an air-superiority wrap, gunship grey, the sand and
+/// field drab of a desert scheme, olive and sea grey from the maritime ones, and
+/// the oxblood, brick and slate an aggressor squadron uses precisely because
+/// they disappear against ground and sky. None is saturated enough to be
+/// mistaken for [`TEAM_HULL`] at a glance, which matters: cyan and red mean
+/// *side*, and a bot is not a side.
+///
+/// Twelve rather than eight so a five-a-side skirmish rarely repeats one.
+const BOT_LIVERY: [Srgba; 12] = [
+    hex(0x76_8a9c), // air superiority blue
+    hex(0x8b_9399), // ghost grey
+    hex(0x4e_555c), // gunship grey
+    hex(0xb2_9d79), // desert sand
+    hex(0x8a_7c5c), // field drab
+    hex(0x63_6b47), // olive drab
+    hex(0x44_5f55), // sea green
+    hex(0x76_4545), // oxblood
+    hex(0x8a_5f4a), // brick
+    hex(0x53_6684), // slate
+    hex(0x50_6d75), // storm grey
+    hex(0x3d_4654), // aggressor charcoal
+];
+
+/// How far a livery's accent sits below its hull.
+///
+/// Multiplied in sRGB rather than in linear light, deliberately: this is
+/// choosing a second *paint*, not simulating a shadow, and a gamma-space scale
+/// is what a painter means by "the same colour, three shades down". At 0.32
+/// every entry in [`BOT_LIVERY`] lands well under [`ACCENT_LUMA`], so the
+/// canopy, the intakes and the exhaust cans stay dark on all twelve.
+const ACCENT_SHADE: f32 = 0.32;
+
+/// The same paint, several shades down. See [`ACCENT_SHADE`].
+const fn shade(c: Srgba) -> Srgba {
+    Srgba::rgb(
+        c.red * ACCENT_SHADE,
+        c.green * ACCENT_SHADE,
+        c.blue * ACCENT_SHADE,
+    )
+}
+
+/// How far apart in [`BOT_LIVERY`] two consecutive ids land, and where the walk
+/// starts.
+///
+/// # Why this and not a hash
+///
+/// The requirement is *variety*, and the constraint is that the answer must be
+/// the same in every window looking at the same aircraft. That rules out `rand`
+/// immediately — two pilots describing the same bot would disagree — and it
+/// rules out `crates/sim`'s seeded streams even more firmly: drawing a colour
+/// from them would consume a value the server did not, and desync a simulation
+/// over something nobody can see.
+///
+/// The obvious remaining answer is to hash the id, and it was the first one
+/// tried. It is worse than it looks. Nine bots drawing independently from twelve
+/// paints is the birthday problem: the expected number of *distinct* colours is
+/// `12 * (1 - (11/12)^9)`, about six and a half, and the measured spread for a
+/// skirmish's ids was five. Three pairs of identical aircraft is precisely the
+/// complaint this feature exists to answer.
+///
+/// A stride coprime with the table length is a bijection over any twelve
+/// consecutive ids, so a skirmish's nine bots take **nine different paints,
+/// always**. Five is coprime with twelve and far enough round the table that
+/// consecutive ids do not read as a sequence — which is the only thing the hash
+/// was buying. This is also what the JS did (`PALETTE[id % PALETTE.length]`),
+/// with a stride of one and eight brighter colours.
+const LIVERY_STRIDE: i32 = 5;
+/// Where the walk starts. Arbitrary, and the one number here that could be
+/// anything.
+const LIVERY_OFFSET: i32 = 7;
+
+/// One bot's paint, decided by its id and by nothing else.
+///
+/// `rem_euclid` rather than `%`: bot ids are **negative** on the wire
+/// (`server/index.js` allocates them as `-(nextId++)`), and Rust's remainder
+/// keeps the sign of the dividend, which would index a table backwards.
+fn bot_livery(id: sim::world::EntityId) -> ShipPaint {
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    let index = id
+        .wrapping_mul(LIVERY_STRIDE)
+        .wrapping_add(LIVERY_OFFSET)
+        .rem_euclid(BOT_LIVERY.len() as i32) as usize;
+    let hull = BOT_LIVERY[index];
+    ShipPaint {
+        hull: hull.into(),
+        accent: shade(hull).into(),
+    }
+}
 
 /// Emissive added to a struck ship at `hit_flash == 1`.
 ///
@@ -650,16 +750,31 @@ struct ShipPaint {
     accent: Color,
 }
 
-/// The materials a ship owns, and the emissive each of them settled on once the
-/// Ultra sweep was done with it.
+/// One of a ship's cloned materials, and what has to be remembered about it.
+struct SkinPart {
+    material: Handle<StandardMaterial>,
+    /// The emissive it settled on once the Ultra sweep was done with it.
+    /// [`flash_ships`] *adds* to this — an engine bell that glows on its own
+    /// must still glow after a flash has come and gone.
+    emissive: LinearRgba,
+    /// Which half of the livery this material takes, decided **once**, from the
+    /// authored colour, in [`paint_and_upgrade`].
+    ///
+    /// Recorded rather than re-derived because the split is not a fixed point:
+    /// team red is a dark colour by Rec. 709 luma, so asking [`is_accent`] about
+    /// a material that has *already been painted* red would call the hull an
+    /// accent and swap the two on the next repaint. See
+    /// `painting_is_not_a_fixed_point_of_the_split`.
+    accent: bool,
+}
+
+/// The materials a ship owns.
 ///
 /// Cloned per ship, which is the one place in this file that is allowed to be:
 /// ten ships with ten different hulls are ten materials however you arrange it,
-/// and ten is not sixty. The base emissive is kept because [`flash_ships`]
-/// *adds* to it — an engine bell that glows on its own must still glow after a
-/// flash has come and gone.
+/// and ten is not sixty.
 #[derive(Component)]
-struct ShipSkin(Vec<(Handle<StandardMaterial>, LinearRgba)>);
+struct ShipSkin(Vec<SkinPart>);
 
 /// The damage flash the ship's materials are currently showing.
 ///
@@ -674,28 +789,49 @@ struct HitFlash(f32);
 /// for why the second one is not redundant.
 type NeedsFlash = Or<(Changed<HitFlash>, Changed<ShipSkin>)>;
 
+/// The same two ways, one component along: the paint moved, or the materials it
+/// writes have only just been created. See [`repaint_ships`].
+type NeedsPaint = Or<(Changed<ShipPaint>, Changed<ShipSkin>)>;
+
+/// What [`sample_ships`] writes on a ship that already exists — the pose, the
+/// alive/dead visibility, the damage flash, and the paint.
+type ShipSample<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Interp,
+        &'static mut Visibility,
+        &'static mut HitFlash,
+        &'static mut ShipPaint,
+        Has<Snap>,
+    ),
+    With<ShipRoot>,
+>;
+
 /// The paint a ship arrives in.
 ///
-/// Three cases, and they are the three the JS has. The local pilot wears the
-/// colours they chose. Anyone on a team wears the team's, which is the only
-/// thing `Frame` can tell us about a stranger — see the module docs on what is
-/// missing. Anyone else gets a stable per-id colour from `main.js`'s palette,
-/// which is what `createShip({ tint })` does for a pilot whose `colors` message
-/// has not arrived.
-fn paint_for(view: &sim::world::ShipView) -> ShipPaint {
+/// Five cases, in the order they take precedence:
+///
+/// 1. **The local pilot** wears the colours they chose, whatever team they are
+///    on. `main.js:781` reads `getSavedShipColor()` for the player and consults
+///    the team only for *other* people's markers.
+/// 2. **A pilot who announced their colours** wears those. That is the `colors`
+///    message, and [`read_remote_paint`] is what puts it in [`RemotePaint`].
+/// 3. **A bot** gets a muted squadron paint, taken from its id — see
+///    [`bot_livery`].
+/// 4. **Anyone on a team** wears the team's, which is all `Frame` can tell us
+///    about a stranger whose `colors` has not arrived yet.
+/// 5. **Anyone else** gets a stable per-id colour from `main.js`'s palette,
+///    which is what `createShip({ tint })` does before a team is assigned.
+fn paint_for(view: &sim::world::ShipView, livery: &Livery, remote: &RemotePaint) -> ShipPaint {
     if view.id == LOCAL_ID {
-        return ShipPaint {
-            hull: saved_color(
-                "spaceships:shipColor",
-                "SPACESHIPS_HULL_COLOR",
-                DEFAULT_HULL,
-            ),
-            accent: saved_color(
-                "spaceships:shipAccentColor",
-                "SPACESHIPS_ACCENT_COLOR",
-                DEFAULT_ACCENT,
-            ),
-        };
+        return livery.paint();
+    }
+    if let Some(&announced) = remote.0.get(&view.id) {
+        return announced;
+    }
+    if view.flags.contains(sim::world::ShipFlags::BOT) {
+        return bot_livery(view.id);
     }
     let hull = match usize::try_from(view.team) {
         Ok(team) if team < TEAM_HULL.len() => TEAM_HULL[team],
@@ -721,36 +857,364 @@ fn is_accent(base_color: Color) -> bool {
     0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue < ACCENT_LUMA
 }
 
-/// One saved colour, from wherever this build keeps them.
+// ---------------------------------------------------------------------------
+// The pilot's own paint
+// ---------------------------------------------------------------------------
+
+/// `localStorage['spaceships:shipColor']` — `customization.js`'s key, and the
+/// name this client keeps it under natively too.
+pub(crate) const HULL_KEY: &str = "spaceships:shipColor";
+/// `localStorage['spaceships:shipAccentColor']`.
+pub(crate) const ACCENT_KEY: &str = "spaceships:shipAccentColor";
+
+/// The colours the local pilot flies in. **The one copy of that fact.**
 ///
-/// On the web that is `localStorage`, the same two keys `customization.js`
-/// writes, so the colours a pilot picks in the lobby are the ones the Bevy
-/// client flies in. Off the web there is no `localStorage` and no lobby yet, so
-/// an environment variable stands in — enough to see the split working, and the
-/// line to replace when the native build grows a profile store.
-fn saved_color(web_key: &str, native_env: &str, fallback: Srgba) -> Color {
-    let stored = read_setting(web_key, native_env);
-    stored
-        .as_deref()
-        .and_then(|s| Srgba::hex(s).ok())
-        .unwrap_or(fallback)
-        .into()
+/// It used to have no copies at all, which is the bug behind *"there is supposed
+/// to be a way to change the colour of your ship but it doesn't seem to work"*:
+/// [`paint_for`] read the saved colour out of storage at the moment a ship
+/// entity was spawned, and `ui.rs` wrote the player's choice to storage — but
+/// natively `save_setting` wrote it precisely nowhere (it logged
+/// `not persisted: the native build has no profile store`), and even on the web
+/// nothing re-read it, so a colour picked during a match could not reach the
+/// aircraft until the process was restarted. Two halves of one setting, neither
+/// of which could see the other.
+///
+/// Now the livery is a resource: `ui.rs` writes it when the picker moves,
+/// [`repaint_ships`] follows it onto the materials, [`persist_livery`] writes it
+/// to disk (or to `localStorage`), and [`announce_livery`] tells the room. Every
+/// one of those is driven by change detection on this one value.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Livery {
+    pub hull: Srgba,
+    pub accent: Srgba,
 }
 
-#[cfg(target_arch = "wasm32")]
-fn read_setting(web_key: &str, _native_env: &str) -> Option<String> {
-    web_sys::window()?
-        .local_storage()
-        .ok()
-        .flatten()?
-        .get_item(web_key)
-        .ok()
-        .flatten()
+impl Default for Livery {
+    /// The authored defaults, and nothing from the environment or the disk —
+    /// [`Livery::saved`] is the one that goes looking. Keeping `Default` pure is
+    /// what lets the tests below assert against a known paint whatever is in the
+    /// shell or in the player's config directory.
+    fn default() -> Livery {
+        Livery {
+            hull: DEFAULT_HULL,
+            accent: DEFAULT_ACCENT,
+        }
+    }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn read_setting(_web_key: &str, native_env: &str) -> Option<String> {
-    std::env::var(native_env).ok()
+impl Livery {
+    /// The livery this installation last saved, falling back to the defaults.
+    ///
+    /// The environment wins over the store on native, so
+    /// `SPACESHIPS_HULL_COLOR=#c0ffee` still overrides for a one-off capture
+    /// without overwriting what the pilot chose — the same rule `api.rs`'s
+    /// credential store applies to `SPACESHIPS_TOKEN`, and for the same reason.
+    pub(crate) fn saved() -> Livery {
+        Livery {
+            hull: saved_color(HULL_KEY, "SPACESHIPS_HULL_COLOR", DEFAULT_HULL),
+            accent: saved_color(ACCENT_KEY, "SPACESHIPS_ACCENT_COLOR", DEFAULT_ACCENT),
+        }
+    }
+
+    fn paint(self) -> ShipPaint {
+        ShipPaint {
+            hull: self.hull.into(),
+            accent: self.accent.into(),
+        }
+    }
+}
+
+/// One saved colour: the environment, then the store, then the fallback.
+fn saved_color(key: &str, native_env: &str, fallback: Srgba) -> Srgba {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(from_env) = std::env::var(native_env).ok().and_then(parse_hex) {
+        return from_env;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = native_env;
+
+    settings::get(key).and_then(parse_hex).unwrap_or(fallback)
+}
+
+/// `#rrggbb`, as `customization.js` writes it. `Srgba::hex` also accepts the
+/// form without the `#`, which is what a shell variable usually carries.
+fn parse_hex(s: impl AsRef<str>) -> Option<Srgba> {
+    Srgba::hex(s.as_ref().trim()).ok()
+}
+
+/// A colour as `#rrggbb`, the exact form the JS customizer stores, so a pilot
+/// who picks a colour here and then opens the Three.js lobby sees the same one.
+fn hex_string(c: Srgba) -> String {
+    format!("#{:06x}", pack_rgb(c))
+}
+
+/// A colour as the wire's packed `0xRRGGBB`. `ClientMessage::Colors` carries an
+/// integer, not a string.
+pub(crate) fn pack_rgb(c: Srgba) -> u32 {
+    let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+    (to_u8(c.red) << 16) | (to_u8(c.green) << 8) | to_u8(c.blue)
+}
+
+/// Where this build keeps a setting between runs.
+///
+/// Two implementations behind one pair of functions, exactly as `api.rs`'s
+/// credential store is arranged — and deliberately the *same keys* on both, so
+/// the wasm client and `public/src/customization.js` share one `localStorage`
+/// entry and a pilot's paint follows them between the two clients.
+///
+/// **What this is not is the account.** `PUT /api/colors` exists on the server
+/// and would make the livery follow the pilot to another machine; wiring it up
+/// is `api.rs`'s to do, and until it does, this store is per-installation.
+pub(crate) mod settings {
+    #[cfg(target_arch = "wasm32")]
+    fn storage() -> Option<web_sys::Storage> {
+        web_sys::window()?.local_storage().ok().flatten()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn get(key: &str) -> Option<String> {
+        storage()?.get_item(key).ok().flatten()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn set(key: &str, value: &str) {
+        if let Some(store) = storage() {
+            let _ = store.set_item(key, value);
+        }
+    }
+
+    // -- native --------------------------------------------------------------
+
+    /// `settings.json`, beside `api.rs`'s `credentials.json` in the user's own
+    /// configuration directory, and honouring the same `SPACESHIPS_STATE_DIR`
+    /// override — one state directory for the client, not two.
+    ///
+    /// Unlike the credential it is not `0600`: a hull colour is not a secret,
+    /// and a settings file the user can read and edit is a feature.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn path() -> Option<std::path::PathBuf> {
+        let dir = if let Some(explicit) = std::env::var_os("SPACESHIPS_STATE_DIR") {
+            std::path::PathBuf::from(explicit)
+        } else if cfg!(target_os = "macos") {
+            std::path::PathBuf::from(std::env::var_os("HOME")?)
+                .join("Library/Application Support/Spaceships")
+        } else if cfg!(windows) {
+            std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("Spaceships")
+        } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            std::path::PathBuf::from(xdg).join("spaceships")
+        } else {
+            std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config/spaceships")
+        };
+        Some(dir.join("settings.json"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn get(key: &str) -> Option<String> {
+        get_from(&path()?, key)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set(key: &str, value: &str) {
+        let Some(path) = path() else { return };
+        if let Err(e) = set_in(&path, key, value) {
+            bevy::log::warn!("scene: could not save {key}: {e}");
+        }
+    }
+
+    // The two above resolve *where*; the two below do the work and take a path.
+    // Split for the reason `api.rs` splits its own store: `std::env::set_var` is
+    // process-global and cargo runs tests on threads, so a test that moved
+    // `SPACESHIPS_STATE_DIR` would race every other test that reads the
+    // environment.
+
+    /// One key out of the store. A file that is missing, truncated, or not JSON
+    /// reads as "nothing saved" — this is a preference, and refusing to start
+    /// over a corrupt colour would be absurd.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn get_from(path: &std::path::Path, key: &str) -> Option<String> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        Some(v.get(key)?.as_str()?.to_owned())
+    }
+
+    /// One key into the store, keeping every other key that is already there.
+    ///
+    /// Read-modify-write rather than a serialized struct, so that a key written
+    /// by a newer build — or by hand — survives being loaded by an older one.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_in(
+        path: &std::path::Path,
+        key: &str,
+        value: &str,
+    ) -> Result<(), std::io::Error> {
+        let mut doc = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| match v {
+                serde_json::Value::Object(map) => Some(map),
+                _ => None,
+            })
+            .unwrap_or_default();
+        doc.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, serde_json::Value::Object(doc).to_string())
+    }
+}
+
+/// What the store held when this process started, and has held since.
+///
+/// The reason it is a resource and not a `Local` in [`persist_livery`]: a
+/// `Local` is first seen on the frame that system first runs, and by then
+/// `Startup` has been and gone — so a livery chosen during startup (which is
+/// what `SPACESHIPS_LIVERY` does) would look like the value that was already on
+/// disk and never be written. Recording the store's own contents at plugin build
+/// time makes "differs from what is saved" mean exactly that, whenever the
+/// difference appeared.
+#[derive(Resource, Debug, Clone, Copy)]
+struct StoredLivery(Livery);
+
+/// Writes the livery to the store when — and only when — it differs from what
+/// is already there.
+///
+/// The comparison is what keeps a launch from rewriting the file with what it
+/// has just read out of it — and, more to the point, what stops a pilot whose
+/// saved hull came from the JS customizer's colour wheel having it quietly
+/// rounded to the nearest entry of this client's paint box.
+fn persist_livery(livery: Res<Livery>, mut stored: ResMut<StoredLivery>) {
+    if stored.0 == *livery {
+        return;
+    }
+    stored.0 = *livery;
+    settings::set(HULL_KEY, &hex_string(livery.hull));
+    settings::set(ACCENT_KEY, &hex_string(livery.accent));
+}
+
+// ---------------------------------------------------------------------------
+// Everyone else's paint
+// ---------------------------------------------------------------------------
+
+/// The colours other pilots have announced, by entity id.
+///
+/// The `colors` message has been decoded since the crossplay work and then
+/// thrown away — `net.rs` says as much in the arm that drops it: *"painting a
+/// remote hull is `scene.rs`'s registry to grow"*. This is that registry. Until
+/// it existed every other pilot in the room wore their team's colour and nothing
+/// else, so a squadron of five looked like one aircraft five times.
+#[derive(Resource, Debug, Default)]
+struct RemotePaint(HashMap<sim::world::EntityId, ShipPaint>);
+
+/// Applies `colors` frames as they arrive, and forgets a pilot when they leave.
+///
+/// Reads [`FromServer`] directly rather than asking `net.rs` to carry a new
+/// event: the decoded frame is already published to the whole app as a Bevy
+/// message, and a paint job is not simulation state — it must not go through
+/// [`crate::net::NetInbox`], which is the queue the fixed tick consumes.
+///
+/// # The one thing borrowed from `net.rs`
+///
+/// The wire numbers players differently from the simulation: `IdSwap` trades
+/// this connection's server id with [`LOCAL_ID`] so that "me" is the same id in
+/// every module. That swap is private to `net.rs`, so [`to_entity`] below
+/// reproduces it from [`NetSession::you`], which is public. It is self-inverse
+/// and it is four lines, but it is still a second copy of a bijection — if
+/// `IdSwap::to_entity` is ever made `pub`, this should call it instead.
+fn read_remote_paint(
+    mut incoming: MessageReader<FromServer>,
+    session: Res<NetSession>,
+    mut remote: ResMut<RemotePaint>,
+) {
+    for FromServer(msg) in incoming.read() {
+        match msg {
+            ServerMessage::Colors {
+                id,
+                hull_color,
+                accent_color,
+            } => {
+                let Some(id) = to_entity(&session, *id) else {
+                    continue;
+                };
+                remote.0.insert(
+                    id,
+                    ShipPaint {
+                        hull: hex(*hull_color).into(),
+                        accent: hex(*accent_color).into(),
+                    },
+                );
+            }
+            // The pilot is gone; their id will be handed to somebody else.
+            ServerMessage::Disconnect { id } => {
+                if let Some(id) = to_entity(&session, *id) {
+                    remote.0.remove(&id);
+                }
+            }
+            // A new room is a new set of ids. Nothing announced in the last one
+            // describes anybody in this one.
+            ServerMessage::Room { .. } => remote.0.clear(),
+            _ => {}
+        }
+    }
+}
+
+/// A wire player id as an entity id. `net::IdSwap::apply`, from the outside.
+fn to_entity(
+    session: &NetSession,
+    id: spaceships_protocol::PlayerId,
+) -> Option<sim::world::EntityId> {
+    let id = sim::world::EntityId::try_from(id).ok()?;
+    let mine = session
+        .you
+        .and_then(|you| sim::world::EntityId::try_from(you).ok());
+    Some(match mine {
+        Some(mine) if id == mine => LOCAL_ID,
+        Some(mine) if id == LOCAL_ID => mine,
+        _ => id,
+    })
+}
+
+/// Tells the room what colours this pilot is flying in.
+///
+/// The other half of [`read_remote_paint`], and just as necessary: a client that
+/// applies everyone else's colours and never sends its own is a client whose
+/// pilot is the only one who cannot be seen properly.
+///
+/// Sent on two occasions, which between them cover every way a peer can come to
+/// need it — `main.js:778` sends it on exactly the second one:
+///
+/// - **The livery changed.** The room is already assembled and has to be told.
+/// - **This client reached a room, or a match started.** Anyone already in the
+///   room learns the colour of somebody who has just arrived, and anyone who
+///   joins later gets it again when the match begins.
+///
+/// `flush_outbox` drops anything written while the socket is shut, so the phase
+/// edge is not merely a convenience: it is the first moment a send can land.
+fn announce_livery(
+    livery: Res<Livery>,
+    session: Res<NetSession>,
+    mut outbox: MessageWriter<ToServer>,
+    mut known: Local<Option<(Livery, Phase)>>,
+) {
+    let now = (*livery, session.phase);
+    let seated = matches!(now.1, Phase::Room | Phase::Playing);
+    match *known {
+        Some(before) if before == now => return,
+        // The first observation is only worth announcing if there is already
+        // somebody to hear it.
+        None if !seated => {
+            *known = Some(now);
+            return;
+        }
+        _ => *known = Some(now),
+    }
+    if !seated {
+        return;
+    }
+    outbox.write(ToServer(ClientMessage::Colors {
+        hull_color: pack_rgb(livery.hull),
+        accent_color: pack_rgb(livery.accent),
+    }));
 }
 
 /// Handles the sync systems need but must not reload every frame.
@@ -769,22 +1233,38 @@ pub struct ScenePlugin;
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Registry>()
+            .init_resource::<RemotePaint>()
+            // Not `init_resource`: the livery is whatever this installation last
+            // saved, and `Livery::default()` is deliberately the authored pair
+            // and nothing else. See [`Livery::saved`].
+            .insert_resource(Livery::saved())
+            .insert_resource(StoredLivery(Livery::saved()))
             // The asteroid field's material. One `MaterialPlugin` per material
             // *type*, not per material — the sixty rocks still share one asset.
             .add_plugins(MaterialPlugin::<RockMaterial>::default())
             .add_systems(Startup, setup)
+            // `PreUpdate`, after the socket has published the frame's traffic:
+            // a `colors` that arrives this frame is applied this frame, before
+            // anything in `Update` or `FixedUpdate` reads the registry.
+            .add_systems(PreUpdate, read_remote_paint.after(NetSet::Receive))
             // Sampling is per *tick*. `FixedUpdate`, after `SimSet`, is the
             // only place `prev` and `curr` are guaranteed to be consecutive
             // ticks — see the module docs on why sampling in `Update` freezes
             // on a frame that ran no tick and lurches on one that ran two.
             // `flash_ships` is chained after the samplers because it is driven
-            // by `Changed<HitFlash>`, and `sample_ships` is what changes it.
+            // by `Changed<HitFlash>`, and `sample_ships` is what changes it —
+            // and `repaint_ships` for the same reason, one component along.
             .add_systems(
                 FixedUpdate,
-                ((sample_ships, sample_rocks), flash_ships)
+                ((sample_ships, sample_rocks), (flash_ships, repaint_ships))
                     .chain()
                     .after(SimSet),
             )
+            // Both are edge-triggered off `Livery`, and neither belongs on the
+            // tick: picking a colour is something a person does between matches,
+            // and `announce_livery` has to be able to write on a frame that ran
+            // no tick at all.
+            .add_systems(Update, (persist_livery, announce_livery))
             // Drawing is per *frame*. `AfterFixedMainLoop` is where Bevy's own
             // docs put this: the fixed loop has finished, so
             // `overstep_fraction` is the leftover accumulator and nothing else
@@ -1351,8 +1831,10 @@ fn sample_ships(
     mut commands: Commands,
     frame: Res<SimFrame>,
     scene: Res<SceneAssets>,
+    livery: Res<Livery>,
+    remote: Res<RemotePaint>,
     mut reg: ResMut<Registry>,
-    mut q: Query<(&mut Interp, &mut Visibility, &mut HitFlash, Has<Snap>), With<ShipRoot>>,
+    mut q: ShipSample,
 ) {
     for view in &frame.0.ships {
         // Boss hitboxes are never drawn — they exist so one damage path can
@@ -1362,6 +1844,12 @@ fn sample_ships(
         }
 
         let pose = Pose::of_ship(view);
+        // Recomputed every tick rather than only at spawn: a livery the pilot
+        // has just changed, a `colors` that has just landed, and a team the
+        // server has just assigned all change the answer under a ship that is
+        // already flying. `set_if_neq` below is what keeps that from touching
+        // ten materials a tick.
+        let paint = paint_for(view, &livery, &remote);
 
         let entity = *reg.ships.entry(view.id).or_insert_with(|| {
             commands
@@ -1372,7 +1860,7 @@ fn sample_ships(
                     Interp::spawned(pose),
                     Visibility::default(),
                     HitFlash::default(),
-                    paint_for(view),
+                    paint,
                 ))
                 .with_children(|ship| {
                     ship.spawn((
@@ -1407,7 +1895,7 @@ fn sample_ships(
 
         // Miss on the tick the entity was spawned — `Interp::spawned` above
         // already holds this pose, and the commands have not been applied yet.
-        if let Ok((mut interp, mut vis, mut flash, marked)) = q.get_mut(entity) {
+        if let Ok((mut interp, mut vis, mut flash, mut worn, marked)) = q.get_mut(entity) {
             if marked {
                 commands.entity(entity).remove::<Snap>();
             }
@@ -1426,8 +1914,9 @@ fn sample_ships(
 
             // `set_if_neq` and not a plain write: this is what keeps
             // `flash_ships` off the material assets of the nine ships nobody
-            // shot this tick.
+            // shot this tick, and `repaint_ships` off the ten nobody recoloured.
             flash.set_if_neq(HitFlash(view.hit_flash));
+            worn.set_if_neq(paint);
         }
 
         // TODO(trails): `BOOSTING`/`BRAKING` are already in `view.flags` and are
@@ -1497,11 +1986,14 @@ fn paint_and_upgrade(
                 };
 
                 // -- The paint ------------------------------------------------
-                let painted = if is_accent(mat.base_color) {
-                    paint.accent
-                } else {
-                    paint.hull
-                };
+                //
+                // The split is read from the *authored* colour and then
+                // remembered on the `SkinPart`, because this is the only moment
+                // it can be read: from here on the material wears a livery, and
+                // asking the same question of a painted material gives a
+                // different answer. See [`SkinPart::accent`].
+                let accent = is_accent(mat.base_color);
+                let painted = if accent { paint.accent } else { paint.hull };
                 // Alpha is the model's, not the palette's: a canopy authored
                 // translucent must stay translucent.
                 mat.base_color = painted.with_alpha(mat.base_color.alpha());
@@ -1550,7 +2042,11 @@ fn paint_and_upgrade(
 
                 let emissive = mat.emissive;
                 let handle = materials.add(mat);
-                skin.push((handle.clone(), emissive));
+                skin.push(SkinPart {
+                    material: handle.clone(),
+                    emissive,
+                    accent,
+                });
                 cloned.insert(source.id(), handle.clone());
                 handle
             }
@@ -1590,10 +2086,11 @@ fn flash_ships(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for (skin, &HitFlash(flash)) in &ships {
-        for (handle, base) in &skin.0 {
-            let Some(mut mat) = materials.get_mut(handle) else {
+        for part in &skin.0 {
+            let Some(mut mat) = materials.get_mut(&part.material) else {
                 continue;
             };
+            let base = part.emissive;
             // Added, not assigned: an engine bell that glows on its own has to
             // still glow once the flash has decayed to nothing.
             mat.emissive = LinearRgba::rgb(
@@ -1601,6 +2098,42 @@ fn flash_ships(
                 base.green + SHIP_FLASH.green * flash,
                 base.blue + SHIP_FLASH.blue * flash,
             );
+        }
+    }
+}
+
+/// Repaints a ship whose livery has changed under it.
+///
+/// [`paint_and_upgrade`] paints once, when the glTF lands, and that was the
+/// whole story while a colour could only be chosen before launch. It cannot be
+/// the whole story now: `ESC` opens the livery page over a running match, and a
+/// pilot who changes their hull there is looking at their own aircraft while
+/// they do it. Same shape as [`flash_ships`], one component along —
+/// `Changed<ShipPaint>` for the colour moving, `Changed<ShipSkin>` for the
+/// materials arriving after it (the glTF finishes loading tens of frames after
+/// the entity exists, and a paint applied in between would be applied to nothing
+/// and then never again).
+///
+/// Idempotent with the initial paint on purpose: the two agree, so a ship that
+/// is spawned and never recoloured is written once by each and looks identical
+/// either way.
+fn repaint_ships(
+    ships: Query<(&ShipPaint, &ShipSkin), NeedsPaint>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for (paint, skin) in &ships {
+        for part in &skin.0 {
+            let Some(mut mat) = materials.get_mut(&part.material) else {
+                continue;
+            };
+            let want = if part.accent {
+                paint.accent
+            } else {
+                paint.hull
+            };
+            // Alpha is the model's, not the palette's: a canopy authored
+            // translucent must stay translucent.
+            mat.base_color = want.with_alpha(mat.base_color.alpha());
         }
     }
 }
@@ -2227,27 +2760,43 @@ mod tests {
         }
     }
 
+    fn bot(id: sim::world::EntityId, team: i32) -> sim::world::ShipView {
+        sim::world::ShipView {
+            flags: sim::world::ShipFlags::ALIVE.with(sim::world::ShipFlags::BOT),
+            ..ship(id, team)
+        }
+    }
+
+    /// The paint on a ship, with nothing saved and nothing announced.
+    fn painted(view: &sim::world::ShipView) -> ShipPaint {
+        paint_for(view, &Livery::default(), &RemotePaint::default())
+    }
+
     /// The local pilot wears their own colours whatever team they are on —
     /// `main.js:781` reads `getSavedShipColor()` for the player and only ever
     /// consults the team for *other* people's markers.
-    ///
-    /// Reads the environment on native, so this asserts the fallback rather
-    /// than the override; `SPACESHIPS_HULL_COLOR` set in the shell would be
-    /// testing the shell.
     #[test]
     fn the_local_pilot_keeps_their_own_colours() {
-        if std::env::var_os("SPACESHIPS_HULL_COLOR").is_some() {
-            return;
-        }
-        let paint = paint_for(&ship(LOCAL_ID, 0));
+        let paint = painted(&ship(LOCAL_ID, 0));
         assert_eq!(paint.hull, Color::from(DEFAULT_HULL));
         assert_eq!(paint.accent, Color::from(DEFAULT_ACCENT));
+
+        // And the chosen pair, once there is one, on either team.
+        let chosen = Livery {
+            hull: hex(0xff_5a3c),
+            accent: hex(0x2a_3138),
+        };
+        for team in [-1, 0, 1] {
+            let paint = paint_for(&ship(LOCAL_ID, team), &chosen, &RemotePaint::default());
+            assert_eq!(paint.hull, Color::from(chosen.hull), "team {team}");
+            assert_eq!(paint.accent, Color::from(chosen.accent), "team {team}");
+        }
     }
 
     #[test]
     fn a_teamed_stranger_wears_the_team_colour() {
-        assert_eq!(paint_for(&ship(7, 0)).hull, Color::from(TEAM_HULL[0]));
-        assert_eq!(paint_for(&ship(8, 1)).hull, Color::from(TEAM_HULL[1]));
+        assert_eq!(painted(&ship(7, 0)).hull, Color::from(TEAM_HULL[0]));
+        assert_eq!(painted(&ship(8, 1)).hull, Color::from(TEAM_HULL[1]));
     }
 
     /// `team == -1` is "unassigned", which is every ship before the host
@@ -2256,8 +2805,362 @@ mod tests {
     fn an_unassigned_stranger_falls_back_to_the_palette() {
         for id in 2..20 {
             let want = PALETTE[id as usize % PALETTE.len()];
-            assert_eq!(paint_for(&ship(id, -1)).hull, Color::from(want));
+            assert_eq!(painted(&ship(id, -1)).hull, Color::from(want));
         }
+    }
+
+    /// A pilot who has announced their colours wears them, and the team colour
+    /// stops applying — that announcement is the whole point of the `colors`
+    /// message, and it used to be dropped on the floor.
+    #[test]
+    fn an_announced_livery_beats_the_team_colour() {
+        let mut remote = RemotePaint::default();
+        let theirs = ShipPaint {
+            hull: hex(0xc0_84fc).into(),
+            accent: hex(0x2a_3138).into(),
+        };
+        remote.0.insert(7, theirs);
+
+        assert_eq!(
+            paint_for(&ship(7, 0), &Livery::default(), &remote),
+            theirs,
+            "the announcement wins over team blue"
+        );
+        // ...and says nothing about anybody else.
+        assert_eq!(
+            paint_for(&ship(8, 0), &Livery::default(), &remote).hull,
+            Color::from(TEAM_HULL[0])
+        );
+    }
+
+    /// Nobody else's announcement can repaint the local pilot's own aircraft.
+    /// The server never echoes `colors` back to its sender, so an entry under
+    /// [`LOCAL_ID`] would have to be a mistake, and the pilot's own choice is
+    /// the one thing on screen they are entitled to be sure of.
+    #[test]
+    fn nothing_announced_can_overrule_the_local_pilot() {
+        let mut remote = RemotePaint::default();
+        remote.0.insert(
+            LOCAL_ID,
+            ShipPaint {
+                hull: hex(0x00_ff00).into(),
+                accent: hex(0x00_ff00).into(),
+            },
+        );
+        let paint = paint_for(&ship(LOCAL_ID, 0), &Livery::default(), &remote);
+        assert_eq!(paint.hull, Color::from(DEFAULT_HULL));
+    }
+
+    // -- The `colors` message ------------------------------------------------
+
+    /// One app with the two resources [`read_remote_paint`] needs, and a way to
+    /// post frames at it. Not a full `App` plugin set: this system reads one
+    /// message stream and writes one map, and nothing about that needs a
+    /// renderer.
+    fn with_socket(you: Option<i64>) -> App {
+        let mut app = App::new();
+        app.add_message::<FromServer>();
+        app.init_resource::<RemotePaint>();
+        app.insert_resource(NetSession {
+            you,
+            ..NetSession::default()
+        });
+        app.add_systems(Update, read_remote_paint);
+        app
+    }
+
+    fn post(app: &mut App, msg: ServerMessage) {
+        app.world_mut()
+            .resource_mut::<bevy::ecs::message::Messages<FromServer>>()
+            .write(FromServer(msg));
+        app.update();
+    }
+
+    fn seen(app: &App, id: sim::world::EntityId) -> Option<ShipPaint> {
+        app.world().resource::<RemotePaint>().0.get(&id).copied()
+    }
+
+    /// The `colors` frame the crossplay work decoded and dropped. It has to
+    /// reach the registry, and it has to land on the ship its *wire* id names.
+    #[test]
+    fn a_colors_frame_repaints_the_pilot_it_names() {
+        // This connection is player 5, so the swap trades 5 and `LOCAL_ID`.
+        let mut app = with_socket(Some(5));
+        post(
+            &mut app,
+            ServerMessage::Colors {
+                id: 7,
+                hull_color: 0xc0_84fc,
+                accent_color: 0x2a_3138,
+            },
+        );
+        assert_eq!(
+            seen(&app, 7),
+            Some(ShipPaint {
+                hull: hex(0xc0_84fc).into(),
+                accent: hex(0x2a_3138).into(),
+            })
+        );
+
+        // The pilot the server happens to call 1 is `LOCAL_ID` inside this
+        // client, and would be painted over the local pilot's own aircraft if
+        // the swap were skipped. It is *this* client that becomes `LOCAL_ID`,
+        // and player 1 takes its number.
+        post(
+            &mut app,
+            ServerMessage::Colors {
+                id: 1,
+                hull_color: 0x46_ff9b,
+                accent_color: 0x00_0000,
+            },
+        );
+        assert_eq!(seen(&app, LOCAL_ID), None, "nothing may land on the pilot");
+        assert_eq!(seen(&app, 5).map(|p| p.hull), Some(hex(0x46_ff9b).into()));
+
+        // A pilot who leaves takes their paint with them: the server hands ids
+        // out again, and the next holder of 7 is somebody else.
+        post(&mut app, ServerMessage::Disconnect { id: 7 });
+        assert_eq!(seen(&app, 7), None);
+
+        // ...and a new room is a new set of ids entirely.
+        post(
+            &mut app,
+            ServerMessage::Room {
+                code: "ABCD".to_owned(),
+                host: false,
+                you: 5,
+                private: false,
+            },
+        );
+        assert_eq!(seen(&app, 5), None, "the room reply clears the registry");
+    }
+
+    /// The other half: this pilot's own colours have to go *out*, or they are
+    /// the only pilot in the room nobody can see properly.
+    #[test]
+    fn the_room_is_told_when_there_is_a_room_to_tell() {
+        let mut app = App::new();
+        app.add_message::<ToServer>();
+        app.insert_resource(Livery::default());
+        app.insert_resource(NetSession::default());
+        app.add_systems(Update, announce_livery);
+
+        let sent = |app: &mut App| -> Vec<ClientMessage> {
+            app.world_mut()
+                .resource_mut::<bevy::ecs::message::Messages<ToServer>>()
+                .drain()
+                .map(|ToServer(msg)| msg)
+                .collect()
+        };
+
+        // Offline: `flush_outbox` would drop it anyway, and there is nobody to
+        // tell.
+        app.update();
+        assert!(sent(&mut app).is_empty(), "nothing goes out with no socket");
+
+        // Reaching a room is the first moment a send can land, so it is the
+        // first moment one is made. `main.js:778` announces at exactly this
+        // point.
+        app.world_mut().resource_mut::<NetSession>().phase = Phase::Room;
+        app.update();
+        assert_eq!(
+            sent(&mut app),
+            vec![ClientMessage::Colors {
+                hull_color: pack_rgb(DEFAULT_HULL),
+                accent_color: pack_rgb(DEFAULT_ACCENT),
+            }]
+        );
+
+        // Sitting there is not news.
+        app.update();
+        assert!(sent(&mut app).is_empty());
+
+        // Changing the paint is.
+        app.world_mut().resource_mut::<Livery>().hull = hex(0xff_5a3c);
+        app.update();
+        assert_eq!(
+            sent(&mut app),
+            vec![ClientMessage::Colors {
+                hull_color: 0xff_5a3c,
+                accent_color: pack_rgb(DEFAULT_ACCENT),
+            }]
+        );
+
+        // And so is the match starting, which is when a client that joined
+        // after the announcement finally has a ship to paint.
+        app.world_mut().resource_mut::<NetSession>().phase = Phase::Playing;
+        app.update();
+        assert_eq!(sent(&mut app).len(), 1);
+    }
+
+    // -- Bot liveries --------------------------------------------------------
+
+    /// The property the whole hashing scheme exists for: two clients watching
+    /// the same fight must agree about what colour a bot is. Nothing here reads
+    /// a clock, a seed, or a random number — the same id gives the same paint,
+    /// every run, on every platform.
+    #[test]
+    fn a_bots_livery_is_a_function_of_its_id_alone() {
+        for id in [-9, -1, 3, 42, 1_000] {
+            let once = painted(&bot(id, 1));
+            for _ in 0..8 {
+                assert_eq!(painted(&bot(id, 1)), once, "bot {id}");
+            }
+            // The team it happens to be on does not enter into it either.
+            assert_eq!(painted(&bot(id, 0)), once, "bot {id} on the other team");
+        }
+    }
+
+    /// Negative ids are bots on the wire (`server/index.js` allocates them as
+    /// `-(nextId++)`), so the index must be a table position and never a
+    /// negative one — which is what `%` would give and `rem_euclid` does not.
+    #[test]
+    fn a_wire_bots_negative_id_still_lands_in_the_table() {
+        for id in -20..0 {
+            let hull = Srgba::from(painted(&bot(id, 1)).hull);
+            assert!(
+                BOT_LIVERY.contains(&hull),
+                "bot {id} was painted something that is not in the box"
+            );
+        }
+        // ...and it is not the same paint as the pilot of the same number.
+        assert_ne!(painted(&bot(-7, 1)), painted(&bot(7, 1)));
+    }
+
+    /// **Nine bots, nine paints.** A skirmish is four allies and five enemies on
+    /// consecutive ids, and a stride coprime with the table length is what makes
+    /// that a guarantee rather than a probability — see [`LIVERY_STRIDE`] for
+    /// what hashing gave instead.
+    #[test]
+    fn nine_bots_come_out_nine_colours() {
+        // The ids `sim_bridge::skirmish` hands out: allies 2..=5, enemies 6..=10.
+        let hulls: Vec<u32> = (2..=10)
+            .map(|id| pack_rgb(Srgba::from(painted(&bot(id, 1)).hull)))
+            .collect();
+        let mut distinct = hulls.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            hulls.len(),
+            "nine bots came out {} colours: {hulls:06x?}",
+            distinct.len()
+        );
+    }
+
+    /// The point of the muted set. A saturated primary reads as a toy on a grey
+    /// airframe, and — more practically — cyan and red mean *side*, so a bot in
+    /// one would be a bot pretending to be a team marker. Chroma is what
+    /// separates them: both team hulls are over 0.55 and no paint reaches 0.30.
+    #[test]
+    fn every_bot_livery_is_a_paint_rather_than_a_colour() {
+        fn chroma(c: Srgba) -> f32 {
+            c.red.max(c.green).max(c.blue) - c.red.min(c.green).min(c.blue)
+        }
+
+        for (i, team) in TEAM_HULL.iter().enumerate() {
+            assert!(
+                chroma(*team) > 0.55,
+                "TEAM_HULL[{i}] is the premise of this test and has stopped being saturated"
+            );
+        }
+        for (i, paint) in BOT_LIVERY.iter().enumerate() {
+            assert!(
+                chroma(*paint) < 0.30,
+                "BOT_LIVERY[{i}] has a chroma of {:.2}, which is a colour, not a paint",
+                chroma(*paint)
+            );
+            let value = paint.red.max(paint.green).max(paint.blue);
+            assert!(
+                (0.15..0.75).contains(&value),
+                "BOT_LIVERY[{i}] is {value:.2} at its brightest: too {} to read as paint",
+                if value < 0.15 { "dark" } else { "bright" }
+            );
+        }
+    }
+
+    /// Every accent has to stay on the dark side of the split, or a bot's
+    /// canopy and intakes come out the same shade as its wings.
+    #[test]
+    fn a_bot_accent_stays_below_the_split() {
+        for (i, paint) in BOT_LIVERY.iter().enumerate() {
+            assert!(
+                is_accent(shade(*paint).into()),
+                "the accent for BOT_LIVERY[{i}] is not dark enough to be one"
+            );
+        }
+    }
+
+    // -- The settings store ---------------------------------------------------
+
+    /// A colour survives a round trip through the store's own spelling, which
+    /// is `customization.js`'s: `#rrggbb`, lower case, no alpha. A pilot who
+    /// picks a hull in this client and then opens the Three.js lobby has to see
+    /// the same one.
+    #[test]
+    fn a_colour_round_trips_through_the_hex_the_js_writes() {
+        for c in [DEFAULT_HULL, DEFAULT_ACCENT, hex(0xff_5a3c), hex(0x00_0000)] {
+            let text = hex_string(c);
+            assert_eq!(text.len(), 7, "{text} is not #rrggbb");
+            assert_eq!(text, text.to_lowercase());
+            let back = parse_hex(&text).expect("the store's own spelling must parse");
+            assert_eq!(pack_rgb(back), pack_rgb(c), "{text}");
+        }
+    }
+
+    /// The wire carries `0xRRGGBB` as an integer, and the far end reads it back
+    /// with [`hex`]. These two are the same conversion in both directions and
+    /// have to stay each other's inverse.
+    #[test]
+    fn the_wire_packing_is_the_inverse_of_the_unpacking() {
+        for packed in [0x00_0000, 0xff_ffff, 0x9f_b6cc, 0xff_5a3c, 0x46_ff9b] {
+            assert_eq!(pack_rgb(hex(packed)), packed);
+        }
+    }
+
+    /// Reading a key back out of a file just written, and — the part that
+    /// matters — leaving every other key in it alone. The livery is two keys and
+    /// `api.rs` keeps its own file; a store that rewrote the document wholesale
+    /// would lose a setting every time another one was saved.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn the_settings_store_keeps_the_keys_it_was_not_asked_about() {
+        let dir = std::env::temp_dir().join(format!(
+            "spaceships-settings-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Nothing saved yet: not an error, just nothing.
+        assert_eq!(settings::get_from(&path, HULL_KEY), None);
+
+        settings::set_in(&path, HULL_KEY, "#ff5a3c").expect("the directory is created for us");
+        settings::set_in(&path, ACCENT_KEY, "#2a3138").expect("second write");
+        settings::set_in(&path, "spaceships:trailShape", "star").expect("third write");
+        // ...and the first key again, with a different value.
+        settings::set_in(&path, HULL_KEY, "#46ff9b").expect("overwrite");
+
+        assert_eq!(
+            settings::get_from(&path, HULL_KEY).as_deref(),
+            Some("#46ff9b")
+        );
+        assert_eq!(
+            settings::get_from(&path, ACCENT_KEY).as_deref(),
+            Some("#2a3138")
+        );
+        assert_eq!(
+            settings::get_from(&path, "spaceships:trailShape").as_deref(),
+            Some("star")
+        );
+
+        // A file that is not JSON reads as "nothing saved" rather than as a
+        // reason to fail to start.
+        std::fs::write(&path, "{ this is not json").expect("write");
+        assert_eq!(settings::get_from(&path, HULL_KEY), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- The asteroid damage tag ---------------------------------------------

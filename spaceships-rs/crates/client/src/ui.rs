@@ -156,6 +156,7 @@ use crate::cockpit::ViewMode;
 use crate::net::{
     wire_map, ConnState, NetCommand, NetConfig, NetSession, NetStatus, Phase, ToServer,
 };
+use crate::scene::Livery;
 use crate::sim_bridge::{MatchSetup, PlayerInput};
 
 // ---------------------------------------------------------------------------
@@ -173,6 +174,7 @@ impl Plugin for UiPlugin {
         app.init_resource::<Menu>()
             .init_resource::<Applied>()
             .init_resource::<PreviewSkin>()
+            .init_resource::<PaintAt>()
             .add_message::<LaunchRequest>()
             .add_message::<ReturnToLobby>()
             .add_systems(Update, reopen_menu)
@@ -180,7 +182,10 @@ impl Plugin for UiPlugin {
             // Before `read_input`, so a page opened by the server this frame is
             // the page the keyboard acts on.
             .add_systems(Update, follow_session.before(read_input))
-            .add_systems(Startup, forced_room)
+            // `Startup`, so the cursor is on the pilot's own paint before the
+            // page is first drawn. `ScenePlugin` inserts `Livery` at plugin
+            // build time, which is before any schedule runs.
+            .add_systems(Startup, (forced_room, init_livery))
             // `PreUpdate`, after `bevy_input` has published the frame's keys
             // and before any consumer in `Update` reads them. See
             // [`swallow_typing`] for why it has to be here and not later.
@@ -201,6 +206,10 @@ impl Plugin for UiPlugin {
                     publish_lobby_open,
                     publish_volume,
                     drive_menu,
+                    // Between the cursor and the paint: `read_input` moves the
+                    // choice, this carries it to the resource, and
+                    // `paint_preview` is what the resource looks like.
+                    follow_livery,
                     paint_preview,
                     spin_preview,
                     fit_tube,
@@ -671,7 +680,7 @@ struct PreviewSkin {
     hull: Option<Handle<StandardMaterial>>,
     accent: Option<Handle<StandardMaterial>>,
     /// The paint last written, so [`paint_preview`] can compare and return.
-    applied: Option<(u8, u8)>,
+    applied: Option<Livery>,
 }
 
 /// The luminance below which an authored material is an **accent** rather than
@@ -700,6 +709,11 @@ const LIVERY: [(&str, u32); 8] = [
     ("AZURE", 0x3d_9d_ff),
     ("GRAPHITE", 0x2a_31_38),
 ];
+
+/// Where the accent cursor rests when nothing has been chosen and nothing
+/// saved: `GRAPHITE`, the one entry that is dark enough to *be* an accent.
+/// `customization.js:11`'s default is `#2a3340`, which is the same paint.
+const DEFAULT_ACCENT_PICK: u8 = 7;
 
 /// `customization.js`'s five trail shapes.
 const TRAIL_SHAPES: [&str; 5] = ["CIRCLE", "SQUARE", "TRIANGLE", "STAR", "DAVID"];
@@ -834,27 +848,182 @@ fn dress_preview(
 /// down: mutating a `StandardMaterial` re-uploads its bind group, so doing it
 /// every frame would be the GPU-side twin of the DOM HUD's per-frame style
 /// write.
+///
+/// It reads [`Livery`] rather than `menu.hull`, which is what makes this a
+/// *preview* rather than a second opinion: the spinning airframe wears exactly
+/// what the flying one does, including a colour that came from the JS
+/// customizer's wheel and is not one of the eight names in [`LIVERY`].
 fn paint_preview(
-    menu: Res<Menu>,
+    livery: Res<Livery>,
     mut skin: ResMut<PreviewSkin>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let want = (menu.hull, menu.accent);
-    if skin.applied == Some(want) {
+    if skin.applied == Some(*livery) {
         return;
     }
     let (Some(hull), Some(accent)) = (skin.hull.clone(), skin.accent.clone()) else {
         // The glTF has not landed yet; try again next frame.
         return;
     };
-    skin.applied = Some(want);
+    skin.applied = Some(*livery);
 
-    for (handle, idx) in [(hull, want.0), (accent, want.1)] {
+    for (handle, colour) in [(hull, livery.hull), (accent, livery.accent)] {
         if let Some(mut mat) = materials.get_mut(&handle) {
-            let colour = pal::rgb(LIVERY[usize::from(idx) % LIVERY.len()].1);
             // Alpha is the model's, not the palette's: a canopy authored
             // translucent must stay translucent (`scene.rs`).
-            mat.base_color = colour.with_alpha(mat.base_color.alpha());
+            mat.base_color = Color::from(colour).with_alpha(mat.base_color.alpha());
+        }
+    }
+}
+
+/// Where the picker's two cursors were when [`Livery`] last agreed with them.
+///
+/// A resource and not a `Local` in [`follow_livery`], because the agreement is
+/// established during `Startup` — [`init_livery`] puts the cursors on the saved
+/// colour — and a `Local` cannot be seeded from another system. It first sees
+/// the world a frame later, by which time the page's own "arrowing onto a row is
+/// choosing it" rule has already moved something, and it would take that for the
+/// starting position. It did: the display said `ICE` while the aircraft was red.
+#[derive(Resource, Default)]
+struct PaintAt(Option<(u8, u8)>);
+
+/// Carries the picker's two indices onto [`Livery`], which is what everything
+/// else reads.
+///
+/// **This is the wire that was missing.** `Action::SetHull` moved
+/// `menu.hull`; `scene.rs` painted the aircraft from storage at spawn; and
+/// nothing joined the two, so the page had a working colour picker attached to
+/// nothing at all.
+///
+/// [`PaintAt`] is not an optimisation. The livery is loaded from the store
+/// before this ever runs and may be a colour the paint box does not contain —
+/// `#c73f7a` off the JS colour wheel, say — while [`init_livery`] can only put
+/// the cursor on the *nearest* name. Writing unconditionally would therefore
+/// quietly round the pilot's saved colour to the nearest name every time the
+/// client started. A colour is written when the cursor *moves*.
+fn follow_livery(menu: Res<Menu>, mut livery: ResMut<Livery>, mut at: ResMut<PaintAt>) {
+    let pick = (menu.hull, menu.accent);
+    if at.0 == Some(pick) {
+        return;
+    }
+    // Nothing seeded it: take this as the starting position rather than as a
+    // choice, which is what `init_livery` would have said.
+    if at.0.is_none() {
+        at.0 = Some(pick);
+        return;
+    }
+    at.0 = Some(pick);
+
+    let chosen = Livery {
+        hull: livery_hex(pick.0),
+        accent: livery_hex(pick.1),
+    };
+    // Guarded because `ResMut` marks the resource changed on deref, and
+    // `scene.rs` hangs a repaint, a disk write and a broadcast off that.
+    if *livery != chosen {
+        *livery = chosen;
+    }
+}
+
+/// One entry of the paint box, as a colour.
+fn livery_hex(pick: u8) -> Srgba {
+    crate::scene::hex(LIVERY[usize::from(pick) % LIVERY.len()].1)
+}
+
+/// Seeds the picker from the livery the pilot is actually flying in.
+///
+/// Without this the page opened on `ICE`/`GRAPHITE` however the aircraft was
+/// painted, so a pilot who had chosen `EMBER` last week came back to a display
+/// insisting they had chosen white. The cursor goes to the nearest name because
+/// the store holds a *colour* and this page offers *names*: a hull that came
+/// from the JS customizer's wheel has no exact entry, and the nearest one is a
+/// truer answer than the first one.
+///
+/// It also moves the page's *cursor* onto the hull the pilot is wearing, and
+/// that is not cosmetic. Arrowing onto a row is choosing it ([`preview`]), and
+/// the cursor starts at slot zero — so a livery page that opened with the cursor
+/// resting on `ICE` armed `ICE`, which used to be harmless and, now that a
+/// choice reaches the aircraft, would repaint every pilot white the moment they
+/// looked at the page.
+///
+/// `SPACESHIPS_LIVERY=ember` — or `ember,graphite`, or a pair of indices — picks
+/// for the pilot at startup, which is how a capture script reaches this page
+/// without a hand on the keyboard. It goes through exactly the same resource a
+/// keypress would, so what it stages is the real behaviour and not a rehearsal
+/// of it: the paint is applied, saved, and announced to the room.
+fn init_livery(mut menu: ResMut<Menu>, mut livery: ResMut<Livery>, mut at: ResMut<PaintAt>) {
+    match forced_livery() {
+        Some((hull, accent)) => {
+            menu.hull = hull;
+            menu.accent = accent;
+            *livery = Livery {
+                hull: livery_hex(hull),
+                accent: livery_hex(accent),
+            };
+        }
+        None => {
+            menu.hull = nearest_livery(livery.hull);
+            menu.accent = nearest_livery(livery.accent);
+        }
+    }
+    // The hull rows are the first controls on the page, so the slot *is* the
+    // paint's index. See [`build_menu`]'s LIVERY section.
+    menu.focus[Screen::Livery.index()] = menu.hull;
+    at.0 = Some((menu.hull, menu.accent));
+}
+
+/// The entry of [`LIVERY`] closest to a colour, by straight-line distance in
+/// sRGB. Not a perceptual metric — for eight well-separated paints, the extra
+/// arithmetic of one would not change a single answer.
+fn nearest_livery(c: Srgba) -> u8 {
+    let mut best = (0u8, f32::INFINITY);
+    for (i, &(_, hex)) in LIVERY.iter().enumerate() {
+        let candidate = crate::scene::hex(hex);
+        let d = (candidate.red - c.red).powi(2)
+            + (candidate.green - c.green).powi(2)
+            + (candidate.blue - c.blue).powi(2);
+        if d < best.1 {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                best = (i as u8, d);
+            }
+        }
+    }
+    best.0
+}
+
+/// `SPACESHIPS_LIVERY=<hull>[,<accent>]`, by name or by index.
+///
+/// Native only; the browser has no environment, the same as every other hook in
+/// this file.
+fn forced_livery() -> Option<(u8, u8)> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let spec = std::env::var("SPACESHIPS_LIVERY").ok()?;
+        let mut parts = spec.split(',').filter(|s| !s.trim().is_empty());
+        let hull = parts.next().and_then(livery_named)?;
+        let accent = parts.next().and_then(livery_named);
+        Some((hull, accent.unwrap_or(DEFAULT_ACCENT_PICK)))
+    }
+}
+
+/// One name — or index — from [`LIVERY`].
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn livery_named(s: &str) -> Option<u8> {
+    let s = s.trim();
+    #[allow(clippy::cast_possible_truncation)]
+    if let Some(i) = LIVERY.iter().position(|(n, _)| n.eq_ignore_ascii_case(s)) {
+        return Some(i as u8);
+    }
+    match s.parse::<u8>() {
+        Ok(i) if usize::from(i) < LIVERY.len() => Some(i),
+        _ => {
+            warn!("SPACESHIPS_LIVERY={s} is not a paint; the saved one stands");
+            None
         }
     }
 }
@@ -1477,8 +1646,13 @@ impl Default for Menu {
             // `customization.js:8`/`:11`'s defaults, as near as this palette
             // gets: a pale hull and a dark accent, which is the split
             // `is_accent` is looking for in the first place.
+            //
+            // Only where the cursor *starts*. [`init_livery`] moves it onto
+            // whatever the pilot last flew before the page is ever drawn, and
+            // this stays pure so that the tests below can build a `Menu` without
+            // reading the player's config directory.
             hull: 0,
-            accent: 7,
+            accent: DEFAULT_ACCENT_PICK,
             trail: 0,
             scheme: 0,
             flags: Flag::DEFAULTS,
@@ -2753,27 +2927,18 @@ fn fmt_trial(best: Option<f32>) -> String {
 
 /// Writes one setting to wherever this build keeps them.
 ///
-/// The mirror of `scene.rs::read_setting`, and deliberately the *same* keys, so
-/// a colour picked here is the colour that flies. On the web that is
-/// `localStorage`. **Natively there is nowhere to put it** — `scene.rs` reads
-/// an environment variable on that side, which a running process cannot write
-/// for its own next launch, so the choice lasts as long as the process. That is
-/// a missing profile store, not something to invent a third scheme for here.
-#[cfg(target_arch = "wasm32")]
+/// `scene.rs`'s store, under the same keys the JS uses — `localStorage` on the
+/// web, `settings.json` in the user's own configuration directory natively.
+///
+/// This used to be two functions, and the native one wrote nothing at all: it
+/// logged *"not persisted: the native build has no profile store"* and dropped
+/// the value on the floor. That was the missing half of "changing your ship's
+/// colour does not work" — the picker was saving into a hole. The livery no
+/// longer comes through here at all (it is [`crate::scene::Livery`], and
+/// `scene.rs` persists it when it changes); what is left is the trail shape,
+/// which the renderer has not grown a use for yet.
 fn save_setting(key: &str, value: &str) {
-    if let Some(store) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = store.set_item(key, value);
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn save_setting(key: &str, value: &str) {
-    debug!("{key} = {value} (not persisted: the native build has no profile store)");
-}
-
-/// A colour, in the `#rrggbb` form `customization.js` writes.
-fn save_colour(key: &str, hex: u32) {
-    save_setting(key, &format!("#{hex:06x}"));
+    crate::scene::settings::set(key, value);
 }
 
 fn display_of(visible: bool) -> Display {
@@ -4912,14 +5077,18 @@ fn apply(
             menu.say("ORDER SELECTED");
         }
         Action::SetItem(i) => menu.item = i,
+        // Neither of these saves anything, and that is not an omission. The
+        // choice *is* `menu.hull`; [`follow_livery`] carries it to
+        // [`crate::scene::Livery`], which is what the aircraft, the preview, the
+        // store and the room all read. Saving here as well would be a second
+        // writer of one fact, and it is the arrangement that let the picker and
+        // the ship disagree in the first place.
         Action::SetHull(i) => {
             menu.hull = i;
-            save_colour("spaceships:shipColor", LIVERY[usize::from(i)].1);
             menu.say("HULL APPLIED");
         }
         Action::SetAccent(i) => {
             menu.accent = i;
-            save_colour("spaceships:shipAccentColor", LIVERY[usize::from(i)].1);
             menu.say("ACCENT APPLIED");
         }
         Action::SetTrail(i) => {
@@ -8103,5 +8272,151 @@ mod tests {
         };
         assert_eq!(closed.screen, 0, "a closed model reports the first page");
         assert_eq!(page_to_hide(Some(closed)), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The paint box
+    // -----------------------------------------------------------------------
+
+    /// Runs [`init_livery`] and then [`follow_livery`] over a world holding
+    /// both resources, driving the picker in between — which is the whole life
+    /// of a colour: loaded from the store, shown on the page, chosen, applied.
+    ///
+    /// The `SystemState` is kept across both calls to `follow_livery` on
+    /// purpose: its `Local` is the "where the cursor started" memory, and a test
+    /// that rebuilt the state between frames would not be testing the thing that
+    /// makes a saved colour survive being looked at.
+    fn pick(saved: Livery, moves: &[(u8, u8)]) -> (u8, u8, Vec<Livery>) {
+        use bevy::ecs::system::SystemState;
+
+        let mut world = World::new();
+        world.insert_resource(Menu::default());
+        world.insert_resource(saved);
+        world.init_resource::<PaintAt>();
+
+        let mut init: SystemState<(ResMut<Menu>, ResMut<Livery>, ResMut<PaintAt>)> =
+            SystemState::new(&mut world);
+        {
+            let (menu, livery, at) = init.get_mut(&mut world).expect("the params validate");
+            init_livery(menu, livery, at);
+        }
+        let opened = {
+            let menu = world.resource::<Menu>();
+            (menu.hull, menu.accent)
+        };
+
+        let mut follow: SystemState<(Res<Menu>, ResMut<Livery>, ResMut<PaintAt>)> =
+            SystemState::new(&mut world);
+        let mut seen = Vec::new();
+        // One frame with the picker untouched, then one per move.
+        for step in std::iter::once(None).chain(moves.iter().map(Some)) {
+            if let Some(&(hull, accent)) = step {
+                let mut menu = world.resource_mut::<Menu>();
+                menu.hull = hull;
+                menu.accent = accent;
+            }
+            let (menu, livery, at) = follow.get_mut(&mut world).expect("the params validate");
+            follow_livery(menu, livery, at);
+            seen.push(*world.resource::<Livery>());
+        }
+        (opened.0, opened.1, seen)
+    }
+
+    /// The cursor opens on the paint the pilot is wearing — and it has to, or
+    /// the page's own arming rule repaints them the moment they look at it. See
+    /// [`init_livery`].
+    #[test]
+    fn the_page_opens_with_the_cursor_on_the_current_hull() {
+        use bevy::ecs::system::SystemState;
+
+        let mut world = World::new();
+        world.insert_resource(Menu::default());
+        world.insert_resource(Livery {
+            hull: livery_hex(5),
+            accent: livery_hex(DEFAULT_ACCENT_PICK),
+        });
+        world.init_resource::<PaintAt>();
+        let mut init: SystemState<(ResMut<Menu>, ResMut<Livery>, ResMut<PaintAt>)> =
+            SystemState::new(&mut world);
+        let (menu, livery, at) = init.get_mut(&mut world).expect("the params validate");
+        init_livery(menu, livery, at);
+
+        let menu = world.resource::<Menu>();
+        assert_eq!(menu.hull, 5);
+        assert_eq!(
+            menu.focus[Screen::Livery.index()],
+            5,
+            "the cursor is on the hull the pilot is wearing"
+        );
+    }
+
+    /// **The bug, as a test.** A colour chosen on the livery page has to reach
+    /// the resource the aircraft is painted from; before this there was no path
+    /// between the two at all.
+    #[test]
+    fn choosing_a_paint_repaints_the_pilots_aircraft() {
+        let ember = 4;
+        let (hull, _, seen) = pick(Livery::default(), &[(ember, DEFAULT_ACCENT_PICK)]);
+        assert_eq!(hull, 1, "the defaults open on STEEL, the nearest name");
+        assert_eq!(
+            seen[0],
+            Livery::default(),
+            "merely looking at the page changes nothing"
+        );
+        assert_eq!(
+            seen[1].hull,
+            livery_hex(ember),
+            "the aircraft wears what was picked"
+        );
+        assert_eq!(seen[1].accent, livery_hex(DEFAULT_ACCENT_PICK));
+    }
+
+    /// A hull that came off the JS customizer's colour *wheel* is not one of the
+    /// eight names here. The page has to open on the nearest of them — and must
+    /// not quietly repaint the aircraft to it, which is what a picker that wrote
+    /// on its first frame would do.
+    #[test]
+    fn a_colour_the_paint_box_does_not_have_is_shown_but_not_rounded() {
+        let off_palette = Livery {
+            hull: crate::scene::hex(0xc7_3f7a),
+            accent: crate::scene::hex(0x2a_3138),
+        };
+        let (hull, accent, seen) = pick(off_palette, &[]);
+        assert_eq!(
+            LIVERY[usize::from(hull)].0,
+            "EMBER",
+            "a raspberry hull is nearest EMBER in this box"
+        );
+        assert_eq!(LIVERY[usize::from(accent)].0, "GRAPHITE");
+        assert_eq!(
+            seen[0], off_palette,
+            "the pilot's own colour survived being looked at"
+        );
+    }
+
+    /// Every name in the box resolves to itself, or the page opens on a
+    /// different paint from the one it is showing.
+    #[test]
+    fn each_paint_is_its_own_nearest_neighbour() {
+        for (i, &(name, hex)) in LIVERY.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let want = i as u8;
+            assert_eq!(
+                nearest_livery(crate::scene::hex(hex)),
+                want,
+                "{name} did not resolve to itself"
+            );
+        }
+    }
+
+    /// The capture hook. Names are case-insensitive, indices work, and anything
+    /// else leaves the saved paint alone rather than picking one at random.
+    #[test]
+    fn the_livery_hook_takes_a_name_or_an_index() {
+        assert_eq!(livery_named("EMBER"), Some(4));
+        assert_eq!(livery_named(" ember "), Some(4));
+        assert_eq!(livery_named("7"), Some(7));
+        assert_eq!(livery_named("8"), None, "there is no ninth paint");
+        assert_eq!(livery_named("puce"), None);
     }
 }
