@@ -1740,12 +1740,47 @@ pub struct BotRules {
     /// (`STUCK_TIME`).
     pub stuck_time: f64,
 
-    /// Terrain clearance below which the bot pulls up. `bot.js:196`.
+    /// Terrain clearance below which the bot pulls up.
+    ///
+    /// **Changed in the Rust port**, from `bot.js:196`'s 180. That number was
+    /// chosen against a heightfield with nothing in it to fly through. On the
+    /// rebuilt Sierras it is larger than every ravine is deep, so a bot could
+    /// never enter one — measured over ninety seconds, bots spent 46% of their
+    /// time between 300 and 400 units up and 6% below 100, cruising serenely
+    /// over the canyons the map was built around.
+    ///
+    /// 90 is under the depth of both ravines, so the low routes are available
+    /// to the AI as well as to players, and it still clears the tree line.
     pub terrain_margin: f64,
-    /// Strength of the pull-up, applied to the desired direction's y before
-    /// renormalizing. `bot.js:205`.
-    pub terrain_pull: f64,
-    /// Hard floor the bot is clamped to above the terrain. `bot.js:264`.
+    /// How far the pull-up may swing the desired heading toward straight up, as
+    /// a fraction: 0 leaves it alone, 1 points it at the sky.
+    ///
+    /// **Changed in the Rust port**, and it is a different quantity from the one
+    /// it replaces, so the JS number does not carry over. `bot.js:205` adds
+    /// `pull * 6` to an already-normalised heading's `y`, which is not a bounded
+    /// operation — at the 40 units of clearance a bot has sitting on its own
+    /// runway it commands 79° nose-up, and every bot in the match performs the
+    /// same vertical launch in unison at the start. A blend toward `+Y` is
+    /// bounded by construction.
+    pub terrain_pull_max: f64,
+    /// Hard floor the bot is clamped to above the terrain, as a last resort
+    /// when the pull-up did not get there in time.
+    ///
+    /// **Changed in the Rust port**, and it is a fix rather than a retune.
+    /// `bot.js:264` clamps to 5 — the same number as
+    /// [`WorldRules::terrain_kill_clearance`], so the clamp that exists to keep
+    /// a bot alive placed it *exactly* on the altitude that kills it, with no
+    /// margin at all. It survived only because the kill test is a strict `<`.
+    ///
+    /// Nothing noticed while [`Self::terrain_margin`] was 180, because the
+    /// pull-up never let a bot get near the floor. Lowering the margin to 90 so
+    /// bots could use the ravines put one on the clamp within seconds, at 5.0
+    /// clearance, one rounding away from dying to its own safety net.
+    ///
+    /// Derived from the kill clearance rather than written as 18, so the two
+    /// cannot drift back together.
+    ///
+    /// [`WorldRules::terrain_kill_clearance`]: crate::rules::WorldRules::terrain_kill_clearance
     pub terrain_min_clearance: f64,
     /// Lookahead multiple of [`Self::speed`] used for the terrain check.
     /// `bot.js:199` (`SPEED * 1.5`).
@@ -1823,9 +1858,9 @@ impl BotRules {
         stuck_speed_threshold: 6.0,
         stuck_time: 1.5,
 
-        terrain_margin: 180.0,
-        terrain_pull: 6.0,
-        terrain_min_clearance: 5.0,
+        terrain_margin: 90.0,
+        terrain_pull_max: 0.9,
+        terrain_min_clearance: WorldRules::DEFAULT.terrain_kill_clearance + 13.0,
         terrain_lookahead_seconds: 1.5,
     };
 

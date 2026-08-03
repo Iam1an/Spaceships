@@ -418,11 +418,25 @@ fn plan_bot(
         let ahead_h = ground.height_at(ahead.x, ahead.z);
         let clearance = (ship.pos.y - below).min(ship.pos.y - ahead_h);
         if clearance < br.terrain_margin {
+            // Blend the desired heading toward straight up, rather than adding
+            // to its `y`. `bot.js:205` does the latter — `desired.y += pull * 6`
+            // on an already-normalised vector — and the 6 makes that a command
+            // to fly *vertically* for any clearance meaningfully under the
+            // margin: measured off the pad at 40 units of clearance, bots held
+            // 79° nose-up for two and a half seconds and overshot to 400 units.
+            // A blend cannot exceed straight up however large the factor gets,
+            // so the worst case is a hard pull rather than a rocket launch.
+            //
+            // Squared, so the response is gentle at the top of the band and
+            // firm at the bottom. Linear spends the whole band steep, which is
+            // the other half of why the JS climb looked like a launch.
             let pull = (br.terrain_margin - clearance) / br.terrain_margin;
-            desired.y += pull * br.terrain_pull;
-            if desired.length() > 0.001 {
-                desired = desired.normalize();
-            }
+            let blend = pull * pull * br.terrain_pull_max;
+            desired = desired.lerp(Vec3::new(0.0, 1.0, 0.0), blend);
+            // A desired heading of straight *down* blended halfway to straight
+            // up is the zero vector, and normalising that is a NaN that would
+            // spread into the ship's quaternion and never come out.
+            desired = desired.try_normalize().unwrap_or(Vec3::new(0.0, 1.0, 0.0));
         }
     }
 
