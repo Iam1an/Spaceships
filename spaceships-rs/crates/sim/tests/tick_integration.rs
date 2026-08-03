@@ -1379,3 +1379,75 @@ fn hold_forward(id: i32) -> Input {
         ..Input::default()
     }
 }
+
+/// **Bots can fly the Sierras.**
+///
+/// A map is not finished when it looks right. The terrain was rebuilt with
+/// 590-unit ranges, ravines with near-vertical walls, and a lake whose surface
+/// is solid — and `bot.rs` navigates all of it with one lookahead sample and a
+/// pull-up, tuned against a heightfield that no longer exists. If the new relief
+/// were beyond it, half of every skirmish would be bots flying into hillsides,
+/// and nothing else in the suite would notice: every other terrain test asks
+/// where the ground *is*, not whether anything can fly over it.
+///
+/// The assertion is on clearance rather than on a death count, because a death
+/// count cannot say what killed anyone — these bots are on two teams and shoot
+/// each other, which is the point of putting them on two teams. Clearance is the
+/// stronger claim anyway: no bot ever entered the kill volume at all.
+///
+/// Measured at the time of writing: minimum clearance 35 units across three
+/// seeds and 60 seconds of flying, against a hard floor of 5. The margin is the
+/// avoidance working, not the clamp catching them.
+#[test]
+fn bots_can_fly_the_terrain_map() {
+    let rules = Rules::DEFAULT;
+    for seed in [1u64, 7, 99] {
+        let mut w = World::new(seed, rules, Mode::Skirmish, MapKind::Terrain);
+        let mut rng = spaceships_sim::rng::Rng::new(seed);
+        // Ten bots scattered over the whole map — ranges, ravines, lake and
+        // coast alike — rather than the one clear corridor a fixture would pick.
+        for i in 0..10i32 {
+            let x = rng.range_f64(-1500.0, 1500.0);
+            let z = rng.range_f64(-1500.0, 1500.0);
+            let ground = spaceships_sim::ship::terrain_height(x, z, &rules);
+            let mut s = Ship::spawn(
+                100 + i,
+                ShipKind::Bot,
+                Vec3::new(x, ground + 120.0, z),
+                Quat::IDENTITY,
+                &rules,
+            );
+            s.team = Some(if i % 2 == 0 { Team::Zero } else { Team::One });
+            w.ships.push(s);
+        }
+
+        let mut lowest = f64::INFINITY;
+        let mut moved = 0.0f64;
+        let start: Vec<Vec3> = w.ships.iter().map(|s| s.pos).collect();
+        for _ in 0..(60 * 60) {
+            tick(&mut w, &[], &[], TICK_DT);
+            for s in &w.ships {
+                if s.alive {
+                    let g = spaceships_sim::ship::terrain_height(s.pos.x, s.pos.z, &rules);
+                    lowest = lowest.min(s.pos.y - g);
+                }
+            }
+        }
+        for (i, s) in w.ships.iter().enumerate() {
+            moved = moved.max(s.pos.distance(start[i]));
+        }
+
+        assert!(
+            lowest > rules.world.terrain_kill_clearance,
+            "seed {seed}: a bot closed to {lowest:.1} of the ground, inside the \
+             {:.1} kill clearance",
+            rules.world.terrain_kill_clearance,
+        );
+        // And they were actually flying, not parked in a corner: a fixture that
+        // never moves would pass the clearance check trivially.
+        assert!(
+            moved > 500.0,
+            "seed {seed}: the bots barely moved ({moved:.0})"
+        );
+    }
+}
