@@ -527,8 +527,9 @@ In progress on branch `rust-port`. The goal is an all-Rust game: a Bevy renderer
 
 ```
 spaceships-rs/
-├── crates/sim        Deterministic simulation. 430 tests. ZERO dependencies.
+├── crates/sim        Deterministic simulation. 435 tests. ZERO dependencies.
 ├── crates/protocol   The 35 WebSocket messages. 48 round-trip tests.
+├── crates/replay     Recording and playback. Depends on `sim` and nothing else.
 ├── crates/server     Replacing server/ — axum + tokio-tungstenite + rusqlite.
 └── crates/client     Bevy 0.19 renderer, native + wasm.
 ```
@@ -542,7 +543,21 @@ spaceships-rs/
 
 ### Why determinism matters beyond netcode
 
-It also makes the planned replay system nearly free: a replay is a seed plus an input log, re-simulated, rather than recorded state. See `BACKLOG.md`.
+It also makes the replay system nearly free: a replay is a seed plus an input log, re-simulated, rather than recorded state.
+
+### Replays (`crates/replay`)
+
+**Recording is always on**, in every mode, and writes to `<state dir>/replays/*.spr` when a match ends or the app exits. `SPACESHIPS_RECORD=0` turns it off. A five-minute match is about 480 kB flown on the mouse and 38 kB on the keyboard — the two aiming axes are `f64` and move every tick, and they cannot be quantised without changing the match.
+
+A recording is **the opening `World`, a rules fingerprint, and the two slices `tick()` was handed on every tick since**. The initial world is stored rather than rebuilt from a seed, which is what lets one path record solo, campaign, trials *and* multiplayer: a networked match's opening state comes off the wire, not out of a seed. The `NetEvent` half of the log is what makes a multiplayer replay correct at all — under `Authority::Server` the client resolves no damage, no respawn and no match clock of its own.
+
+`SPACESHIPS_REPLAY=<file>` plays one back. In the viewer: `Space` play/pause, `,`/`.` step, arrows scrub, `-`/`=` rate (0.1×–4×), `Tab` ride a ship, `V` inside/outside, `G` free camera. `SPACESHIPS_REPLAY_VIEW=free|chase|seat[:id]` and `SPACESHIPS_REPLAY_AT=<seconds>` open on a given view and moment, for captures — the same family as `SPACESHIPS_COCKPIT`.
+
+**A replay is never a second simulation.** Playback calls `sim::tick::tick` with the recorded slices; there is no replay branch inside `sim` and there must never be one, or a replay stops being evidence of what happened.
+
+Two known gaps, both documented at their call sites: seeking through a *trials* or *campaign* replay loses the work `sim_bridge::step_modes` does outside `sim` (playing forward is exact), and riding another aircraft shows the recorded pilot's gauges, because `sim` derives `HudState` for `World::local_id` alone.
+
+`cargo run --release -p spaceships-replay --example budget` prints the size and seek-cost sweep. `BACKLOG.md` §1 has phase two, including the export-encoder decision.
 
 ### The Sierras (Rust port only)
 

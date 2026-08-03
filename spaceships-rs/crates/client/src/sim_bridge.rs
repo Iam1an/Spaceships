@@ -684,7 +684,25 @@ fn fixed_tick(
     mut roster: ResMut<Roster>,
     mut inbox: ResMut<crate::net::NetInbox>,
     lobby: Option<Res<crate::ui::LobbyOpen>>,
+    mut tape: ResMut<crate::replay::Tape>,
+    theatre: Option<ResMut<crate::replay::Theatre>>,
 ) {
+    // Nobody is flying a replay, so none of what follows applies: the stick and
+    // the server's traffic both come off the recording, and `replay.rs`'s
+    // transport decides whether this step happens at all. What *is* shared is
+    // everything after the step, which is the point — a replayed tick produces
+    // the same `Frame` a live one did, so the renderer cannot tell them apart.
+    if let Some(mut theatre) = theatre {
+        if theatre.running() {
+            if let Some(replayed) = theatre.step(&mut world.0) {
+                frame.0 = replayed;
+                step_modes(&mut world.0, &mut frame.0, &mut roster, &setup, TICK_DT);
+            }
+        }
+        roster.sync(&world.0);
+        return;
+    }
+
     // The lobby is not an overlay on a running game: while it is up, a *solo*
     // match is frozen. Without this the world keeps ticking behind the menu, so
     // bots hunt and kill a player who is reading a mission brief and cannot
@@ -731,6 +749,14 @@ fn fixed_tick(
     // than reading it — is what makes a rendered frame that runs three fixed
     // steps apply each event once.
     let events = std::mem::take(&mut inbox.0);
+
+    // The dashcam, and the one contract it has: the slices as they go *in*.
+    // Recording after the call would still see the right values, but the queue
+    // above has been drained by then and a future edit that moved this line
+    // below the tick would silently record an empty event log — which is
+    // precisely the log a multiplayer replay cannot do without.
+    tape.push(&[player], &events);
+
     frame.0 = tick(&mut world.0, &[player], &events, TICK_DT);
 
     step_modes(&mut world.0, &mut frame.0, &mut roster, &setup, TICK_DT);

@@ -1330,10 +1330,13 @@ impl Screen {
 /// - unset — the product behaviour: self test, then the mission board.
 ///
 /// With one exception. `sim_bridge.rs` reads `SPACESHIPS_MODE` to choose a
-/// match and `cockpit.rs` reads `SPACESHIPS_COCKPIT` to sit the pilot down.
-/// Either says the operator has already made the choice this menu exists to
-/// offer, so the menu stands down and lets them fly — which keeps every
-/// existing capture recipe in this crate working unchanged.
+/// match, `cockpit.rs` reads `SPACESHIPS_COCKPIT` to sit the pilot down, and
+/// `replay.rs` reads `SPACESHIPS_REPLAY` to play a recorded one back. Each says
+/// the operator has already made the choice this menu exists to offer, so the
+/// menu stands down and lets them fly — which keeps every existing capture
+/// recipe in this crate working unchanged. The replay case is not merely a
+/// convenience: a mission board over a recording offers to launch a match that
+/// would throw the recording away.
 fn forced_screen() -> (Option<Screen>, bool) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -1352,7 +1355,8 @@ fn forced_screen() -> (Option<Screen>, bool) {
             },
             Err(_) => {
                 let flying = std::env::var_os("SPACESHIPS_MODE").is_some()
-                    || std::env::var_os("SPACESHIPS_COCKPIT").is_some();
+                    || std::env::var_os("SPACESHIPS_COCKPIT").is_some()
+                    || std::env::var_os("SPACESHIPS_REPLAY").is_some();
                 (None, !flying)
             }
         }

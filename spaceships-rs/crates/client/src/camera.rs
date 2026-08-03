@@ -37,7 +37,6 @@ use bevy::render::render_resource::ShaderType;
 use bevy::shader::{Shader, ShaderRef};
 
 use crate::scene::ShipRoot;
-use crate::LOCAL_ID;
 
 /// `ThirdPersonCamera.distance`.
 const DISTANCE: f32 = 11.0;
@@ -93,7 +92,17 @@ impl Plugin for FollowCameraPlugin {
             .add_systems(Startup, (install_grade_shader, spawn_camera))
             // The chase target is a transform, so this has to land before
             // transform propagation or the camera trails by a frame.
-            .add_systems(PostUpdate, follow.before(TransformSystems::Propagate))
+            //
+            // Gated on the camera still being attached to a ship: a replay's
+            // free camera flies six degrees of freedom and writes the same
+            // `Transform`, and two systems fighting over one camera is a view
+            // that snaps back to the ship every frame.
+            .add_systems(
+                PostUpdate,
+                follow
+                    .before(TransformSystems::Propagate)
+                    .run_if(crate::replay::camera_is_attached),
+            )
             .add_systems(Update, advance_grain);
     }
 }
@@ -435,9 +444,13 @@ fn advance_grain(time: Res<Time>, mut grades: Query<&mut FilmGrade>) {
 fn follow(
     ships: Query<(&ShipRoot, &Transform), Without<ChaseCam>>,
     time: Res<Time>,
+    // Which ship, rather than `LOCAL_ID`. It *is* `LOCAL_ID` in a live match —
+    // that is the resource's default — and it is somebody else's aircraft when
+    // a replay is riding one. See `replay::ViewTarget`.
+    target: Res<crate::replay::ViewTarget>,
     mut cam: Query<(&mut Transform, &mut ChaseCam), Without<ShipRoot>>,
 ) {
-    let Some((_, me)) = ships.iter().find(|(root, _)| root.0 == LOCAL_ID) else {
+    let Some((_, me)) = ships.iter().find(|(root, _)| root.0 == target.0) else {
         return;
     };
     let Ok((mut tf, mut chase)) = cam.single_mut() else {

@@ -15,6 +15,11 @@ rust-version = "1.95"
 # The whole point: the renderer reads the simulation, never the reverse.
 spaceships-sim.workspace = true
 
+# Recording and playback. Depends on `sim` and nothing else, so bringing it in
+# adds no crate to the graph beyond itself — and the file format it defines is
+# hand-rolled for exactly that reason.
+spaceships-replay.workspace = true
+
 # The 35 wire messages. Plain serde/JSON, no platform assumptions, so the same
 # crate compiles for both transports in `net.rs` without a single `cfg`.
 spaceships-protocol.workspace = true

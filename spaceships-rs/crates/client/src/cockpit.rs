@@ -102,9 +102,10 @@ use spaceships_sim as sim;
 
 use crate::audio::AudioCommands;
 use crate::camera::FlightCamera;
+use crate::replay::ViewTarget;
 use crate::scene::ShipRoot;
 use crate::sim_bridge::SimFrame;
-use crate::LOCAL_ID;
+use sim::world::EntityId;
 
 // ---------------------------------------------------------------------------
 // Profiles
@@ -445,6 +446,7 @@ impl Plugin for CockpitPlugin {
                 Update,
                 (
                     build_cockpit,
+                    reseat_interior,
                     toggle_view,
                     tick_power,
                     drive_head,
@@ -582,6 +584,8 @@ impl Head {
 fn toggle_view(
     keys: Res<ButtonInput<KeyCode>>,
     frame: Res<SimFrame>,
+    target: Res<ViewTarget>,
+    free: Res<crate::replay::FreeCam>,
     mut view: ResMut<ViewMode>,
     mut head: ResMut<Head>,
     // `FlightCamera` and not `Camera3d`: the menu's ship preview is a second
@@ -595,13 +599,12 @@ fn toggle_view(
         view.first_person = !view.first_person;
     }
 
-    let alive = frame
-        .0
-        .ships
-        .iter()
-        .find(|s| s.id == LOCAL_ID)
+    let alive = seated_ship(&frame.0, target.0)
         .is_some_and(|s| s.flags.contains(sim::world::ShipFlags::ALIVE));
-    let seated = view.first_person && alive;
+    // A canopy drawn around a camera that has left the aircraft is a box in the
+    // middle of the map, so free flight is third person by construction — the
+    // same rule as being dead, for the same reason.
+    let seated = view.first_person && alive && !free.active;
     if seated == view.seated {
         return;
     }
@@ -1145,13 +1148,14 @@ fn build_cockpit(
     mut commands: Commands,
     ships: Query<(Entity, &ShipRoot)>,
     rig: Option<Res<Rig>>,
+    target: Res<ViewTarget>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     if rig.is_some() {
         return;
     }
-    let Some((ship, _)) = ships.iter().find(|(_, r)| r.0 == LOCAL_ID) else {
+    let Some((ship, _)) = ships.iter().find(|(_, r)| r.0 == target.0) else {
         return;
     };
 
@@ -1199,6 +1203,36 @@ fn build_cockpit(
         swatch: palette.swatch.clone(),
         lit: palette.lit,
     });
+}
+
+/// Moves the interior onto whichever ship is being ridden.
+///
+/// The tub, the canopy and the panel are one subtree parented to a ship, so the
+/// ship's world matrix carries them and `seat_camera` only has to place an eye.
+/// That is the right structure and it has exactly one consequence: riding a
+/// different aircraft means re-parenting, not rebuilding. One `ChildOf` write,
+/// and only on the frame the target actually changes — `Res::is_changed` is
+/// true for the frame a resource is written, and `ViewTarget` is written by a
+/// key press.
+///
+/// A live match never runs the body: `ViewTarget` is written once, at
+/// `init_resource`, and never again.
+fn reseat_interior(
+    mut commands: Commands,
+    target: Res<ViewTarget>,
+    rig: Option<Res<Rig>>,
+    ships: Query<(Entity, &ShipRoot)>,
+) {
+    if !target.is_changed() {
+        return;
+    }
+    let Some(rig) = rig else {
+        return;
+    };
+    let Some((ship, _)) = ships.iter().find(|(_, r)| r.0 == target.0) else {
+        return;
+    };
+    commands.entity(rig.root).insert(ChildOf(ship));
 }
 
 /// `createCockpit`: the tub, the canopy hoops, the seat, and the controls.
@@ -1830,6 +1864,7 @@ fn drive_head(
     motion: Res<AccumulatedMouseMotion>,
     view: Res<ViewMode>,
     frame: Res<SimFrame>,
+    target: Res<ViewTarget>,
     mut head: ResMut<Head>,
 ) {
     if !view.seated {
@@ -1844,7 +1879,7 @@ fn drive_head(
         Look::Boresight
     };
 
-    let me = local_ship(&frame.0);
+    let me = seated_ship(&frame.0, target.0);
     head.update(
         look,
         steer(&frame.0),
@@ -1873,8 +1908,14 @@ fn steer(frame: &sim::world::Frame) -> (f32, f32) {
     (sx, sy)
 }
 
-fn local_ship(frame: &sim::world::Frame) -> Option<&sim::world::ShipView> {
-    frame.ships.iter().find(|s| s.id == LOCAL_ID)
+/// The ship whose cockpit this is.
+///
+/// [`LOCAL_ID`] in a live match — that is `ViewTarget`'s default — and whoever
+/// a replay is riding otherwise. Reading a resource rather than the constant is
+/// the whole of what "ride a plane" needs from this module; see
+/// `replay::ViewTarget`.
+fn seated_ship(frame: &sim::world::Frame, id: EntityId) -> Option<&sim::world::ShipView> {
+    frame.ships.iter().find(|s| s.id == id)
 }
 
 /// three.js's `MathUtils.damp`: frame-rate-independent exponential approach.
@@ -1904,6 +1945,7 @@ fn seat_camera(
     view: Res<ViewMode>,
     head: Res<Head>,
     rig: Option<Res<Rig>>,
+    target: Res<ViewTarget>,
     ships: Query<(&ShipRoot, &GlobalTransform)>,
     mut cam: CameraPose,
 ) {
@@ -1913,7 +1955,7 @@ fn seat_camera(
     let Some(rig) = rig else {
         return;
     };
-    let Some((_, ship)) = ships.iter().find(|(r, _)| r.0 == LOCAL_ID) else {
+    let Some((_, ship)) = ships.iter().find(|(r, _)| r.0 == target.0) else {
         return;
     };
     let Ok((mut tf, mut global)) = cam.single_mut() else {
@@ -1977,12 +2019,21 @@ fn mil(v: f32) -> u16 {
     (v.clamp(0.0, 1.0) * 1000.0).round() as u16
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "eleven, against clippy's ten: five resources the panel is built \
+              from and four queries for the component types it writes. Grouping \
+              the writes the way `hud.rs`'s `HudWrite` does would buy one \
+              parameter and cost an indirection in every one of the forty \
+              places below that reaches for a query."
+)]
 fn drive_instruments(
     time: Res<Time>,
     view: Res<ViewMode>,
     power: Res<CockpitPower>,
     frame: Res<SimFrame>,
     rig: Option<Res<Rig>>,
+    target: Res<ViewTarget>,
     mut applied: ResMut<Applied>,
     // `Without<ShipRoot>` is load-bearing: the cockpit hangs off the ship, so
     // both queries touch `Transform` and Bevy cannot prove the archetypes are
@@ -2012,7 +2063,14 @@ fn drive_instruments(
     }
 
     let hud = frame.0.hud;
-    let me = local_ship(&frame.0);
+    // **The gauges are the recorded pilot's, not the ridden ship's.**
+    // `HudState` is computed for `World::local_id` alone, so riding an enemy in
+    // a replay puts you in their seat with your own telemetry on the panel.
+    // Fixing it properly means `sim` deriving a `HudState` per ship, which is a
+    // simulation change and not a rendering one; until then the pose, the
+    // canopy, the radar centre and the hull hiding all follow the target and
+    // the needles do not.
+    let me = seated_ship(&frame.0, target.0);
     let boosting = me.is_some_and(|s| s.flags.contains(sim::world::ShipFlags::BOOSTING));
 
     // -- the controls, which move continuously ------------------------------
@@ -2042,6 +2100,7 @@ fn drive_instruments(
     draw_contacts(
         &rig,
         &frame.0,
+        target.0,
         &ships,
         dark,
         &mut transforms,
@@ -2180,6 +2239,7 @@ fn drive_instruments(
 fn draw_contacts(
     rig: &Rig,
     frame: &sim::world::Frame,
+    seat: EntityId,
     ships: &Query<(&ShipRoot, &Transform)>,
     dark: bool,
     transforms: &mut Query<&mut Transform, Without<ShipRoot>>,
@@ -2188,11 +2248,11 @@ fn draw_contacts(
 ) {
     let mut shown = 0;
     if !dark {
-        let me = ships.iter().find(|(r, _)| r.0 == LOCAL_ID).map(|(_, t)| *t);
+        let me = ships.iter().find(|(r, _)| r.0 == seat).map(|(_, t)| *t);
         if let Some(me) = me {
-            let my_team = local_ship(frame).map_or(-1, |s| s.team);
+            let my_team = seated_ship(frame, seat).map_or(-1, |s| s.team);
             for (root, tf) in ships {
-                if shown >= rig.blips.len() || root.0 == LOCAL_ID {
+                if shown >= rig.blips.len() || root.0 == seat {
                     continue;
                 }
                 let Some(view) = frame.ships.iter().find(|s| s.id == root.0) else {
@@ -2322,6 +2382,7 @@ struct HullMode {
 fn sync_hull(
     view: Res<ViewMode>,
     rig: Option<Res<Rig>>,
+    target: Res<ViewTarget>,
     mut mode: ResMut<HullMode>,
     ships: Query<(&ShipRoot, &Children)>,
     children: Query<&Children>,
@@ -2337,7 +2398,7 @@ fn sync_hull(
     let Some(rig) = rig else {
         return;
     };
-    let Some((_, roots)) = ships.iter().find(|(r, _)| r.0 == LOCAL_ID) else {
+    let Some((_, roots)) = ships.iter().find(|(r, _)| r.0 == target.0) else {
         return;
     };
     let fp = view.seated;
