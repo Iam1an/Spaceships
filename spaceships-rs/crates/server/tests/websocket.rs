@@ -284,12 +284,13 @@ async fn the_terrain_map_spawns_on_the_airfields_with_no_asteroids() {
     let v = j(&a.expect("start", 2000).await);
     assert_eq!(v["map"], "terrain");
     assert_eq!(v["asteroids"].as_array().unwrap().len(), 0);
+    // The pads sit on mesas since the map rebuild, so "above the runway" is a
+    // clearance over `airfield_elevation` and not an absolute altitude.
+    let rules = spaceships_sim::rules::Rules::DEFAULT;
     let pos = &v["spawns"]["1"]["pos"];
-    assert!(
-        (pos[1].as_f64().unwrap() - 40.0).abs() < 6.0,
-        "above the runway"
-    );
-    assert!(pos[2].as_f64().unwrap() < -1380.0);
+    let clearance = pos[1].as_f64().unwrap() - rules.world.airfield_elevation;
+    assert!((clearance - 40.0).abs() < 6.0, "above the runway");
+    assert!(pos[2].as_f64().unwrap() < -(rules.spawn.terrain_z - 20.0));
 }
 
 #[tokio::test]

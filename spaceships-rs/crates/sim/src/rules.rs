@@ -1127,15 +1127,50 @@ pub struct WorldRules {
     /// Airfield box half-extents on the terrain map. `airfield.js:2`
     /// (`AIRFIELD_HALF`).
     pub airfield_half: Vec3,
-    /// Airfield z positions, at `±airfield_z`. `main.js:145`/`:148` and
-    /// `terrain.js:6`–`:7` — both ∓1500.
+    /// Airfield z positions, at `±airfield_z`.
+    ///
+    /// **Changed in the Rust port**, from the JS's ∓1500. A mesa is its pad
+    /// plus [`crate::terrain`]'s apron and ramp — 393 units either side of this
+    /// — and at 1500 the far ramp finished 93 units *outside* the map, where
+    /// the height function has already handed over to open sea. 1400 puts the
+    /// whole mesa inside the border, so the back slope runs down into the water
+    /// instead of ending in a cliff over nothing.
     pub airfield_z: f64,
+    /// Elevation of the landing pads above the waterline.
+    ///
+    /// **New in the Rust port.** The JS flattened both airfields to `y = 0`, so
+    /// each team spawned at the bottom of a circular pit with the surrounding
+    /// hills above them on every bearing. [`crate::terrain`] builds a mesa
+    /// instead: the pad is held at this elevation and the ground ramps down off
+    /// its rim, which is what makes a base high ground rather than a hole.
+    ///
+    /// Read by three places that must agree — the heightfield that flattens the
+    /// pad, the [`BoxVolume`] a ship lands on, and
+    /// [`SpawnRules::terrain_y`], which is this plus the launch height.
+    ///
+    /// [`BoxVolume`]: crate::world::BoxVolume
+    pub airfield_elevation: f64,
 
-    /// Terrain extent; outside `±size/2` the height function returns 0.
-    /// `terrain.js:2` (`TERRAIN_SIZE`).
+    /// Terrain extent; outside `±size/2` the height function returns
+    /// [`Self::water_level`].
+    ///
+    /// Must be an exact multiple of [`crate::terrain::LATTICE_SEGMENTS`]; see
+    /// that constant for why.
     pub terrain_size: f64,
+    /// The waterline: the sea around the island, and the surface of the lake
+    /// and rivers cut into it.
+    ///
+    /// **New in the Rust port**, along with there being any water. Zero is not
+    /// arbitrary — the JS height function clamped at zero and the map edge fell
+    /// away to a flat plain at zero, so putting the sea there is the reading of
+    /// the old map that changes the fewest other numbers. What *is* new is that
+    /// the terrain is now allowed below it.
+    pub water_level: f64,
     /// Height above the terrain surface at which a ship is killed.
     /// `terrain.js:4` (`TERRAIN_KILL_CLEARANCE`), used at `main.js:2251`.
+    ///
+    /// Measured from the *surface*, which since the port includes the water: a
+    /// lake stops a ship exactly as a hillside does.
     pub terrain_kill_clearance: f64,
 
     /// Asteroid field generation.
@@ -1152,9 +1187,11 @@ impl WorldRules {
         mothership_half: Vec3::new(45.0, 18.0, 35.0),
         mothership_z: 600.0,
         airfield_half: Vec3::new(280.0, 4.0, 190.0),
-        airfield_z: 1500.0,
+        airfield_z: 1400.0,
+        airfield_elevation: 210.0,
 
         terrain_size: 3600.0,
+        water_level: 0.0,
         terrain_kill_clearance: 5.0,
 
         asteroid_field: AsteroidFieldRules {
@@ -1199,11 +1236,22 @@ pub struct SpawnRules {
     /// solo players outside it, sometimes clipping the hull on frame one.
     pub space_jitter: Vec3,
 
-    /// Team spawn z on the terrain map, at `∓terrain_z`. `main.js:226` and
-    /// `server/index.js:486`–`:478` — both ∓1400.
+    /// Team spawn z on the terrain map, at `∓terrain_z`.
+    ///
+    /// **Changed in the Rust port**, from the JS's ∓1400, tracking
+    /// [`WorldRules::airfield_z`]: it is 100 units in front of the pad centre,
+    /// exactly as the JS's was.
+    ///
+    /// [`WorldRules::airfield_z`]: crate::rules::WorldRules::airfield_z
     pub terrain_z: f64,
-    /// Team spawn y on the terrain map — above the runway. `main.js:226` and
-    /// `server/index.js:486` — both 40.
+    /// Team spawn y on the terrain map — above the runway.
+    ///
+    /// **Changed in the Rust port**, from the JS's 40. The runway is no longer
+    /// at sea level, so this is
+    /// [`WorldRules::airfield_elevation`]` + `[`Self::TERRAIN_LAUNCH_HEIGHT`]
+    /// and the 40 units of clearance over the tarmac are unchanged.
+    ///
+    /// [`WorldRules::airfield_elevation`]: crate::rules::WorldRules::airfield_elevation
     pub terrain_y: f64,
     /// Full width of the spawn scatter box on the terrain map.
     ///
@@ -1236,14 +1284,18 @@ pub struct SpawnRules {
 }
 
 impl SpawnRules {
+    /// Clearance a ship starts with over its own landing pad. The JS's 40, kept
+    /// as the *height above the tarmac* now that the tarmac has moved up.
+    pub const TERRAIN_LAUNCH_HEIGHT: f64 = 40.0;
+
     /// The frozen default.
     pub const DEFAULT: Self = Self {
         space_z: 540.0,
         space_y: 0.0,
         space_jitter: Vec3::new(8.0, 4.0, 6.0),
 
-        terrain_z: 1400.0,
-        terrain_y: 40.0,
+        terrain_z: WorldRules::DEFAULT.airfield_z - 100.0,
+        terrain_y: WorldRules::DEFAULT.airfield_elevation + Self::TERRAIN_LAUNCH_HEIGHT,
         terrain_jitter: Vec3::new(60.0, 10.0, 40.0),
 
         trials_start: Vec3::new(0.0, 20.0, -510.0),
