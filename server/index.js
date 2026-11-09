@@ -183,11 +183,20 @@ app.post('/api/campaign-result', (req, res) => {
 
 // During dev iteration we want every reload to fetch fresh assets so HTML/CSS
 // edits show up without needing a hard refresh.
-app.use(express.static(path.join(root, 'public'), {
-  etag: false,
-  lastModified: false,
-  setHeaders: (res) => res.set('Cache-Control', 'no-store'),
-}));
+// Prefer the Vite build in dist/ (`npm run build`); when it isn't there,
+// express.static falls straight through and public/ serves the app unbundled.
+app.use(
+  express.static(path.join(root, 'dist'), {
+    etag: false,
+    lastModified: false,
+    setHeaders: (res) => res.set('Cache-Control', 'no-store'),
+  }),
+  express.static(path.join(root, 'public'), {
+    etag: false,
+    lastModified: false,
+    setHeaders: (res) => res.set('Cache-Control', 'no-store'),
+  }),
+);
 
 const server = http.createServer(app);
 

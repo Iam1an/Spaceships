@@ -24,6 +24,7 @@
 - [Game Modes](#-game-modes)
 - [Controls](#-controls)
 - [Weapons](#%EF%B8%8F-weapons)
+- [Development & Testing](#-development--testing)
 - [Architecture](#-architecture)
 - [Project Structure](#-project-structure)
 - [Tech Stack](#-tech-stack)
@@ -143,6 +144,49 @@ flowchart LR
 
 ---
 
+## 🧪 Development & Testing
+
+```bash
+npm start        # builds with Vite, serves on :4000
+npm run dev      # Vite dev server with HMR, proxies API + WebSocket to :4000
+npm run build    # build to dist/
+```
+
+### Getting a quiet match to test in
+
+Most gameplay changes are impossible to observe in a normal match — you get
+killed before you can see anything. To get an **empty lobby**:
+
+> **Multiplayer → Create Game → uncheck "Auto-fill uneven teams with bot" →
+> Recruit Players**
+
+No bot is added and you have the map to yourself: free to fly around, line up
+specific shots, and watch what actually happens. Use it for weapon behavior,
+collision, hit registration, camera work, HUD state, and performance profiling.
+
+The toggle is `#autoBotInput`, read by `autoBotEnabled()` in
+`public/src/lobby/rooms.js` and sent as `allowBot` on the `create` message.
+
+### Other entry points
+
+| Route | Good for |
+|:---|:---|
+| **Solo → Train with Robot** | Combat *with* an opponent — bad if you need to stay alive |
+| **Solo → Trials** | Flight model and terrain; checkpoint courses, no combat |
+| **Solo → Campaign** | Mission 3 is the only way to reach the capital-ship boss |
+
+`playwright` is available for automated checks — guest login needs no
+credentials, so no fixture accounts are required. Run **headed** when measuring
+anything GPU-related; headless Chromium falls back to software GL and the
+numbers are meaningless.
+
+> **Known local-only breakage:** the client calls `/spaceships/api/*` but the
+> server registers `/api/*`. These 404 under `npm start`; production sits behind
+> a proxy that strips the prefix, and `npm run dev` works around it with a
+> rewrite.
+
+---
+
 ## 🏗️ Architecture
 
 ```mermaid
@@ -198,11 +242,9 @@ graph TD
 │       ├── mothership.js     # Static mothership object
 │       ├── warp.js           # Warp jump visual effect
 │       │
-│       ├── carrier.js        # Aircraft carrier (team base)
 │       ├── terrain.js        # Ground terrain + airfields
 │       ├── airfield.js       # Landing and spawn zones
 │       ├── trees.js          # Environmental foliage
-│       ├── water.js          # Water surface rendering
 │       └── clouds.js         # Volumetric cloud layer
 │
 ├── server/
@@ -247,6 +289,12 @@ This game and all its code, assets, and design are the exclusive property of the
 |:---|:---|
 | Game creator & Logic | **Ian** |
 | Online play & backend infrastructure | **Gheat** |
+
+### Third-party assets
+
+`public/jet.glb` (the fighter model) is derived from a Sketchfab model under CC-BY-4.0, which requires the following credit:
+
+> This work is based on "Modern Jet Fighter Low Poly Game Ready Free" (https://sketchfab.com/3d-models/modern-jet-fighter-low-poly-game-ready-free-cd2bd715dcd14dc4b47ebaeb2403fb89) by Hdjusj (https://sketchfab.com/Hdjusj) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
 
 ---
 

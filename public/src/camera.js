@@ -5,7 +5,6 @@ export class ThirdPersonCamera {
     this.target = target;
     this.distance = 11;
     this.heightOffset = 5.6;
-    this.lookAhead = 4;
     this.yaw = 0;
     this.pitch = 0.2;
     this.sensitivity = 0.0035;

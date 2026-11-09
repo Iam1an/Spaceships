@@ -977,14 +977,9 @@
     </button>
   </div>
 
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
-      }
-    }
-  </script>
+  <!-- `three` and `three/addons/*` used to be resolved by an importmap pointing
+       at unpkg.com. They now come from node_modules (three pinned to 0.160.0)
+       and are bundled by Vite — no CDN fetch at runtime. -->
   <script type="module" src="./src/lobby.js"></script>
 </body>
 </html>

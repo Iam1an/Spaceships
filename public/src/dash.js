@@ -60,7 +60,7 @@ function faceAtEye(mesh, eye) {
 
 export function createDash(profile, accent) {
   const { eye, tub } = profile;
-  const { halfWidth: HW, floorY, dashZ } = tub;
+  const { halfWidth: HW, dashZ } = tub;
   const dashTopY = tub.dashTop;
   // Panel depth is fixed rather than measured down to the floor: on the admin hull the
   // floor sits high (clear of the spine), which would otherwise leave a 0.13-deep panel.

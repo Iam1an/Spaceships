@@ -18,7 +18,7 @@ import { createDash } from './dash.js';
 // height, and everything above is open bubble canopy carried on two thin hoops. A boxed-in
 // roof and full-height walls are what made the first pass feel like a grey crate.
 
-export const COCKPIT_PROFILES = {
+const COCKPIT_PROFILES = {
   default: {
     id: 'default',
     // Seated above the fuselage spine but well back in the blister (ship-local z 0.1..2.6),
@@ -30,7 +30,6 @@ export const COCKPIT_PROFILES = {
       halfWidth: 0.60,
       floorY: 0.64,
       railY: 0.92,   // canopy rail: top of the solid tub sides
-      ceilY: 1.56,   // apex of the canopy hoops
       backZ: -0.70,
       dashZ: 1.50,
       dashTop: 1.04,   // panel top; the canopy rail lines up with it
@@ -52,7 +51,6 @@ export const COCKPIT_PROFILES = {
       halfWidth: 0.74,
       floorY: 0.54,
       railY: 0.86,
-      ceilY: 1.58,
       backZ: 3.05,
       dashZ: 5.15,
       dashTop: 0.94,
@@ -64,7 +62,7 @@ export const COCKPIT_PROFILES = {
 
 // Cockpit lamps and interior meshes share this layer so the lamps cannot spill onto the
 // exterior hull. Interior meshes stay on layer 0 as well, so the camera still renders them.
-export const COCKPIT_LAYER = 1;
+const COCKPIT_LAYER = 1;
 
 export function getCockpitProfile(isAdmin) {
   return isAdmin ? COCKPIT_PROFILES.admin : COCKPIT_PROFILES.default;

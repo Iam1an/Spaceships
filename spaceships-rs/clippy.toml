@@ -1,0 +1,8 @@
+# The wire protocol mirrors JS field names one-for-one, so a handful of structs
+# legitimately carry many similarly-named fields. Keep the arg-count lint from
+# firing on the math helpers in `sim`.
+too-many-arguments-threshold = 10
+
+# `f32`/`f64` literals in the sim math tests are compared with epsilons, never
+# with `==`; this just documents the intent for future contributors.
+avoid-breaking-exported-api = false

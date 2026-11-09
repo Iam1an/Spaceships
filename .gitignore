@@ -16,6 +16,14 @@ dist/
 build/
 *.log
 
+# Vite
+.vite/
+node_modules/.vite/
+node_modules/.vite-temp/
+*.local
+vite.config.js.timestamp-*
+vite.config.mjs.timestamp-*
+
 # Env / secrets (none today, but be safe)
 .env
 .env.local
@@ -27,5 +35,7 @@ pilots.db-shm
 pilots.db-wal
 
 # Claude
+# .claude holds agent worktrees and local settings -- not source.
+# CLAUDE.md IS tracked: it carries project context that agents need, and
+# untracked files do not propagate into git worktrees.
 .claude
-CLAUDE.md

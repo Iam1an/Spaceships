@@ -11,7 +11,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 
-export const ULTRA_KEY = 'spaceships:ultraGraphics';
+const ULTRA_KEY = 'spaceships:ultraGraphics';
 
 // Read once at module load. Changing the setting mid-session does nothing until
 // reload, which is exactly what the settings hint promises.
@@ -51,7 +51,7 @@ const MAX_TARGET_BYTES = 160 * 1048576;
 
 let _quality = null;
 
-export function getQuality() {
+function getQuality() {
   if (_quality) return _quality;
 
   const cssPixels = window.innerWidth * window.innerHeight;
@@ -87,7 +87,6 @@ export function getQuality() {
     dpr,
     samples,
     bloomScale: 0.5,
-    estMB: Math.round(est(dpr, samples) / 1048576),
   };
   return _quality;
 }
@@ -373,7 +372,7 @@ export function applySkyEnvironment(scene, renderer, skyColor, groundColor) {
 // the bloom pass has something above 1.0 to catch.
 const _upgraded = new WeakSet();
 
-export function upgradeMaterials(root, opts = {}) {
+function upgradeMaterials(root, opts = {}) {
   if (!ULTRA || !root) return;
   const {
     envIntensity = 0.45,
@@ -440,23 +439,6 @@ export function sweepScene(scene) {
     }
   });
   upgradeMaterials(scene);
-}
-
-// Bump a single material into HDR for bloom without touching a whole subtree.
-export function makeGlow(material, intensity = 2.0) {
-  if (!ULTRA || !material) return material;
-  const mats = Array.isArray(material) ? material : [material];
-  for (const m of mats) {
-    if (!m || _upgraded.has(m)) continue;
-    _upgraded.add(m);
-    if (m.isMeshBasicMaterial) {
-      m.color.multiplyScalar(intensity);
-      m.toneMapped = false;
-    } else if (m.emissive) {
-      m.emissiveIntensity = (m.emissiveIntensity || 1) * intensity;
-    }
-  }
-  return material;
 }
 
 // ── Lighting ────────────────────────────────────────────────────────────────

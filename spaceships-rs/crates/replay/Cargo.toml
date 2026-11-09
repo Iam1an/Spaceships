@@ -1,0 +1,16 @@
+[package]
+name = "spaceships-replay"
+description = "Recording and playback for Spaceships: a match as a seed, a rules fingerprint, and an input log."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# `sim` and nothing else. The file format is hand-rolled little-endian rather
+# than serde-derived, for the reason the crate docs give: `sim` carries no
+# derives and must not grow a dependency to get them, and a format this crate
+# writes by hand is one it can also read forever.
+[dependencies]
+spaceships-sim.workspace = true
+
+[dev-dependencies]
